@@ -361,9 +361,11 @@ void UNet::apply_transformer_(const Transformer2D& t,
     const int H_heads = t.num_heads;
 
     // 1. residual is `x` itself; we add the post-transformer result back in.
-    // 2. GroupNorm in NCHW.
+    // 2. GroupNorm in NCHW. Diffusers' Transformer2DModel uses eps=1e-6 on
+    //    this outer GroupNorm (distinct from the 1e-5 used on the ResNet
+    //    GroupNorms); hard-code it here rather than relying on cfg_.eps.
     bt::group_norm_forward_gpu(x, t.gn_g, t.gn_b,
-                               1, C, H, W, cfg_.norm_num_groups, cfg_.eps, gn_);
+                               1, C, H, W, cfg_.norm_num_groups, 1e-6f, gn_);
 
     // 3. NCHW -> (L, C) sequence.
     bt::nchw_to_sequence_gpu(gn_, 1, C, H, W, seq_);
@@ -405,9 +407,7 @@ void UNet::apply_transformer_(const Transformer2D& t,
             tseq_, blk.n3g, blk.n3b, ln_, cfg_.eps);
         bt::linear_forward_batched_fp16_gpu(blk.ff1_W, &blk.ff1_b, ln_, ff_mid_);
         // Exact GELU (erf) — SD1.5's BasicTransformerBlock uses PyTorch's
-        // F.gelu with the default approximate=False. The tanh-approx variant
-        // accumulates ~0.1% per-element error which CFG amplifies into visible
-        // texture artifacts.
+        // F.gelu with default approximate=False.
         bt::geglu_exact_forward_gpu(ff_mid_, ff_act_);
         bt::linear_forward_batched_fp16_gpu(blk.ff2_W, &blk.ff2_b, ff_act_, ff_out_);
         bt::add_inplace_gpu(tseq_, ff_out_);
