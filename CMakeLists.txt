@@ -86,6 +86,7 @@ target_sources(brodiffusion PRIVATE
     src/safetensors.cpp
     src/tokenizer_clip.cpp
     src/clip.cpp
+    src/vae.cpp
 )
 
 # --- CLI ---
