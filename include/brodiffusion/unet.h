@@ -191,7 +191,7 @@ private:
     brotensor::GpuTensor freq_emb_, temb_a_, temb_b_, temb_silu_, temb_proj_;
     brotensor::GpuTensor cat_buf_;
     brotensor::GpuTensor gn_, seq_, proj_in_seq_, tseq_, ln_;
-    brotensor::GpuTensor Q_, K_, V_, attn_out_, attn_proj_;
+    brotensor::GpuTensor attn_proj_;
     brotensor::GpuTensor ff_mid_, ff_act_, ff_out_;
     brotensor::GpuTensor proj_out_seq_, proj_out_nchw_;
 };

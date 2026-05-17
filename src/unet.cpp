@@ -383,17 +383,16 @@ void UNet::apply_transformer_(const Transformer2D& t,
         bt::add_inplace_gpu(tseq_, attn_proj_);
 
         // ── cross-attention (K, V from `ctx`) ─────────────────────────────
-        // Can't use the fused qkvo op here: brotensor requires Wk/Wv to be
-        // square (D, D), but SD1.5 cross-attention has rectangular Wk/Wv
-        // of shape (D, cross_attention_dim). Falls back to explicit Q/K/V.
         bt::layernorm_forward_inference_batched_fp16_gpu(
             tseq_, blk.n2g, blk.n2b, ln_, cfg_.eps);
-        bt::linear_forward_batched_fp16_gpu(blk.Wq2, /*bias=*/nullptr, ln_, Q_);
-        bt::linear_forward_batched_fp16_gpu(blk.Wk2, /*bias=*/nullptr, ctx, K_);
-        bt::linear_forward_batched_fp16_gpu(blk.Wv2, /*bias=*/nullptr, ctx, V_);
-        bt::flash_attention_forward_gpu(Q_, K_, V_, /*d_mask=*/nullptr,
-                                        H_heads, /*causal=*/false, attn_out_);
-        bt::linear_forward_batched_fp16_gpu(blk.Wo2, &blk.bo2, attn_out_, attn_proj_);
+        bt::flash_attention_qkvo_forward_gpu(
+            ln_, &ctx,
+            blk.Wq2, /*bq=*/nullptr,
+            blk.Wk2, /*bk=*/nullptr,
+            blk.Wv2, /*bv=*/nullptr,
+            blk.Wo2, &blk.bo2,
+            /*d_mask=*/nullptr, H_heads, /*causal=*/false,
+            attn_proj_);
         bt::add_inplace_gpu(tseq_, attn_proj_);
 
         // ── feed-forward (GEGLU) ──────────────────────────────────────────
