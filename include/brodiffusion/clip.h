@@ -103,7 +103,7 @@ private:
     brotensor::GpuTensor tok_emb_, pos_emb_;
     brotensor::GpuTensor x_;                            // residual stream
     brotensor::GpuTensor ln_out_;
-    brotensor::GpuTensor Q_, K_, V_, attn_out_, proj_out_;
+    brotensor::GpuTensor proj_out_;
     brotensor::GpuTensor ffn_mid_, ffn_act_, ffn_out_;
 };
 

@@ -2,7 +2,9 @@
 
 // UNet2DConditionModel for SD1.5 (the noise-prediction backbone).
 //
-// Inference-only, FP16, batch size N = 1. Architecture mirrors Hugging
+// Inference-only, FP16, batch size N = 1 (the forward path hard-codes N=1
+// throughout; the underlying brotensor ops support N > 1, so generalizing
+// is mostly a matter of plumbing the batch dim through). Architecture mirrors Hugging
 // Face's diffusers `UNet2DConditionModel` defaults for SD1.5:
 //
 //   block_out_channels = [320, 640, 1280, 1280]

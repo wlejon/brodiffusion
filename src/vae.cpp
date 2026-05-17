@@ -180,16 +180,12 @@ void Decoder::apply_attention_(const Attention& a, int H, int W,
                                ln_nchw_);
     // NCHW → (H*W, C) sequence.
     bt::nchw_to_sequence_gpu(ln_nchw_, 1, a.C, H, W, seq_);
-    // Q, K, V via linear with biases.
-    bt::linear_forward_batched_fp16_gpu(a.Wq, &a.bq, seq_, Q_);
-    bt::linear_forward_batched_fp16_gpu(a.Wk, &a.bk, seq_, K_);
-    bt::linear_forward_batched_fp16_gpu(a.Wv, &a.bv, seq_, V_);
-    // Non-causal single-head full self-attention.
-    bt::flash_attention_forward_gpu(Q_, K_, V_, /*d_mask=*/nullptr,
-                                    cfg_.num_attention_heads, /*causal=*/false,
-                                    attn_seq_);
-    // Output projection.
-    bt::linear_forward_batched_fp16_gpu(a.Wo, &a.bo, attn_seq_, proj_seq_);
+    // Fused Q/K/V/O projections + non-causal single-head self-attention.
+    bt::flash_attention_qkvo_forward_gpu(
+        seq_, /*Ctx=*/nullptr,
+        a.Wq, &a.bq, a.Wk, &a.bk, a.Wv, &a.bv, a.Wo, &a.bo,
+        /*d_mask=*/nullptr, cfg_.num_attention_heads, /*causal=*/false,
+        proj_seq_);
     // Sequence → NCHW.
     bt::sequence_to_nchw_gpu(proj_seq_, 1, a.C, H, W, attn_nchw_);
     // Residual add.

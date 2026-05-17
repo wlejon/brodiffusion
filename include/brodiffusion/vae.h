@@ -141,7 +141,7 @@ private:
 
     // Scratch (re-used across decode calls).
     brotensor::GpuTensor x_, y_;      // ping-pong residual stream
-    brotensor::GpuTensor seq_, Q_, K_, V_, attn_seq_, proj_seq_, attn_nchw_;
+    brotensor::GpuTensor seq_, proj_seq_, attn_nchw_;
     brotensor::GpuTensor ln_nchw_;
 };
 

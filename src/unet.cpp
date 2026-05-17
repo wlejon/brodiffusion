@@ -353,7 +353,6 @@ void UNet::apply_transformer_(const Transformer2D& t,
                               const bt::GpuTensor& ctx,
                               int H, int W, bt::GpuTensor& x) {
     const int C  = t.C;
-    const int L  = H * W;
     const int H_heads = t.num_heads;
 
     // 1. residual is `x` itself; we add the post-transformer result back in.
@@ -370,18 +369,23 @@ void UNet::apply_transformer_(const Transformer2D& t,
     // 5. transformer blocks (always 1 for SD1.5).
     tseq_ = proj_in_seq_.clone();
     for (const AttnFFN& blk : t.blocks) {
-        // ── self-attention ────────────────────────────────────────────────
+        // ── self-attention (Q/K/V bias-less, Wo biased) ───────────────────
         bt::layernorm_forward_inference_batched_fp16_gpu(
             tseq_, blk.n1g, blk.n1b, ln_, cfg_.eps);
-        bt::linear_forward_batched_fp16_gpu(blk.Wq1, /*bias=*/nullptr, ln_, Q_);
-        bt::linear_forward_batched_fp16_gpu(blk.Wk1, /*bias=*/nullptr, ln_, K_);
-        bt::linear_forward_batched_fp16_gpu(blk.Wv1, /*bias=*/nullptr, ln_, V_);
-        bt::flash_attention_forward_gpu(Q_, K_, V_, /*d_mask=*/nullptr,
-                                        H_heads, /*causal=*/false, attn_out_);
-        bt::linear_forward_batched_fp16_gpu(blk.Wo1, &blk.bo1, attn_out_, attn_proj_);
+        bt::flash_attention_qkvo_forward_gpu(
+            ln_, /*Ctx=*/nullptr,
+            blk.Wq1, /*bq=*/nullptr,
+            blk.Wk1, /*bk=*/nullptr,
+            blk.Wv1, /*bv=*/nullptr,
+            blk.Wo1, &blk.bo1,
+            /*d_mask=*/nullptr, H_heads, /*causal=*/false,
+            attn_proj_);
         bt::add_inplace_gpu(tseq_, attn_proj_);
 
         // ── cross-attention (K, V from `ctx`) ─────────────────────────────
+        // Can't use the fused qkvo op here: brotensor requires Wk/Wv to be
+        // square (D, D), but SD1.5 cross-attention has rectangular Wk/Wv
+        // of shape (D, cross_attention_dim). Falls back to explicit Q/K/V.
         bt::layernorm_forward_inference_batched_fp16_gpu(
             tseq_, blk.n2g, blk.n2b, ln_, cfg_.eps);
         bt::linear_forward_batched_fp16_gpu(blk.Wq2, /*bias=*/nullptr, ln_, Q_);
@@ -409,7 +413,6 @@ void UNet::apply_transformer_(const Transformer2D& t,
 
     // 8. residual add.
     bt::add_inplace_gpu(x, proj_out_nchw_);
-    (void)L;
 }
 
 // ─── forward ───────────────────────────────────────────────────────────────
@@ -502,12 +505,14 @@ void UNet::forward(const bt::GpuTensor& sample,
         UpBlock& u = up_blocks_[static_cast<std::size_t>(i)];
         const int layers = cfg_.layers_per_block + 1;
         for (int j = 0; j < layers; ++j) {
-            // Channel-axis concat with popped skip. For N=1, NCHW channel
-            // concat is exactly a flat row-concat.
+            // Channel-axis concat with popped skip.
             bt::GpuTensor skip = std::move(skips.back());
             skips.pop_back();
-            std::vector<const bt::GpuTensor*> parts = {&x_, &skip};
-            bt::concat_rows_gpu(parts, cat_buf_);
+            const int C_x_now    = x_.cols / (Hc * Wc);
+            const int C_skip_now = skip.cols / (Hc * Wc);
+            const std::vector<int> C_parts    = {C_x_now, C_skip_now};
+            const std::vector<const bt::GpuTensor*> parts = {&x_, &skip};
+            bt::concat_nchw_channels_gpu(parts, /*N=*/1, Hc, Wc, C_parts, cat_buf_);
             std::swap(x_, cat_buf_);
 
             apply_resnet_(u.resnets[static_cast<std::size_t>(j)], Hc, Wc, x_, y_);

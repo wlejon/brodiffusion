@@ -140,14 +140,14 @@ void TextEncoder::forward(const int32_t* ids, bt::GpuTensor& out) {
         bt::layernorm_forward_inference_batched_fp16_gpu(
             x_, layer.ln1_gamma, layer.ln1_beta, ln_out_, cfg_.layer_norm_eps);
 
-        bt::linear_forward_batched_fp16_gpu(layer.Wq, &layer.bq, ln_out_, Q_);
-        bt::linear_forward_batched_fp16_gpu(layer.Wk, &layer.bk, ln_out_, K_);
-        bt::linear_forward_batched_fp16_gpu(layer.Wv, &layer.bv, ln_out_, V_);
-
-        bt::flash_attention_forward_gpu(Q_, K_, V_, /*d_mask=*/nullptr,
-                                        H, /*causal=*/true, attn_out_);
-
-        bt::linear_forward_batched_fp16_gpu(layer.Wo, &layer.bo, attn_out_, proj_out_);
+        bt::flash_attention_qkvo_forward_gpu(
+            ln_out_, /*Ctx=*/nullptr,
+            layer.Wq, &layer.bq,
+            layer.Wk, &layer.bk,
+            layer.Wv, &layer.bv,
+            layer.Wo, &layer.bo,
+            /*d_mask=*/nullptr, H, /*causal=*/true,
+            proj_out_);
         bt::add_inplace_gpu(x_, proj_out_);
 
         // ── MLP block ─────────────────────────────────────────────────────
