@@ -88,6 +88,8 @@ target_sources(brodiffusion PRIVATE
     src/clip.cpp
     src/vae.cpp
     src/unet.cpp
+    src/scheduler.cpp
+    src/pipeline.cpp
 )
 
 # --- CLI ---
