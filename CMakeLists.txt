@@ -83,6 +83,8 @@ endif()
 
 target_sources(brodiffusion PRIVATE
     src/version.cpp
+    src/safetensors.cpp
+    src/tokenizer_clip.cpp
 )
 
 # --- CLI ---

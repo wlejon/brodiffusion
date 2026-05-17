@@ -9,4 +9,6 @@ function(brodiffusion_add_test name)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-brodiffusion_add_test(brodiffusion_test_smoke test_smoke.cpp)
+brodiffusion_add_test(brodiffusion_test_smoke          test_smoke.cpp)
+brodiffusion_add_test(brodiffusion_test_safetensors    test_safetensors.cpp)
+brodiffusion_add_test(brodiffusion_test_tokenizer_clip test_tokenizer_clip.cpp)
