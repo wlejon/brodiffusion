@@ -199,7 +199,10 @@ void UNet::load_weights(const st::File& f, const std::string& prefix) {
     for (int i = 0; i < nb; ++i) {
         DownBlock& d = down_blocks_[static_cast<std::size_t>(i)];
         const int C_out = d.C_out;
-        const int num_heads = C_out / cfg_.attention_head_dim;
+        // NOTE: diffusers' SD1.5 config uses `attention_head_dim` as the
+        // *number of heads* (a backwards-compat quirk documented in
+        // UNet2DConditionModel.__init__). Head dim is therefore C_out/num_heads.
+        const int num_heads = cfg_.attention_head_dim;
 
         d.resnets.clear();
         d.resnets.resize(static_cast<std::size_t>(cfg_.layers_per_block));
@@ -241,7 +244,7 @@ void UNet::load_weights(const st::File& f, const std::string& prefix) {
         const std::string mp = prefix + "mid_block.";
         load_resnet_(f, mp + "resnets.0.", mid_C, mid_C, mid_.r0);
         load_transformer_(f, mp + "attentions.0.", mid_C,
-                          mid_C / cfg_.attention_head_dim, mid_.t);
+                          cfg_.attention_head_dim, mid_.t);
         load_resnet_(f, mp + "resnets.1.", mid_C, mid_C, mid_.r1);
     }
 
@@ -263,7 +266,7 @@ void UNet::load_weights(const st::File& f, const std::string& prefix) {
     for (int i = 0; i < nb; ++i) {
         UpBlock& u = up_blocks_[static_cast<std::size_t>(i)];
         const int C_out = u.C_out;
-        const int num_heads = C_out / cfg_.attention_head_dim;
+        const int num_heads = cfg_.attention_head_dim;
         const int layers = cfg_.layers_per_block + 1;
 
         u.resnets.clear();
@@ -401,7 +404,11 @@ void UNet::apply_transformer_(const Transformer2D& t,
         bt::layernorm_forward_inference_batched_fp16_gpu(
             tseq_, blk.n3g, blk.n3b, ln_, cfg_.eps);
         bt::linear_forward_batched_fp16_gpu(blk.ff1_W, &blk.ff1_b, ln_, ff_mid_);
-        bt::geglu_forward_gpu(ff_mid_, ff_act_);
+        // Exact GELU (erf) — SD1.5's BasicTransformerBlock uses PyTorch's
+        // F.gelu with the default approximate=False. The tanh-approx variant
+        // accumulates ~0.1% per-element error which CFG amplifies into visible
+        // texture artifacts.
+        bt::geglu_exact_forward_gpu(ff_mid_, ff_act_);
         bt::linear_forward_batched_fp16_gpu(blk.ff2_W, &blk.ff2_b, ff_act_, ff_out_);
         bt::add_inplace_gpu(tseq_, ff_out_);
     }

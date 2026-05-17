@@ -132,6 +132,12 @@ private:
     DecoderConfig cfg_;
 
     // Weights.
+    // post_quant_conv lives ABOVE the "decoder." prefix in diffusers' VAE; it's
+    // a 1x1 conv (in_channels -> in_channels) applied between the latent scale
+    // and the decoder proper. Optional: legacy/encoder-less checkpoints may
+    // omit it (has_post_quant_conv_ == false).
+    brotensor::GpuTensor post_quant_W_, post_quant_b_;
+    bool                 has_post_quant_conv_ = false;
     brotensor::GpuTensor conv_in_W_,  conv_in_b_;
     Resnet               mid_res0_,   mid_res1_;
     Attention            mid_attn_;

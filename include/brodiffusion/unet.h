@@ -11,7 +11,9 @@
 //   layers_per_block   = 2
 //   norm_num_groups    = 32
 //   cross_attention_dim = 768            (CLIP ViT-L/14 hidden dim)
-//   attention_head_dim  = 8              (heads = block_out_channels[i] / 8)
+//   attention_head_dim  = 8              (actually means num_heads — diffusers
+//                                          backwards-compat quirk; head_dim is
+//                                          block_out_channels[i] / 8)
 //   time_embed_dim      = 4 * block_out_channels[0] = 1280
 //
 // Top-level structure:

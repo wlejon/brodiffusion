@@ -89,6 +89,31 @@ void Decoder::load_weights(const st::File& f, const std::string& prefix) {
     const int mid_C   = cfg_.block_out_channels.back();
     const int first_C = cfg_.block_out_channels.front();
 
+    // post_quant_conv lives at the sibling level of "decoder." (e.g. plain
+    // "post_quant_conv.{weight,bias}" for a standalone diffusers VAE export, or
+    // "first_stage_model.post_quant_conv.{weight,bias}" for the SD1.5 single-
+    // file checkpoint). Derive the parent prefix by stripping a trailing
+    // "decoder." if present, then look up the tensors. If they're missing we
+    // assume the checkpoint omits this layer (rare; not standard SD1.5).
+    std::string parent = prefix;
+    {
+        const std::string tail = "decoder.";
+        if (parent.size() >= tail.size() &&
+            parent.compare(parent.size() - tail.size(), tail.size(), tail) == 0) {
+            parent.erase(parent.size() - tail.size());
+        }
+    }
+    const auto* pqw = f.find(parent + "post_quant_conv.weight");
+    const auto* pqb = f.find(parent + "post_quant_conv.bias");
+    has_post_quant_conv_ = (pqw != nullptr && pqb != nullptr);
+    if (has_post_quant_conv_) {
+        // 1x1 conv (in_channels, in_channels, 1, 1) -> 2D (in_channels, in_channels).
+        upload_fp16_checked(*pqw, cfg_.in_channels, cfg_.in_channels,
+                            post_quant_W_, "post_quant_conv.weight");
+        upload_fp16_checked(*pqb, cfg_.in_channels, 1,
+                            post_quant_b_, "post_quant_conv.bias");
+    }
+
     // conv_in: (mid_C, in_channels, 3, 3) → 2D (mid_C, in_channels * 9)
     upload_fp16_checked(need(f, prefix + "conv_in.weight"),
                         mid_C, cfg_.in_channels * 3 * 3, conv_in_W_, "conv_in.weight");
@@ -240,6 +265,20 @@ void Decoder::decode(const bt::GpuTensor& latent,
     x_ = latent.clone();
     if (cfg_.scaling_factor != 1.0f) {
         bt::scale_inplace_gpu(x_, 1.0f / cfg_.scaling_factor);
+    }
+
+    // 1b. post_quant_conv: 1x1 conv (in_channels -> in_channels). Applied by
+    // AutoencoderKL.decode() in diffusers BEFORE the decoder module proper. The
+    // weights ship in the same safetensors file (loaded with prefix above the
+    // "decoder." subtree), and skipping it produces images that match the
+    // decoder output bit-for-bit but render with severe block/color artifacts.
+    if (has_post_quant_conv_) {
+        bt::conv2d_forward_gpu(x_, post_quant_W_, &post_quant_b_,
+                               /*N=*/1, cfg_.in_channels, H_lat, W_lat,
+                               cfg_.in_channels, /*kH=*/1, /*kW=*/1,
+                               1, 1, /*pad=*/0, 0, 1, 1,
+                               y_);
+        std::swap(x_, y_);
     }
 
     // 2. conv_in: in_channels -> mid_C.
