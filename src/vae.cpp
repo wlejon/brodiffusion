@@ -26,10 +26,12 @@ const st::TensorView& need(const st::File& f, const std::string& key) {
     return *v;
 }
 
+// Accepts F16 (used as-is) or F32 (converted host-side); SD1.5 full
+// checkpoints ship as F32.
 void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
                         bt::GpuTensor& dst, const char* name) {
-    if (v.dtype != st::Dtype::F16) {
-        fail(std::string(name) + ": expected FP16, got " + st::dtype_name(v.dtype));
+    if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
+        fail(std::string(name) + ": expected F16 or F32, got " + st::dtype_name(v.dtype));
     }
     int64_t expected = static_cast<int64_t>(rows) * static_cast<int64_t>(cols);
     if (v.numel() != expected) {
@@ -37,7 +39,7 @@ void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
              std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
              std::to_string(v.numel()) + ")");
     }
-    st::upload(v, rows, cols, dst);
+    st::upload_fp16(v, rows, cols, dst);
 }
 
 }  // namespace
@@ -100,14 +102,25 @@ void Decoder::load_weights(const st::File& f, const std::string& prefix) {
     const std::string ap = prefix + "mid_block.attentions.0.";
     upload_fp16_checked(need(f, ap + "group_norm.weight"), mid_C, 1, mid_attn_.gn_g, "attn.gn.w");
     upload_fp16_checked(need(f, ap + "group_norm.bias"),   mid_C, 1, mid_attn_.gn_b, "attn.gn.b");
-    upload_fp16_checked(need(f, ap + "query.weight"),      mid_C, mid_C, mid_attn_.Wq, "attn.q.w");
-    upload_fp16_checked(need(f, ap + "query.bias"),        mid_C, 1, mid_attn_.bq, "attn.q.b");
-    upload_fp16_checked(need(f, ap + "key.weight"),        mid_C, mid_C, mid_attn_.Wk, "attn.k.w");
-    upload_fp16_checked(need(f, ap + "key.bias"),          mid_C, 1, mid_attn_.bk, "attn.k.b");
-    upload_fp16_checked(need(f, ap + "value.weight"),      mid_C, mid_C, mid_attn_.Wv, "attn.v.w");
-    upload_fp16_checked(need(f, ap + "value.bias"),        mid_C, 1, mid_attn_.bv, "attn.v.b");
-    upload_fp16_checked(need(f, ap + "proj_attn.weight"),  mid_C, mid_C, mid_attn_.Wo, "attn.o.w");
-    upload_fp16_checked(need(f, ap + "proj_attn.bias"),    mid_C, 1, mid_attn_.bo, "attn.o.b");
+    // Diffusers >=0.20 renamed the VAE mid-block attention tensors to match
+    // the BasicTransformerBlock naming (to_q/to_k/to_v/to_out.0). The older
+    // query/key/value/proj_attn names live on in legacy checkpoints — accept
+    // either.
+    auto need_alt = [&](const char* primary, const char* legacy) -> const st::TensorView& {
+        const auto* v = f.find(ap + primary);
+        if (v) return *v;
+        v = f.find(ap + legacy);
+        if (v) return *v;
+        fail("missing attention tensor '" + ap + primary + "' (also tried '" + ap + legacy + "')");
+    };
+    upload_fp16_checked(need_alt("to_q.weight",     "query.weight"),     mid_C, mid_C, mid_attn_.Wq, "attn.q.w");
+    upload_fp16_checked(need_alt("to_q.bias",       "query.bias"),       mid_C, 1, mid_attn_.bq, "attn.q.b");
+    upload_fp16_checked(need_alt("to_k.weight",     "key.weight"),       mid_C, mid_C, mid_attn_.Wk, "attn.k.w");
+    upload_fp16_checked(need_alt("to_k.bias",       "key.bias"),         mid_C, 1, mid_attn_.bk, "attn.k.b");
+    upload_fp16_checked(need_alt("to_v.weight",     "value.weight"),     mid_C, mid_C, mid_attn_.Wv, "attn.v.w");
+    upload_fp16_checked(need_alt("to_v.bias",       "value.bias"),       mid_C, 1, mid_attn_.bv, "attn.v.b");
+    upload_fp16_checked(need_alt("to_out.0.weight", "proj_attn.weight"), mid_C, mid_C, mid_attn_.Wo, "attn.o.w");
+    upload_fp16_checked(need_alt("to_out.0.bias",   "proj_attn.bias"),   mid_C, 1, mid_attn_.bo, "attn.o.b");
     mid_attn_.C = mid_C;
 
     // up_blocks. Channel order is reversed: up_blocks[0] takes block_out_channels.back().

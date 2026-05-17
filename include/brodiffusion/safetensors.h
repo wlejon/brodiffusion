@@ -101,4 +101,10 @@ private:
 // Throws std::runtime_error if the byte count or dtype is wrong.
 void upload(const TensorView& view, int rows, int cols, brotensor::GpuTensor& dst);
 
+// Like upload(), but always produces an FP16 GpuTensor. If the source view is
+// F32, it is converted host-side via brotensor::fp32_to_fp16_bits before
+// upload (the SD1.5 full checkpoints ship as F32; their "fp16" sub-variants
+// are diffusers-only). If the source is F16, it's uploaded as-is.
+void upload_fp16(const TensorView& view, int rows, int cols, brotensor::GpuTensor& dst);
+
 }

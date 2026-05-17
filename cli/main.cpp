@@ -1,7 +1,23 @@
+#include "brodiffusion/pipeline.h"
+#include "brodiffusion/safetensors.h"
+#include "brodiffusion/tokenizer.h"
 #include "brodiffusion/version.h"
 
+#include "brotensor/runtime.h"
+
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace pl   = brodiffusion::pipeline;
+namespace st   = brodiffusion::safetensors;
+namespace clip = brodiffusion::clip;
 
 static int usage() {
     std::printf(
@@ -9,18 +25,104 @@ static int usage() {
         "\n"
         "Usage:\n"
         "  brodiffusion --version\n"
-        "  brodiffusion txt2img --model <safetensors> --prompt <text> --out <ppm>\n"
+        "  brodiffusion txt2img --text <st> --unet <st> --vae <st>\n"
+        "                       --vocab <vocab.json> --merges <merges.txt>\n"
+        "                       --prompt <text> --out <ppm>\n"
         "                       [--negative <text>] [--steps N] [--cfg F]\n"
         "                       [--width N] [--height N] [--seed N]\n"
         "\n"
-        "--out writes uncompressed PPM (P6) — a dev convenience, not a real\n"
-        "image format. The library returns RGB8 host buffers; encoding is the\n"
-        "consumer's job (bro's image-api on integration).\n"
-        "\n"
-        "Pipelines are not implemented yet. See README.md for status.\n",
+        "Writes an uncompressed PPM (P6) — a dev convenience for sanity-checking\n"
+        "the generation pipeline. Proper PNG/JPEG encoding lives outside this\n"
+        "library (bro's image-api on integration).\n",
         brodiffusion::version_string());
     return 0;
 }
+
+namespace {
+
+const char* arg_after(int argc, char** argv, const char* flag) {
+    for (int i = 1; i < argc - 1; ++i) {
+        if (std::strcmp(argv[i], flag) == 0) return argv[i + 1];
+    }
+    return nullptr;
+}
+
+int run_txt2img(int argc, char** argv) {
+    const char* text_path   = arg_after(argc, argv, "--text");
+    const char* unet_path   = arg_after(argc, argv, "--unet");
+    const char* vae_path    = arg_after(argc, argv, "--vae");
+    const char* vocab_path  = arg_after(argc, argv, "--vocab");
+    const char* merges_path = arg_after(argc, argv, "--merges");
+    const char* prompt      = arg_after(argc, argv, "--prompt");
+    const char* out_path    = arg_after(argc, argv, "--out");
+    const char* neg         = arg_after(argc, argv, "--negative");
+    const char* steps_s     = arg_after(argc, argv, "--steps");
+    const char* cfg_s       = arg_after(argc, argv, "--cfg");
+    const char* width_s     = arg_after(argc, argv, "--width");
+    const char* height_s    = arg_after(argc, argv, "--height");
+    const char* seed_s      = arg_after(argc, argv, "--seed");
+
+    if (!text_path || !unet_path || !vae_path ||
+        !vocab_path || !merges_path || !prompt || !out_path) {
+        std::fprintf(stderr,
+            "txt2img: --text, --unet, --vae, --vocab, --merges, --prompt, --out are required\n");
+        return 2;
+    }
+
+    pl::GenerateOptions opts;
+    if (neg)     opts.negative_prompt = neg;
+    if (steps_s) opts.num_inference_steps = std::atoi(steps_s);
+    if (cfg_s)   opts.guidance_scale = static_cast<float>(std::atof(cfg_s));
+    if (width_s) opts.width  = std::atoi(width_s);
+    if (height_s)opts.height = std::atoi(height_s);
+    if (seed_s)  opts.seed = static_cast<std::uint64_t>(std::strtoull(seed_s, nullptr, 10));
+
+    brotensor::cuda_init();
+
+    auto tok = clip::Tokenizer::load(vocab_path, merges_path);
+
+    pl::PipelineConfig cfg;
+    pl::Pipeline pipeline(cfg, std::move(tok));
+
+    std::printf("Loading weights:\n  text: %s\n  unet: %s\n  vae:  %s\n",
+                text_path, unet_path, vae_path);
+    auto text_file = st::File::open(text_path);
+    auto unet_file = st::File::open(unet_path);
+    auto vae_file  = st::File::open(vae_path);
+    pipeline.load_weights(text_file, unet_file, vae_file);
+
+    std::printf("Generating %dx%d, %d steps, CFG=%.1f, seed=%llu\n",
+                opts.width, opts.height, opts.num_inference_steps,
+                static_cast<double>(opts.guidance_scale),
+                static_cast<unsigned long long>(opts.seed));
+
+    auto img = pipeline.generate(prompt, opts);  // (3*H*W) NCHW, FP32 in [-1, 1]
+
+    // Convert planar [-1,1] FP32 → interleaved RGB8.
+    const int H = opts.height, W = opts.width;
+    const int plane = H * W;
+    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(3) * plane);
+    for (int i = 0; i < plane; ++i) {
+        for (int c = 0; c < 3; ++c) {
+            float v = (img[c * plane + i] + 1.0f) * 127.5f;
+            v = std::clamp(v, 0.0f, 255.0f);
+            rgb[3 * i + c] = static_cast<std::uint8_t>(v + 0.5f);
+        }
+    }
+
+    std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        std::fprintf(stderr, "txt2img: cannot open output %s\n", out_path);
+        return 1;
+    }
+    f << "P6\n" << W << " " << H << "\n255\n";
+    f.write(reinterpret_cast<const char*>(rgb.data()),
+            static_cast<std::streamsize>(rgb.size()));
+    std::printf("Wrote %s\n", out_path);
+    return 0;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) return usage();
@@ -29,8 +131,12 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (std::strcmp(argv[1], "txt2img") == 0) {
-        std::fprintf(stderr, "txt2img: not implemented yet\n");
-        return 2;
+        try {
+            return run_txt2img(argc, argv);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "txt2img: %s\n", e.what());
+            return 1;
+        }
     }
     return usage();
 }

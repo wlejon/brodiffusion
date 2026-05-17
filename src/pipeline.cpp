@@ -54,6 +54,14 @@ void Pipeline::load_weights(const safetensors::File& f,
     vae_.load_weights(f, vae_prefix);
 }
 
+void Pipeline::load_weights(const safetensors::File& text_file,
+                            const safetensors::File& unet_file,
+                            const safetensors::File& vae_file) {
+    text_encoder_.load_weights(text_file, "text_model.");
+    unet_.load_weights(unet_file, "");
+    vae_.load_weights(vae_file, "decoder.");
+}
+
 void Pipeline::encode_prompt_(std::string_view prompt, bt::GpuTensor& out) {
     std::vector<std::int32_t> ids = tokenizer_.encode(prompt);
     if (static_cast<int>(ids.size()) != cfg_.text_encoder.max_position) {

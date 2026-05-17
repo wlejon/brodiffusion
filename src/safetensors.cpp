@@ -6,6 +6,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
@@ -425,6 +426,33 @@ void upload(const TensorView& view, int rows, int cols, brotensor::GpuTensor& ds
     } else {
         throw std::runtime_error(
             std::string("safetensors::upload: unsupported dtype ") +
+            dtype_name(view.dtype) + " for tensor '" + view.name + "'");
+    }
+}
+
+void upload_fp16(const TensorView& view, int rows, int cols, brotensor::GpuTensor& dst) {
+    if (rows <= 0 || cols <= 0) {
+        throw std::runtime_error("safetensors::upload_fp16: rows/cols must be positive");
+    }
+    const std::size_t n = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+    const std::size_t expected = n * static_cast<std::size_t>(dtype_size_bytes(view.dtype));
+    if (expected != view.nbytes) {
+        throw std::runtime_error(
+            "safetensors::upload_fp16: byte count mismatch for tensor '" + view.name + "'");
+    }
+    if (view.dtype == Dtype::F16) {
+        brotensor::upload_fp16(reinterpret_cast<const uint16_t*>(view.data),
+                               rows, cols, dst);
+    } else if (view.dtype == Dtype::F32) {
+        const float* src = reinterpret_cast<const float*>(view.data);
+        std::vector<uint16_t> tmp(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            tmp[i] = brotensor::fp32_to_fp16_bits(src[i]);
+        }
+        brotensor::upload_fp16(tmp.data(), rows, cols, dst);
+    } else {
+        throw std::runtime_error(
+            std::string("safetensors::upload_fp16: unsupported dtype ") +
             dtype_name(view.dtype) + " for tensor '" + view.name + "'");
     }
 }

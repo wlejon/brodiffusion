@@ -12,3 +12,7 @@ compile_commands.json
 *.ckpt
 *.bin
 *.ppm
+*.png
+
+# Downloaded model weights and tokenizer files (see scripts/download-weights.ps1).
+weights/

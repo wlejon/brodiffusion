@@ -67,6 +67,12 @@ public:
                       const std::string& unet_prefix,
                       const std::string& vae_prefix);
 
+    // Load each module from its own diffusers-format safetensors file. Uses
+    // the diffusers default prefixes ("text_model.", "", "decoder.").
+    void load_weights(const safetensors::File& text_file,
+                      const safetensors::File& unet_file,
+                      const safetensors::File& vae_file);
+
     // Generate an image. Returns a freshly-allocated host buffer of
     // 3 * height * width FP32 values in NCHW (C=3, [-1, 1]).
     std::vector<float> generate(std::string_view prompt,

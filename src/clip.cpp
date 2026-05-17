@@ -22,12 +22,14 @@ namespace {
     throw std::runtime_error("clip::TextEncoder: " + msg);
 }
 
-// Upload a FP16 safetensors view, asserting the expected (rows, cols) shape.
-// Permits the source tensor to be 1-D (treated as (n, 1)) or 2-D.
+// Upload a safetensors view as a FP16 GpuTensor. Accepts F16 source (used
+// as-is) or F32 source (converted host-side); SD1.5 full checkpoints ship
+// as F32. Asserts the expected (rows, cols) shape; permits the source tensor
+// to be 1-D (treated as (n, 1)) or 2-D.
 void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
                          bt::GpuTensor& dst, const char* name) {
-    if (v.dtype != st::Dtype::F16) {
-        fail(std::string(name) + ": expected FP16, got " +
+    if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
+        fail(std::string(name) + ": expected F16 or F32, got " +
              st::dtype_name(v.dtype));
     }
     int64_t expected = static_cast<int64_t>(rows) * static_cast<int64_t>(cols);
@@ -36,7 +38,7 @@ void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
              std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
              std::to_string(v.numel()) + " elements)");
     }
-    st::upload(v, rows, cols, dst);
+    st::upload_fp16(v, rows, cols, dst);
 }
 
 const st::TensorView& need(const st::File& f, const std::string& key) {
