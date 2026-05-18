@@ -160,15 +160,6 @@ int main(int argc, char** argv) {
             brotensor::cuda_init();
             auto tok = clip::Tokenizer::load(vocab_path, merges_path);
             pl::PipelineConfig cfg;
-            // Phase-1 distillation: opt into the L=4096 self-attn student via
-            // BRODIFFUSION_STUDENT=1. Zero-init at construction time; an
-            // explicit student_prefix is plumbed once we have trained weights.
-            if (const char* sf = std::getenv("BRODIFFUSION_STUDENT");
-                sf && sf[0] && sf[0] != '0') {
-                cfg.unet.enable_selfattn_student_L4096 = true;
-                std::fprintf(stderr, "[bench] selfattn student L=4096 ENABLED (zero-init)\n");
-                std::fflush(stderr);
-            }
             pl::Pipeline pipeline(cfg, std::move(tok));
             pipeline.load_weights(st::File::open(text_path),
                                   st::File::open(unet_path),

@@ -48,8 +48,6 @@
 // weights and activations are FP16 — convert host-side if your checkpoint
 // ships FP32 weights.
 
-#include "brodiffusion/student_selfattn.h"
-
 #include "brotensor/device_buffer.h"
 #include "brotensor/tensor.h"
 
@@ -73,26 +71,6 @@ struct UNetConfig {
     int attention_head_dim  = 8;
     // time_embed_dim = block_out_channels[0] * time_embed_dim_mult.
     int time_embed_dim_mult = 4;
-
-    // Phase-1 distillation: replace the self-attention sub-layer of the
-    // four L = 4096 (top-resolution, C = 320) Transformer2D blocks with a
-    // cheap residual depthwise-separable conv stack (SelfAttnStudent).
-    //
-    // Order of the 4 student slots (matches forward-pass visit order):
-    //   [0] down_blocks[0].transformers[0]   (encoder, top-res, layer 0)
-    //   [1] down_blocks[0].transformers[1]   (encoder, top-res, layer 1)
-    //   [2] up_blocks[nb-1].transformers[1]  (decoder, top-res, second-to-last)
-    //   [3] up_blocks[nb-1].transformers[2]  (decoder, top-res, last)
-    //
-    // Cross-attention + FF sub-layers of those blocks are *unchanged*. Other
-    // resolutions (L = 1024, 256, 64) always use the original self-attention.
-    //
-    // When false (default) the student tensors are not even allocated.
-    // When true and the student weights aren't present in the safetensors
-    // file, the student is left zero-initialised (identity behaviour — it
-    // skips the self-attention contribution entirely, which is the expected
-    // pre-training swap-in state).
-    bool enable_selfattn_student_L4096 = false;
 };
 
 class UNet {
@@ -111,15 +89,8 @@ public:
     //
     // Every tensor must be FP16. Throws std::runtime_error on missing names,
     // shape mismatches, or dtype mismatch.
-    //
-    // student_prefix: when the self-attn student is enabled, the per-block
-    //   weights are looked up at
-    //     <student_prefix>block<i>.dw.<j>.weight  etc.  (i = 0..3, j = 0..2)
-    //   If the prefix is empty or the weights are absent, the students stay
-    //   at their zero-init (identity) state. Ignored if the flag is off.
     void load_weights(const brodiffusion::safetensors::File& f,
-                      const std::string& prefix = "",
-                      const std::string& student_prefix = "");
+                      const std::string& prefix = "");
 
     // Forward pass.
     //   sample:                (1, in_channels * H * W) FP16 — noisy latent
@@ -229,16 +200,9 @@ private:
                        brotensor::GpuTensor& x, brotensor::GpuTensor& tmp);
     // If `cache_entry` is non-null, its (K, V) replace the cross-attn K/V
     // projections (must have been primed against the same `ctx`).
-    // If `student` is non-null, its forward() replaces the self-attention
-    // sub-layer of the transformer block; the surrounding GroupNorm /
-    // proj_in / proj_out path is unchanged (we still go sequence-shape for
-    // cross-attn + FF, but the self-attn step consumes NCHW directly via
-    // the student's pre-seq-transpose hook). See apply_transformer_ for
-    // the exact swap point.
     void apply_transformer_(const Transformer2D& t,
                             const brotensor::GpuTensor& ctx,
                             const CrossAttnKVCacheEntry* cache_entry,
-                            const student::SelfAttnStudent* student,
                             int H, int W,
                             brotensor::GpuTensor& x);
     // Shared forward worker; xattn_cache may be null (legacy path) or point
@@ -275,18 +239,6 @@ private:
     brotensor::GpuTensor attn_proj_;
     brotensor::GpuTensor ff_mid_, ff_act_, ff_out_;
     brotensor::GpuTensor proj_out_seq_, proj_out_nchw_;
-
-    // Self-attn student modules (Phase-1 distillation). Empty unless
-    // cfg_.enable_selfattn_student_L4096 == true; otherwise sized to 4
-    // and ordered to match the forward-pass visit order described on
-    // UNetConfig::enable_selfattn_student_L4096.
-    std::vector<student::SelfAttnStudent> students_;
-    // Scratch buffer for the student's intermediate (post-dwconv) NCHW
-    // activation. Reused across blocks and across timesteps.
-    brotensor::GpuTensor student_scratch_;
-    // Holds the student forward output (NCHW); the result is swapped back
-    // into `x` after the student call.
-    brotensor::GpuTensor student_out_;
 };
 
 }  // namespace brodiffusion::unet
