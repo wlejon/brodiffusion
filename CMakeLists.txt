@@ -25,6 +25,17 @@ endif()
 option(BROTENSOR_WITH_CUDA  "Build GPU backend (CUDA)"  OFF)
 option(BROTENSOR_WITH_METAL "Build GPU backend (Metal)" OFF)
 
+# brodiffusion ships SD1.5-specific fused CUDA kernels (e.g. fused_resblock.cu);
+# enable the CUDA language only when CUDA is the selected backend.
+if(BROTENSOR_WITH_CUDA)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES native)
+    endif()
+endif()
+
 # --- Siblings: bromath (header-only) + brotensor (GPU ops) ---
 #
 # Prefer standalone repos at ../<name>; fall back to third_party/ submodules.
@@ -91,6 +102,12 @@ target_sources(brodiffusion PRIVATE
     src/scheduler.cpp
     src/pipeline.cpp
 )
+
+if(BROTENSOR_WITH_CUDA)
+    target_sources(brodiffusion PRIVATE src/fused_resblock.cu)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(brodiffusion PUBLIC CUDA::cudart)
+endif()
 
 # --- CLI ---
 option(BRODIFFUSION_CLI "Build the brodiffusion CLI" ${PROJECT_IS_TOP_LEVEL})

@@ -6,6 +6,7 @@
 #include "brotensor/runtime.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -135,6 +136,58 @@ int main(int argc, char** argv) {
             return run_txt2img(argc, argv);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "txt2img: %s\n", e.what());
+            return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "bench") == 0) {
+        try {
+            const char* text_path   = arg_after(argc, argv, "--text");
+            const char* unet_path   = arg_after(argc, argv, "--unet");
+            const char* vae_path    = arg_after(argc, argv, "--vae");
+            const char* vocab_path  = arg_after(argc, argv, "--vocab");
+            const char* merges_path = arg_after(argc, argv, "--merges");
+            const char* steps_s     = arg_after(argc, argv, "--steps");
+            const char* iters_s     = arg_after(argc, argv, "--iters");
+            const char* warmup_s    = arg_after(argc, argv, "--warmup");
+            if (!text_path || !unet_path || !vae_path || !vocab_path || !merges_path) {
+                std::fprintf(stderr, "bench: --text, --unet, --vae, --vocab, --merges required\n");
+                return 2;
+            }
+            const int steps  = steps_s  ? std::atoi(steps_s)  : 5;
+            const int iters  = iters_s  ? std::atoi(iters_s)  : 5;
+            const int warmup = warmup_s ? std::atoi(warmup_s) : 1;
+
+            brotensor::cuda_init();
+            auto tok = clip::Tokenizer::load(vocab_path, merges_path);
+            pl::PipelineConfig cfg;
+            pl::Pipeline pipeline(cfg, std::move(tok));
+            pipeline.load_weights(st::File::open(text_path),
+                                  st::File::open(unet_path),
+                                  st::File::open(vae_path));
+            pl::GenerateOptions opts;
+            opts.num_inference_steps = steps;
+            opts.guidance_scale = 1.0f;   // skip uncond pass — bench unet+vae core
+            opts.width = 512; opts.height = 512; opts.seed = 1;
+
+            for (int i = 0; i < warmup; ++i) (void)pipeline.generate("an astronaut", opts);
+            using clk = std::chrono::high_resolution_clock;
+            double sum_ms = 0.0, mn = 1e30, mx = 0.0;
+            for (int i = 0; i < iters; ++i) {
+                auto t0 = clk::now();
+                (void)pipeline.generate("an astronaut", opts);
+                auto t1 = clk::now();
+                double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                sum_ms += ms; mn = std::min(mn, ms); mx = std::max(mx, ms);
+                std::printf("  iter %d: %.2f ms (%.2f steps/s)\n", i, ms, 1000.0 * steps / ms);
+            }
+            const double avg = sum_ms / iters;
+            std::printf("bench: steps=%d iters=%d  avg=%.2f ms  min=%.2f  max=%.2f\n",
+                        steps, iters, avg, mn, mx);
+            std::printf("       per-step=%.2f ms  throughput=%.2f (steps=%d)/s  (target 24/s @ %d steps)\n",
+                        avg / steps, 1000.0 / avg, steps, steps);
+            return 0;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "bench: %s\n", e.what());
             return 1;
         }
     }

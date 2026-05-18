@@ -1,15 +1,20 @@
 #include "brodiffusion/unet.h"
 #include "brodiffusion/safetensors.h"
+#include "brodiffusion/fused_resblock.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <cuda_runtime.h>
 
 namespace brodiffusion::unet {
 
@@ -341,16 +346,16 @@ void UNet::apply_resnet_(const Resnet& r, int H, int W,
 
     const bt::GpuTensor* skip_W = r.has_shortcut ? &r.Ws : nullptr;
     const bt::GpuTensor* skip_b = r.has_shortcut ? &r.bs : nullptr;
-    bt::resblock_forward_gpu(x,
-                             r.n1g, r.n1b,
-                             r.W1, &r.b1,
-                             &temb_proj_,
-                             r.n2g, r.n2b,
-                             r.W2, &r.b2,
-                             skip_W, skip_b,
-                             /*N=*/1, r.C_in, r.C_out, H, W,
-                             cfg_.norm_num_groups, cfg_.eps,
-                             tmp);
+    brodiffusion::fused_resblock_forward(x,
+                                         r.n1g, r.n1b,
+                                         r.W1, r.b1,
+                                         temb_proj_,
+                                         r.n2g, r.n2b,
+                                         r.W2, r.b2,
+                                         skip_W, skip_b,
+                                         r.C_in, r.C_out, H, W,
+                                         cfg_.norm_num_groups, cfg_.eps,
+                                         tmp);
     std::swap(x, tmp);
 }
 
@@ -453,6 +458,35 @@ void UNet::forward(const bt::GpuTensor& sample,
                    bt::GpuTensor& out) {
     if (conv_in_W_.size() == 0) fail("forward: weights not loaded");
 
+    // ── Optional GPU profiling (env: UNET_PROF=1) ───────────────────────────
+    const bool prof_enabled = (std::getenv("UNET_PROF") != nullptr);
+    struct ProfBlock {
+        cudaEvent_t s{}, e{};
+        float ms_accum{0.0f};
+    };
+    ProfBlock pb_conv_in, pb_down_res, pb_down_xform, pb_down_samp;
+    ProfBlock pb_mid, pb_up_res, pb_up_xform, pb_up_samp, pb_conv_out;
+    ProfBlock* pb_all[] = {&pb_conv_in, &pb_down_res, &pb_down_xform, &pb_down_samp,
+                           &pb_mid, &pb_up_res, &pb_up_xform, &pb_up_samp, &pb_conv_out};
+    if (prof_enabled) {
+        for (auto* p : pb_all) {
+            cudaEventCreate(&p->s);
+            cudaEventCreate(&p->e);
+        }
+    }
+    auto prof_begin = [&](ProfBlock& p) {
+        if (prof_enabled) cudaEventRecord(p.s);
+    };
+    auto prof_end = [&](ProfBlock& p) {
+        if (prof_enabled) {
+            cudaEventRecord(p.e);
+            cudaEventSynchronize(p.e);
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, p.s, p.e);
+            p.ms_accum += ms;
+        }
+    };
+
     const int nb      = static_cast<int>(cfg_.block_out_channels.size());
     const int first_C = cfg_.block_out_channels.front();
 
@@ -469,9 +503,11 @@ void UNet::forward(const bt::GpuTensor& sample,
 
     // ── 2. conv_in: in_channels -> first_C ─────────────────────────────────
     x_ = sample.clone();
+    prof_begin(pb_conv_in);
     apply_conv3x3_(conv_in_W_, conv_in_b_, cfg_.in_channels, first_C, H, W,
                    /*stride=*/1, /*pad=*/1, x_, y_);
     std::swap(x_, y_);
+    prof_end(pb_conv_in);
 
     // Skip stack: each entry is a deep copy of the residual stream at push time.
     std::vector<bt::GpuTensor> skips;
@@ -484,19 +520,25 @@ void UNet::forward(const bt::GpuTensor& sample,
     for (int i = 0; i < nb; ++i) {
         DownBlock& d = down_blocks_[static_cast<std::size_t>(i)];
         for (int j = 0; j < cfg_.layers_per_block; ++j) {
+            prof_begin(pb_down_res);
             apply_resnet_(d.resnets[static_cast<std::size_t>(j)], Hc, Wc, x_, y_);
+            prof_end(pb_down_res);
             if (d.has_attention) {
+                prof_begin(pb_down_xform);
                 apply_transformer_(d.transformers[static_cast<std::size_t>(j)],
                                    encoder_hidden_states, Hc, Wc, x_);
+                prof_end(pb_down_xform);
             }
             skips.push_back(x_.clone());
         }
         if (d.has_downsampler) {
             // 3x3 stride-2 conv same-channels.
+            prof_begin(pb_down_samp);
             apply_conv3x3_(d.downsampler.W, d.downsampler.b,
                            d.C_out, d.C_out, Hc, Wc,
                            /*stride=*/2, /*pad=*/1, x_, y_);
             std::swap(x_, y_);
+            prof_end(pb_down_samp);
             Hc /= 2;
             Wc /= 2;
             skips.push_back(x_.clone());
@@ -504,9 +546,11 @@ void UNet::forward(const bt::GpuTensor& sample,
     }
 
     // ── 4. mid_block: resnet -> transformer -> resnet ──────────────────────
+    prof_begin(pb_mid);
     apply_resnet_(mid_.r0, Hc, Wc, x_, y_);
     apply_transformer_(mid_.t, encoder_hidden_states, Hc, Wc, x_);
     apply_resnet_(mid_.r1, Hc, Wc, x_, y_);
+    prof_end(pb_mid);
 
     // ── 5. up_blocks ───────────────────────────────────────────────────────
     for (int i = 0; i < nb; ++i) {
@@ -523,23 +567,30 @@ void UNet::forward(const bt::GpuTensor& sample,
             bt::concat_nchw_channels_gpu(parts, /*N=*/1, Hc, Wc, C_parts, cat_buf_);
             std::swap(x_, cat_buf_);
 
+            prof_begin(pb_up_res);
             apply_resnet_(u.resnets[static_cast<std::size_t>(j)], Hc, Wc, x_, y_);
+            prof_end(pb_up_res);
             if (u.has_attention) {
+                prof_begin(pb_up_xform);
                 apply_transformer_(u.transformers[static_cast<std::size_t>(j)],
                                    encoder_hidden_states, Hc, Wc, x_);
+                prof_end(pb_up_xform);
             }
         }
         if (u.has_upsampler) {
+            prof_begin(pb_up_samp);
             bt::upsample_nearest_2x_gpu(x_, 1, u.C_out, Hc, Wc, y_);
             apply_conv3x3_(u.upsampler.W, u.upsampler.b,
                            u.C_out, u.C_out, 2 * Hc, 2 * Wc,
                            /*stride=*/1, /*pad=*/1, y_, x_);
+            prof_end(pb_up_samp);
             Hc *= 2;
             Wc *= 2;
         }
     }
 
     // ── 6. conv_norm_out -> SiLU -> conv_out ───────────────────────────────
+    prof_begin(pb_conv_out);
     bt::group_norm_forward_gpu(x_, norm_out_g_, norm_out_b_,
                                1, first_C, Hc, Wc, cfg_.norm_num_groups, cfg_.eps,
                                y_);
@@ -547,6 +598,24 @@ void UNet::forward(const bt::GpuTensor& sample,
     apply_conv3x3_(conv_out_W_, conv_out_b_,
                    first_C, cfg_.out_channels, Hc, Wc,
                    /*stride=*/1, /*pad=*/1, y_, out);
+    prof_end(pb_conv_out);
+
+    if (prof_enabled) {
+        std::fprintf(stderr,
+            "[UNET_PROF] conv_in=%.3f down_res=%.3f down_xform=%.3f down_samp=%.3f "
+            "mid=%.3f up_res=%.3f up_xform=%.3f up_samp=%.3f conv_out=%.3f "
+            "(ms, sum=%.3f)\n",
+            pb_conv_in.ms_accum, pb_down_res.ms_accum, pb_down_xform.ms_accum,
+            pb_down_samp.ms_accum, pb_mid.ms_accum, pb_up_res.ms_accum,
+            pb_up_xform.ms_accum, pb_up_samp.ms_accum, pb_conv_out.ms_accum,
+            pb_conv_in.ms_accum + pb_down_res.ms_accum + pb_down_xform.ms_accum +
+            pb_down_samp.ms_accum + pb_mid.ms_accum + pb_up_res.ms_accum +
+            pb_up_xform.ms_accum + pb_up_samp.ms_accum + pb_conv_out.ms_accum);
+        for (auto* p : pb_all) {
+            cudaEventDestroy(p->s);
+            cudaEventDestroy(p->e);
+        }
+    }
 }
 
 }  // namespace brodiffusion::unet

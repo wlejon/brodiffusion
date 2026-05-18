@@ -11,7 +11,10 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <cstdio>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -100,27 +103,39 @@ std::vector<float> Pipeline::generate(std::string_view prompt,
     bt::upload_fp16(noise.data(), 1, n_lat, latent_);
 
     // 3. Schedule + denoising loop.
+    const bool prof = std::getenv("BRODIFF_PROF") != nullptr;
+    using clk = std::chrono::high_resolution_clock;
+    double unet_ms = 0.0, vae_ms = 0.0;
     scheduler_.set_timesteps(opts.num_inference_steps);
     for (int i = 0; i < scheduler_.num_inference_steps(); ++i) {
         const float t = static_cast<float>(scheduler_.timesteps()[i]);
 
+        auto t0 = clk::now();
         unet_.forward(latent_, H_lat, W_lat, t, ctx_cond_, noise_pred_cond_);
 
         if (do_cfg) {
             unet_.forward(latent_, H_lat, W_lat, t, ctx_uncond_, noise_pred_uncond_);
-            // noise_pred = uncond + scale * (cond - uncond)
-            //            = scale * cond + (1 - scale) * uncond
             bt::scale_inplace_gpu(noise_pred_cond_, opts.guidance_scale);
             bt::scale_inplace_gpu(noise_pred_uncond_, 1.0f - opts.guidance_scale);
             bt::add_inplace_gpu(noise_pred_cond_, noise_pred_uncond_);
         }
+        if (prof) bt::cuda_sync();
+        auto t1 = clk::now();
+        unet_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
         scheduler_.step(noise_pred_cond_, i, latent_, scratch_);
     }
 
     // 4. Decode through the VAE (scaling factor applied internally).
+    auto tv0 = clk::now();
     vae_.decode(latent_, H_lat, W_lat, decoded_);
     bt::cuda_sync();
+    auto tv1 = clk::now();
+    vae_ms = std::chrono::duration<double, std::milli>(tv1 - tv0).count();
+    if (prof) {
+        std::fprintf(stderr, "    [prof] unet_total=%.1f ms  vae=%.1f ms\n", unet_ms, vae_ms);
+        std::fflush(stderr);
+    }
 
     // 5. Download FP16 → FP32 host buffer.
     const int n_img = cfg_.vae.out_channels * opts.height * opts.width;
