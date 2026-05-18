@@ -1,3 +1,4 @@
+#include "brodiffusion/distill.h"
 #include "brodiffusion/pipeline.h"
 #include "brodiffusion/safetensors.h"
 #include "brodiffusion/tokenizer.h"
@@ -452,6 +453,54 @@ int run_capture_inlet(int argc, char** argv) {
     return 0;
 }
 
+int run_distill_inlet(int argc, char** argv) {
+    namespace dl = brodiffusion::distill;
+    const char* cap_dir   = arg_after(argc, argv, "--capture-dir");
+    const char* out_path  = arg_after(argc, argv, "--out");
+    const char* steps_s   = arg_after(argc, argv, "--steps");
+    const char* lr_s      = arg_after(argc, argv, "--lr");
+    const char* b1_s      = arg_after(argc, argv, "--beta1");
+    const char* b2_s      = arg_after(argc, argv, "--beta2");
+    const char* eps_s     = arg_after(argc, argv, "--eps");
+    const char* seed_s    = arg_after(argc, argv, "--shuffle-seed");
+    const char* log_s     = arg_after(argc, argv, "--log-every");
+    const char* ckpt_s    = arg_after(argc, argv, "--ckpt-every");
+    const char* init_s    = arg_after(argc, argv, "--init");
+    const char* lw_s      = arg_after(argc, argv, "--loss-weight");
+    if (!cap_dir || !out_path) {
+        std::fprintf(stderr, "distill-inlet: --capture-dir and --out required\n");
+        return 2;
+    }
+    dl::TrainOptions o;
+    if (steps_s) o.steps = std::atoi(steps_s);
+    if (lr_s)    o.lr    = static_cast<float>(std::atof(lr_s));
+    if (b1_s)    o.beta1 = static_cast<float>(std::atof(b1_s));
+    if (b2_s)    o.beta2 = static_cast<float>(std::atof(b2_s));
+    if (eps_s)   o.eps   = static_cast<float>(std::atof(eps_s));
+    if (seed_s)  o.shuffle_seed = std::strtoull(seed_s, nullptr, 10);
+    if (log_s)   o.log_every    = std::atoi(log_s);
+    if (ckpt_s)  o.ckpt_every   = std::atoi(ckpt_s);
+    if (lw_s) {
+        std::string s(lw_s);
+        std::array<float, 12> w{};
+        size_t idx = 0, pos = 0;
+        while (pos < s.size() && idx < 12) {
+            size_t comma = s.find(',', pos);
+            std::string tok = s.substr(pos, comma - pos);
+            w[idx++] = static_cast<float>(std::atof(tok.c_str()));
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+        if (idx != 12) {
+            std::fprintf(stderr, "distill-inlet: --loss-weight needs 12 comma-separated floats\n");
+            return 2;
+        }
+        o.loss_weights = w;
+    }
+    std::string init = init_s ? init_s : "";
+    return dl::run_distill(cap_dir, out_path, init, o);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -473,6 +522,14 @@ int main(int argc, char** argv) {
             return run_capture_inlet(argc, argv);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "capture-inlet: %s\n", e.what());
+            return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "distill-inlet") == 0) {
+        try {
+            return run_distill_inlet(argc, argv);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "distill-inlet: %s\n", e.what());
             return 1;
         }
     }
