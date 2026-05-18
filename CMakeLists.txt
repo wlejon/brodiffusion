@@ -101,6 +101,7 @@ target_sources(brodiffusion PRIVATE
     src/unet.cpp
     src/scheduler.cpp
     src/lcm_scheduler.cpp
+    src/lora.cpp
     src/pipeline.cpp
 )
 

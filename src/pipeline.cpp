@@ -2,6 +2,7 @@
 
 #include "brodiffusion/clip.h"
 #include "brodiffusion/lcm_scheduler.h"
+#include "brodiffusion/lora.h"
 #include "brodiffusion/safetensors.h"
 #include "brodiffusion/scheduler.h"
 #include "brodiffusion/tokenizer.h"
@@ -80,6 +81,26 @@ void Pipeline::load_weights(const safetensors::File& text_file,
     vae_.load_weights(vae_file, "decoder.");
 }
 
+void Pipeline::apply_lora(const safetensors::File& f, float scale) {
+    const std::vector<lora::Triple> triples = lora::enumerate(f);
+    if (triples.empty()) {
+        fail("apply_lora: no LoRA triples found in file");
+    }
+    for (const lora::Triple& t : triples) {
+        const float scale_total = (static_cast<float>(t.alpha) /
+                                   static_cast<float>(t.rank)) * scale;
+        const safetensors::TensorView& down = f.get(t.down_key);
+        const safetensors::TensorView& up   = f.get(t.up_key);
+        if (t.domain == "unet") {
+            unet_.apply_lora_delta(t.target_path, down, up, scale_total);
+        } else if (t.domain == "text_encoder") {
+            text_encoder_.apply_lora_delta(t.target_path, down, up, scale_total);
+        } else {
+            fail("apply_lora: unknown domain '" + t.domain + "'");
+        }
+    }
+}
+
 void Pipeline::encode_prompt_(std::string_view prompt, bt::GpuTensor& out) {
     std::vector<std::int32_t> ids = tokenizer_.encode(prompt);
     if (static_cast<int>(ids.size()) != cfg_.text_encoder.max_position) {
@@ -150,9 +171,18 @@ std::vector<float> Pipeline::generate(std::string_view prompt,
 
         auto t0 = clk::now();
         if (is_lcm) {
-            unet_.forward(latent_, H_lat, W_lat, t,
-                          opts.guidance_scale,
-                          ctx_cond_, xattn_cache_cond_, noise_pred_cond_);
+            // LCM with cond_proj (distilled-LCM checkpoints) feeds w through
+            // the cond_proj path. LCM-LoRA on a vanilla SD1.5 UNet has no
+            // cond_proj — fall back to the cache-only forward; w is implicit
+            // in the LoRA-merged weights of the consistency model.
+            if (cfg_.unet.time_cond_proj_dim > 0) {
+                unet_.forward(latent_, H_lat, W_lat, t,
+                              opts.guidance_scale,
+                              ctx_cond_, xattn_cache_cond_, noise_pred_cond_);
+            } else {
+                unet_.forward(latent_, H_lat, W_lat, t, ctx_cond_,
+                              xattn_cache_cond_, noise_pred_cond_);
+            }
         } else {
             unet_.forward(latent_, H_lat, W_lat, t, ctx_cond_,
                           xattn_cache_cond_, noise_pred_cond_);

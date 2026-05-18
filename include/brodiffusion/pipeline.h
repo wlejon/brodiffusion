@@ -79,6 +79,23 @@ public:
                       const safetensors::File& unet_file,
                       const safetensors::File& vae_file);
 
+    // Merge a LoRA file's deltas into the base UNet and CLIP weights.
+    //
+    // Must be called *after* load_weights() and *before* generate(). The
+    // cross-attention K/V cache is re-primed inside every generate() call,
+    // so calling apply_lora() between generates is safe — the next generate
+    // will rebuild the cache against the updated K/V projections.
+    //
+    // `scale` is a user multiplier applied on top of the per-LoRA alpha/rank
+    // factor (default 1.0 = use as-shipped). Negative values are allowed
+    // (subtract / undo). May be called more than once to stack multiple
+    // LoRAs.
+    //
+    // Accepts both kohya-ss/A1111 and diffusers/PEFT key conventions; the
+    // format is auto-detected from the key prefixes. Throws if the file
+    // contains LoRA tensors that don't map to a known SD1.5 target.
+    void apply_lora(const safetensors::File& f, float scale = 1.0f);
+
     // Generate an image. Returns a freshly-allocated host buffer of
     // 3 * height * width FP32 values in NCHW (C=3, [-1, 1]).
     std::vector<float> generate(std::string_view prompt,

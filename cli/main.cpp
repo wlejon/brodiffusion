@@ -33,12 +33,22 @@ static int usage() {
         "                       [--negative <text>] [--steps N] [--cfg F]\n"
         "                       [--width N] [--height N] [--seed N]\n"
         "                       [--scheduler ddim|lcm]\n"
+        "                       [--lora <path>[:<scale>]]... [--lcm-lora <path>]\n"
         "\n"
         "  --scheduler lcm  selects the LCM (Latent Consistency Model) scheduler;\n"
         "                   requires an LCM-distilled UNet checkpoint (e.g.\n"
         "                   SimianLuo/LCM_Dreamshaper_v7). When set, default --steps\n"
         "                   becomes 4 and the uncond pass is skipped; --cfg is reused\n"
         "                   as the guidance-scale embedding `w`.\n"
+        "\n"
+        "  --lora <path>[:<scale>]  merge a LoRA file into the loaded weights\n"
+        "                   before generation. Repeatable; scale defaults to 1.0\n"
+        "                   and may be negative. Supports both kohya-ss/A1111 and\n"
+        "                   diffusers/PEFT key conventions (auto-detected).\n"
+        "\n"
+        "  --lcm-lora <path>  sugar for '--scheduler lcm --steps 4 --cfg 1.0\n"
+        "                   --lora <path>' against a vanilla SD1.5 UNet (no\n"
+        "                   cond_proj; LCM-LoRA on top of stock SD1.5).\n"
         "\n"
         "Writes an uncompressed PPM (P6) — a dev convenience for sanity-checking\n"
         "the generation pipeline. Proper PNG/JPEG encoding lives outside this\n"
@@ -56,6 +66,40 @@ const char* arg_after(int argc, char** argv, const char* flag) {
     return nullptr;
 }
 
+struct LoraSpec {
+    std::string path;
+    float       scale = 1.0f;
+};
+
+// Collect every "--lora <path>[:<scale>]" from argv. Repeatable.
+std::vector<LoraSpec> collect_loras(int argc, char** argv) {
+    std::vector<LoraSpec> out;
+    for (int i = 1; i < argc - 1; ++i) {
+        if (std::strcmp(argv[i], "--lora") != 0) continue;
+        std::string raw = argv[i + 1];
+        // Split on the LAST ':' so Windows drive letters ("D:\foo:0.8") parse
+        // correctly — the path may contain colons. A trailing
+        // ":<number>" is the scale; anything else is part of the path.
+        LoraSpec s;
+        auto pos = raw.rfind(':');
+        bool has_scale = false;
+        if (pos != std::string::npos && pos != 0 && pos > 1) {
+            const std::string tail = raw.substr(pos + 1);
+            // Heuristic: a scale is a parseable float of strlen() > 0.
+            char* endp = nullptr;
+            float v = std::strtof(tail.c_str(), &endp);
+            if (endp && *endp == '\0' && !tail.empty()) {
+                s.scale = v;
+                s.path  = raw.substr(0, pos);
+                has_scale = true;
+            }
+        }
+        if (!has_scale) s.path = raw;
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
 int run_txt2img(int argc, char** argv) {
     const char* text_path   = arg_after(argc, argv, "--text");
     const char* unet_path   = arg_after(argc, argv, "--unet");
@@ -71,6 +115,7 @@ int run_txt2img(int argc, char** argv) {
     const char* height_s    = arg_after(argc, argv, "--height");
     const char* seed_s      = arg_after(argc, argv, "--seed");
     const char* sched_s     = arg_after(argc, argv, "--scheduler");
+    const char* lcm_lora    = arg_after(argc, argv, "--lcm-lora");
 
     if (!text_path || !unet_path || !vae_path ||
         !vocab_path || !merges_path || !prompt || !out_path) {
@@ -88,11 +133,26 @@ int run_txt2img(int argc, char** argv) {
         }
     }
 
+    // Collect explicit --lora flags. --lcm-lora is sugar for "LCM scheduler
+    // on a vanilla SD1.5 UNet + this LoRA at scale 1.0"; the LoRA is appended
+    // to the list and the scheduler/steps/cfg defaults are flipped.
+    auto loras = collect_loras(argc, argv);
+    bool lcm_lora_mode = false;
+    if (lcm_lora) {
+        use_lcm = true;
+        lcm_lora_mode = true;
+        LoraSpec s;
+        s.path  = lcm_lora;
+        s.scale = 1.0f;
+        loras.push_back(std::move(s));
+    }
+
     pl::GenerateOptions opts;
     if (neg)     opts.negative_prompt = neg;
     if (steps_s) opts.num_inference_steps = std::atoi(steps_s);
     else if (use_lcm) opts.num_inference_steps = 4;
     if (cfg_s)   opts.guidance_scale = static_cast<float>(std::atof(cfg_s));
+    else if (lcm_lora_mode) opts.guidance_scale = 1.0f;
     if (width_s) opts.width  = std::atoi(width_s);
     if (height_s)opts.height = std::atoi(height_s);
     if (seed_s)  opts.seed = static_cast<std::uint64_t>(std::strtoull(seed_s, nullptr, 10));
@@ -104,7 +164,9 @@ int run_txt2img(int argc, char** argv) {
     pl::PipelineConfig cfg;
     if (use_lcm) {
         cfg.scheduler = brodiffusion::scheduler::LCMConfig{};
-        cfg.unet.time_cond_proj_dim = 256;
+        // LCM-LoRA runs on a vanilla SD1.5 UNet (no cond_proj weight); only
+        // a distilled LCM checkpoint has time_cond_proj_dim=256.
+        if (!lcm_lora_mode) cfg.unet.time_cond_proj_dim = 256;
     }
     pl::Pipeline pipeline(cfg, std::move(tok));
 
@@ -114,6 +176,16 @@ int run_txt2img(int argc, char** argv) {
     auto unet_file = st::File::open(unet_path);
     auto vae_file  = st::File::open(vae_path);
     pipeline.load_weights(text_file, unet_file, vae_file);
+
+    // Merge LoRAs in command-line order. Each apply_lora call mutates the
+    // underlying UNet/CLIP weights in place; later calls stack on earlier
+    // ones, so the order matches the user's argv order.
+    for (const auto& spec : loras) {
+        std::printf("Applying LoRA: %s (scale=%.3f)\n", spec.path.c_str(),
+                    static_cast<double>(spec.scale));
+        auto lora_file = st::File::open(spec.path);
+        pipeline.apply_lora(lora_file, spec.scale);
+    }
 
     std::printf("Generating %dx%d, %d steps, CFG=%.1f, seed=%llu\n",
                 opts.width, opts.height, opts.num_inference_steps,
@@ -201,6 +273,12 @@ int main(int argc, char** argv) {
             pipeline.load_weights(st::File::open(text_path),
                                   st::File::open(unet_path),
                                   st::File::open(vae_path));
+            for (const auto& spec : collect_loras(argc, argv)) {
+                std::printf("Applying LoRA: %s (scale=%.3f)\n", spec.path.c_str(),
+                            static_cast<double>(spec.scale));
+                auto lora_file = st::File::open(spec.path);
+                pipeline.apply_lora(lora_file, spec.scale);
+            }
             pl::GenerateOptions opts;
             opts.num_inference_steps = steps;
             opts.guidance_scale = 1.0f;   // skip uncond pass — bench unet+vae core

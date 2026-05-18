@@ -25,7 +25,7 @@
 #include <string>
 #include <vector>
 
-namespace brodiffusion::safetensors { class File; }
+namespace brodiffusion::safetensors { class File; struct TensorView; }
 
 namespace brodiffusion::clip {
 
@@ -80,6 +80,17 @@ public:
     void forward(const int32_t* ids, brotensor::GpuTensor& out);
 
     const TextEncoderConfig& config() const { return cfg_; }
+
+    // Fold a LoRA delta into the base FP16 weight identified by `target_path`,
+    // a diffusers path within the CLIP module (e.g.
+    // "text_model.encoder.layers.0.self_attn.q_proj"). Same semantics as
+    // brodiffusion::unet::UNet::apply_lora_delta: in-place
+    //     W += scale_total * (lora_up @ lora_down)
+    // with `scale_total = (alpha / rank) * user_scale` baked in by the caller.
+    void apply_lora_delta(const std::string& target_path,
+                          const brodiffusion::safetensors::TensorView& lora_down,
+                          const brodiffusion::safetensors::TensorView& lora_up,
+                          float scale_total);
 
 private:
     struct Layer {

@@ -6,10 +6,12 @@
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -549,6 +551,302 @@ void UNet::forward(const bt::GpuTensor& sample,
     }
     forward_impl_(sample, H, W, timestep, &guidance_scale_embedding,
                   encoder_hidden_states, &xattn_cache, out);
+}
+
+// ─── LoRA merge ────────────────────────────────────────────────────────────
+//
+// Resolve a diffusers tensor path to the corresponding base FP16 weight
+// pointer. Supports only the keys community LoRAs actually patch in SD1.5:
+// the eight attention projections and the two GEGLU FF projections inside
+// each Transformer2D's BasicTransformerBlock. Returns nullptr if the path
+// is not recognized.
+
+namespace {
+
+// Local resolution: walks the UNet to find the GpuTensor* for a diffusers
+// target path. Lives in the .cpp so it can touch private struct fields via
+// the UNet method `lora_target_` below.
+
+}  // namespace
+
+namespace {
+
+// Parse "<head>.<int>(.|$)" — consume the integer immediately after a literal
+// head + dot. On success advances `pos` past the integer and returns true.
+bool match_dotted_int(const std::string& s, std::size_t& pos,
+                      const char* head, int& out) {
+    std::size_t h = std::strlen(head);
+    if (s.compare(pos, h, head) != 0) return false;
+    pos += h;
+    if (pos >= s.size() || !std::isdigit(static_cast<unsigned char>(s[pos]))) return false;
+    int v = 0;
+    while (pos < s.size() && std::isdigit(static_cast<unsigned char>(s[pos]))) {
+        v = v * 10 + (s[pos] - '0');
+        ++pos;
+    }
+    out = v;
+    return true;
+}
+
+}  // namespace
+
+bt::GpuTensor* UNet::resolve_transformer_target_(Transformer2D& tr,
+                                                  const std::string& sub) {
+    if (sub == "proj_in")  return &tr.pi_W;
+    if (sub == "proj_out") return &tr.po_W;
+    static const std::string tb = "transformer_blocks.0.";
+    if (sub.rfind(tb, 0) != 0) return nullptr;
+    if (tr.blocks.empty()) return nullptr;
+    AttnFFN& blk = tr.blocks[0];
+    const std::string tail = sub.substr(tb.size());
+    if (tail == "attn1.to_q")       return &blk.Wq1;
+    if (tail == "attn1.to_k")       return &blk.Wk1;
+    if (tail == "attn1.to_v")       return &blk.Wv1;
+    if (tail == "attn1.to_out.0")   return &blk.Wo1;
+    if (tail == "attn2.to_q")       return &blk.Wq2;
+    if (tail == "attn2.to_k")       return &blk.Wk2;
+    if (tail == "attn2.to_v")       return &blk.Wv2;
+    if (tail == "attn2.to_out.0")   return &blk.Wo2;
+    if (tail == "ff.net.0.proj")    return &blk.ff1_W;
+    if (tail == "ff.net.2")         return &blk.ff2_W;
+    return nullptr;
+}
+
+bt::GpuTensor* UNet::resolve_resnet_target_(Resnet& r, const std::string& tail) {
+    if (tail == "conv1")          return &r.W1;
+    if (tail == "conv2")          return &r.W2;
+    if (tail == "conv_shortcut")  return r.has_shortcut ? &r.Ws : nullptr;
+    if (tail == "time_emb_proj")  return &r.temb_W;
+    return nullptr;
+}
+
+bt::GpuTensor* UNet::lora_target_(const std::string& target_path) {
+    // Branch on the top-level block segment.
+    if (target_path.rfind("down_blocks.", 0) == 0) {
+        std::size_t pos = 0;
+        int i = 0;
+        if (!match_dotted_int(target_path, pos, "down_blocks.", i)) return nullptr;
+        if (i < 0 || i >= static_cast<int>(down_blocks_.size())) return nullptr;
+        if (pos >= target_path.size() || target_path[pos] != '.') return nullptr;
+        ++pos;
+        DownBlock& d = down_blocks_[static_cast<std::size_t>(i)];
+        // resnets.<k>.<tail>
+        std::size_t p = pos;
+        int k = 0;
+        if (match_dotted_int(target_path, p, "resnets.", k)) {
+            if (p >= target_path.size() || target_path[p] != '.') return nullptr;
+            ++p;
+            if (k < 0 || k >= static_cast<int>(d.resnets.size())) return nullptr;
+            return resolve_resnet_target_(d.resnets[static_cast<std::size_t>(k)],
+                                         target_path.substr(p));
+        }
+        // attentions.<j>.<sub>
+        p = pos;
+        int j = 0;
+        if (match_dotted_int(target_path, p, "attentions.", j)) {
+            if (p >= target_path.size() || target_path[p] != '.') return nullptr;
+            ++p;
+            if (!d.has_attention) return nullptr;
+            if (j < 0 || j >= static_cast<int>(d.transformers.size())) return nullptr;
+            return resolve_transformer_target_(
+d.transformers[static_cast<std::size_t>(j)],
+                       target_path.substr(p));
+        }
+        // downsamplers.0.conv
+        if (target_path.compare(pos, std::string::npos, "downsamplers.0.conv") == 0) {
+            return d.has_downsampler ? &d.downsampler.W : nullptr;
+        }
+        return nullptr;
+    }
+    if (target_path.rfind("up_blocks.", 0) == 0) {
+        std::size_t pos = 0;
+        int i = 0;
+        if (!match_dotted_int(target_path, pos, "up_blocks.", i)) return nullptr;
+        if (i < 0 || i >= static_cast<int>(up_blocks_.size())) return nullptr;
+        if (pos >= target_path.size() || target_path[pos] != '.') return nullptr;
+        ++pos;
+        UpBlock& u = up_blocks_[static_cast<std::size_t>(i)];
+        std::size_t p = pos;
+        int k = 0;
+        if (match_dotted_int(target_path, p, "resnets.", k)) {
+            if (p >= target_path.size() || target_path[p] != '.') return nullptr;
+            ++p;
+            if (k < 0 || k >= static_cast<int>(u.resnets.size())) return nullptr;
+            return resolve_resnet_target_(u.resnets[static_cast<std::size_t>(k)],
+                                         target_path.substr(p));
+        }
+        p = pos;
+        int j = 0;
+        if (match_dotted_int(target_path, p, "attentions.", j)) {
+            if (p >= target_path.size() || target_path[p] != '.') return nullptr;
+            ++p;
+            if (!u.has_attention) return nullptr;
+            if (j < 0 || j >= static_cast<int>(u.transformers.size())) return nullptr;
+            return resolve_transformer_target_(
+u.transformers[static_cast<std::size_t>(j)],
+                       target_path.substr(p));
+        }
+        if (target_path.compare(pos, std::string::npos, "upsamplers.0.conv") == 0) {
+            return u.has_upsampler ? &u.upsampler.W : nullptr;
+        }
+        return nullptr;
+    }
+    // mid_block: "mid_block.resnets.{0,1}.<tail>" or
+    //            "mid_block.attentions.0.<sub>".
+    static const std::string mid_pfx = "mid_block.";
+    if (target_path.rfind(mid_pfx, 0) == 0) {
+        const std::string rest = target_path.substr(mid_pfx.size());
+        std::size_t p = 0;
+        int k = 0;
+        if (match_dotted_int(rest, p, "resnets.", k)) {
+            if (p >= rest.size() || rest[p] != '.') return nullptr;
+            ++p;
+            const std::string tail = rest.substr(p);
+            if (k == 0) return resolve_resnet_target_(mid_.r0, tail);
+            if (k == 1) return resolve_resnet_target_(mid_.r1, tail);
+            return nullptr;
+        }
+        p = 0;
+        int j = 0;
+        if (match_dotted_int(rest, p, "attentions.", j)) {
+            if (p >= rest.size() || rest[p] != '.') return nullptr;
+            ++p;
+            if (j != 0) return nullptr;
+            return resolve_transformer_target_(mid_.t, rest.substr(p));
+        }
+        return nullptr;
+    }
+    return nullptr;
+}
+
+namespace {
+
+// Upload an arbitrary 2-D safetensors view (F16 or F32) as a FP16 GpuTensor
+// of shape (rows, cols). Convolutional LoRA layouts (rank, C, kH, kW) flatten
+// to (rank, C*kH*kW) — the caller is responsible for picking rows/cols.
+void upload_view_fp16(const st::TensorView& v, int rows, int cols,
+                      bt::GpuTensor& dst, const std::string& tag) {
+    if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
+        throw std::runtime_error("unet::UNet: lora " + tag +
+            ": expected F16 or F32, got " + st::dtype_name(v.dtype));
+    }
+    int64_t expected = static_cast<int64_t>(rows) * static_cast<int64_t>(cols);
+    if (v.numel() != expected) {
+        throw std::runtime_error("unet::UNet: lora " + tag +
+            ": shape numel mismatch (expected " + std::to_string(expected) +
+            ", got " + std::to_string(v.numel()) + ")");
+    }
+    st::upload_fp16(v, rows, cols, dst);
+}
+
+// Read an FP16 tensor back into host memory as fp32 (debug / numerical
+// merge path uses this only in tests). Not used here; merge happens
+// entirely on-device via matmul + scale_inplace + add_inplace.
+
+// Compute the (rank, in_dim) and (out_dim, rank) shapes from the raw views.
+// Validates against the base weight's (rows = out_dim, cols = in_dim) shape
+// when the LoRA down is 2-D, and supports the conv-style 4-D layout
+// (rank, C_in, kH, kW) by flattening to (rank, C_in*kH*kW).
+struct LoraShape {
+    int rank   = 0;
+    int in_dim = 0;
+    int out_dim = 0;
+};
+LoraShape resolve_lora_shape(const st::TensorView& down,
+                             const st::TensorView& up,
+                             int W_rows, int W_cols,
+                             const std::string& tag) {
+    if (down.shape.empty() || up.shape.empty()) {
+        throw std::runtime_error("unet::UNet: lora " + tag + ": empty shapes");
+    }
+    LoraShape s;
+    s.rank = static_cast<int>(down.shape[0]);
+    if (s.rank <= 0) {
+        throw std::runtime_error("unet::UNet: lora " + tag + ": rank <= 0");
+    }
+    // lora_up: (out_dim, rank). Always 2-D in practice.
+    if (up.shape.size() == 2) {
+        s.out_dim = static_cast<int>(up.shape[0]);
+        if (static_cast<int>(up.shape[1]) != s.rank) {
+            throw std::runtime_error("unet::UNet: lora " + tag +
+                ": lora_up.shape[1] (" + std::to_string(up.shape[1]) +
+                ") != rank (" + std::to_string(s.rank) + ")");
+        }
+    } else if (up.shape.size() == 4) {
+        // (out_dim, rank, 1, 1) conv-shaped up.
+        if (up.shape[2] != 1 || up.shape[3] != 1) {
+            throw std::runtime_error("unet::UNet: lora " + tag +
+                ": lora_up 4-D shape with kH/kW != 1 not supported");
+        }
+        s.out_dim = static_cast<int>(up.shape[0]);
+        if (static_cast<int>(up.shape[1]) != s.rank) {
+            throw std::runtime_error("unet::UNet: lora " + tag +
+                ": lora_up 4-D shape[1] != rank");
+        }
+    } else {
+        throw std::runtime_error("unet::UNet: lora " + tag +
+            ": lora_up has unsupported rank " + std::to_string(up.shape.size()));
+    }
+    // lora_down: (rank, in_dim) 2-D, or (rank, C_in, kH, kW) 4-D.
+    if (down.shape.size() == 2) {
+        s.in_dim = static_cast<int>(down.shape[1]);
+    } else if (down.shape.size() == 4) {
+        if (down.shape[2] == 1 && down.shape[3] == 1) {
+            s.in_dim = static_cast<int>(down.shape[1]);
+        } else {
+            // 3x3 conv LoRA (rare). Flatten only if it reduces cleanly to W_cols.
+            int64_t flat = down.shape[1] * down.shape[2] * down.shape[3];
+            if (flat == static_cast<int64_t>(W_cols)) {
+                s.in_dim = static_cast<int>(flat);
+            } else {
+                throw std::runtime_error("unet::UNet: lora " + tag +
+                    ": 4-D lora_down with kH*kW > 1 doesn't reduce to base "
+                    "weight cols (" + std::to_string(W_cols) + ")");
+            }
+        }
+    } else {
+        throw std::runtime_error("unet::UNet: lora " + tag +
+            ": lora_down has unsupported rank " + std::to_string(down.shape.size()));
+    }
+    if (s.out_dim != W_rows || s.in_dim != W_cols) {
+        throw std::runtime_error("unet::UNet: lora " + tag +
+            ": (out_dim, in_dim) = (" + std::to_string(s.out_dim) + ", " +
+            std::to_string(s.in_dim) + ") does not match base weight (" +
+            std::to_string(W_rows) + ", " + std::to_string(W_cols) + ")");
+    }
+    return s;
+}
+
+}  // namespace
+
+void UNet::apply_lora_delta(const std::string& target_path,
+                            const st::TensorView& lora_down,
+                            const st::TensorView& lora_up,
+                            float scale_total) {
+    bt::GpuTensor* W = lora_target_(target_path);
+    if (!W) {
+        fail("apply_lora_delta: unknown target '" + target_path + "'");
+    }
+    if (W->size() == 0) {
+        fail("apply_lora_delta: target '" + target_path + "' has no weights "
+             "loaded (call load_weights first)");
+    }
+    const int W_rows = W->rows;
+    const int W_cols = W->cols;
+    const LoraShape s = resolve_lora_shape(lora_down, lora_up, W_rows, W_cols,
+                                           target_path);
+
+    // Upload as FP16 GpuTensors. lora_down: (rank, in_dim);
+    // lora_up: (out_dim, rank).
+    bt::GpuTensor down_g, up_g;
+    upload_view_fp16(lora_down, s.rank,    s.in_dim, down_g, target_path + ".lora_down");
+    upload_view_fp16(lora_up,   s.out_dim, s.rank,   up_g,   target_path + ".lora_up");
+
+    // delta = up @ down — shape (out_dim, in_dim) = W shape.
+    bt::GpuTensor delta;
+    bt::matmul_gpu(up_g, down_g, delta);
+    bt::scale_inplace_gpu(delta, scale_total);
+    bt::add_inplace_gpu(*W, delta);
 }
 
 int UNet::num_xattn_blocks() const {

@@ -56,7 +56,7 @@
 #include <string>
 #include <vector>
 
-namespace brodiffusion::safetensors { class File; }
+namespace brodiffusion::safetensors { class File; struct TensorView; }
 
 namespace brodiffusion::unet {
 
@@ -170,6 +170,25 @@ public:
     // size of any cache returned by prime_xattn_cache.
     int num_xattn_blocks() const;
 
+    // Fold a LoRA delta into the base FP16 weight identified by `target_path`.
+    // `target_path` is a diffusers path *within* the UNet (no "unet." prefix),
+    // e.g. "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q" or
+    // "ff.net.0.proj". Throws if the path is unknown or shapes don't match.
+    //
+    // The merge is in-place:
+    //     W += scale_total * (lora_up @ lora_down)
+    // where `scale_total = (alpha / rank) * user_scale` is computed by the
+    // caller. `lora_down` is (rank, in_dim) and `lora_up` is (out_dim, rank);
+    // F16 or F32 source are both accepted (F32 converted host-side, matching
+    // the rest of the UNet loader).
+    //
+    // Must be called *after* `load_weights()`. May be called more than once
+    // (e.g. to stack multiple LoRAs).
+    void apply_lora_delta(const std::string& target_path,
+                          const brodiffusion::safetensors::TensorView& lora_down,
+                          const brodiffusion::safetensors::TensorView& lora_up,
+                          float scale_total);
+
     const UNetConfig& config() const { return cfg_; }
 
 private:
@@ -249,6 +268,18 @@ private:
                        const brotensor::GpuTensor& encoder_hidden_states,
                        const CrossAttnKVCache* xattn_cache,
                        brotensor::GpuTensor& out);
+    // Returns a pointer to the FP16 base weight identified by `target_path`
+    // (a diffusers tail within the UNet, e.g. "down_blocks.0.attentions.0.
+    // transformer_blocks.0.attn1.to_q"). Returns nullptr if the path doesn't
+    // match a recognized LoRA-patchable layer.
+    brotensor::GpuTensor* lora_target_(const std::string& target_path);
+    // Sub-dispatchers used by lora_target_. `sub` is the diffusers path tail
+    // remaining after the block-level prefix has been consumed.
+    static brotensor::GpuTensor* resolve_transformer_target_(Transformer2D& tr,
+                                                              const std::string& sub);
+    static brotensor::GpuTensor* resolve_resnet_target_(Resnet& r,
+                                                        const std::string& tail);
+
     void apply_conv3x3_(const brotensor::GpuTensor& W,
                         const brotensor::GpuTensor& b,
                         int C_in, int C_out, int H, int W_,

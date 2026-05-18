@@ -116,61 +116,53 @@ void LCM::step(const bt::GpuTensor& noise_pred,
     const float sqrt_at_prev   = std::sqrt(alpha_t_prev);
     const float sqrt_1mat_prev = std::sqrt(1.0f - alpha_t_prev);
 
-    // Consistency-function boundary conditions. `scaled_t = t / timestep_scaling`
-    // is what diffusers calls `c_t` after the LCMScheduler's internal scaling.
-    const float scaled_t = static_cast<float>(t) / cfg_.timestep_scaling;
+    // Boundary-condition scalings. `scaled_t = t * timestep_scaling` matches
+    // diffusers' LCMScheduler exactly; with timestep_scaling=10 and SD1.5
+    // timesteps, c_skip is ~1e-9 and c_out is ~1.0, so the boundary scaling
+    // is effectively a no-op for distilled LCM / LCM-LoRA inference. The
+    // formula is kept faithful for parity with future schedules.
+    const float scaled_t = static_cast<float>(t) * cfg_.timestep_scaling;
     const float sigma2   = kSigmaData * kSigmaData;
     const float denom    = scaled_t * scaled_t + sigma2;
     const float c_skip   = sigma2 / denom;
     const float c_out    = scaled_t / std::sqrt(denom);
-
-    // predicted_original = (sample - sqrt(1 - alpha_t) * noise_pred) / sqrt(alpha_t)
-    //                    = (1/sqrt_at) * sample + (-sqrt_1mat/sqrt_at) * noise_pred
-    // denoised           = c_out * predicted_original + c_skip * sample
-    //
-    // Combining:
-    //   denoised = (c_out / sqrt_at) * sample
-    //            + (-c_out * sqrt_1mat / sqrt_at) * noise_pred
-    //            + c_skip * sample
-    //            = A0 * sample + B0 * noise_pred
-    // where:
-    const float A0 = c_out / sqrt_at + c_skip;
-    const float B0 = -c_out * sqrt_1mat / sqrt_at;
-
-    // Final step: sample = denoised.
-    // Otherwise:  sample = sqrt(alpha_t_prev) * denoised + sqrt(1 - alpha_t_prev) * noise
-    //                    = (sqrt_at_prev * A0) * sample
-    //                    + (sqrt_at_prev * B0) * noise_pred
-    //                    + sqrt_1mat_prev      * noise
-    float A, B, C;
-    if (is_final) {
-        A = A0; B = B0; C = 0.0f;
-    } else {
-        A = sqrt_at_prev * A0;
-        B = sqrt_at_prev * B0;
-        C = sqrt_1mat_prev;
-    }
 
     if (scratch.rows != noise_pred.rows || scratch.cols != noise_pred.cols ||
         scratch.dtype != bt::Dtype::FP16) {
         scratch.resize(noise_pred.rows, noise_pred.cols, bt::Dtype::FP16);
     }
 
-    // scratch = B * noise_pred
+    // Compute predicted_x0 = (sample - sqrt(1-a_t)*noise_pred) / sqrt(a_t).
+    // CRITICAL: do the subtraction in small-magnitude space first, THEN
+    // divide by sqrt(a_t). The expanded form
+    //   (1/sqrt_at)*sample + (-sqrt_1mat/sqrt_at)*noise_pred
+    // has both terms at magnitude ~14 at t=999 and the difference is what
+    // matters — in FP16 we'd lose ~10 bits of precision to catastrophic
+    // cancellation, which compounds across LCM's few denoising steps.
+    //   scratch = -sqrt_1mat * noise_pred
     bt::copy_d2d_gpu(noise_pred, 0, scratch, 0, noise_pred.size());
-    bt::scale_inplace_gpu(scratch, B);
-    // sample = A * sample
-    bt::scale_inplace_gpu(sample, A);
-    // sample += scratch  (= A*sample + B*noise_pred)
+    bt::scale_inplace_gpu(scratch, -sqrt_1mat);
+    //   scratch += sample           (small-magnitude subtraction)
+    bt::add_inplace_gpu(scratch, sample);
+    //   scratch *= 1/sqrt_at        (predicted_x0)
+    bt::scale_inplace_gpu(scratch, 1.0f / sqrt_at);
+
+    // denoised = c_out * predicted_x0 + c_skip * sample. In place: sample
+    // becomes denoised via   sample = c_skip*sample + c_out*scratch.
+    bt::scale_inplace_gpu(sample, c_skip);
+    bt::scale_inplace_gpu(scratch, c_out);
     bt::add_inplace_gpu(sample, scratch);
-    // sample += C * noise  (only non-final steps)
-    if (!is_final && C != 0.0f) {
+
+    // Final step: sample = denoised (no re-noising).
+    // Otherwise:  sample = sqrt(a_t_prev)*denoised + sqrt(1 - a_t_prev)*noise.
+    if (!is_final) {
         if (noise.dtype != bt::Dtype::FP16) fail("noise must be FP16");
         if (noise.rows != sample.rows || noise.cols != sample.cols) {
             fail("noise shape mismatch");
         }
+        bt::scale_inplace_gpu(sample, sqrt_at_prev);
         bt::copy_d2d_gpu(noise, 0, scratch, 0, noise.size());
-        bt::scale_inplace_gpu(scratch, C);
+        bt::scale_inplace_gpu(scratch, sqrt_1mat_prev);
         bt::add_inplace_gpu(sample, scratch);
     }
 }

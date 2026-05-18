@@ -4,7 +4,9 @@
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
 
+#include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -165,6 +167,105 @@ void TextEncoder::forward(const int32_t* ids, bt::GpuTensor& out) {
 
     bt::layernorm_forward_inference_batched_fp16_gpu(
         x_, final_gamma_, final_beta_, out, cfg_.layer_norm_eps);
+}
+
+// ─── LoRA merge ────────────────────────────────────────────────────────────
+
+namespace {
+
+bool parse_clip_target_(const std::string& target_path,
+                        int& layer_idx, std::string& proj) {
+    // Expected: "text_model.encoder.layers.<i>.self_attn.<q|k|v|out>_proj".
+    static const std::string head = "text_model.encoder.layers.";
+    if (target_path.compare(0, head.size(), head) != 0) return false;
+    std::size_t p = head.size();
+    if (p >= target_path.size() ||
+        !std::isdigit(static_cast<unsigned char>(target_path[p]))) {
+        return false;
+    }
+    int v = 0;
+    while (p < target_path.size() &&
+           std::isdigit(static_cast<unsigned char>(target_path[p]))) {
+        v = v * 10 + (target_path[p] - '0');
+        ++p;
+    }
+    layer_idx = v;
+    static const std::string mid = ".self_attn.";
+    if (target_path.compare(p, mid.size(), mid) != 0) return false;
+    proj = target_path.substr(p + mid.size());
+    return (proj == "q_proj" || proj == "k_proj" ||
+            proj == "v_proj" || proj == "out_proj");
+}
+
+void upload_view_fp16(const st::TensorView& v, int rows, int cols,
+                      bt::GpuTensor& dst, const std::string& tag) {
+    if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
+        throw std::runtime_error("clip::TextEncoder: lora " + tag +
+            ": expected F16 or F32, got " + st::dtype_name(v.dtype));
+    }
+    int64_t expected = static_cast<int64_t>(rows) * static_cast<int64_t>(cols);
+    if (v.numel() != expected) {
+        throw std::runtime_error("clip::TextEncoder: lora " + tag +
+            ": shape numel mismatch (expected " + std::to_string(expected) +
+            ", got " + std::to_string(v.numel()) + ")");
+    }
+    st::upload_fp16(v, rows, cols, dst);
+}
+
+}  // namespace
+
+void TextEncoder::apply_lora_delta(const std::string& target_path,
+                                   const st::TensorView& lora_down,
+                                   const st::TensorView& lora_up,
+                                   float scale_total) {
+    int layer_idx = 0;
+    std::string proj;
+    if (!parse_clip_target_(target_path, layer_idx, proj)) {
+        fail("apply_lora_delta: unknown target '" + target_path + "'");
+    }
+    if (layer_idx < 0 || layer_idx >= static_cast<int>(layers_.size())) {
+        fail("apply_lora_delta: layer index " + std::to_string(layer_idx) +
+             " out of range");
+    }
+    Layer& L = layers_[static_cast<std::size_t>(layer_idx)];
+    bt::GpuTensor* W = nullptr;
+    if (proj == "q_proj")        W = &L.Wq;
+    else if (proj == "k_proj")   W = &L.Wk;
+    else if (proj == "v_proj")   W = &L.Wv;
+    else if (proj == "out_proj") W = &L.Wo;
+    if (!W || W->size() == 0) {
+        fail("apply_lora_delta: target '" + target_path +
+             "' has no weights loaded");
+    }
+    const int W_rows = W->rows;
+    const int W_cols = W->cols;
+
+    // lora_down: (rank, in_dim); lora_up: (out_dim, rank). CLIP targets are
+    // pure linear (out=in=D), so the shape is always 2-D.
+    if (lora_down.shape.size() != 2 || lora_up.shape.size() != 2) {
+        fail("apply_lora_delta: CLIP LoRA tensors must be 2-D");
+    }
+    const int rank = static_cast<int>(lora_down.shape[0]);
+    if (rank <= 0) fail("apply_lora_delta: rank <= 0");
+    if (static_cast<int>(lora_up.shape[1]) != rank) {
+        fail("apply_lora_delta: lora_up.cols (" +
+             std::to_string(lora_up.shape[1]) + ") != rank (" +
+             std::to_string(rank) + ")");
+    }
+    if (static_cast<int>(lora_up.shape[0]) != W_rows ||
+        static_cast<int>(lora_down.shape[1]) != W_cols) {
+        fail("apply_lora_delta: (out_dim, in_dim) shape mismatch for '" +
+             target_path + "'");
+    }
+
+    bt::GpuTensor down_g, up_g;
+    upload_view_fp16(lora_down, rank,   W_cols, down_g, target_path + ".lora_down");
+    upload_view_fp16(lora_up,   W_rows, rank,   up_g,   target_path + ".lora_up");
+
+    bt::GpuTensor delta;
+    bt::matmul_gpu(up_g, down_g, delta);
+    bt::scale_inplace_gpu(delta, scale_total);
+    bt::add_inplace_gpu(*W, delta);
 }
 
 }  // namespace brodiffusion::clip
