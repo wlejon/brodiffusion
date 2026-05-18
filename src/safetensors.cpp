@@ -3,6 +3,7 @@
 #include "brotensor/tensor.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -455,6 +456,130 @@ void upload_fp16(const TensorView& view, int rows, int cols, brotensor::GpuTenso
             std::string("safetensors::upload_fp16: unsupported dtype ") +
             dtype_name(view.dtype) + " for tensor '" + view.name + "'");
     }
+}
+
+// ─── Writer ────────────────────────────────────────────────────────────────
+
+namespace {
+
+const char* dtype_safetensors_name(Dtype d) {
+    switch (d) {
+        case Dtype::F32:  return "F32";
+        case Dtype::F16:  return "F16";
+        case Dtype::BF16: return "BF16";
+        case Dtype::I32:  return "I32";
+        case Dtype::I64:  return "I64";
+        case Dtype::U8:   return "U8";
+        case Dtype::BOOL: return "BOOL";
+        default: throw std::runtime_error("safetensors::write: unsupported dtype");
+    }
+}
+
+void json_escape_append(std::string& out, const std::string& s) {
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\t': out += "\\t";  break;
+            case '\r': out += "\\r";  break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x",
+                                  static_cast<unsigned>(static_cast<unsigned char>(c)));
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+}
+
+}  // namespace
+
+void write_file(const std::string& path, const std::vector<WriteEntry>& entries) {
+    // Validate + compute offsets.
+    std::vector<uint64_t> off_start(entries.size()), off_end(entries.size());
+    uint64_t cursor = 0;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const WriteEntry& e = entries[i];
+        if (e.name.empty()) {
+            throw std::runtime_error("safetensors::write: empty tensor name");
+        }
+        if (!e.host_data && e.bytes > 0) {
+            throw std::runtime_error("safetensors::write: '" + e.name + "' null data");
+        }
+        int dsz = dtype_size_bytes(e.dtype);
+        if (dsz <= 0) {
+            throw std::runtime_error("safetensors::write: '" + e.name + "' bad dtype");
+        }
+        int64_t n = 1;
+        for (int64_t d : e.shape) {
+            if (d < 0) throw std::runtime_error("safetensors::write: '" + e.name + "' negative shape");
+            n *= d;
+        }
+        std::size_t expected = static_cast<std::size_t>(n) * static_cast<std::size_t>(dsz);
+        if (expected != e.bytes) {
+            throw std::runtime_error("safetensors::write: '" + e.name +
+                "' byte count mismatch (shape=" + std::to_string(expected) +
+                " bytes=" + std::to_string(e.bytes) + ")");
+        }
+        off_start[i] = cursor;
+        cursor += e.bytes;
+        off_end[i]   = cursor;
+    }
+
+    // Build JSON header.
+    std::string hdr;
+    hdr.reserve(256 * entries.size() + 16);
+    hdr += '{';
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        if (i) hdr += ',';
+        hdr += '"';
+        json_escape_append(hdr, entries[i].name);
+        hdr += "\":{\"dtype\":\"";
+        hdr += dtype_safetensors_name(entries[i].dtype);
+        hdr += "\",\"shape\":[";
+        for (std::size_t j = 0; j < entries[i].shape.size(); ++j) {
+            if (j) hdr += ',';
+            hdr += std::to_string(entries[i].shape[j]);
+        }
+        hdr += "],\"data_offsets\":[";
+        hdr += std::to_string(off_start[i]);
+        hdr += ',';
+        hdr += std::to_string(off_end[i]);
+        hdr += "]}";
+    }
+    hdr += '}';
+    // Pad header to 8-byte alignment so payload tensor starts are aligned.
+    while ((hdr.size() % 8) != 0) hdr += ' ';
+
+    uint64_t header_size = static_cast<uint64_t>(hdr.size());
+
+    // Write file.
+#ifdef _WIN32
+    FILE* fp = nullptr;
+    fopen_s(&fp, path.c_str(), "wb");
+#else
+    FILE* fp = std::fopen(path.c_str(), "wb");
+#endif
+    if (!fp) throw std::runtime_error("safetensors::write: cannot open '" + path + "'");
+
+    auto wfail = [&](const std::string& what) {
+        std::fclose(fp);
+        throw std::runtime_error("safetensors::write: " + what + " '" + path + "'");
+    };
+
+    if (std::fwrite(&header_size, 1, 8, fp) != 8) wfail("header_size write failed");
+    if (std::fwrite(hdr.data(), 1, hdr.size(), fp) != hdr.size()) wfail("header write failed");
+    for (const WriteEntry& e : entries) {
+        if (e.bytes == 0) continue;
+        if (std::fwrite(e.host_data, 1, e.bytes, fp) != e.bytes) wfail("payload write failed");
+    }
+    std::fclose(fp);
 }
 
 }  // namespace brodiffusion::safetensors

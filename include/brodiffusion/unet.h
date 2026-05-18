@@ -52,6 +52,7 @@
 #include "brotensor/device_buffer.h"
 #include "brotensor/tensor.h"
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -59,6 +60,30 @@
 namespace brodiffusion::safetensors { class File; }
 
 namespace brodiffusion::unet {
+
+// Optional hook for capturing teacher-path inputs (sample, raw t_emb, ctx)
+// and the 12 skip tensors that the down path pushes onto the skip stack.
+// Used by the `capture-inlet` CLI subcommand to record the Inlet trainer's
+// (input, target) corpus straight off the live teacher pipeline. When the
+// hook pointer on UNet is null (the common case), forward() pays exactly one
+// pointer-compare of overhead — no allocations, no D2H copies. The hook is
+// only ever invoked when `cfg.enable_inlet` is false (the teacher down path
+// is the only one that produces 12 separate skip tensors).
+struct InletCaptureHook {
+    virtual ~InletCaptureHook() = default;
+    // Called once per UNet forward, AFTER the (linear → silu → linear) time
+    // embedding has been computed but BEFORE the down path runs.
+    //   sample    : (1, in_channels * H * W) FP16
+    //   t_emb_raw : (1, time_embed_dim)      FP16 — post-second-linear, NOT silu'd
+    //   ctx       : (L_text, cross_attn_dim) FP16
+    virtual void on_inputs(const brotensor::GpuTensor& sample,
+                           const brotensor::GpuTensor& t_emb_raw,
+                           const brotensor::GpuTensor& ctx) = 0;
+    // Called once per UNet forward, immediately after the teacher down path
+    // has finished (and pushed all 12 skips). Pointers are valid only for
+    // the duration of the call.
+    virtual void on_skips(const std::array<const brotensor::GpuTensor*, 12>& skips) = 0;
+};
 
 struct UNetConfig {
     int in_channels   = 4;
@@ -151,6 +176,12 @@ public:
     int num_xattn_blocks() const;
 
     const UNetConfig& config() const { return cfg_; }
+
+    // Install an optional capture hook (see InletCaptureHook above). Pass
+    // nullptr to disable. Zero overhead when null. Must remain alive for the
+    // duration of any forward() call that triggers it.
+    void set_capture_hook(InletCaptureHook* h) { capture_hook_ = h; }
+    InletCaptureHook* capture_hook() const { return capture_hook_; }
 
 private:
     struct Resnet {
@@ -255,6 +286,10 @@ private:
 
     // Inlet replacement for the teacher down path. Active iff cfg_.enable_inlet.
     inlet::Inlet inlet_;
+
+    // Optional capture hook for distillation corpus dumping (see top of file).
+    // Null in every normal txt2img/bench path.
+    InletCaptureHook* capture_hook_ = nullptr;
 };
 
 }  // namespace brodiffusion::unet

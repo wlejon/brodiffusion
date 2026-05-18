@@ -596,6 +596,14 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
     // Master temb in temb_b_. Pre-compute SiLU once for reuse across resblocks.
     bt::silu_forward_gpu(temb_b_, temb_silu_);
 
+    // ── Optional capture hook: emit inputs *before* the down path runs ─────
+    // Only meaningful when the teacher down path is in use; the inlet path
+    // doesn't produce 12 separate skip tensors with the layout the trainer
+    // expects. Pay one pointer-compare in the common (null) case.
+    if (capture_hook_ && !cfg_.enable_inlet) {
+        capture_hook_->on_inputs(sample, temb_b_, encoder_hidden_states);
+    }
+
     // Skip stack: each entry is a deep copy of the residual stream at push time.
     // Down-path xattn caches advance xattn_idx (kept in scope for mid + up).
     std::vector<bt::GpuTensor> skips;
@@ -681,6 +689,20 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
                 skips.push_back(x_.clone());
             }
         }
+    }
+
+    // ── Optional capture hook: emit the 12 down-path skips ────────────────
+    // Only the teacher path produces these as a stack of 12 separate tensors
+    // matching the trainer's expected layout. The inlet path is skipped.
+    if (capture_hook_ && !cfg_.enable_inlet) {
+        if (skips.size() != 12) {
+            fail("capture hook: expected 12 skips, got " + std::to_string(skips.size()));
+        }
+        std::array<const bt::GpuTensor*, 12> skip_ptrs{};
+        for (int i = 0; i < 12; ++i) {
+            skip_ptrs[static_cast<std::size_t>(i)] = &skips[static_cast<std::size_t>(i)];
+        }
+        capture_hook_->on_skips(skip_ptrs);
     }
 
     // ── 4. mid_block: resnet -> transformer -> resnet ──────────────────────

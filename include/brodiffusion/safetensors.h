@@ -107,4 +107,21 @@ void upload(const TensorView& view, int rows, int cols, brotensor::GpuTensor& ds
 // are diffusers-only). If the source is F16, it's uploaded as-is.
 void upload_fp16(const TensorView& view, int rows, int cols, brotensor::GpuTensor& dst);
 
+// ─── Writer ────────────────────────────────────────────────────────────────
+//
+// Minimal safetensors writer. Builds the JSON header in insertion order and
+// concatenates raw tensor bytes. All entries' `host_data` must point to
+// `bytes` bytes of valid host memory matching `dtype`/`shape`. Tensor names
+// must be unique. Throws std::runtime_error on I/O failure or invalid input.
+
+struct WriteEntry {
+    std::string             name;
+    Dtype                   dtype = Dtype::F16;
+    std::vector<int64_t>    shape;
+    const void*             host_data = nullptr;
+    std::size_t             bytes = 0;
+};
+
+void write_file(const std::string& path, const std::vector<WriteEntry>& entries);
+
 }
