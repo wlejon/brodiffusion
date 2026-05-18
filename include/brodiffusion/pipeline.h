@@ -86,6 +86,11 @@ public:
         unet_.set_capture_hook(h);
     }
 
+    // Direct access to inner UNet for advanced wiring (e.g. loading trained
+    // inlet weights post-construction).
+    unet::UNet&       unet()       { return unet_; }
+    const unet::UNet& unet() const { return unet_; }
+
 private:
     void encode_prompt_(std::string_view prompt, brotensor::GpuTensor& out);
 

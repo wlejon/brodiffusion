@@ -72,6 +72,7 @@ int run_txt2img(int argc, char** argv) {
     const char* width_s     = arg_after(argc, argv, "--width");
     const char* height_s    = arg_after(argc, argv, "--height");
     const char* seed_s      = arg_after(argc, argv, "--seed");
+    const char* inlet_w_s   = arg_after(argc, argv, "--inlet-weights");
 
     if (!text_path || !unet_path || !vae_path ||
         !vocab_path || !merges_path || !prompt || !out_path) {
@@ -93,6 +94,13 @@ int run_txt2img(int argc, char** argv) {
     auto tok = clip::Tokenizer::load(vocab_path, merges_path);
 
     pl::PipelineConfig cfg;
+    const char* inlet_env_t = std::getenv("BRODIFFUSION_INLET");
+    const bool enable_inlet_t = (inlet_env_t && inlet_env_t[0] == '1');
+    if (enable_inlet_t) {
+        cfg.unet.enable_inlet = true;
+        std::fprintf(stderr, "[txt2img] BRODIFFUSION_INLET=1 — inlet enabled\n");
+        std::fflush(stderr);
+    }
     pl::Pipeline pipeline(cfg, std::move(tok));
 
     std::printf("Loading weights:\n  text: %s\n  unet: %s\n  vae:  %s\n",
@@ -101,6 +109,12 @@ int run_txt2img(int argc, char** argv) {
     auto unet_file = st::File::open(unet_path);
     auto vae_file  = st::File::open(vae_path);
     pipeline.load_weights(text_file, unet_file, vae_file);
+    if (enable_inlet_t && inlet_w_s) {
+        std::fprintf(stderr, "[txt2img] loading inlet weights: %s\n", inlet_w_s);
+        std::fflush(stderr);
+        auto inlet_file = st::File::open(inlet_w_s);
+        pipeline.unet().load_inlet_weights(inlet_file, "");
+    }
 
     std::printf("Generating %dx%d, %d steps, CFG=%.1f, seed=%llu\n",
                 opts.width, opts.height, opts.num_inference_steps,
@@ -146,6 +160,7 @@ public:
         path_ = path;
         have_inputs_ = false;
         have_skips_  = false;
+        have_eps_    = false;
     }
 
     void on_inputs(const brotensor::GpuTensor& sample,
@@ -188,7 +203,17 @@ public:
             }
         }
         have_skips_ = true;
-        flush_();
+        flush_if_ready_();
+    }
+
+    void on_eps(const brotensor::GpuTensor& eps_pred) override {
+        copy_to_host_(eps_pred, in_eps_);
+        in_eps_shape_ = {1, 4, 64, 64};
+        if (static_cast<int64_t>(eps_pred.size()) != 4LL * 64 * 64) {
+            throw std::runtime_error("capture-inlet: eps_pred size mismatch");
+        }
+        have_eps_ = true;
+        flush_if_ready_();
     }
 
 private:
@@ -197,13 +222,11 @@ private:
         brotensor::download_fp16(g, host.data());
     }
 
-    void flush_() {
-        if (!have_inputs_ || !have_skips_) {
-            throw std::runtime_error("capture-inlet: flush before both halves seen");
-        }
+    void flush_if_ready_() {
+        if (!have_inputs_ || !have_skips_ || !have_eps_) return;
         namespace st = brodiffusion::safetensors;
         std::vector<st::WriteEntry> ents;
-        ents.reserve(15);
+        ents.reserve(16);
 
         auto push = [&](const char* name,
                         const std::vector<uint16_t>& h,
@@ -219,6 +242,7 @@ private:
         push("sample",    in_sample_, in_sample_shape_);
         push("t_emb_raw", in_temb_,   in_temb_shape_);
         push("ctx",       in_ctx_,    in_ctx_shape_);
+        push("eps_pred",  in_eps_,    in_eps_shape_);
         for (int i = 0; i < 12; ++i) {
             std::string name = "s" + std::to_string(i);
             push(name.c_str(),
@@ -231,13 +255,15 @@ private:
         st::write_file(path_, ents);
         have_inputs_ = false;
         have_skips_  = false;
+        have_eps_    = false;
     }
 
     std::string path_;
-    bool have_inputs_ = false, have_skips_ = false;
+    bool have_inputs_ = false, have_skips_ = false, have_eps_ = false;
 
-    std::vector<uint16_t>             in_sample_, in_temb_, in_ctx_;
-    std::vector<int64_t>              in_sample_shape_, in_temb_shape_, in_ctx_shape_;
+    std::vector<uint16_t>             in_sample_, in_temb_, in_ctx_, in_eps_;
+    std::vector<int64_t>              in_sample_shape_, in_temb_shape_,
+                                       in_ctx_shape_, in_eps_shape_;
     std::array<std::vector<uint16_t>, 12> skip_buf_;
     std::array<std::vector<int64_t>, 12>  skip_shape_;
 };
@@ -273,9 +299,11 @@ public:
 
     void on_skips(const std::array<const brotensor::GpuTensor*, 12>& skips) override {
         writer_.on_skips(skips);
+    }
+
+    void on_eps(const brotensor::GpuTensor& eps_pred) override {
+        writer_.on_eps(eps_pred);
         files_written_++;
-        // Approximate bytes (no fs call): each capture file is sample 32KB +
-        // t_emb 2.56KB + ctx ≈ 118.27KB + 12 skips. Compute exactly.
         bytes_written_ += last_file_bytes_();
         call_idx_++;
     }
@@ -286,12 +314,12 @@ public:
 
 private:
     static uint64_t last_file_bytes_() {
-        // sample (4*64*64) + t_emb (1280) + ctx (77*768) + s0..s11
+        // sample (4*64*64) + t_emb (1280) + ctx (77*768) + eps (4*64*64) + s0..s11
         const int64_t per_tap[12] = {
             320LL*64*64, 320LL*64*64, 320LL*64*64, 320LL*32*32,
             640LL*32*32, 640LL*32*32, 640LL*16*16,
             1280LL*16*16, 1280LL*16*16, 1280LL*8*8, 1280LL*8*8, 1280LL*8*8};
-        int64_t n = 4LL*64*64 + 1280LL + 77LL*768LL;
+        int64_t n = 4LL*64*64 + 1280LL + 77LL*768LL + 4LL*64*64;
         for (int i = 0; i < 12; ++i) n += per_tap[i];
         return static_cast<uint64_t>(n) * 2ULL;  // FP16
     }
@@ -568,6 +596,13 @@ int main(int argc, char** argv) {
             pipeline.load_weights(st::File::open(text_path),
                                   st::File::open(unet_path),
                                   st::File::open(vae_path));
+            const char* inlet_w = arg_after(argc, argv, "--inlet-weights");
+            if (enable_inlet && inlet_w) {
+                std::fprintf(stderr, "[bench] loading inlet weights: %s\n", inlet_w);
+                std::fflush(stderr);
+                auto inlet_file = st::File::open(inlet_w);
+                pipeline.unet().load_inlet_weights(inlet_file, "");
+            }
             pl::GenerateOptions opts;
             opts.num_inference_steps = steps;
             opts.guidance_scale = 1.0f;   // skip uncond pass — bench unet+vae core

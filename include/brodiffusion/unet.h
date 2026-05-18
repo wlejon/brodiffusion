@@ -83,6 +83,11 @@ struct InletCaptureHook {
     // has finished (and pushed all 12 skips). Pointers are valid only for
     // the duration of the call.
     virtual void on_skips(const std::array<const brotensor::GpuTensor*, 12>& skips) = 0;
+    // Called once per UNet forward, immediately after conv_out — the final
+    // epsilon prediction. Optional (default no-op) so the existing capture
+    // path keeps working; e2e distillation overrides this to dump eps_pred.
+    //   eps_pred : (1, out_channels * H * W) FP16
+    virtual void on_eps(const brotensor::GpuTensor& eps_pred) { (void)eps_pred; }
 };
 
 struct UNetConfig {
@@ -103,6 +108,17 @@ struct UNetConfig {
     // the inlet stays zero-initialised (useful for ceiling benches).
     bool enable_inlet = false;
 };
+
+// Forward declaration so we can friend the dX-only up-path backward, which
+// lives in src/unet_backward.cu and needs to read every weight struct.
+void unet_up_path_backward(const class UNet& net,
+                           const brotensor::GpuTensor& bottleneck_in,
+                           const std::array<const brotensor::GpuTensor*, 12>& skips_in,
+                           const brotensor::GpuTensor& ctx,
+                           const brotensor::GpuTensor& t_emb_raw,
+                           const brotensor::GpuTensor& d_eps_pred,
+                           std::array<brotensor::GpuTensor, 12>& d_skips_out,
+                           brotensor::GpuTensor& d_bottleneck_out);
 
 class UNet {
 public:
@@ -290,6 +306,18 @@ private:
     // Optional capture hook for distillation corpus dumping (see top of file).
     // Null in every normal txt2img/bench path.
     InletCaptureHook* capture_hook_ = nullptr;
+
+    // dX-only backward through the frozen mid+up+conv_out path. Needs read
+    // access to every weight struct above.
+    friend void unet_up_path_backward(
+        const UNet& net,
+        const brotensor::GpuTensor& bottleneck_in,
+        const std::array<const brotensor::GpuTensor*, 12>& skips_in,
+        const brotensor::GpuTensor& ctx,
+        const brotensor::GpuTensor& t_emb_raw,
+        const brotensor::GpuTensor& d_eps_pred,
+        std::array<brotensor::GpuTensor, 12>& d_skips_out,
+        brotensor::GpuTensor& d_bottleneck_out);
 };
 
 }  // namespace brodiffusion::unet

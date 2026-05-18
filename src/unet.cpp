@@ -764,6 +764,10 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
                    /*stride=*/1, /*pad=*/1, y_, out);
     prof_end(pb_conv_out);
 
+    if (capture_hook_ && !cfg_.enable_inlet) {
+        capture_hook_->on_eps(out);
+    }
+
     if (prof_enabled) {
         std::fprintf(stderr,
             "[UNET_PROF] conv_in=%.3f down_res=%.3f down_xform=%.3f down_samp=%.3f "
