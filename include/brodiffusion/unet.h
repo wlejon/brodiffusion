@@ -48,6 +48,7 @@
 // weights and activations are FP16 — convert host-side if your checkpoint
 // ships FP32 weights.
 
+#include "brodiffusion/inlet.h"
 #include "brotensor/device_buffer.h"
 #include "brotensor/tensor.h"
 
@@ -71,6 +72,11 @@ struct UNetConfig {
     int attention_head_dim  = 8;
     // time_embed_dim = block_out_channels[0] * time_embed_dim_mult.
     int time_embed_dim_mult = 4;
+    // When true, the teacher down path is replaced at forward time by the
+    // distilled `Inlet` module (see brodiffusion/inlet.h). Inlet weights are
+    // loaded by load_weights() when `inlet_prefix` is non-empty; otherwise
+    // the inlet stays zero-initialised (useful for ceiling benches).
+    bool enable_inlet = false;
 };
 
 class UNet {
@@ -91,6 +97,13 @@ public:
     // shape mismatches, or dtype mismatch.
     void load_weights(const brodiffusion::safetensors::File& f,
                       const std::string& prefix = "");
+
+    // Load inlet weights from a separate safetensors file. Only meaningful
+    // when `cfg.enable_inlet` is true. If never called (or `inlet_prefix`
+    // is empty), the inlet stays zero-initialised — every tap emits zeros,
+    // which is fine for ceiling benches but produces garbage outputs.
+    void load_inlet_weights(const brodiffusion::safetensors::File& f,
+                            const std::string& inlet_prefix = "");
 
     // Forward pass.
     //   sample:                (1, in_channels * H * W) FP16 — noisy latent
@@ -239,6 +252,9 @@ private:
     brotensor::GpuTensor attn_proj_;
     brotensor::GpuTensor ff_mid_, ff_act_, ff_out_;
     brotensor::GpuTensor proj_out_seq_, proj_out_nchw_;
+
+    // Inlet replacement for the teacher down path. Active iff cfg_.enable_inlet.
+    inlet::Inlet inlet_;
 };
 
 }  // namespace brodiffusion::unet

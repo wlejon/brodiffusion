@@ -160,6 +160,16 @@ int main(int argc, char** argv) {
             brotensor::cuda_init();
             auto tok = clip::Tokenizer::load(vocab_path, merges_path);
             pl::PipelineConfig cfg;
+            // Optional: replace the teacher UNet down path with the inlet
+            // module. Weights stay zero-init (ceiling bench) unless --inlet
+            // is also provided.
+            const char* inlet_env = std::getenv("BRODIFFUSION_INLET");
+            const bool enable_inlet = (inlet_env && inlet_env[0] == '1');
+            if (enable_inlet) {
+                cfg.unet.enable_inlet = true;
+                std::fprintf(stderr, "[bench] BRODIFFUSION_INLET=1 — inlet enabled (zero-init unless --inlet given)\n");
+                std::fflush(stderr);
+            }
             pl::Pipeline pipeline(cfg, std::move(tok));
             pipeline.load_weights(st::File::open(text_path),
                                   st::File::open(unet_path),

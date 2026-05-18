@@ -325,6 +325,21 @@ void UNet::load_weights(const st::File& f, const std::string& prefix) {
                         cfg_.out_channels, first_C * 3 * 3, conv_out_W_, "conv_out.weight");
     upload_fp16_checked(need(f, prefix + "conv_out.bias"),
                         cfg_.out_channels, 1, conv_out_b_, "conv_out.bias");
+
+    // Inlet (optional): allocate + zero-init unconditionally when enabled,
+    // so a ceiling-bench caller can flip the flag without supplying weights.
+    // Real weights are loaded via load_inlet_weights().
+    if (cfg_.enable_inlet) {
+        inlet_.allocate();
+        inlet_.zero_init();
+    }
+}
+
+void UNet::load_inlet_weights(const st::File& f, const std::string& inlet_prefix) {
+    if (!cfg_.enable_inlet) {
+        fail("load_inlet_weights: cfg.enable_inlet is false");
+    }
+    inlet_.load_from_safetensors(f, inlet_prefix);
 }
 
 // ─── per-block forward helpers ─────────────────────────────────────────────
@@ -581,53 +596,90 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
     // Master temb in temb_b_. Pre-compute SiLU once for reuse across resblocks.
     bt::silu_forward_gpu(temb_b_, temb_silu_);
 
-    // ── 2. conv_in: in_channels -> first_C ─────────────────────────────────
-    x_ = sample.clone();
-    prof_begin(pb_conv_in);
-    apply_conv3x3_(conv_in_W_, conv_in_b_, cfg_.in_channels, first_C, H, W,
-                   /*stride=*/1, /*pad=*/1, x_, y_);
-    std::swap(x_, y_);
-    prof_end(pb_conv_in);
-
     // Skip stack: each entry is a deep copy of the residual stream at push time.
+    // Down-path xattn caches advance xattn_idx (kept in scope for mid + up).
     std::vector<bt::GpuTensor> skips;
     skips.reserve(static_cast<std::size_t>(nb) *
                   static_cast<std::size_t>(cfg_.layers_per_block + 1));
-    skips.push_back(x_.clone());
-
-    // ── 3. down_blocks ─────────────────────────────────────────────────────
     int Hc = H, Wc = W;
     int xattn_idx = 0;
     auto cache_at = [&](int i) -> const CrossAttnKVCacheEntry* {
         return xattn_cache ? &(*xattn_cache)[static_cast<std::size_t>(i)] : nullptr;
     };
-    for (int i = 0; i < nb; ++i) {
-        DownBlock& d = down_blocks_[static_cast<std::size_t>(i)];
-        for (int j = 0; j < cfg_.layers_per_block; ++j) {
-            prof_begin(pb_down_res);
-            apply_resnet_(d.resnets[static_cast<std::size_t>(j)], Hc, Wc, x_, y_);
-            prof_end(pb_down_res);
-            if (d.has_attention) {
-                prof_begin(pb_down_xform);
-                apply_transformer_(d.transformers[static_cast<std::size_t>(j)],
-                                   encoder_hidden_states,
-                                   cache_at(xattn_idx++),
-                                   Hc, Wc, x_);
-                prof_end(pb_down_xform);
-            }
-            skips.push_back(x_.clone());
+
+    if (cfg_.enable_inlet) {
+        // ── 2 + 3. Inlet replaces conv_in and the entire teacher down path.
+        // Produces skips[0..11] in the same push order the teacher emits,
+        // and `bottleneck` == skips[11] semantically (separate buffer).
+        // SD1.5 dims are hard-coded in the inlet (H=W=64, ctx=(77,768)).
+        if (H != 64 || W != 64) {
+            fail("inlet: only supports H=W=64 (SD1.5 default latent)");
         }
-        if (d.has_downsampler) {
-            // 3x3 stride-2 conv same-channels.
-            prof_begin(pb_down_samp);
-            apply_conv3x3_(d.downsampler.W, d.downsampler.b,
-                           d.C_out, d.C_out, Hc, Wc,
-                           /*stride=*/2, /*pad=*/1, x_, y_);
-            std::swap(x_, y_);
-            prof_end(pb_down_samp);
-            Hc /= 2;
-            Wc /= 2;
-            skips.push_back(x_.clone());
+        prof_begin(pb_conv_in);
+        std::array<bt::GpuTensor, 12> inlet_skips;
+        bt::GpuTensor bottleneck;
+        inlet_.forward(sample, /*t_emb=*/temb_b_, /*ctx=*/encoder_hidden_states,
+                       inlet_skips, bottleneck);
+        for (int i = 0; i < 12; ++i) {
+            skips.push_back(std::move(inlet_skips[static_cast<std::size_t>(i)]));
+        }
+        x_ = std::move(bottleneck);
+        // 12 skips pushed: spatial dim at top of stack matches teacher's
+        // post-down state — 8x8 at 1280 channels.
+        Hc = 8;
+        Wc = 8;
+        // The xattn cache (when supplied) is sized for the full teacher path:
+        // [down_attn_*, mid, up_attn_*]. The inlet doesn't consume the
+        // down-path entries (one transformer per resnet within each attention
+        // down-block), but mid + up still do, so we advance the cursor past
+        // every skipped down xattn.
+        for (int i = 0; i < nb; ++i) {
+            const DownBlock& d = down_blocks_[static_cast<std::size_t>(i)];
+            if (d.has_attention) {
+                xattn_idx += static_cast<int>(d.transformers.size());
+            }
+        }
+        prof_end(pb_conv_in);
+    } else {
+        // ── 2. conv_in: in_channels -> first_C ─────────────────────────────
+        x_ = sample.clone();
+        prof_begin(pb_conv_in);
+        apply_conv3x3_(conv_in_W_, conv_in_b_, cfg_.in_channels, first_C, H, W,
+                       /*stride=*/1, /*pad=*/1, x_, y_);
+        std::swap(x_, y_);
+        prof_end(pb_conv_in);
+
+        skips.push_back(x_.clone());
+
+        // ── 3. down_blocks ─────────────────────────────────────────────────
+        for (int i = 0; i < nb; ++i) {
+            DownBlock& d = down_blocks_[static_cast<std::size_t>(i)];
+            for (int j = 0; j < cfg_.layers_per_block; ++j) {
+                prof_begin(pb_down_res);
+                apply_resnet_(d.resnets[static_cast<std::size_t>(j)], Hc, Wc, x_, y_);
+                prof_end(pb_down_res);
+                if (d.has_attention) {
+                    prof_begin(pb_down_xform);
+                    apply_transformer_(d.transformers[static_cast<std::size_t>(j)],
+                                       encoder_hidden_states,
+                                       cache_at(xattn_idx++),
+                                       Hc, Wc, x_);
+                    prof_end(pb_down_xform);
+                }
+                skips.push_back(x_.clone());
+            }
+            if (d.has_downsampler) {
+                // 3x3 stride-2 conv same-channels.
+                prof_begin(pb_down_samp);
+                apply_conv3x3_(d.downsampler.W, d.downsampler.b,
+                               d.C_out, d.C_out, Hc, Wc,
+                               /*stride=*/2, /*pad=*/1, x_, y_);
+                std::swap(x_, y_);
+                prof_end(pb_down_samp);
+                Hc /= 2;
+                Wc /= 2;
+                skips.push_back(x_.clone());
+            }
         }
     }
 
