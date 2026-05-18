@@ -1,6 +1,7 @@
 #include "brodiffusion/unet.h"
 #include "brodiffusion/safetensors.h"
 #include "brodiffusion/fused_resblock.h"
+#include "brodiffusion/fused_transformer.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
@@ -392,7 +393,7 @@ void UNet::apply_transformer_(const Transformer2D& t,
             blk.Wo1, &blk.bo1,
             /*d_mask=*/nullptr, H_heads, /*causal=*/false,
             attn_proj_);
-        bt::add_inplace_gpu(tseq_, attn_proj_);
+        brodiffusion::add_inplace_fp16_vec(tseq_, attn_proj_);
 
         // ── cross-attention (K, V from `ctx`) ─────────────────────────────
         bt::layernorm_forward_inference_batched_fp16_gpu(
@@ -405,17 +406,16 @@ void UNet::apply_transformer_(const Transformer2D& t,
             blk.Wo2, &blk.bo2,
             /*d_mask=*/nullptr, H_heads, /*causal=*/false,
             attn_proj_);
-        bt::add_inplace_gpu(tseq_, attn_proj_);
+        brodiffusion::add_inplace_fp16_vec(tseq_, attn_proj_);
 
         // ── feed-forward (GEGLU) ──────────────────────────────────────────
         bt::layernorm_forward_inference_batched_fp16_gpu(
             tseq_, blk.n3g, blk.n3b, ln_, cfg_.eps);
-        bt::linear_forward_batched_fp16_gpu(blk.ff1_W, &blk.ff1_b, ln_, ff_mid_);
-        // Exact GELU (erf) — SD1.5's BasicTransformerBlock uses PyTorch's
-        // F.gelu with default approximate=False.
-        bt::geglu_exact_forward_gpu(ff_mid_, ff_act_);
+        // Fused FF1 + exact-GEGLU: skips the (B, 2*D) intermediate of FF1.
+        // SD1.5's BasicTransformerBlock uses F.gelu(approximate=False).
+        brodiffusion::fused_linear_geglu(ln_, blk.ff1_W, blk.ff1_b, ff_act_);
         bt::linear_forward_batched_fp16_gpu(blk.ff2_W, &blk.ff2_b, ff_act_, ff_out_);
-        bt::add_inplace_gpu(tseq_, ff_out_);
+        brodiffusion::add_inplace_fp16_vec(tseq_, ff_out_);
     }
 
     // 6. proj_out: 1x1 conv ≡ Linear.
