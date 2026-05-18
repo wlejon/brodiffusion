@@ -92,6 +92,12 @@ std::vector<float> Pipeline::generate(std::string_view prompt,
     encode_prompt_(prompt, ctx_cond_);
     if (do_cfg) encode_prompt_(opts.negative_prompt, ctx_uncond_);
 
+    // 1b. Pre-project cross-attention K/V for the (cond, uncond) text contexts.
+    // Text context is fixed across all denoising steps, so projecting K/V
+    // once eliminates 16 × steps × (1 + do_cfg) redundant matmuls per layer.
+    unet_.prime_xattn_cache(ctx_cond_, xattn_cache_cond_);
+    if (do_cfg) unet_.prime_xattn_cache(ctx_uncond_, xattn_cache_uncond_);
+
     // 2. Initial noise. randn(1, C_lat*H_lat*W_lat) FP16 * init_noise_sigma.
     std::mt19937_64 rng(opts.seed);
     std::normal_distribution<float> nrm(0.0f, 1.0f);
@@ -111,10 +117,12 @@ std::vector<float> Pipeline::generate(std::string_view prompt,
         const float t = static_cast<float>(scheduler_.timesteps()[i]);
 
         auto t0 = clk::now();
-        unet_.forward(latent_, H_lat, W_lat, t, ctx_cond_, noise_pred_cond_);
+        unet_.forward(latent_, H_lat, W_lat, t, ctx_cond_,
+                      xattn_cache_cond_, noise_pred_cond_);
 
         if (do_cfg) {
-            unet_.forward(latent_, H_lat, W_lat, t, ctx_uncond_, noise_pred_uncond_);
+            unet_.forward(latent_, H_lat, W_lat, t, ctx_uncond_,
+                          xattn_cache_uncond_, noise_pred_uncond_);
             bt::scale_inplace_gpu(noise_pred_cond_, opts.guidance_scale);
             bt::scale_inplace_gpu(noise_pred_uncond_, 1.0f - opts.guidance_scale);
             bt::add_inplace_gpu(noise_pred_cond_, noise_pred_uncond_);

@@ -94,6 +94,11 @@ private:
     brotensor::GpuTensor ctx_cond_, ctx_uncond_;
     brotensor::GpuTensor latent_, noise_pred_cond_, noise_pred_uncond_;
     brotensor::GpuTensor decoded_, scratch_;
+
+    // Cross-attention K/V projected from the text context once per generate(),
+    // reused for all denoising steps. CFG (cond + uncond) keeps two caches.
+    unet::UNet::CrossAttnKVCache xattn_cache_cond_;
+    unet::UNet::CrossAttnKVCache xattn_cache_uncond_;
 };
 
 }  // namespace brodiffusion::pipeline

@@ -362,6 +362,7 @@ void UNet::apply_resnet_(const Resnet& r, int H, int W,
 
 void UNet::apply_transformer_(const Transformer2D& t,
                               const bt::GpuTensor& ctx,
+                              const CrossAttnKVCacheEntry* cache_entry,
                               int H, int W, bt::GpuTensor& x) {
     const int C  = t.C;
     const int H_heads = t.num_heads;
@@ -395,17 +396,28 @@ void UNet::apply_transformer_(const Transformer2D& t,
             attn_proj_);
         brodiffusion::add_inplace_fp16_vec(tseq_, attn_proj_);
 
-        // ── cross-attention (K, V from `ctx`) ─────────────────────────────
+        // ── cross-attention (K, V from `ctx` — possibly cached) ───────────
         bt::layernorm_forward_inference_batched_fp16_gpu(
             tseq_, blk.n2g, blk.n2b, ln_, cfg_.eps);
-        bt::flash_attention_qkvo_forward_gpu(
-            ln_, &ctx,
-            blk.Wq2, /*bq=*/nullptr,
-            blk.Wk2, /*bk=*/nullptr,
-            blk.Wv2, /*bv=*/nullptr,
-            blk.Wo2, &blk.bo2,
-            /*d_mask=*/nullptr, H_heads, /*causal=*/false,
-            attn_proj_);
+        if (cache_entry) {
+            // K/V already projected from `ctx` upstream — skip the two
+            // per-step matmuls and feed the cached buffers straight in.
+            bt::flash_attention_q_with_kv_cached_forward_gpu(
+                ln_, cache_entry->K, cache_entry->V,
+                blk.Wq2, /*bq=*/nullptr,
+                blk.Wo2, &blk.bo2,
+                /*d_mask=*/nullptr, H_heads, /*causal=*/false,
+                attn_proj_);
+        } else {
+            bt::flash_attention_qkvo_forward_gpu(
+                ln_, &ctx,
+                blk.Wq2, /*bq=*/nullptr,
+                blk.Wk2, /*bk=*/nullptr,
+                blk.Wv2, /*bv=*/nullptr,
+                blk.Wo2, &blk.bo2,
+                /*d_mask=*/nullptr, H_heads, /*causal=*/false,
+                attn_proj_);
+        }
         brodiffusion::add_inplace_fp16_vec(tseq_, attn_proj_);
 
         // ── feed-forward (GEGLU) ──────────────────────────────────────────
@@ -456,6 +468,74 @@ void UNet::forward(const bt::GpuTensor& sample,
                    float timestep,
                    const bt::GpuTensor& encoder_hidden_states,
                    bt::GpuTensor& out) {
+    forward_impl_(sample, H, W, timestep, encoder_hidden_states,
+                  /*xattn_cache=*/nullptr, out);
+}
+
+void UNet::forward(const bt::GpuTensor& sample,
+                   int H, int W,
+                   float timestep,
+                   const bt::GpuTensor& encoder_hidden_states,
+                   const CrossAttnKVCache& xattn_cache,
+                   bt::GpuTensor& out) {
+    if (static_cast<int>(xattn_cache.size()) != num_xattn_blocks()) {
+        fail("forward: cross-attn KV cache has " +
+             std::to_string(xattn_cache.size()) + " entries, expected " +
+             std::to_string(num_xattn_blocks()));
+    }
+    forward_impl_(sample, H, W, timestep, encoder_hidden_states,
+                  &xattn_cache, out);
+}
+
+int UNet::num_xattn_blocks() const {
+    int n = 0;
+    for (const DownBlock& d : down_blocks_) {
+        if (d.has_attention) n += static_cast<int>(d.transformers.size());
+    }
+    n += 1;  // mid block always has one Transformer2D
+    for (const UpBlock& u : up_blocks_) {
+        if (u.has_attention) n += static_cast<int>(u.transformers.size());
+    }
+    return n;
+}
+
+void UNet::prime_xattn_cache(const bt::GpuTensor& ctx,
+                             CrossAttnKVCache& cache) {
+    if (conv_in_W_.size() == 0) fail("prime_xattn_cache: weights not loaded");
+    const int n = num_xattn_blocks();
+    cache.resize(static_cast<std::size_t>(n));
+
+    int idx = 0;
+    auto project = [&](const Transformer2D& t) {
+        if (t.blocks.empty()) fail("internal: Transformer2D has no inner blocks");
+        const AttnFFN& blk = t.blocks[0];
+        CrossAttnKVCacheEntry& e = cache[static_cast<std::size_t>(idx++)];
+        bt::flash_attention_project_kv_gpu(
+            ctx,
+            blk.Wk2, /*bk=*/nullptr,
+            blk.Wv2, /*bv=*/nullptr,
+            e.K, e.V);
+    };
+
+    for (const DownBlock& d : down_blocks_) {
+        if (!d.has_attention) continue;
+        for (const Transformer2D& t : d.transformers) project(t);
+    }
+    project(mid_.t);
+    for (const UpBlock& u : up_blocks_) {
+        if (!u.has_attention) continue;
+        for (const Transformer2D& t : u.transformers) project(t);
+    }
+
+    if (idx != n) fail("internal: prime_xattn_cache traversal mismatch");
+}
+
+void UNet::forward_impl_(const bt::GpuTensor& sample,
+                         int H, int W,
+                         float timestep,
+                         const bt::GpuTensor& encoder_hidden_states,
+                         const CrossAttnKVCache* xattn_cache,
+                         bt::GpuTensor& out) {
     if (conv_in_W_.size() == 0) fail("forward: weights not loaded");
 
     // ── Optional GPU profiling (env: UNET_PROF=1) ───────────────────────────
@@ -517,6 +597,10 @@ void UNet::forward(const bt::GpuTensor& sample,
 
     // ── 3. down_blocks ─────────────────────────────────────────────────────
     int Hc = H, Wc = W;
+    int xattn_idx = 0;
+    auto cache_at = [&](int i) -> const CrossAttnKVCacheEntry* {
+        return xattn_cache ? &(*xattn_cache)[static_cast<std::size_t>(i)] : nullptr;
+    };
     for (int i = 0; i < nb; ++i) {
         DownBlock& d = down_blocks_[static_cast<std::size_t>(i)];
         for (int j = 0; j < cfg_.layers_per_block; ++j) {
@@ -526,7 +610,9 @@ void UNet::forward(const bt::GpuTensor& sample,
             if (d.has_attention) {
                 prof_begin(pb_down_xform);
                 apply_transformer_(d.transformers[static_cast<std::size_t>(j)],
-                                   encoder_hidden_states, Hc, Wc, x_);
+                                   encoder_hidden_states,
+                                   cache_at(xattn_idx++),
+                                   Hc, Wc, x_);
                 prof_end(pb_down_xform);
             }
             skips.push_back(x_.clone());
@@ -548,7 +634,9 @@ void UNet::forward(const bt::GpuTensor& sample,
     // ── 4. mid_block: resnet -> transformer -> resnet ──────────────────────
     prof_begin(pb_mid);
     apply_resnet_(mid_.r0, Hc, Wc, x_, y_);
-    apply_transformer_(mid_.t, encoder_hidden_states, Hc, Wc, x_);
+    apply_transformer_(mid_.t, encoder_hidden_states,
+                       cache_at(xattn_idx++),
+                       Hc, Wc, x_);
     apply_resnet_(mid_.r1, Hc, Wc, x_, y_);
     prof_end(pb_mid);
 
@@ -573,7 +661,9 @@ void UNet::forward(const bt::GpuTensor& sample,
             if (u.has_attention) {
                 prof_begin(pb_up_xform);
                 apply_transformer_(u.transformers[static_cast<std::size_t>(j)],
-                                   encoder_hidden_states, Hc, Wc, x_);
+                                   encoder_hidden_states,
+                                   cache_at(xattn_idx++),
+                                   Hc, Wc, x_);
                 prof_end(pb_up_xform);
             }
         }

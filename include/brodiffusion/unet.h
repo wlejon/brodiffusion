@@ -105,6 +105,38 @@ public:
                  const brotensor::GpuTensor& encoder_hidden_states,
                  brotensor::GpuTensor& out);
 
+    // Cached cross-attention K/V for a single context tensor — one (K, V) pair
+    // per Transformer2D block, FP16, layout matching
+    // brotensor::flash_attention_forward_gpu's K/V args (Lk, C). The text
+    // context is fixed across all denoising steps so projecting K/V once per
+    // generate() per CFG branch eliminates 16 × steps × 2 redundant matmuls.
+    struct CrossAttnKVCacheEntry {
+        brotensor::GpuTensor K;  // (Lk, C)
+        brotensor::GpuTensor V;  // (Lk, C)
+    };
+    using CrossAttnKVCache = std::vector<CrossAttnKVCacheEntry>;
+
+    // Populate `cache` with one (K, V) pair per Transformer2D block (in the
+    // same traversal order the forward pass visits them: down blocks,
+    // mid block, up blocks). `cache` is resized as needed.
+    void prime_xattn_cache(const brotensor::GpuTensor& ctx,
+                           CrossAttnKVCache& cache);
+
+    // Variant of forward that uses a pre-primed K/V cache built from the
+    // same `encoder_hidden_states` (or, more precisely, from a ctx with the
+    // exact tokens the cache was primed against). Cross-attention layers
+    // skip the K/V projection step; self-attention is unchanged.
+    void forward(const brotensor::GpuTensor& sample,
+                 int H, int W,
+                 float timestep,
+                 const brotensor::GpuTensor& encoder_hidden_states,
+                 const CrossAttnKVCache& xattn_cache,
+                 brotensor::GpuTensor& out);
+
+    // Number of Transformer2D (cross-attn) blocks in the model — matches the
+    // size of any cache returned by prime_xattn_cache.
+    int num_xattn_blocks() const;
+
     const UNetConfig& config() const { return cfg_; }
 
 private:
@@ -166,10 +198,21 @@ private:
 
     void apply_resnet_(const Resnet& r, int H, int W,
                        brotensor::GpuTensor& x, brotensor::GpuTensor& tmp);
+    // If `cache_entry` is non-null, its (K, V) replace the cross-attn K/V
+    // projections (must have been primed against the same `ctx`).
     void apply_transformer_(const Transformer2D& t,
                             const brotensor::GpuTensor& ctx,
+                            const CrossAttnKVCacheEntry* cache_entry,
                             int H, int W,
                             brotensor::GpuTensor& x);
+    // Shared forward worker; xattn_cache may be null (legacy path) or point
+    // at a cache with exactly num_xattn_blocks() entries.
+    void forward_impl_(const brotensor::GpuTensor& sample,
+                       int H, int W,
+                       float timestep,
+                       const brotensor::GpuTensor& encoder_hidden_states,
+                       const CrossAttnKVCache* xattn_cache,
+                       brotensor::GpuTensor& out);
     void apply_conv3x3_(const brotensor::GpuTensor& W,
                         const brotensor::GpuTensor& b,
                         int C_in, int C_out, int H, int W_,
