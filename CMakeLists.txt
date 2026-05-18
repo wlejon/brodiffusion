@@ -107,9 +107,7 @@ if(BROTENSOR_WITH_CUDA)
     target_sources(brodiffusion PRIVATE
         src/fused_resblock.cu
         src/fused_transformer.cu
-        src/inlet.cu
-        src/distill.cu
-        src/unet_backward.cu
+        src/optim.cu
     )
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(brodiffusion PUBLIC CUDA::cudart)

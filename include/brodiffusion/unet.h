@@ -48,7 +48,6 @@
 // weights and activations are FP16 — convert host-side if your checkpoint
 // ships FP32 weights.
 
-#include "brodiffusion/inlet.h"
 #include "brotensor/device_buffer.h"
 #include "brotensor/tensor.h"
 
@@ -60,35 +59,6 @@
 namespace brodiffusion::safetensors { class File; }
 
 namespace brodiffusion::unet {
-
-// Optional hook for capturing teacher-path inputs (sample, raw t_emb, ctx)
-// and the 12 skip tensors that the down path pushes onto the skip stack.
-// Used by the `capture-inlet` CLI subcommand to record the Inlet trainer's
-// (input, target) corpus straight off the live teacher pipeline. When the
-// hook pointer on UNet is null (the common case), forward() pays exactly one
-// pointer-compare of overhead — no allocations, no D2H copies. The hook is
-// only ever invoked when `cfg.enable_inlet` is false (the teacher down path
-// is the only one that produces 12 separate skip tensors).
-struct InletCaptureHook {
-    virtual ~InletCaptureHook() = default;
-    // Called once per UNet forward, AFTER the (linear → silu → linear) time
-    // embedding has been computed but BEFORE the down path runs.
-    //   sample    : (1, in_channels * H * W) FP16
-    //   t_emb_raw : (1, time_embed_dim)      FP16 — post-second-linear, NOT silu'd
-    //   ctx       : (L_text, cross_attn_dim) FP16
-    virtual void on_inputs(const brotensor::GpuTensor& sample,
-                           const brotensor::GpuTensor& t_emb_raw,
-                           const brotensor::GpuTensor& ctx) = 0;
-    // Called once per UNet forward, immediately after the teacher down path
-    // has finished (and pushed all 12 skips). Pointers are valid only for
-    // the duration of the call.
-    virtual void on_skips(const std::array<const brotensor::GpuTensor*, 12>& skips) = 0;
-    // Called once per UNet forward, immediately after conv_out — the final
-    // epsilon prediction. Optional (default no-op) so the existing capture
-    // path keeps working; e2e distillation overrides this to dump eps_pred.
-    //   eps_pred : (1, out_channels * H * W) FP16
-    virtual void on_eps(const brotensor::GpuTensor& eps_pred) { (void)eps_pred; }
-};
 
 struct UNetConfig {
     int in_channels   = 4;
@@ -102,23 +72,7 @@ struct UNetConfig {
     int attention_head_dim  = 8;
     // time_embed_dim = block_out_channels[0] * time_embed_dim_mult.
     int time_embed_dim_mult = 4;
-    // When true, the teacher down path is replaced at forward time by the
-    // distilled `Inlet` module (see brodiffusion/inlet.h). Inlet weights are
-    // loaded by load_weights() when `inlet_prefix` is non-empty; otherwise
-    // the inlet stays zero-initialised (useful for ceiling benches).
-    bool enable_inlet = false;
 };
-
-// Forward declaration so we can friend the dX-only up-path backward, which
-// lives in src/unet_backward.cu and needs to read every weight struct.
-void unet_up_path_backward(const class UNet& net,
-                           const brotensor::GpuTensor& bottleneck_in,
-                           const std::array<const brotensor::GpuTensor*, 12>& skips_in,
-                           const brotensor::GpuTensor& ctx,
-                           const brotensor::GpuTensor& t_emb_raw,
-                           const brotensor::GpuTensor& d_eps_pred,
-                           std::array<brotensor::GpuTensor, 12>& d_skips_out,
-                           brotensor::GpuTensor& d_bottleneck_out);
 
 class UNet {
 public:
@@ -138,13 +92,6 @@ public:
     // shape mismatches, or dtype mismatch.
     void load_weights(const brodiffusion::safetensors::File& f,
                       const std::string& prefix = "");
-
-    // Load inlet weights from a separate safetensors file. Only meaningful
-    // when `cfg.enable_inlet` is true. If never called (or `inlet_prefix`
-    // is empty), the inlet stays zero-initialised — every tap emits zeros,
-    // which is fine for ceiling benches but produces garbage outputs.
-    void load_inlet_weights(const brodiffusion::safetensors::File& f,
-                            const std::string& inlet_prefix = "");
 
     // Forward pass.
     //   sample:                (1, in_channels * H * W) FP16 — noisy latent
@@ -192,12 +139,6 @@ public:
     int num_xattn_blocks() const;
 
     const UNetConfig& config() const { return cfg_; }
-
-    // Install an optional capture hook (see InletCaptureHook above). Pass
-    // nullptr to disable. Zero overhead when null. Must remain alive for the
-    // duration of any forward() call that triggers it.
-    void set_capture_hook(InletCaptureHook* h) { capture_hook_ = h; }
-    InletCaptureHook* capture_hook() const { return capture_hook_; }
 
 private:
     struct Resnet {
@@ -299,25 +240,6 @@ private:
     brotensor::GpuTensor attn_proj_;
     brotensor::GpuTensor ff_mid_, ff_act_, ff_out_;
     brotensor::GpuTensor proj_out_seq_, proj_out_nchw_;
-
-    // Inlet replacement for the teacher down path. Active iff cfg_.enable_inlet.
-    inlet::Inlet inlet_;
-
-    // Optional capture hook for distillation corpus dumping (see top of file).
-    // Null in every normal txt2img/bench path.
-    InletCaptureHook* capture_hook_ = nullptr;
-
-    // dX-only backward through the frozen mid+up+conv_out path. Needs read
-    // access to every weight struct above.
-    friend void unet_up_path_backward(
-        const UNet& net,
-        const brotensor::GpuTensor& bottleneck_in,
-        const std::array<const brotensor::GpuTensor*, 12>& skips_in,
-        const brotensor::GpuTensor& ctx,
-        const brotensor::GpuTensor& t_emb_raw,
-        const brotensor::GpuTensor& d_eps_pred,
-        std::array<brotensor::GpuTensor, 12>& d_skips_out,
-        brotensor::GpuTensor& d_bottleneck_out);
 };
 
 }  // namespace brodiffusion::unet

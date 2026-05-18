@@ -32,9 +32,10 @@ Planned modules (not yet present):
 | `brodiffusion/pipeline.h` | high-level txt2img pipeline |
 | `brodiffusion/image_buffer.h` | plain RGB8 host buffer (no encoders) |
 
-Inference-only for now. Training would gate on brotensor adding backward
+First pass is inference-only; training is in scope for later. Backward
 passes for the diffusion-flavored ops (conv2d, GroupNorm, cross-attention,
-resample) which currently ship FP16 forward only.
+resample) live in brotensor, and a mixed-precision Adam helper for
+FP16 weights with an FP32 master copy lives in `brodiffusion/optim.h`.
 
 ## Build
 
@@ -88,4 +89,3 @@ the RGB8 host buffer returned by the pipeline and encode as they see fit.
 - **Image encoding (PNG/JPEG)** — consumer's responsibility; bro's image-api
   handles it on integration. The library returns RGB8 host buffers.
 - **QuickJS / JS bindings** — live in bro.
-- **Training** — inference only for now.

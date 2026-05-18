@@ -80,17 +80,6 @@ public:
 
     const PipelineConfig& config() const { return cfg_; }
 
-    // Install a capture hook on the inner UNet (see unet::InletCaptureHook).
-    // Used by the `capture-inlet` CLI subcommand. Pass nullptr to disable.
-    void set_inlet_capture_hook(unet::InletCaptureHook* h) {
-        unet_.set_capture_hook(h);
-    }
-
-    // Direct access to inner UNet for advanced wiring (e.g. loading trained
-    // inlet weights post-construction).
-    unet::UNet&       unet()       { return unet_; }
-    const unet::UNet& unet() const { return unet_; }
-
 private:
     void encode_prompt_(std::string_view prompt, brotensor::GpuTensor& out);
 
