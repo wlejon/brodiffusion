@@ -2,6 +2,7 @@
 #include "brodiffusion/safetensors.h"
 #include "brodiffusion/fused_resblock.h"
 #include "brodiffusion/fused_transformer.h"
+#include "brodiffusion/student_selfattn.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
@@ -76,6 +77,24 @@ UNet::UNet(const UNetConfig& cfg) : cfg_(cfg) {
 
     down_blocks_.resize(static_cast<std::size_t>(nb));
     up_blocks_.resize(static_cast<std::size_t>(nb));
+
+    // Self-attn student modules (Phase-1 distillation): 4 slots, all at
+    // L = 4096 (top resolution, C = block_out_channels[0]). The actual
+    // spatial dims aren't known until the first forward — but C is, so we
+    // can allocate weights here. allocate() reshapes for (C, H=0, W=0); the
+    // forward path passes the real H/W per call (the student is
+    // shape-polymorphic).
+    if (cfg_.enable_selfattn_student_L4096) {
+        students_.resize(4);
+        const int C = cfg_.block_out_channels.front();
+        // Spatial dims will be set per-call at the forward-pass swap point
+        // (the student's weights are shape-independent — only its `height`
+        // and `width` fields drive conv2d's shape arg).
+        for (auto& s : students_) {
+            s.allocate(C, /*H=*/0, /*W=*/0);
+            s.zero_init();
+        }
+    }
     for (int i = 0; i < nb; ++i) {
         // Down: all except the last are cross-attention + downsample.
         DownBlock& d = down_blocks_[static_cast<std::size_t>(i)];
@@ -179,7 +198,8 @@ void UNet::load_transformer_(const st::File& f, const std::string& p,
                         C, 1, blk.ff2_b, "tr.b.ff.net.2.bias");
 }
 
-void UNet::load_weights(const st::File& f, const std::string& prefix) {
+void UNet::load_weights(const st::File& f, const std::string& prefix,
+                        const std::string& student_prefix) {
     const int nb       = static_cast<int>(cfg_.block_out_channels.size());
     const int first_C  = cfg_.block_out_channels.front();
     const int mid_C    = cfg_.block_out_channels.back();
@@ -325,6 +345,17 @@ void UNet::load_weights(const st::File& f, const std::string& prefix) {
                         cfg_.out_channels, first_C * 3 * 3, conv_out_W_, "conv_out.weight");
     upload_fp16_checked(need(f, prefix + "conv_out.bias"),
                         cfg_.out_channels, 1, conv_out_b_, "conv_out.bias");
+
+    // ── self-attn students (Phase-1 distillation) ──────────────────────────
+    // Only attempt loading when (a) the flag is on, (b) the caller passed a
+    // non-empty student_prefix, and (c) at least one expected key exists in
+    // the file. Otherwise leave the zero-init from the ctor in place.
+    if (cfg_.enable_selfattn_student_L4096 && !student_prefix.empty()) {
+        for (std::size_t i = 0; i < students_.size(); ++i) {
+            const std::string p = student_prefix + "block" + std::to_string(i) + ".";
+            students_[i].load_from_safetensors(f, p);
+        }
+    }
 }
 
 // ─── per-block forward helpers ─────────────────────────────────────────────
@@ -363,6 +394,7 @@ void UNet::apply_resnet_(const Resnet& r, int H, int W,
 void UNet::apply_transformer_(const Transformer2D& t,
                               const bt::GpuTensor& ctx,
                               const CrossAttnKVCacheEntry* cache_entry,
+                              const student::SelfAttnStudent* student,
                               int H, int W, bt::GpuTensor& x) {
     const int C  = t.C;
     const int H_heads = t.num_heads;
@@ -384,17 +416,36 @@ void UNet::apply_transformer_(const Transformer2D& t,
     tseq_ = proj_in_seq_.clone();
     for (const AttnFFN& blk : t.blocks) {
         // ── self-attention (Q/K/V bias-less, Wo biased) ───────────────────
-        bt::layernorm_forward_inference_batched_fp16_gpu(
-            tseq_, blk.n1g, blk.n1b, ln_, cfg_.eps);
-        bt::flash_attention_qkvo_forward_gpu(
-            ln_, /*Ctx=*/nullptr,
-            blk.Wq1, /*bq=*/nullptr,
-            blk.Wk1, /*bk=*/nullptr,
-            blk.Wv1, /*bv=*/nullptr,
-            blk.Wo1, &blk.bo1,
-            /*d_mask=*/nullptr, H_heads, /*causal=*/false,
-            attn_proj_);
-        brodiffusion::add_inplace_fp16_vec(tseq_, attn_proj_);
+        // When the student is enabled for THIS block, replace the entire
+        // (LN1 → self-attn → residual-add) step. The student consumes/produces
+        // NCHW and absorbs the residual itself (its three inner layers each
+        // do y += pw(silu(dw(y)))). We pay one extra seq↔NCHW pair around it
+        // rather than restructuring the whole transformer's outer transposes
+        // — that overhead is negligible next to the 4096×4096 attention we're
+        // skipping.
+        if (student) {
+            // tseq_ shape: (L=H*W, C) in row-major sequence layout.
+            bt::sequence_to_nchw_gpu(tseq_, 1, C, H, W, student_out_);
+            // Refresh per-call spatial dims (cheap; weights are unchanged).
+            student::SelfAttnStudent& s =
+                const_cast<student::SelfAttnStudent&>(*student);
+            s.height = H;
+            s.width  = W;
+            s.forward(student_out_, attn_proj_, student_scratch_);
+            bt::nchw_to_sequence_gpu(attn_proj_, 1, C, H, W, tseq_);
+        } else {
+            bt::layernorm_forward_inference_batched_fp16_gpu(
+                tseq_, blk.n1g, blk.n1b, ln_, cfg_.eps);
+            bt::flash_attention_qkvo_forward_gpu(
+                ln_, /*Ctx=*/nullptr,
+                blk.Wq1, /*bq=*/nullptr,
+                blk.Wk1, /*bk=*/nullptr,
+                blk.Wv1, /*bv=*/nullptr,
+                blk.Wo1, &blk.bo1,
+                /*d_mask=*/nullptr, H_heads, /*causal=*/false,
+                attn_proj_);
+            brodiffusion::add_inplace_fp16_vec(tseq_, attn_proj_);
+        }
 
         // ── cross-attention (K, V from `ctx` — possibly cached) ───────────
         bt::layernorm_forward_inference_batched_fp16_gpu(
@@ -601,6 +652,24 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
     auto cache_at = [&](int i) -> const CrossAttnKVCacheEntry* {
         return xattn_cache ? &(*xattn_cache)[static_cast<std::size_t>(i)] : nullptr;
     };
+    // Self-attn student routing. The 4 student slots cover the L=4096
+    // transformers in this exact order (matches UNetConfig docstring):
+    //   slot 0: down_blocks[0].transformers[0]
+    //   slot 1: down_blocks[0].transformers[1]
+    //   slot 2: up_blocks[nb-1].transformers[1]
+    //   slot 3: up_blocks[nb-1].transformers[2]
+    // `path` is 0 = down, 1 = mid, 2 = up.
+    const bool use_student = cfg_.enable_selfattn_student_L4096 &&
+                             !students_.empty();
+    auto student_at = [&](int path, int block_i, int layer_j)
+            -> const student::SelfAttnStudent* {
+        if (!use_student) return nullptr;
+        if (path == 0 && block_i == 0 && layer_j == 0) return &students_[0];
+        if (path == 0 && block_i == 0 && layer_j == 1) return &students_[1];
+        if (path == 2 && block_i == nb - 1 && layer_j == 1) return &students_[2];
+        if (path == 2 && block_i == nb - 1 && layer_j == 2) return &students_[3];
+        return nullptr;
+    };
     for (int i = 0; i < nb; ++i) {
         DownBlock& d = down_blocks_[static_cast<std::size_t>(i)];
         for (int j = 0; j < cfg_.layers_per_block; ++j) {
@@ -612,6 +681,7 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
                 apply_transformer_(d.transformers[static_cast<std::size_t>(j)],
                                    encoder_hidden_states,
                                    cache_at(xattn_idx++),
+                                   student_at(/*path=*/0, i, j),
                                    Hc, Wc, x_);
                 prof_end(pb_down_xform);
             }
@@ -636,6 +706,7 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
     apply_resnet_(mid_.r0, Hc, Wc, x_, y_);
     apply_transformer_(mid_.t, encoder_hidden_states,
                        cache_at(xattn_idx++),
+                       /*student=*/nullptr,
                        Hc, Wc, x_);
     apply_resnet_(mid_.r1, Hc, Wc, x_, y_);
     prof_end(pb_mid);
@@ -663,6 +734,7 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
                 apply_transformer_(u.transformers[static_cast<std::size_t>(j)],
                                    encoder_hidden_states,
                                    cache_at(xattn_idx++),
+                                   student_at(/*path=*/2, i, j),
                                    Hc, Wc, x_);
                 prof_end(pb_up_xform);
             }
