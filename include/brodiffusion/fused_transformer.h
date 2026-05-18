@@ -32,6 +32,19 @@ void fused_linear_geglu(const brotensor::GpuTensor& X,
                         const brotensor::GpuTensor& b,
                         brotensor::GpuTensor& Y);
 
+// W8A16 variant: ff1 weight is INT8 with per-output-row FP32 scales. The
+// linear part is delegated to brotensor::linear_forward_batched_int8w_fp16_gpu
+// into an FP16 (B, 2*D_out) buffer (not fused), then geglu_forward_gpu turns
+// that into Y(B, D_out). Bias stays FP16 (2*D_out, 1).
+//   W_int8: (2*D_out, D_in) Dtype::INT8
+//   scales: (2*D_out, 1)    FP32
+//   b:      FP16 (2*D_out, 1)
+void fused_linear_geglu(const brotensor::GpuTensor& X,
+                        const brotensor::GpuTensor& W_int8,
+                        const brotensor::GpuTensor& W_scales,
+                        const brotensor::GpuTensor& b,
+                        brotensor::GpuTensor& Y);
+
 // Vectorised FP16 elementwise add: Y[i] += X[i].
 // brotensor::add_inplace_gpu's FP16 kernel goes through __half2float per
 // element; this one uses __half2 vector adds (and int4 vector loads when

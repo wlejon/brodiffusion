@@ -357,23 +357,51 @@ void UNet::apply_conv3x3_(const bt::GpuTensor& W, const bt::GpuTensor& b,
                            out);
 }
 
+void UNet::apply_conv3x3_q_(const QWeight& Wq, const bt::GpuTensor& b,
+                            int C_in, int C_out, int H, int W_,
+                            int stride, int pad,
+                            const bt::GpuTensor& in, bt::GpuTensor& out) {
+    bt::conv2d_int8w_fp16_forward_gpu(in, Wq.W_int8, Wq.scales, &b,
+                                      /*N=*/1, C_in, H, W_,
+                                      C_out, /*kH=*/3, /*kW=*/3,
+                                      stride, stride, pad, pad, /*dil=*/1, 1,
+                                      /*groups=*/1, out);
+}
+
 void UNet::apply_resnet_(const Resnet& r, int H, int W,
                          bt::GpuTensor& x, bt::GpuTensor& tmp) {
     // Per-resblock time-emb projection: silu(temb) -> Linear -> (1, C_out).
     bt::linear_forward_batched_fp16_gpu(r.temb_W, &r.temb_b, temb_silu_, temb_proj_);
 
-    const bt::GpuTensor* skip_W = r.has_shortcut ? &r.Ws : nullptr;
-    const bt::GpuTensor* skip_b = r.has_shortcut ? &r.bs : nullptr;
-    brodiffusion::fused_resblock_forward(x,
-                                         r.n1g, r.n1b,
-                                         r.W1, r.b1,
-                                         temb_proj_,
-                                         r.n2g, r.n2b,
-                                         r.W2, r.b2,
-                                         skip_W, skip_b,
-                                         r.C_in, r.C_out, H, W,
-                                         cfg_.norm_num_groups, cfg_.eps,
-                                         tmp);
+    if (r.W1_q.active()) {
+        const QWeight* skip_q = r.has_shortcut ? &r.Ws_q : nullptr;
+        const bt::GpuTensor* skip_b = r.has_shortcut ? &r.bs : nullptr;
+        const bt::GpuTensor* skip_W_int8   = skip_q ? &skip_q->W_int8 : nullptr;
+        const bt::GpuTensor* skip_W_scales = skip_q ? &skip_q->scales : nullptr;
+        brodiffusion::fused_resblock_forward(x,
+                                             r.n1g, r.n1b,
+                                             r.W1_q.W_int8, r.W1_q.scales, r.b1,
+                                             temb_proj_,
+                                             r.n2g, r.n2b,
+                                             r.W2_q.W_int8, r.W2_q.scales, r.b2,
+                                             skip_W_int8, skip_W_scales, skip_b,
+                                             r.C_in, r.C_out, H, W,
+                                             cfg_.norm_num_groups, cfg_.eps,
+                                             tmp);
+    } else {
+        const bt::GpuTensor* skip_W = r.has_shortcut ? &r.Ws : nullptr;
+        const bt::GpuTensor* skip_b = r.has_shortcut ? &r.bs : nullptr;
+        brodiffusion::fused_resblock_forward(x,
+                                             r.n1g, r.n1b,
+                                             r.W1, r.b1,
+                                             temb_proj_,
+                                             r.n2g, r.n2b,
+                                             r.W2, r.b2,
+                                             skip_W, skip_b,
+                                             r.C_in, r.C_out, H, W,
+                                             cfg_.norm_num_groups, cfg_.eps,
+                                             tmp);
+    }
     std::swap(x, tmp);
 }
 
@@ -395,7 +423,12 @@ void UNet::apply_transformer_(const Transformer2D& t,
     bt::nchw_to_sequence_gpu(gn_, 1, C, H, W, seq_);
 
     // 4. proj_in: 1x1 conv ≡ Linear over C.
-    bt::linear_forward_batched_fp16_gpu(t.pi_W, &t.pi_b, seq_, proj_in_seq_);
+    if (t.pi_q.active()) {
+        bt::linear_forward_batched_int8w_fp16_gpu(
+            t.pi_q.W_int8, t.pi_q.scales, &t.pi_b, seq_, proj_in_seq_);
+    } else {
+        bt::linear_forward_batched_fp16_gpu(t.pi_W, &t.pi_b, seq_, proj_in_seq_);
+    }
 
     // 5. transformer blocks (always 1 for SD1.5).
     tseq_ = proj_in_seq_.clone();
@@ -403,14 +436,25 @@ void UNet::apply_transformer_(const Transformer2D& t,
         // ── self-attention (Q/K/V bias-less, Wo biased) ───────────────────
         bt::layernorm_forward_inference_batched_fp16_gpu(
             tseq_, blk.n1g, blk.n1b, ln_, cfg_.eps);
-        bt::flash_attention_qkvo_forward_gpu(
-            ln_, /*Ctx=*/nullptr,
-            blk.Wq1, /*bq=*/nullptr,
-            blk.Wk1, /*bk=*/nullptr,
-            blk.Wv1, /*bv=*/nullptr,
-            blk.Wo1, &blk.bo1,
-            /*d_mask=*/nullptr, H_heads, /*causal=*/false,
-            attn_proj_);
+        if (blk.Wq1_q.active()) {
+            bt::flash_attention_qkvo_int8w_fp16_gpu(
+                ln_, /*Ctx=*/nullptr,
+                blk.Wq1_q.W_int8, blk.Wq1_q.scales, /*bq=*/nullptr,
+                blk.Wk1_q.W_int8, blk.Wk1_q.scales, /*bk=*/nullptr,
+                blk.Wv1_q.W_int8, blk.Wv1_q.scales, /*bv=*/nullptr,
+                blk.Wo1_q.W_int8, blk.Wo1_q.scales, &blk.bo1,
+                /*d_mask=*/nullptr, H_heads, /*causal=*/false,
+                attn_proj_);
+        } else {
+            bt::flash_attention_qkvo_forward_gpu(
+                ln_, /*Ctx=*/nullptr,
+                blk.Wq1, /*bq=*/nullptr,
+                blk.Wk1, /*bk=*/nullptr,
+                blk.Wv1, /*bv=*/nullptr,
+                blk.Wo1, &blk.bo1,
+                /*d_mask=*/nullptr, H_heads, /*causal=*/false,
+                attn_proj_);
+        }
         brodiffusion::add_inplace_fp16_vec(tseq_, attn_proj_);
 
         // ── cross-attention (K, V from `ctx` — possibly cached) ───────────
@@ -419,21 +463,41 @@ void UNet::apply_transformer_(const Transformer2D& t,
         if (cache_entry) {
             // K/V already projected from `ctx` upstream — skip the two
             // per-step matmuls and feed the cached buffers straight in.
-            bt::flash_attention_q_with_kv_cached_forward_gpu(
-                ln_, cache_entry->K, cache_entry->V,
-                blk.Wq2, /*bq=*/nullptr,
-                blk.Wo2, &blk.bo2,
-                /*d_mask=*/nullptr, H_heads, /*causal=*/false,
-                attn_proj_);
+            if (blk.Wq2_q.active()) {
+                bt::flash_attention_q_with_kv_cached_int8w_fp16_gpu(
+                    ln_, cache_entry->K, cache_entry->V,
+                    blk.Wq2_q.W_int8, blk.Wq2_q.scales, /*bq=*/nullptr,
+                    blk.Wo2_q.W_int8, blk.Wo2_q.scales, &blk.bo2,
+                    /*d_mask=*/nullptr, H_heads, /*causal=*/false,
+                    attn_proj_);
+            } else {
+                bt::flash_attention_q_with_kv_cached_forward_gpu(
+                    ln_, cache_entry->K, cache_entry->V,
+                    blk.Wq2, /*bq=*/nullptr,
+                    blk.Wo2, &blk.bo2,
+                    /*d_mask=*/nullptr, H_heads, /*causal=*/false,
+                    attn_proj_);
+            }
         } else {
-            bt::flash_attention_qkvo_forward_gpu(
-                ln_, &ctx,
-                blk.Wq2, /*bq=*/nullptr,
-                blk.Wk2, /*bk=*/nullptr,
-                blk.Wv2, /*bv=*/nullptr,
-                blk.Wo2, &blk.bo2,
-                /*d_mask=*/nullptr, H_heads, /*causal=*/false,
-                attn_proj_);
+            if (blk.Wq2_q.active()) {
+                bt::flash_attention_qkvo_int8w_fp16_gpu(
+                    ln_, &ctx,
+                    blk.Wq2_q.W_int8, blk.Wq2_q.scales, /*bq=*/nullptr,
+                    blk.Wk2_q.W_int8, blk.Wk2_q.scales, /*bk=*/nullptr,
+                    blk.Wv2_q.W_int8, blk.Wv2_q.scales, /*bv=*/nullptr,
+                    blk.Wo2_q.W_int8, blk.Wo2_q.scales, &blk.bo2,
+                    /*d_mask=*/nullptr, H_heads, /*causal=*/false,
+                    attn_proj_);
+            } else {
+                bt::flash_attention_qkvo_forward_gpu(
+                    ln_, &ctx,
+                    blk.Wq2, /*bq=*/nullptr,
+                    blk.Wk2, /*bk=*/nullptr,
+                    blk.Wv2, /*bv=*/nullptr,
+                    blk.Wo2, &blk.bo2,
+                    /*d_mask=*/nullptr, H_heads, /*causal=*/false,
+                    attn_proj_);
+            }
         }
         brodiffusion::add_inplace_fp16_vec(tseq_, attn_proj_);
 
@@ -442,13 +506,28 @@ void UNet::apply_transformer_(const Transformer2D& t,
             tseq_, blk.n3g, blk.n3b, ln_, cfg_.eps);
         // Fused FF1 + exact-GEGLU: skips the (B, 2*D) intermediate of FF1.
         // SD1.5's BasicTransformerBlock uses F.gelu(approximate=False).
-        brodiffusion::fused_linear_geglu(ln_, blk.ff1_W, blk.ff1_b, ff_act_);
-        bt::linear_forward_batched_fp16_gpu(blk.ff2_W, &blk.ff2_b, ff_act_, ff_out_);
+        if (blk.ff1_q.active()) {
+            brodiffusion::fused_linear_geglu(
+                ln_, blk.ff1_q.W_int8, blk.ff1_q.scales, blk.ff1_b, ff_act_);
+        } else {
+            brodiffusion::fused_linear_geglu(ln_, blk.ff1_W, blk.ff1_b, ff_act_);
+        }
+        if (blk.ff2_q.active()) {
+            bt::linear_forward_batched_int8w_fp16_gpu(
+                blk.ff2_q.W_int8, blk.ff2_q.scales, &blk.ff2_b, ff_act_, ff_out_);
+        } else {
+            bt::linear_forward_batched_fp16_gpu(blk.ff2_W, &blk.ff2_b, ff_act_, ff_out_);
+        }
         brodiffusion::add_inplace_fp16_vec(tseq_, ff_out_);
     }
 
     // 6. proj_out: 1x1 conv ≡ Linear.
-    bt::linear_forward_batched_fp16_gpu(t.po_W, &t.po_b, tseq_, proj_out_seq_);
+    if (t.po_q.active()) {
+        bt::linear_forward_batched_int8w_fp16_gpu(
+            t.po_q.W_int8, t.po_q.scales, &t.po_b, tseq_, proj_out_seq_);
+    } else {
+        bt::linear_forward_batched_fp16_gpu(t.po_W, &t.po_b, tseq_, proj_out_seq_);
+    }
 
     // 7. seq -> NCHW.
     bt::sequence_to_nchw_gpu(proj_out_seq_, 1, C, H, W, proj_out_nchw_);
@@ -823,6 +902,11 @@ void UNet::apply_lora_delta(const std::string& target_path,
                             const st::TensorView& lora_down,
                             const st::TensorView& lora_up,
                             float scale_total) {
+    if (finalized_) {
+        fail("apply_lora_delta: called after finalize_weights(); LoRA must be "
+             "applied before quantisation/finalisation (the FP16 base weights "
+             "are no longer in memory)");
+    }
     bt::GpuTensor* W = lora_target_(target_path);
     if (!W) {
         fail("apply_lora_delta: unknown target '" + target_path + "'");
@@ -849,6 +933,82 @@ void UNet::apply_lora_delta(const std::string& target_path,
     bt::add_inplace_gpu(*W, delta);
 }
 
+void UNet::quantize_weight_inplace_(bt::GpuTensor& W_fp16, QWeight& q) {
+    if (W_fp16.size() == 0) return;             // nothing to quantise
+    if (W_fp16.dtype != bt::Dtype::FP16) {
+        fail("quantize_weight_inplace_: weight is not FP16");
+    }
+    const int out = W_fp16.rows;
+    const int in  = W_fp16.cols;
+
+    std::vector<uint16_t> host_fp16(static_cast<std::size_t>(out) *
+                                    static_cast<std::size_t>(in));
+    bt::download_fp16(W_fp16, host_fp16.data());
+
+    std::vector<int8_t> host_int8(host_fp16.size());
+    std::vector<float>  host_scales(static_cast<std::size_t>(out));
+    bt::quantize_int8_per_row_host(host_fp16.data(), out, in,
+                                   host_int8.data(), host_scales.data());
+
+    // Upload INT8 weights.
+    q.W_int8.resize(out, in, bt::Dtype::INT8);
+    cudaMemcpy(q.W_int8.data, host_int8.data(),
+               static_cast<std::size_t>(out) * static_cast<std::size_t>(in),
+               cudaMemcpyHostToDevice);
+    // Upload FP32 scales.
+    bt::upload(host_scales.data(), out, 1, q.scales);
+
+    // Free original FP16 storage by replacing with default-constructed tensor.
+    W_fp16 = bt::GpuTensor();
+}
+
+void UNet::finalize_weights() {
+    if (finalized_) return;
+    finalized_ = true;
+    if (!cfg_.quantize_weights) return;
+    if (conv_in_W_.size() == 0) fail("finalize_weights: weights not loaded");
+
+    auto quant_resnet = [&](Resnet& r) {
+        quantize_weight_inplace_(r.W1, r.W1_q);
+        quantize_weight_inplace_(r.W2, r.W2_q);
+        if (r.has_shortcut) quantize_weight_inplace_(r.Ws, r.Ws_q);
+    };
+    auto quant_transformer = [&](Transformer2D& t) {
+        quantize_weight_inplace_(t.pi_W, t.pi_q);
+        quantize_weight_inplace_(t.po_W, t.po_q);
+        for (AttnFFN& blk : t.blocks) {
+            quantize_weight_inplace_(blk.Wq1, blk.Wq1_q);
+            quantize_weight_inplace_(blk.Wk1, blk.Wk1_q);
+            quantize_weight_inplace_(blk.Wv1, blk.Wv1_q);
+            quantize_weight_inplace_(blk.Wo1, blk.Wo1_q);
+            quantize_weight_inplace_(blk.Wq2, blk.Wq2_q);
+            quantize_weight_inplace_(blk.Wk2, blk.Wk2_q);
+            quantize_weight_inplace_(blk.Wv2, blk.Wv2_q);
+            quantize_weight_inplace_(blk.Wo2, blk.Wo2_q);
+            quantize_weight_inplace_(blk.ff1_W, blk.ff1_q);
+            quantize_weight_inplace_(blk.ff2_W, blk.ff2_q);
+        }
+    };
+
+    for (DownBlock& d : down_blocks_) {
+        for (Resnet& r : d.resnets) quant_resnet(r);
+        for (Transformer2D& t : d.transformers) quant_transformer(t);
+        if (d.has_downsampler) {
+            quantize_weight_inplace_(d.downsampler.W, d.downsampler.W_q);
+        }
+    }
+    quant_resnet(mid_.r0);
+    quant_transformer(mid_.t);
+    quant_resnet(mid_.r1);
+    for (UpBlock& u : up_blocks_) {
+        for (Resnet& r : u.resnets) quant_resnet(r);
+        for (Transformer2D& t : u.transformers) quant_transformer(t);
+        if (u.has_upsampler) {
+            quantize_weight_inplace_(u.upsampler.W, u.upsampler.W_q);
+        }
+    }
+}
+
 int UNet::num_xattn_blocks() const {
     int n = 0;
     for (const DownBlock& d : down_blocks_) {
@@ -872,11 +1032,19 @@ void UNet::prime_xattn_cache(const bt::GpuTensor& ctx,
         if (t.blocks.empty()) fail("internal: Transformer2D has no inner blocks");
         const AttnFFN& blk = t.blocks[0];
         CrossAttnKVCacheEntry& e = cache[static_cast<std::size_t>(idx++)];
-        bt::flash_attention_project_kv_gpu(
-            ctx,
-            blk.Wk2, /*bk=*/nullptr,
-            blk.Wv2, /*bv=*/nullptr,
-            e.K, e.V);
+        if (blk.Wk2_q.active()) {
+            bt::flash_attention_project_kv_int8w_fp16_gpu(
+                ctx,
+                blk.Wk2_q.W_int8, blk.Wk2_q.scales, /*bk=*/nullptr,
+                blk.Wv2_q.W_int8, blk.Wv2_q.scales, /*bv=*/nullptr,
+                e.K, e.V);
+        } else {
+            bt::flash_attention_project_kv_gpu(
+                ctx,
+                blk.Wk2, /*bk=*/nullptr,
+                blk.Wv2, /*bv=*/nullptr,
+                e.K, e.V);
+        }
     };
 
     for (const DownBlock& d : down_blocks_) {
@@ -1003,9 +1171,15 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
         if (d.has_downsampler) {
             // 3x3 stride-2 conv same-channels.
             prof_begin(pb_down_samp);
-            apply_conv3x3_(d.downsampler.W, d.downsampler.b,
-                           d.C_out, d.C_out, Hc, Wc,
-                           /*stride=*/2, /*pad=*/1, x_, y_);
+            if (d.downsampler.W_q.active()) {
+                apply_conv3x3_q_(d.downsampler.W_q, d.downsampler.b,
+                                 d.C_out, d.C_out, Hc, Wc,
+                                 /*stride=*/2, /*pad=*/1, x_, y_);
+            } else {
+                apply_conv3x3_(d.downsampler.W, d.downsampler.b,
+                               d.C_out, d.C_out, Hc, Wc,
+                               /*stride=*/2, /*pad=*/1, x_, y_);
+            }
             std::swap(x_, y_);
             prof_end(pb_down_samp);
             Hc /= 2;
@@ -1053,9 +1227,15 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
         if (u.has_upsampler) {
             prof_begin(pb_up_samp);
             bt::upsample_nearest_2x_gpu(x_, 1, u.C_out, Hc, Wc, y_);
-            apply_conv3x3_(u.upsampler.W, u.upsampler.b,
-                           u.C_out, u.C_out, 2 * Hc, 2 * Wc,
-                           /*stride=*/1, /*pad=*/1, y_, x_);
+            if (u.upsampler.W_q.active()) {
+                apply_conv3x3_q_(u.upsampler.W_q, u.upsampler.b,
+                                 u.C_out, u.C_out, 2 * Hc, 2 * Wc,
+                                 /*stride=*/1, /*pad=*/1, y_, x_);
+            } else {
+                apply_conv3x3_(u.upsampler.W, u.upsampler.b,
+                               u.C_out, u.C_out, 2 * Hc, 2 * Wc,
+                               /*stride=*/1, /*pad=*/1, y_, x_);
+            }
             prof_end(pb_up_samp);
             Hc *= 2;
             Wc *= 2;

@@ -85,6 +85,15 @@ struct UNetConfig {
     // added to the time embedding *after* linear_1 and *before* the SiLU,
     // matching diffusers' TimestepEmbedding.forward.
     int time_cond_proj_dim = 0;
+
+    // When true, finalize_weights() converts the big UNet weights (ResBlock
+    // 3x3/1x1 conv weights, attention Q/K/V/O projections, transformer
+    // proj_in/proj_out, FF1/FF2 linears, down/upsampler 3x3 convs) from FP16
+    // to INT8 weight-only quantisation (W8A16). Small/sensitive layers
+    // (conv_in, conv_out, GroupNorm gain/bias, time embedding, cond_proj,
+    // per-resblock time_emb_proj, all biases) stay FP16. Per-output-row
+    // symmetric scales (matching brotensor::quantize_int8_per_row_host).
+    bool quantize_weights = false;
 };
 
 class UNet {
@@ -189,14 +198,37 @@ public:
                           const brodiffusion::safetensors::TensorView& lora_up,
                           float scale_total);
 
+    // Finalize the UNet weights for inference. When the config has
+    // `quantize_weights == true` this converts the big linear / conv weights
+    // listed in UNetConfig::quantize_weights to INT8 (per-output-row symmetric
+    // FP32 scales) and frees the original FP16 storage. When
+    // `quantize_weights == false` this is a no-op except for marking the UNet
+    // finalized, after which apply_lora_delta() throws.
+    //
+    // Idempotent: a second call is a no-op. apply_lora_delta() must be called
+    // BEFORE finalize_weights() — once finalized, the FP16 storage backing the
+    // LoRA-patchable layers is gone.
+    void finalize_weights();
+    bool is_finalized() const { return finalized_; }
+
     const UNetConfig& config() const { return cfg_; }
 
 private:
+    // Paired INT8 weight + per-output-row FP32 scales. Populated by
+    // finalize_weights() when quantize_weights is true; .W_int8.size() == 0
+    // means this layer is still using its FP16 weight.
+    struct QWeight {
+        brotensor::GpuTensor W_int8;   // INT8 (out, in)
+        brotensor::GpuTensor scales;   // FP32 (out, 1)
+        bool active() const { return W_int8.size() > 0; }
+    };
     struct Resnet {
         brotensor::GpuTensor n1g, n1b, W1, b1;
         brotensor::GpuTensor temb_W, temb_b;
         brotensor::GpuTensor n2g, n2b, W2, b2;
         brotensor::GpuTensor Ws, bs;
+        // INT8 counterparts (populated by finalize_weights when enabled).
+        QWeight W1_q, W2_q, Ws_q;
         bool has_shortcut = false;
         int  C_in = 0, C_out = 0;
     };
@@ -208,17 +240,23 @@ private:
         brotensor::GpuTensor n3g, n3b;
         brotensor::GpuTensor ff1_W, ff1_b;
         brotensor::GpuTensor ff2_W, ff2_b;
+        // INT8 counterparts.
+        QWeight Wq1_q, Wk1_q, Wv1_q, Wo1_q;
+        QWeight Wq2_q, Wk2_q, Wv2_q, Wo2_q;
+        QWeight ff1_q, ff2_q;
     };
     struct Transformer2D {
         brotensor::GpuTensor gn_g, gn_b;
         brotensor::GpuTensor pi_W, pi_b;
         brotensor::GpuTensor po_W, po_b;
+        QWeight pi_q, po_q;
         std::vector<AttnFFN> blocks;
         int  C = 0;
         int  num_heads = 0;
     };
     struct SampleConv {
         brotensor::GpuTensor W, b;
+        QWeight W_q;
     };
     struct DownBlock {
         std::vector<Resnet>        resnets;
@@ -286,8 +324,20 @@ private:
                         int stride, int pad,
                         const brotensor::GpuTensor& in,
                         brotensor::GpuTensor& out);
+    // INT8 variant; called when the supplied QWeight is active.
+    void apply_conv3x3_q_(const QWeight& Wq,
+                          const brotensor::GpuTensor& b,
+                          int C_in, int C_out, int H, int W_,
+                          int stride, int pad,
+                          const brotensor::GpuTensor& in,
+                          brotensor::GpuTensor& out);
+    // Helper used by finalize_weights() to quantise a single FP16 weight in
+    // place: downloads the FP16 weight, runs quantize_int8_per_row_host,
+    // uploads INT8 + scales, then frees the FP16 GpuTensor.
+    void quantize_weight_inplace_(brotensor::GpuTensor& W_fp16, QWeight& q);
 
     UNetConfig cfg_;
+    bool finalized_ = false;
     int time_embed_dim_ = 0;
     int freq_dim_       = 0;
 

@@ -127,6 +127,13 @@ std::vector<float> Pipeline::generate(std::string_view prompt,
     // cond_proj input, so there is no second CFG branch.
     const bool do_cfg = !is_lcm && (opts.guidance_scale != 1.0f);
 
+    // 0. Finalize UNet weights for inference. Idempotent: a second call is a
+    // no-op. This is where W8A16 quantisation (cfg_.unet.quantize_weights)
+    // actually happens — placed AFTER any apply_lora() calls (which the caller
+    // does between load_weights and generate) so the FP16 weights still exist
+    // when LoRA merges run.
+    unet_.finalize_weights();
+
     // 1. Encode prompt(s).
     encode_prompt_(prompt, ctx_cond_);
     if (do_cfg) encode_prompt_(opts.negative_prompt, ctx_uncond_);

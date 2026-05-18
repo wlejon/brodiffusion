@@ -20,6 +20,7 @@
 
 #include "brodiffusion/fused_transformer.h"
 
+#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <cuda_runtime.h>
@@ -340,6 +341,45 @@ void fused_linear_geglu(const bt::GpuTensor& X,
         reinterpret_cast<__half*>(Y.data_fp16()),
         B, D_out, D_in);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void fused_linear_geglu(const bt::GpuTensor& X,
+                        const bt::GpuTensor& W_int8,
+                        const bt::GpuTensor& W_scales,
+                        const bt::GpuTensor& b,
+                        bt::GpuTensor& Y) {
+    if (X.dtype != bt::Dtype::FP16 || b.dtype != bt::Dtype::FP16) {
+        throw std::runtime_error("fused_linear_geglu(int8w): X and b must be FP16");
+    }
+    if (W_int8.dtype != bt::Dtype::INT8) {
+        throw std::runtime_error("fused_linear_geglu(int8w): W_int8 must be INT8");
+    }
+    if (W_scales.dtype != bt::Dtype::FP32) {
+        throw std::runtime_error("fused_linear_geglu(int8w): W_scales must be FP32");
+    }
+    const int B     = X.rows;
+    const int D_in  = X.cols;
+    const int two_D = W_int8.rows;
+    if (W_int8.cols != D_in) {
+        throw std::runtime_error("fused_linear_geglu(int8w): W.cols != X.cols");
+    }
+    if ((two_D & 1) != 0) {
+        throw std::runtime_error("fused_linear_geglu(int8w): W.rows must be even");
+    }
+    if (static_cast<int>(b.size()) != two_D) {
+        throw std::runtime_error("fused_linear_geglu(int8w): bias length != W.rows");
+    }
+    const int D_out = two_D / 2;
+    if (Y.rows != B || Y.cols != D_out || Y.dtype != bt::Dtype::FP16) {
+        Y.resize(B, D_out, bt::Dtype::FP16);
+    }
+    if (B == 0 || D_out == 0) return;
+
+    // (B, in) @ dequant(W_int8)^T + b -> tmp (B, 2*D_out) FP16.
+    thread_local static bt::GpuTensor ff1_tmp;
+    bt::linear_forward_batched_int8w_fp16_gpu(W_int8, W_scales, &b, X, ff1_tmp);
+    // GEGLU (exact GELU, matches SD1.5 / diffusers default).
+    bt::geglu_exact_forward_gpu(ff1_tmp, Y);
 }
 
 void add_inplace_fp16_vec(bt::GpuTensor& Y, const bt::GpuTensor& X) {

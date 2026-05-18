@@ -34,6 +34,7 @@ static int usage() {
         "                       [--width N] [--height N] [--seed N]\n"
         "                       [--scheduler ddim|lcm]\n"
         "                       [--lora <path>[:<scale>]]... [--lcm-lora <path>]\n"
+        "                       [--quantize-unet]\n"
         "\n"
         "  --scheduler lcm  selects the LCM (Latent Consistency Model) scheduler;\n"
         "                   requires an LCM-distilled UNet checkpoint (e.g.\n"
@@ -117,6 +118,11 @@ int run_txt2img(int argc, char** argv) {
     const char* sched_s     = arg_after(argc, argv, "--scheduler");
     const char* lcm_lora    = arg_after(argc, argv, "--lcm-lora");
 
+    bool quantize_unet = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--quantize-unet") == 0) quantize_unet = true;
+    }
+
     if (!text_path || !unet_path || !vae_path ||
         !vocab_path || !merges_path || !prompt || !out_path) {
         std::fprintf(stderr,
@@ -168,6 +174,7 @@ int run_txt2img(int argc, char** argv) {
         // a distilled LCM checkpoint has time_cond_proj_dim=256.
         if (!lcm_lora_mode) cfg.unet.time_cond_proj_dim = 256;
     }
+    cfg.unet.quantize_weights = quantize_unet;
     pl::Pipeline pipeline(cfg, std::move(tok));
 
     std::printf("Loading weights:\n  text: %s\n  unet: %s\n  vae:  %s\n",
