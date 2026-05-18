@@ -205,10 +205,13 @@ void UNet::load_weights(const st::File& f, const std::string& prefix) {
                         time_embed_dim_, 1, te_l2_b_, "te.linear_2.bias");
 
     // LCM cond_proj: only present in distilled checkpoints. No bias term
-    // (diffusers' TimestepEmbedding constructs it as `nn.Linear(..., bias=False)`).
+    // (diffusers' TimestepEmbedding constructs it as `nn.Linear(cond_proj_dim,
+    // in_channels=freq_dim, bias=False)`, and adds its output to `sample`
+    // *before* linear_1). Shape is (freq_dim_, cond_proj_dim), not
+    // (time_embed_dim_, cond_proj_dim) — caught by Dreamshaper-7 LCM at load.
     if (cfg_.time_cond_proj_dim > 0) {
         upload_fp16_checked(need(f, prefix + "time_embedding.cond_proj.weight"),
-                            time_embed_dim_, cfg_.time_cond_proj_dim,
+                            freq_dim_, cfg_.time_cond_proj_dim,
                             te_cond_W_, "te.cond_proj.weight");
     }
 
@@ -637,28 +640,25 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
     compute_sinusoidal_emb_fp16(timestep, freq_dim_, sin_bits);
     bt::upload_fp16(sin_bits.data(), 1, freq_dim_, freq_emb_);
 
-    bt::linear_forward_batched_fp16_gpu(te_l1_W_, &te_l1_b_, freq_emb_, temb_a_);
-
-    // LCM cond_proj: add projected guidance-scale embedding to linear_1 output
-    // *before* the SiLU. Matches diffusers' TimestepEmbedding.forward when
-    // `cond_proj` is present (the activation order is linear_1 -> add cond ->
-    // SiLU -> linear_2). The distilled weights are trained against exactly
-    // this layout, so don't reorder.
+    // LCM cond_proj: add projected guidance-scale embedding to the freq_emb
+    // *before* linear_1. Matches diffusers' TimestepEmbedding.forward:
+    //   if condition is not None: sample = sample + cond_proj(condition)
+    //   sample = linear_1(sample) -> SiLU -> linear_2
+    // cond_proj projects (cond_proj_dim) -> (freq_dim), not -> (time_embed_dim).
     if (gs_emb != nullptr) {
         if (cfg_.time_cond_proj_dim <= 0) fail("forward: internal: gs_emb without cond_proj");
         // diffusers' get_guidance_scale_embedding scales w by 1000 before the
-        // sinusoidal embedding (see diffusers.utils.torch_utils): the same
-        // helper that produces the timestep embedding is reused with w*1000
-        // as the "timestep".
+        // sinusoidal embedding.
         std::vector<uint16_t> w_bits;
         compute_guidance_scale_emb_fp16((*gs_emb) * 1000.0f, cfg_.time_cond_proj_dim, w_bits);
         bt::upload_fp16(w_bits.data(), 1, cfg_.time_cond_proj_dim, w_emb_);
         // cond_proj is bias-free: pass nullptr.
         bt::linear_forward_batched_fp16_gpu(te_cond_W_, /*bias=*/nullptr,
                                             w_emb_, temb_cond_);
-        bt::add_inplace_gpu(temb_a_, temb_cond_);
+        bt::add_inplace_gpu(freq_emb_, temb_cond_);
     }
 
+    bt::linear_forward_batched_fp16_gpu(te_l1_W_, &te_l1_b_, freq_emb_, temb_a_);
     bt::silu_forward_gpu(temb_a_, temb_a_);
     bt::linear_forward_batched_fp16_gpu(te_l2_W_, &te_l2_b_, temb_a_, temb_b_);
     // Master temb in temb_b_. Pre-compute SiLU once for reuse across resblocks.
