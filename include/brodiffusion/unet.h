@@ -139,6 +139,14 @@ public:
     };
     using CrossAttnKVCache = std::vector<CrossAttnKVCacheEntry>;
 
+    // Head-averaged cross-attention softmax map per Transformer2D block, in the
+    // same traversal order the forward pass visits them. Each entry has shape
+    // (Lq, Lk) FP16, where Lq is the layer's spatial token count (H*W at that
+    // resolution) and Lk is the text-context length (77 for SD1.5/CLIP). The
+    // trace-mode forward overload below populates this vector for downstream
+    // research consumers (cross-attention tree search, attention scoring).
+    using CrossAttnTrace = std::vector<brotensor::GpuTensor>;
+
     // Populate `cache` with one (K, V) pair per Transformer2D block (in the
     // same traversal order the forward pass visits them: down blocks,
     // mid block, up blocks). `cache` is resized as needed.
@@ -174,6 +182,34 @@ public:
                  const brotensor::GpuTensor& encoder_hidden_states,
                  const CrossAttnKVCache& xattn_cache,
                  brotensor::GpuTensor& out);
+
+    // Trace-mode forward. Routes each cross-attention (`attn2`) call through
+    // brotensor::cross_attention_forward_with_attn_gpu so the head-averaged
+    // softmax map can be observed and an optional per-layer FP32 pre-softmax
+    // logit bias can be injected. Self-attention (`attn1`) still uses the
+    // fast flash path.
+    //
+    // `trace_out`, if non-null, is resized to num_xattn_blocks() and each
+    // entry is filled with the head-averaged (Lq, Lk) attention map for
+    // that layer.
+    //
+    // `attn_logit_biases`, if non-null, must have length num_xattn_blocks();
+    // entry `i` is either null (no bias) or a (Lq_i, Lk) FP32 GpuTensor added
+    // to the scaled QKᵀ scores before softmax at layer i.
+    //
+    // Trace mode currently does NOT use the K/V cache (the with-attn brotensor
+    // op has no cached variant yet) — K/V are reprojected from `ctx` at every
+    // layer. Acceptable cost for experiment-mode tree search; if it bottlenecks
+    // we'll ask brotensor for `..._q_with_kv_cached_with_attn_gpu`.
+    //
+    // INT8 (quantize_weights) is not supported in trace mode and will throw.
+    void forward_trace(const brotensor::GpuTensor& sample,
+                       int H, int W,
+                       float timestep,
+                       const brotensor::GpuTensor& encoder_hidden_states,
+                       const std::vector<const brotensor::GpuTensor*>* attn_logit_biases,
+                       CrossAttnTrace* trace_out,
+                       brotensor::GpuTensor& out);
 
     // Number of Transformer2D (cross-attn) blocks in the model — matches the
     // size of any cache returned by prime_xattn_cache.
@@ -294,17 +330,30 @@ private:
                             const brotensor::GpuTensor& ctx,
                             const CrossAttnKVCacheEntry* cache_entry,
                             int H, int W,
-                            brotensor::GpuTensor& x);
+                            brotensor::GpuTensor& x,
+                            // Trace plumbing. Both null = fast path (existing
+                            // behaviour). When trace_out_entry is non-null,
+                            // attn2 is routed through cross_attention_forward_
+                            // with_attn_gpu and AttnAvg is written to
+                            // *trace_out_entry. attn_logit_bias is an optional
+                            // FP32 (Lq, Lk) pre-softmax bias passed straight
+                            // through to the brotensor op.
+                            brotensor::GpuTensor* trace_out_entry = nullptr,
+                            const brotensor::GpuTensor* attn_logit_bias = nullptr);
     // Shared forward worker; xattn_cache may be null (legacy path) or point
     // at a cache with exactly num_xattn_blocks() entries. If `gs_emb` is
     // non-null the LCM cond_proj path is used (requires time_cond_proj_dim>0);
-    // otherwise the vanilla SD1.5 time-embedding path is used.
+    // otherwise the vanilla SD1.5 time-embedding path is used. `trace_out`
+    // and `attn_logit_biases` (both optional) wire the trace-mode plumbing
+    // for cross-attention research; see UNet::forward_trace.
     void forward_impl_(const brotensor::GpuTensor& sample,
                        int H, int W,
                        float timestep,
                        const float* gs_emb,
                        const brotensor::GpuTensor& encoder_hidden_states,
                        const CrossAttnKVCache* xattn_cache,
+                       const std::vector<const brotensor::GpuTensor*>* attn_logit_biases,
+                       CrossAttnTrace* trace_out,
                        brotensor::GpuTensor& out);
     // Returns a pointer to the FP16 base weight identified by `target_path`
     // (a diffusers tail within the UNet, e.g. "down_blocks.0.attentions.0.

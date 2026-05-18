@@ -382,6 +382,39 @@ void fused_linear_geglu(const bt::GpuTensor& X,
     bt::geglu_exact_forward_gpu(ff1_tmp, Y);
 }
 
+namespace {
+
+__global__ void add_inplace_row_bias_fp16_kernel(__half* __restrict__ Y,
+                                                 const __half* __restrict__ bias,
+                                                 int rows, int cols) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= cols) return;
+    const __half b = bias[j];
+    for (int i = 0; i < rows; ++i) {
+        const int off = i * cols + j;
+        Y[off] = __hadd(Y[off], b);
+    }
+}
+
+}  // namespace
+
+void add_inplace_row_bias_fp16(bt::GpuTensor& Y, const bt::GpuTensor& bias) {
+    if (Y.dtype != bt::Dtype::FP16 || bias.dtype != bt::Dtype::FP16) {
+        throw std::runtime_error("add_inplace_row_bias_fp16: tensors must be FP16");
+    }
+    if (static_cast<int>(bias.size()) != Y.cols) {
+        throw std::runtime_error("add_inplace_row_bias_fp16: bias.size() must equal Y.cols");
+    }
+    if (Y.cols == 0 || Y.rows == 0) return;
+    constexpr int kThreads = 256;
+    const int blocks = (Y.cols + kThreads - 1) / kThreads;
+    add_inplace_row_bias_fp16_kernel<<<blocks, kThreads>>>(
+        reinterpret_cast<__half*>(Y.data_fp16()),
+        reinterpret_cast<const __half*>(bias.data_fp16()),
+        Y.rows, Y.cols);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
 void add_inplace_fp16_vec(bt::GpuTensor& Y, const bt::GpuTensor& X) {
     if (Y.dtype != bt::Dtype::FP16 || X.dtype != bt::Dtype::FP16) {
         throw std::runtime_error("add_inplace_fp16_vec: both tensors must be FP16");

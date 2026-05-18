@@ -51,4 +51,12 @@ void fused_linear_geglu(const brotensor::GpuTensor& X,
 // alignment allows). Same shape semantics: Y and X must match.
 void add_inplace_fp16_vec(brotensor::GpuTensor& Y, const brotensor::GpuTensor& X);
 
+// Per-column broadcast bias add: Y[i, j] += bias[j], where Y is (rows, cols)
+// FP16 row-major and bias is FP16 length cols (shape (cols,1) or (1,cols)
+// both accepted — we only look at size()). Used by trace-mode cross-attention
+// to fold the attn2.to_out bias that brotensor::cross_attention_forward_with_
+// attn_gpu does not accept as an input.
+void add_inplace_row_bias_fp16(brotensor::GpuTensor& Y,
+                               const brotensor::GpuTensor& bias);
+
 } // namespace brodiffusion

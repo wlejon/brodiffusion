@@ -17,6 +17,7 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -354,6 +355,59 @@ int main() {
         bt::download_fp16(out, bits2.data());
         bt::cuda_sync();
         CHECK(std::memcmp(bits1.data(), bits2.data(), bits1.size() * 2) == 0);
+
+        // ── trace-mode forward ────────────────────────────────────────────
+        // Same inputs, same UNet — exercises forward_trace, asserts the
+        // CrossAttnTrace is populated with (Lq, Lk) softmax maps (rows sum
+        // to ~1.0), and confirms the trace-path output matches the fast
+        // path within FP16 numerical noise (different attn kernels = small
+        // rounding drift even though the math is identical).
+        un::UNet::CrossAttnTrace trace;
+        net.forward_trace(latent, H, W, 500.0f, ctx,
+                          /*attn_logit_biases=*/nullptr, &trace, out);
+        bt::cuda_sync();
+
+        const int n_xattn = net.num_xattn_blocks();
+        CHECK(static_cast<int>(trace.size()) == n_xattn);
+
+        // Verify each trace entry: (Lq, Lk=L_text), softmax row-sum ~= 1.
+        for (int i = 0; i < n_xattn; ++i) {
+            const bt::GpuTensor& m = trace[static_cast<std::size_t>(i)];
+            CHECK(m.dtype == bt::Dtype::FP16);
+            CHECK(m.cols == L_text);
+            CHECK(m.rows > 0);
+            std::vector<uint16_t> hb(static_cast<std::size_t>(m.rows * m.cols));
+            bt::download_fp16(m, hb.data());
+            bt::cuda_sync();
+            // Each row of (Lq, Lk) is a softmax over Lk keys.
+            for (int r = 0; r < m.rows; ++r) {
+                float s = 0.0f;
+                for (int c = 0; c < m.cols; ++c) {
+                    s += bt::fp16_bits_to_fp32(
+                        hb[static_cast<std::size_t>(r) * m.cols + c]);
+                }
+                CHECK(s > 0.95f && s < 1.05f);
+            }
+        }
+
+        // Trace-path output should match the fast-path output closely.
+        std::vector<uint16_t> bits_trace(bits1.size());
+        bt::download_fp16(out, bits_trace.data());
+        bt::cuda_sync();
+        int nonfinite_trace = 0;
+        float max_abs_diff = 0.0f;
+        for (std::size_t k = 0; k < bits1.size(); ++k) {
+            if (!is_finite_fp16(bits_trace[k])) ++nonfinite_trace;
+            const float va = bt::fp16_bits_to_fp32(bits1[k]);
+            const float vb = bt::fp16_bits_to_fp32(bits_trace[k]);
+            const float d = std::fabs(va - vb);
+            if (d > max_abs_diff) max_abs_diff = d;
+        }
+        CHECK(nonfinite_trace == 0);
+        // Flash vs non-flash kernels drift in low FP16 bits; the small
+        // synthetic UNet has activation magnitudes O(1), so 0.05 is a
+        // generous-but-meaningful bound.
+        CHECK(max_abs_diff < 0.05f);
     }
 
     std::error_code ec;

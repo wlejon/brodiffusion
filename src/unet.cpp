@@ -408,7 +408,16 @@ void UNet::apply_resnet_(const Resnet& r, int H, int W,
 void UNet::apply_transformer_(const Transformer2D& t,
                               const bt::GpuTensor& ctx,
                               const CrossAttnKVCacheEntry* cache_entry,
-                              int H, int W, bt::GpuTensor& x) {
+                              int H, int W, bt::GpuTensor& x,
+                              bt::GpuTensor* trace_out_entry,
+                              const bt::GpuTensor* attn_logit_bias) {
+    // Trace mode is incompatible with the cached K/V fast path because
+    // brotensor's cross_attention_forward_with_attn_gpu reprojects K/V from
+    // ctx every call. forward_trace() already ensures no cache is passed.
+    if (trace_out_entry != nullptr && cache_entry != nullptr) {
+        fail("apply_transformer_: trace_out_entry and cache_entry are "
+             "mutually exclusive");
+    }
     const int C  = t.C;
     const int H_heads = t.num_heads;
 
@@ -460,7 +469,21 @@ void UNet::apply_transformer_(const Transformer2D& t,
         // ── cross-attention (K, V from `ctx` — possibly cached) ───────────
         bt::layernorm_forward_inference_batched_fp16_gpu(
             tseq_, blk.n2g, blk.n2b, ln_, cfg_.eps);
-        if (cache_entry) {
+        if (trace_out_entry) {
+            // Trace path: brotensor's cross_attention_forward_with_attn_gpu
+            // writes the FP16 head-averaged softmax map to AttnAvg. No Wo
+            // bias is supported by that op, so we manually add bo2 after.
+            // (forward_trace already guards against INT8.)
+            bt::cross_attention_forward_with_attn_gpu(
+                ln_, ctx,
+                blk.Wq2, blk.Wk2, blk.Wv2, blk.Wo2,
+                /*d_mask=*/nullptr,
+                attn_logit_bias,
+                H_heads,
+                attn_proj_, *trace_out_entry);
+            // Add output bias bo2 (per-column broadcast across rows of attn_proj_).
+            brodiffusion::add_inplace_row_bias_fp16(attn_proj_, blk.bo2);
+        } else if (cache_entry) {
             // K/V already projected from `ctx` upstream — skip the two
             // per-step matmuls and feed the cached buffers straight in.
             if (blk.Wq2_q.active()) {
@@ -590,7 +613,8 @@ void UNet::forward(const bt::GpuTensor& sample,
              "guidance_scale_embedding overload");
     }
     forward_impl_(sample, H, W, timestep, /*gs_emb=*/nullptr,
-                  encoder_hidden_states, /*xattn_cache=*/nullptr, out);
+                  encoder_hidden_states, /*xattn_cache=*/nullptr,
+                  /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr, out);
 }
 
 void UNet::forward(const bt::GpuTensor& sample,
@@ -609,7 +633,8 @@ void UNet::forward(const bt::GpuTensor& sample,
              std::to_string(num_xattn_blocks()));
     }
     forward_impl_(sample, H, W, timestep, /*gs_emb=*/nullptr,
-                  encoder_hidden_states, &xattn_cache, out);
+                  encoder_hidden_states, &xattn_cache,
+                  /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr, out);
 }
 
 void UNet::forward(const bt::GpuTensor& sample,
@@ -629,7 +654,39 @@ void UNet::forward(const bt::GpuTensor& sample,
              std::to_string(num_xattn_blocks()));
     }
     forward_impl_(sample, H, W, timestep, &guidance_scale_embedding,
-                  encoder_hidden_states, &xattn_cache, out);
+                  encoder_hidden_states, &xattn_cache,
+                  /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr, out);
+}
+
+void UNet::forward_trace(const bt::GpuTensor& sample,
+                         int H, int W,
+                         float timestep,
+                         const bt::GpuTensor& encoder_hidden_states,
+                         const std::vector<const bt::GpuTensor*>* attn_logit_biases,
+                         CrossAttnTrace* trace_out,
+                         bt::GpuTensor& out) {
+    if (cfg_.quantize_weights) {
+        fail("forward_trace: INT8 quantize_weights not yet supported in trace "
+             "mode (brotensor::cross_attention_forward_with_attn_gpu is FP16 "
+             "only)");
+    }
+    if (cfg_.time_cond_proj_dim > 0) {
+        fail("forward_trace: LCM cond_proj path not yet supported in trace "
+             "mode; use the FP16 vanilla SD1.5 path");
+    }
+    const int n = num_xattn_blocks();
+    if (attn_logit_biases &&
+        static_cast<int>(attn_logit_biases->size()) != n) {
+        fail("forward_trace: attn_logit_biases has " +
+             std::to_string(attn_logit_biases->size()) + " entries, expected " +
+             std::to_string(n));
+    }
+    if (trace_out) {
+        trace_out->resize(static_cast<std::size_t>(n));
+    }
+    forward_impl_(sample, H, W, timestep, /*gs_emb=*/nullptr,
+                  encoder_hidden_states, /*xattn_cache=*/nullptr,
+                  attn_logit_biases, trace_out, out);
 }
 
 // ─── LoRA merge ────────────────────────────────────────────────────────────
@@ -1066,6 +1123,8 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
                          const float* gs_emb,
                          const bt::GpuTensor& encoder_hidden_states,
                          const CrossAttnKVCache* xattn_cache,
+                         const std::vector<const bt::GpuTensor*>* attn_logit_biases,
+                         CrossAttnTrace* trace_out,
                          bt::GpuTensor& out) {
     if (conv_in_W_.size() == 0) fail("forward: weights not loaded");
 
@@ -1140,6 +1199,13 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
     auto cache_at = [&](int i) -> const CrossAttnKVCacheEntry* {
         return xattn_cache ? &(*xattn_cache)[static_cast<std::size_t>(i)] : nullptr;
     };
+    auto trace_at = [&](int i) -> bt::GpuTensor* {
+        return trace_out ? &(*trace_out)[static_cast<std::size_t>(i)] : nullptr;
+    };
+    auto bias_at = [&](int i) -> const bt::GpuTensor* {
+        return attn_logit_biases ? (*attn_logit_biases)[static_cast<std::size_t>(i)]
+                                 : nullptr;
+    };
 
     // ── 2. conv_in: in_channels -> first_C ─────────────────────────────────
     x_ = sample.clone();
@@ -1160,10 +1226,12 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
             prof_end(pb_down_res);
             if (d.has_attention) {
                 prof_begin(pb_down_xform);
+                const int idx = xattn_idx++;
                 apply_transformer_(d.transformers[static_cast<std::size_t>(j)],
                                    encoder_hidden_states,
-                                   cache_at(xattn_idx++),
-                                   Hc, Wc, x_);
+                                   cache_at(idx),
+                                   Hc, Wc, x_,
+                                   trace_at(idx), bias_at(idx));
                 prof_end(pb_down_xform);
             }
             skips.push_back(x_.clone());
@@ -1191,9 +1259,13 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
     // ── 4. mid_block: resnet -> transformer -> resnet ──────────────────────
     prof_begin(pb_mid);
     apply_resnet_(mid_.r0, Hc, Wc, x_, y_);
-    apply_transformer_(mid_.t, encoder_hidden_states,
-                       cache_at(xattn_idx++),
-                       Hc, Wc, x_);
+    {
+        const int idx = xattn_idx++;
+        apply_transformer_(mid_.t, encoder_hidden_states,
+                           cache_at(idx),
+                           Hc, Wc, x_,
+                           trace_at(idx), bias_at(idx));
+    }
     apply_resnet_(mid_.r1, Hc, Wc, x_, y_);
     prof_end(pb_mid);
 
@@ -1217,10 +1289,12 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
             prof_end(pb_up_res);
             if (u.has_attention) {
                 prof_begin(pb_up_xform);
+                const int idx = xattn_idx++;
                 apply_transformer_(u.transformers[static_cast<std::size_t>(j)],
                                    encoder_hidden_states,
-                                   cache_at(xattn_idx++),
-                                   Hc, Wc, x_);
+                                   cache_at(idx),
+                                   Hc, Wc, x_,
+                                   trace_at(idx), bias_at(idx));
                 prof_end(pb_up_xform);
             }
         }
