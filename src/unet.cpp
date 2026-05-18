@@ -61,6 +61,10 @@ UNet::UNet(const UNetConfig& cfg) : cfg_(cfg) {
     if (cfg_.attention_head_dim <= 0) fail("attention_head_dim must be positive");
     if (cfg_.cross_attention_dim <= 0) fail("cross_attention_dim must be positive");
     if (cfg_.time_embed_dim_mult <= 0) fail("time_embed_dim_mult must be positive");
+    if (cfg_.time_cond_proj_dim < 0) fail("time_cond_proj_dim must be >= 0");
+    if (cfg_.time_cond_proj_dim > 0 && (cfg_.time_cond_proj_dim % 2) != 0) {
+        fail("time_cond_proj_dim must be even (sinusoidal embedding)");
+    }
     for (int c : cfg_.block_out_channels) {
         if (c <= 0 || c % cfg_.norm_num_groups != 0) {
             fail("each block_out_channels entry must be a positive multiple of norm_num_groups");
@@ -199,6 +203,14 @@ void UNet::load_weights(const st::File& f, const std::string& prefix) {
                         time_embed_dim_, time_embed_dim_, te_l2_W_, "te.linear_2.weight");
     upload_fp16_checked(need(f, prefix + "time_embedding.linear_2.bias"),
                         time_embed_dim_, 1, te_l2_b_, "te.linear_2.bias");
+
+    // LCM cond_proj: only present in distilled checkpoints. No bias term
+    // (diffusers' TimestepEmbedding constructs it as `nn.Linear(..., bias=False)`).
+    if (cfg_.time_cond_proj_dim > 0) {
+        upload_fp16_checked(need(f, prefix + "time_embedding.cond_proj.weight"),
+                            time_embed_dim_, cfg_.time_cond_proj_dim,
+                            te_cond_W_, "te.cond_proj.weight");
+    }
 
     // ── down_blocks ────────────────────────────────────────────────────────
     int C_prev = first_C;
@@ -444,6 +456,27 @@ void UNet::apply_transformer_(const Transformer2D& t,
 
 namespace {
 
+// Sinusoidal embedding matching diffusers' `get_guidance_scale_embedding`
+// helper used by LCM. Two important differences from the timestep helper:
+//   1. The frequency divisor is `(half - 1)`, not `half`.
+//   2. The output layout is [sin..., cos...] (no flip_sin_to_cos).
+// Callers should pre-multiply w by 1000 (diffusers does this before calling
+// the helper).
+//   Output layout: [sin(w*freq_0), ..., sin(w*freq_{H-1}), cos(w*freq_0), ...].
+void compute_guidance_scale_emb_fp16(float w, int dim,
+                                     std::vector<uint16_t>& out) {
+    const int half = dim / 2;
+    out.resize(static_cast<std::size_t>(dim));
+    const float log_period = std::log(10000.0f);
+    const float denom = (half > 1) ? static_cast<float>(half - 1) : 1.0f;
+    for (int i = 0; i < half; ++i) {
+        const float freq = std::exp(-log_period * static_cast<float>(i) / denom);
+        const float angle = w * freq;
+        out[static_cast<std::size_t>(i)]        = bt::fp32_to_fp16_bits(std::sin(angle));
+        out[static_cast<std::size_t>(i + half)] = bt::fp32_to_fp16_bits(std::cos(angle));
+    }
+}
+
 // Sinusoidal timestep embedding matching diffusers `get_timestep_embedding`
 // with flip_sin_to_cos=True, downscale_freq_shift=0, scale=1, max_period=10000.
 // Output layout: [cos(t*freq_0), ..., cos(t*freq_{H-1}), sin(t*freq_0), ...].
@@ -468,8 +501,12 @@ void UNet::forward(const bt::GpuTensor& sample,
                    float timestep,
                    const bt::GpuTensor& encoder_hidden_states,
                    bt::GpuTensor& out) {
-    forward_impl_(sample, H, W, timestep, encoder_hidden_states,
-                  /*xattn_cache=*/nullptr, out);
+    if (cfg_.time_cond_proj_dim > 0) {
+        fail("forward: UNet built with time_cond_proj_dim>0 requires the "
+             "guidance_scale_embedding overload");
+    }
+    forward_impl_(sample, H, W, timestep, /*gs_emb=*/nullptr,
+                  encoder_hidden_states, /*xattn_cache=*/nullptr, out);
 }
 
 void UNet::forward(const bt::GpuTensor& sample,
@@ -478,13 +515,37 @@ void UNet::forward(const bt::GpuTensor& sample,
                    const bt::GpuTensor& encoder_hidden_states,
                    const CrossAttnKVCache& xattn_cache,
                    bt::GpuTensor& out) {
+    if (cfg_.time_cond_proj_dim > 0) {
+        fail("forward: UNet built with time_cond_proj_dim>0 requires the "
+             "guidance_scale_embedding overload");
+    }
     if (static_cast<int>(xattn_cache.size()) != num_xattn_blocks()) {
         fail("forward: cross-attn KV cache has " +
              std::to_string(xattn_cache.size()) + " entries, expected " +
              std::to_string(num_xattn_blocks()));
     }
-    forward_impl_(sample, H, W, timestep, encoder_hidden_states,
-                  &xattn_cache, out);
+    forward_impl_(sample, H, W, timestep, /*gs_emb=*/nullptr,
+                  encoder_hidden_states, &xattn_cache, out);
+}
+
+void UNet::forward(const bt::GpuTensor& sample,
+                   int H, int W,
+                   float timestep,
+                   float guidance_scale_embedding,
+                   const bt::GpuTensor& encoder_hidden_states,
+                   const CrossAttnKVCache& xattn_cache,
+                   bt::GpuTensor& out) {
+    if (cfg_.time_cond_proj_dim <= 0) {
+        fail("forward(guidance_scale_embedding): UNet built with "
+             "time_cond_proj_dim=0; LCM cond_proj path unavailable");
+    }
+    if (static_cast<int>(xattn_cache.size()) != num_xattn_blocks()) {
+        fail("forward: cross-attn KV cache has " +
+             std::to_string(xattn_cache.size()) + " entries, expected " +
+             std::to_string(num_xattn_blocks()));
+    }
+    forward_impl_(sample, H, W, timestep, &guidance_scale_embedding,
+                  encoder_hidden_states, &xattn_cache, out);
 }
 
 int UNet::num_xattn_blocks() const {
@@ -533,6 +594,7 @@ void UNet::prime_xattn_cache(const bt::GpuTensor& ctx,
 void UNet::forward_impl_(const bt::GpuTensor& sample,
                          int H, int W,
                          float timestep,
+                         const float* gs_emb,
                          const bt::GpuTensor& encoder_hidden_states,
                          const CrossAttnKVCache* xattn_cache,
                          bt::GpuTensor& out) {
@@ -576,6 +638,27 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
     bt::upload_fp16(sin_bits.data(), 1, freq_dim_, freq_emb_);
 
     bt::linear_forward_batched_fp16_gpu(te_l1_W_, &te_l1_b_, freq_emb_, temb_a_);
+
+    // LCM cond_proj: add projected guidance-scale embedding to linear_1 output
+    // *before* the SiLU. Matches diffusers' TimestepEmbedding.forward when
+    // `cond_proj` is present (the activation order is linear_1 -> add cond ->
+    // SiLU -> linear_2). The distilled weights are trained against exactly
+    // this layout, so don't reorder.
+    if (gs_emb != nullptr) {
+        if (cfg_.time_cond_proj_dim <= 0) fail("forward: internal: gs_emb without cond_proj");
+        // diffusers' get_guidance_scale_embedding scales w by 1000 before the
+        // sinusoidal embedding (see diffusers.utils.torch_utils): the same
+        // helper that produces the timestep embedding is reused with w*1000
+        // as the "timestep".
+        std::vector<uint16_t> w_bits;
+        compute_guidance_scale_emb_fp16((*gs_emb) * 1000.0f, cfg_.time_cond_proj_dim, w_bits);
+        bt::upload_fp16(w_bits.data(), 1, cfg_.time_cond_proj_dim, w_emb_);
+        // cond_proj is bias-free: pass nullptr.
+        bt::linear_forward_batched_fp16_gpu(te_cond_W_, /*bias=*/nullptr,
+                                            w_emb_, temb_cond_);
+        bt::add_inplace_gpu(temb_a_, temb_cond_);
+    }
+
     bt::silu_forward_gpu(temb_a_, temb_a_);
     bt::linear_forward_batched_fp16_gpu(te_l2_W_, &te_l2_b_, temb_a_, temb_b_);
     // Master temb in temb_b_. Pre-compute SiLU once for reuse across resblocks.

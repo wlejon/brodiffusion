@@ -32,6 +32,13 @@ static int usage() {
         "                       --prompt <text> --out <ppm>\n"
         "                       [--negative <text>] [--steps N] [--cfg F]\n"
         "                       [--width N] [--height N] [--seed N]\n"
+        "                       [--scheduler ddim|lcm]\n"
+        "\n"
+        "  --scheduler lcm  selects the LCM (Latent Consistency Model) scheduler;\n"
+        "                   requires an LCM-distilled UNet checkpoint (e.g.\n"
+        "                   SimianLuo/LCM_Dreamshaper_v7). When set, default --steps\n"
+        "                   becomes 4 and the uncond pass is skipped; --cfg is reused\n"
+        "                   as the guidance-scale embedding `w`.\n"
         "\n"
         "Writes an uncompressed PPM (P6) — a dev convenience for sanity-checking\n"
         "the generation pipeline. Proper PNG/JPEG encoding lives outside this\n"
@@ -63,6 +70,7 @@ int run_txt2img(int argc, char** argv) {
     const char* width_s     = arg_after(argc, argv, "--width");
     const char* height_s    = arg_after(argc, argv, "--height");
     const char* seed_s      = arg_after(argc, argv, "--seed");
+    const char* sched_s     = arg_after(argc, argv, "--scheduler");
 
     if (!text_path || !unet_path || !vae_path ||
         !vocab_path || !merges_path || !prompt || !out_path) {
@@ -71,9 +79,19 @@ int run_txt2img(int argc, char** argv) {
         return 2;
     }
 
+    bool use_lcm = false;
+    if (sched_s) {
+        if (std::strcmp(sched_s, "lcm") == 0) use_lcm = true;
+        else if (std::strcmp(sched_s, "ddim") != 0) {
+            std::fprintf(stderr, "txt2img: --scheduler must be 'ddim' or 'lcm'\n");
+            return 2;
+        }
+    }
+
     pl::GenerateOptions opts;
     if (neg)     opts.negative_prompt = neg;
     if (steps_s) opts.num_inference_steps = std::atoi(steps_s);
+    else if (use_lcm) opts.num_inference_steps = 4;
     if (cfg_s)   opts.guidance_scale = static_cast<float>(std::atof(cfg_s));
     if (width_s) opts.width  = std::atoi(width_s);
     if (height_s)opts.height = std::atoi(height_s);
@@ -84,6 +102,10 @@ int run_txt2img(int argc, char** argv) {
     auto tok = clip::Tokenizer::load(vocab_path, merges_path);
 
     pl::PipelineConfig cfg;
+    if (use_lcm) {
+        cfg.scheduler = brodiffusion::scheduler::LCMConfig{};
+        cfg.unet.time_cond_proj_dim = 256;
+    }
     pl::Pipeline pipeline(cfg, std::move(tok));
 
     std::printf("Loading weights:\n  text: %s\n  unet: %s\n  vae:  %s\n",
@@ -151,17 +173,30 @@ int main(int argc, char** argv) {
             const char* steps_s     = arg_after(argc, argv, "--steps");
             const char* iters_s     = arg_after(argc, argv, "--iters");
             const char* warmup_s    = arg_after(argc, argv, "--warmup");
+            const char* sched_s     = arg_after(argc, argv, "--scheduler");
             if (!text_path || !unet_path || !vae_path || !vocab_path || !merges_path) {
                 std::fprintf(stderr, "bench: --text, --unet, --vae, --vocab, --merges required\n");
                 return 2;
             }
-            const int steps  = steps_s  ? std::atoi(steps_s)  : 5;
+            bool use_lcm = false;
+            if (sched_s) {
+                if (std::strcmp(sched_s, "lcm") == 0) use_lcm = true;
+                else if (std::strcmp(sched_s, "ddim") != 0) {
+                    std::fprintf(stderr, "bench: --scheduler must be 'ddim' or 'lcm'\n");
+                    return 2;
+                }
+            }
+            const int steps  = steps_s  ? std::atoi(steps_s)  : (use_lcm ? 4 : 5);
             const int iters  = iters_s  ? std::atoi(iters_s)  : 5;
             const int warmup = warmup_s ? std::atoi(warmup_s) : 1;
 
             brotensor::cuda_init();
             auto tok = clip::Tokenizer::load(vocab_path, merges_path);
             pl::PipelineConfig cfg;
+            if (use_lcm) {
+                cfg.scheduler = brodiffusion::scheduler::LCMConfig{};
+                cfg.unet.time_cond_proj_dim = 256;
+            }
             pl::Pipeline pipeline(cfg, std::move(tok));
             pipeline.load_weights(st::File::open(text_path),
                                   st::File::open(unet_path),

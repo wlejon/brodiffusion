@@ -12,6 +12,7 @@
 // rather than batching, since the rest of the inference stack is N=1.
 
 #include "brodiffusion/clip.h"
+#include "brodiffusion/lcm_scheduler.h"
 #include "brodiffusion/scheduler.h"
 #include "brodiffusion/tokenizer.h"
 #include "brodiffusion/unet.h"
@@ -22,6 +23,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace brodiffusion::safetensors { class File; }
@@ -32,7 +34,11 @@ struct PipelineConfig {
     unet::UNetConfig         unet;
     vae::DecoderConfig       vae;
     clip::TextEncoderConfig  text_encoder;
-    scheduler::DDIMConfig    scheduler;
+    // DDIM (default, vanilla SD1.5) or LCM (latent-consistency, distilled
+    // checkpoints with unet.time_cond_proj_dim > 0). The pipeline branches on
+    // the active alternative; existing call sites that don't set this keep
+    // working unchanged.
+    std::variant<scheduler::DDIMConfig, scheduler::LCMConfig> scheduler;
 };
 
 struct GenerateOptions {
@@ -88,12 +94,15 @@ private:
     clip::TextEncoder  text_encoder_;
     unet::UNet         unet_;
     vae::Decoder       vae_;
-    scheduler::DDIM    scheduler_;
+    std::variant<scheduler::DDIM, scheduler::LCM> scheduler_;
 
     // Scratch tensors kept alive across generate() calls.
     brotensor::GpuTensor ctx_cond_, ctx_uncond_;
     brotensor::GpuTensor latent_, noise_pred_cond_, noise_pred_uncond_;
     brotensor::GpuTensor decoded_, scratch_;
+    // Per-step Gaussian noise used by LCM (resampled at every non-final step
+    // from the same RNG stream as the initial latent noise). Unused in DDIM.
+    brotensor::GpuTensor noise_step_;
 
     // Cross-attention K/V projected from the text context once per generate(),
     // reused for all denoising steps. CFG (cond + uncond) keeps two caches.

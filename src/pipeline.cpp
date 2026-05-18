@@ -1,6 +1,7 @@
 #include "brodiffusion/pipeline.h"
 
 #include "brodiffusion/clip.h"
+#include "brodiffusion/lcm_scheduler.h"
 #include "brodiffusion/safetensors.h"
 #include "brodiffusion/scheduler.h"
 #include "brodiffusion/tokenizer.h"
@@ -19,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace brodiffusion::pipeline {
@@ -31,6 +33,19 @@ namespace {
     throw std::runtime_error("pipeline::Pipeline: " + msg);
 }
 
+// Construct the scheduler variant from the matching config variant.
+std::variant<scheduler::DDIM, scheduler::LCM>
+make_scheduler(const std::variant<scheduler::DDIMConfig, scheduler::LCMConfig>& v) {
+    if (std::holds_alternative<scheduler::LCMConfig>(v)) {
+        return std::variant<scheduler::DDIM, scheduler::LCM>{
+            std::in_place_type<scheduler::LCM>,
+            std::get<scheduler::LCMConfig>(v)};
+    }
+    return std::variant<scheduler::DDIM, scheduler::LCM>{
+        std::in_place_type<scheduler::DDIM>,
+        std::get<scheduler::DDIMConfig>(v)};
+}
+
 }  // namespace
 
 Pipeline::Pipeline(const PipelineConfig& cfg, clip::Tokenizer tokenizer)
@@ -39,7 +54,7 @@ Pipeline::Pipeline(const PipelineConfig& cfg, clip::Tokenizer tokenizer)
       text_encoder_(cfg.text_encoder),
       unet_(cfg.unet),
       vae_(cfg.vae),
-      scheduler_(cfg.scheduler) {}
+      scheduler_(make_scheduler(cfg.scheduler)) {}
 
 void Pipeline::load_weights(const safetensors::File& f) {
     load_weights(f,
@@ -86,7 +101,10 @@ std::vector<float> Pipeline::generate(std::string_view prompt,
     const int W_lat = opts.width  / 8;
     const int C_lat = cfg_.unet.in_channels;
     const int n_lat = C_lat * H_lat * W_lat;
-    const bool do_cfg = opts.guidance_scale != 1.0f;
+    const bool is_lcm = std::holds_alternative<scheduler::LCM>(scheduler_);
+    // LCM skips the uncond pass entirely: w is baked into the UNet via the
+    // cond_proj input, so there is no second CFG branch.
+    const bool do_cfg = !is_lcm && (opts.guidance_scale != 1.0f);
 
     // 1. Encode prompt(s).
     encode_prompt_(prompt, ctx_cond_);
@@ -99,9 +117,13 @@ std::vector<float> Pipeline::generate(std::string_view prompt,
     if (do_cfg) unet_.prime_xattn_cache(ctx_uncond_, xattn_cache_uncond_);
 
     // 2. Initial noise. randn(1, C_lat*H_lat*W_lat) FP16 * init_noise_sigma.
+    // The RNG stream is shared with the per-step LCM noise resampling below
+    // (continuation, no re-seed) so a given seed deterministically reproduces
+    // both the initial latent AND every step's resampled noise.
     std::mt19937_64 rng(opts.seed);
     std::normal_distribution<float> nrm(0.0f, 1.0f);
-    const float sigma = scheduler_.init_noise_sigma();
+    const float sigma = std::visit(
+        [](const auto& s) { return s.init_noise_sigma(); }, scheduler_);
     std::vector<std::uint16_t> noise(n_lat);
     for (int i = 0; i < n_lat; ++i) {
         noise[i] = bt::fp32_to_fp16_bits(sigma * nrm(rng));
@@ -112,26 +134,53 @@ std::vector<float> Pipeline::generate(std::string_view prompt,
     const bool prof = std::getenv("BRODIFF_PROF") != nullptr;
     using clk = std::chrono::high_resolution_clock;
     double unet_ms = 0.0, vae_ms = 0.0;
-    scheduler_.set_timesteps(opts.num_inference_steps);
-    for (int i = 0; i < scheduler_.num_inference_steps(); ++i) {
-        const float t = static_cast<float>(scheduler_.timesteps()[i]);
+
+    std::visit([&](auto& s) { s.set_timesteps(opts.num_inference_steps); },
+               scheduler_);
+    const int n_steps = std::visit(
+        [](const auto& s) { return s.num_inference_steps(); }, scheduler_);
+
+    std::vector<std::uint16_t> step_noise_bits;
+    if (is_lcm) step_noise_bits.resize(n_lat);
+
+    for (int i = 0; i < n_steps; ++i) {
+        const int t_int = std::visit(
+            [i](const auto& s) { return s.timesteps()[i]; }, scheduler_);
+        const float t = static_cast<float>(t_int);
 
         auto t0 = clk::now();
-        unet_.forward(latent_, H_lat, W_lat, t, ctx_cond_,
-                      xattn_cache_cond_, noise_pred_cond_);
-
-        if (do_cfg) {
-            unet_.forward(latent_, H_lat, W_lat, t, ctx_uncond_,
-                          xattn_cache_uncond_, noise_pred_uncond_);
-            bt::scale_inplace_gpu(noise_pred_cond_, opts.guidance_scale);
-            bt::scale_inplace_gpu(noise_pred_uncond_, 1.0f - opts.guidance_scale);
-            bt::add_inplace_gpu(noise_pred_cond_, noise_pred_uncond_);
+        if (is_lcm) {
+            unet_.forward(latent_, H_lat, W_lat, t,
+                          opts.guidance_scale,
+                          ctx_cond_, xattn_cache_cond_, noise_pred_cond_);
+        } else {
+            unet_.forward(latent_, H_lat, W_lat, t, ctx_cond_,
+                          xattn_cache_cond_, noise_pred_cond_);
+            if (do_cfg) {
+                unet_.forward(latent_, H_lat, W_lat, t, ctx_uncond_,
+                              xattn_cache_uncond_, noise_pred_uncond_);
+                bt::scale_inplace_gpu(noise_pred_cond_, opts.guidance_scale);
+                bt::scale_inplace_gpu(noise_pred_uncond_, 1.0f - opts.guidance_scale);
+                bt::add_inplace_gpu(noise_pred_cond_, noise_pred_uncond_);
+            }
         }
         if (prof) bt::cuda_sync();
         auto t1 = clk::now();
         unet_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-        scheduler_.step(noise_pred_cond_, i, latent_, scratch_);
+        if (is_lcm) {
+            // LCM resamples fresh Gaussian noise from the same RNG stream
+            // every step; the scheduler ignores it on the final step.
+            for (int k = 0; k < n_lat; ++k) {
+                step_noise_bits[k] = bt::fp32_to_fp16_bits(nrm(rng));
+            }
+            bt::upload_fp16(step_noise_bits.data(), 1, n_lat, noise_step_);
+            std::get<scheduler::LCM>(scheduler_).step(
+                noise_pred_cond_, i, latent_, noise_step_, scratch_);
+        } else {
+            std::get<scheduler::DDIM>(scheduler_).step(
+                noise_pred_cond_, i, latent_, scratch_);
+        }
     }
 
     // 4. Decode through the VAE (scaling factor applied internally).

@@ -72,6 +72,19 @@ struct UNetConfig {
     int attention_head_dim  = 8;
     // time_embed_dim = block_out_channels[0] * time_embed_dim_mult.
     int time_embed_dim_mult = 4;
+
+    // Optional guidance-scale-embedding projection dimension. When > 0 the
+    // UNet expects the checkpoint to contain `time_embedding.cond_proj.weight`
+    // of shape (time_embed_dim, time_cond_proj_dim), no bias, and the caller
+    // must use the forward() overload that takes a `guidance_scale_embedding`
+    // float. When 0 (default — vanilla SD1.5) no cond_proj weight is loaded
+    // and the existing forward() overloads are used.
+    //
+    // LCM-distilled checkpoints (e.g. SimianLuo/LCM_Dreamshaper_v7) ship with
+    // time_cond_proj_dim = 256; the projected guidance-scale embedding is
+    // added to the time embedding *after* linear_1 and *before* the SiLU,
+    // matching diffusers' TimestepEmbedding.forward.
+    int time_cond_proj_dim = 0;
 };
 
 class UNet {
@@ -130,6 +143,25 @@ public:
     void forward(const brotensor::GpuTensor& sample,
                  int H, int W,
                  float timestep,
+                 const brotensor::GpuTensor& encoder_hidden_states,
+                 const CrossAttnKVCache& xattn_cache,
+                 brotensor::GpuTensor& out);
+
+    // LCM guidance-scale-embedding forward.
+    //
+    // Only valid when the UNet was built with `time_cond_proj_dim > 0`. The
+    // raw guidance scale `w` (e.g. 7.5) is passed in; this overload internally
+    // computes the sinusoidal `w_emb = sinusoidal(w * 1000, time_cond_proj_dim)`
+    // matching diffusers' `get_guidance_scale_embedding`, then projects it
+    // through the loaded `time_embedding.cond_proj.weight` and adds it to the
+    // time embedding before the SiLU between linear_1 and linear_2.
+    //
+    // The non-LCM overloads above will throw if the UNet was built with
+    // `time_cond_proj_dim > 0`; this overload will throw if it was 0.
+    void forward(const brotensor::GpuTensor& sample,
+                 int H, int W,
+                 float timestep,
+                 float guidance_scale_embedding,
                  const brotensor::GpuTensor& encoder_hidden_states,
                  const CrossAttnKVCache& xattn_cache,
                  brotensor::GpuTensor& out);
@@ -207,10 +239,13 @@ private:
                             int H, int W,
                             brotensor::GpuTensor& x);
     // Shared forward worker; xattn_cache may be null (legacy path) or point
-    // at a cache with exactly num_xattn_blocks() entries.
+    // at a cache with exactly num_xattn_blocks() entries. If `gs_emb` is
+    // non-null the LCM cond_proj path is used (requires time_cond_proj_dim>0);
+    // otherwise the vanilla SD1.5 time-embedding path is used.
     void forward_impl_(const brotensor::GpuTensor& sample,
                        int H, int W,
                        float timestep,
+                       const float* gs_emb,
                        const brotensor::GpuTensor& encoder_hidden_states,
                        const CrossAttnKVCache* xattn_cache,
                        brotensor::GpuTensor& out);
@@ -227,6 +262,8 @@ private:
 
     brotensor::GpuTensor conv_in_W_,  conv_in_b_;
     brotensor::GpuTensor te_l1_W_, te_l1_b_, te_l2_W_, te_l2_b_;
+    // cond_proj weight (LCM only; empty when time_cond_proj_dim == 0).
+    brotensor::GpuTensor te_cond_W_;
     std::vector<DownBlock> down_blocks_;
     MidBlock               mid_;
     std::vector<UpBlock>   up_blocks_;
@@ -235,6 +272,9 @@ private:
 
     brotensor::GpuTensor x_, y_;
     brotensor::GpuTensor freq_emb_, temb_a_, temb_b_, temb_silu_, temb_proj_;
+    // LCM scratch: w_emb_ holds the sinusoidal guidance-scale embedding,
+    // temb_cond_ holds cond_proj(w_emb_); both unused when time_cond_proj_dim==0.
+    brotensor::GpuTensor w_emb_, temb_cond_;
     brotensor::GpuTensor cat_buf_;
     brotensor::GpuTensor gn_, seq_, proj_in_seq_, tseq_, ln_;
     brotensor::GpuTensor attn_proj_;
