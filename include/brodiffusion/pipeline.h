@@ -21,6 +21,7 @@
 #include "brotensor/tensor.h"
 
 #include <cstdint>
+#include <random>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -39,6 +40,29 @@ struct PipelineConfig {
     // the active alternative; existing call sites that don't set this keep
     // working unchanged.
     std::variant<scheduler::DDIMConfig, scheduler::LCMConfig> scheduler;
+};
+
+// Snapshot of mid-generation state. Cheap to fork — only the FP16 latent
+// carries device memory; the rest is host-side scalars / RNG state.
+//
+// The cross-attention K/V cache (which holds the projected text context) is
+// NOT part of this snapshot — it lives on Pipeline, is rebuilt at every
+// prime(), and stays constant across all branched states within a generation.
+// Forking a state therefore costs one latent clone, not a full UNet replay.
+//
+// Used by cross-attention tree search: at any step, .clone() the current
+// state, advance the clone differently from the original (different RNG, a
+// different attn_logit_bias, etc.), score, and pick a winner.
+struct PipelineState {
+    brotensor::GpuTensor latent;  // (1, C_lat * H_lat * W_lat) FP16
+    std::mt19937_64 rng;          // initial-noise + per-step LCM noise stream
+    int step_index = 0;           // 0-based: how many step_once() calls have run
+    int n_steps    = 0;           // total scheduled steps for this generation
+    int H_lat      = 0;
+    int W_lat      = 0;
+
+    // Deep clone: copies latent on the GPU. RNG and ints are trivial copies.
+    PipelineState clone() const;
 };
 
 struct GenerateOptions {
@@ -98,8 +122,31 @@ public:
 
     // Generate an image. Returns a freshly-allocated host buffer of
     // 3 * height * width FP32 values in NCHW (C=3, [-1, 1]).
+    //
+    // Internally: prime() → loop(step_once) → decode(). Bit-equivalent to
+    // calling those three primitives directly.
     std::vector<float> generate(std::string_view prompt,
                                 const GenerateOptions& opts);
+
+    // ── Step-wise API (for cross-attention tree search and similar) ───────
+    //
+    // prime():        encode prompt(s), build xattn caches, allocate initial
+    //                 latent noise. Returns a state with step_index=0.
+    // step_once():    advance one denoising step (mutates state). If
+    //                 trace_out is non-null, the UNet forward runs in trace
+    //                 mode (no K/V cache reuse, FP16 only) and fills the
+    //                 attention-map trace. Throws if state is already at
+    //                 n_steps.
+    // decode():       VAE-decode a state's latent to an FP32 host buffer
+    //                 (same shape and units as generate()).
+    //
+    // The xattn cache lives on `this` and is shared across all branched
+    // states from the same prime() call. Calling apply_lora() between
+    // prime() and step_once() leaves the cache stale — re-prime() to refresh.
+    PipelineState prime(std::string_view prompt, const GenerateOptions& opts);
+    void step_once(PipelineState& state, const GenerateOptions& opts,
+                   unet::UNet::CrossAttnTrace* trace_out = nullptr);
+    std::vector<float> decode(const PipelineState& state);
 
     const PipelineConfig& config() const { return cfg_; }
 
@@ -115,7 +162,9 @@ private:
 
     // Scratch tensors kept alive across generate() calls.
     brotensor::GpuTensor ctx_cond_, ctx_uncond_;
-    brotensor::GpuTensor latent_, noise_pred_cond_, noise_pred_uncond_;
+    // Working buffers reused across step_once() calls. The current latent
+    // lives on PipelineState, not here.
+    brotensor::GpuTensor noise_pred_cond_, noise_pred_uncond_;
     brotensor::GpuTensor decoded_, scratch_;
     // Per-step Gaussian noise used by LCM (resampled at every non-final step
     // from the same RNG stream as the initial latent noise). Unused in DDIM.
