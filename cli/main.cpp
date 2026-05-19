@@ -4,6 +4,7 @@
 #include "brodiffusion/clip_image.h"
 #include "brodiffusion/clip_score.h"
 #include "brodiffusion/sd_mcts.h"
+#include "brodiffusion/value_head.h"
 #endif
 #include "brodiffusion/pipeline.h"
 #include "brodiffusion/safetensors.h"
@@ -19,8 +20,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -655,6 +658,257 @@ int run_sd_mcts(int argc, char** argv) {
     std::printf("Wrote %s\n", out_path);
     return 0;
 }
+int run_value_head(int argc, char** argv) {
+    namespace vh = brodiffusion::value_head;
+    namespace fs = std::filesystem;
+
+    const char* traces_dir = arg_after(argc, argv, "--traces");
+    const char* out_path   = arg_after(argc, argv, "--out");
+    const char* epochs_s   = arg_after(argc, argv, "--epochs");
+    const char* batch_s    = arg_after(argc, argv, "--batch");
+    const char* lr_s       = arg_after(argc, argv, "--lr");
+    const char* hidden_s   = arg_after(argc, argv, "--hidden");
+    const char* seed_s     = arg_after(argc, argv, "--seed");
+    const char* branch_s   = arg_after(argc, argv, "--branching");
+    bool eval_only = false;
+    const char* load_path  = arg_after(argc, argv, "--load");
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--eval") == 0) eval_only = true;
+    }
+
+    if (!traces_dir || (!out_path && !eval_only)) {
+        std::fprintf(stderr,
+            "value-head: --traces <dir> required; --out <weights> required unless --eval\n"
+            "            [--epochs N=20] [--batch N=64] [--lr F=1e-3]\n"
+            "            [--hidden N=128] [--branching B=3] [--seed N=1]\n"
+            "            [--load <weights>] [--eval]\n"
+            "\n"
+            "Reads trace_a<N>.bin produced by `sd-mcts --enumerate-trace-out`,\n"
+            "trains a small MLP value head that predicts the recorded terminal\n"
+            "score from (latent_at_decision_t, action_one_hot). With --eval,\n"
+            "loads --load weights and just reports per-example MSE / Pearson r.\n");
+        return 2;
+    }
+
+    int epochs   = epochs_s  ? std::atoi(epochs_s)  : 20;
+    int batch    = batch_s   ? std::atoi(batch_s)   : 64;
+    float lr     = lr_s      ? static_cast<float>(std::atof(lr_s)) : 1e-3f;
+    int hidden   = hidden_s  ? std::atoi(hidden_s)  : 128;
+    int branchB  = branch_s  ? std::atoi(branch_s)  : 3;
+    std::uint64_t seed = seed_s
+        ? static_cast<std::uint64_t>(std::strtoull(seed_s, nullptr, 10)) : 1;
+
+    // ── Walk the traces dir, load every trace_a*.bin, build example matrix. ─
+    // Examples: one per (trace_file, decision_index). Input vector is
+    //   [latent_flat | action_one_hot(B)] of size (latent_dim + B).
+    // Target: the terminal score recorded in the trace header.
+    int latent_dim = -1;
+    int C_lat = -1, H_lat = -1, W_lat = -1;
+    std::vector<float> X_flat;   // concatenated rows
+    std::vector<float> Y_flat;
+    int n_examples = 0;
+
+    std::vector<fs::path> files;
+    for (const auto& e : fs::directory_iterator(traces_dir)) {
+        const auto& p = e.path();
+        const auto stem = p.stem().string();
+        if (stem.rfind("trace_a", 0) == 0 && p.extension() == ".bin") {
+            files.push_back(p);
+        }
+    }
+    std::sort(files.begin(), files.end());
+    if (files.empty()) {
+        std::fprintf(stderr, "value-head: no trace_a*.bin files in %s\n", traces_dir);
+        return 1;
+    }
+
+    for (const auto& p : files) {
+        std::ifstream f(p, std::ios::binary);
+        if (!f) { std::fprintf(stderr, "  skip (open): %s\n", p.string().c_str()); continue; }
+        std::int32_t magic=0, ver=0, action=0, D=0, C=0, H=0, W=0;
+        float score=0.0f; std::uint64_t fseed=0;
+        f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+        f.read(reinterpret_cast<char*>(&ver),   sizeof(ver));
+        f.read(reinterpret_cast<char*>(&action),sizeof(action));
+        f.read(reinterpret_cast<char*>(&D),     sizeof(D));
+        f.read(reinterpret_cast<char*>(&C),     sizeof(C));
+        f.read(reinterpret_cast<char*>(&H),     sizeof(H));
+        f.read(reinterpret_cast<char*>(&W),     sizeof(W));
+        f.read(reinterpret_cast<char*>(&score), sizeof(score));
+        f.read(reinterpret_cast<char*>(&fseed), sizeof(fseed));
+        if (magic != 0x42445354 || ver != 1) {
+            std::fprintf(stderr, "  skip (magic): %s\n", p.string().c_str()); continue;
+        }
+        if (action >= branchB) {
+            std::fprintf(stderr,
+                "  skip (action %d >= --branching %d): %s\n",
+                action, branchB, p.string().c_str());
+            continue;
+        }
+        const int ld = C * H * W;
+        if (latent_dim < 0) {
+            latent_dim = ld; C_lat = C; H_lat = H; W_lat = W;
+        } else if (latent_dim != ld) {
+            std::fprintf(stderr,
+                "  skip (latent dim %d != %d): %s\n",
+                ld, latent_dim, p.string().c_str());
+            continue;
+        }
+        std::vector<float> latent(static_cast<std::size_t>(ld));
+        for (int d = 0; d < D; ++d) {
+            std::int32_t step_idx = 0;
+            f.read(reinterpret_cast<char*>(&step_idx), sizeof(step_idx));
+            f.read(reinterpret_cast<char*>(latent.data()),
+                   static_cast<std::streamsize>(latent.size() * sizeof(float)));
+            if (!f) { std::fprintf(stderr, "  short read: %s\n", p.string().c_str()); break; }
+
+            // Append [latent | one-hot(action, B)] to X_flat, score to Y_flat.
+            X_flat.insert(X_flat.end(), latent.begin(), latent.end());
+            for (int b = 0; b < branchB; ++b) X_flat.push_back(b == action ? 1.0f : 0.0f);
+            Y_flat.push_back(score);
+            ++n_examples;
+        }
+    }
+
+    if (n_examples == 0) {
+        std::fprintf(stderr, "value-head: 0 examples extracted\n");
+        return 1;
+    }
+
+    const int in_dim = latent_dim + branchB;
+    std::printf("value-head: loaded %d examples from %zu trace files\n",
+                n_examples, files.size());
+    std::printf("  latent: %d (C=%d,H=%d,W=%d), in_dim=%d, B=%d\n",
+                latent_dim, C_lat, H_lat, W_lat, in_dim, branchB);
+
+    // Target stats — useful sanity check (if all targets are equal there's
+    // no signal to learn).
+    double y_mean = 0.0, y_min = Y_flat[0], y_max = Y_flat[0];
+    for (float v : Y_flat) {
+        y_mean += v;
+        if (v < y_min) y_min = v;
+        if (v > y_max) y_max = v;
+    }
+    y_mean /= Y_flat.size();
+    double y_var = 0.0;
+    for (float v : Y_flat) { double d = v - y_mean; y_var += d * d; }
+    y_var /= Y_flat.size();
+    std::printf("  target: mean=%.6f var=%.6e (min=%.4f max=%.4f spread=%.4f)\n",
+                y_mean, y_var, y_min, y_max, y_max - y_min);
+
+    brotensor::cuda_init();
+
+    vh::Config cfg;
+    cfg.latent_dim = latent_dim;
+    cfg.branching  = branchB;
+    cfg.hidden_dim = hidden;
+    cfg.lr         = lr;
+    cfg.seed       = seed;
+    vh::ValueHead head(cfg);
+    if (load_path) {
+        std::printf("  loading initial weights: %s\n", load_path);
+        head.load(load_path);
+    }
+
+    // Permutation indices for SGD.
+    std::vector<int> perm(static_cast<std::size_t>(n_examples));
+    for (int i = 0; i < n_examples; ++i) perm[static_cast<std::size_t>(i)] = i;
+    std::mt19937_64 rng(seed ^ 0xBAD5EEDULL);
+
+    brotensor::GpuTensor X_BD, Y_pred_B1, dY_B1;
+    std::vector<float> X_batch_host(static_cast<std::size_t>(batch) * in_dim);
+    std::vector<float> Y_target_host(static_cast<std::size_t>(batch));
+    std::vector<float> Y_pred_host(static_cast<std::size_t>(batch));
+    std::vector<float> dY_host(static_cast<std::size_t>(batch));
+
+    if (eval_only) {
+        // Single forward pass over the whole set in `batch`-sized chunks.
+        double mse = 0.0, sxy = 0.0, sx2 = 0.0, sy2 = 0.0, sx = 0.0, sy = 0.0;
+        int n_done = 0;
+        for (int start = 0; start < n_examples; start += batch) {
+            const int B_actual = std::min(batch, n_examples - start);
+            X_batch_host.resize(static_cast<std::size_t>(B_actual) * in_dim);
+            Y_target_host.resize(static_cast<std::size_t>(B_actual));
+            for (int b = 0; b < B_actual; ++b) {
+                const int idx = start + b;
+                const float* src = &X_flat[static_cast<std::size_t>(idx) * in_dim];
+                std::copy(src, src + in_dim,
+                          X_batch_host.begin() + static_cast<std::ptrdiff_t>(b) * in_dim);
+                Y_target_host[static_cast<std::size_t>(b)] =
+                    Y_flat[static_cast<std::size_t>(idx)];
+            }
+            brotensor::upload(X_batch_host.data(), B_actual, in_dim, X_BD);
+            head.forward(X_BD, Y_pred_B1);
+            Y_pred_host.resize(static_cast<std::size_t>(B_actual));
+            brotensor::download(Y_pred_B1, Y_pred_host.data());
+            for (int b = 0; b < B_actual; ++b) {
+                const double yp = Y_pred_host[static_cast<std::size_t>(b)];
+                const double yt = Y_target_host[static_cast<std::size_t>(b)];
+                const double d  = yp - yt;
+                mse += d * d;
+                sxy += yp * yt; sx2 += yp * yp; sy2 += yt * yt;
+                sx  += yp;      sy  += yt;
+                ++n_done;
+            }
+        }
+        mse /= n_done;
+        const double mx = sx / n_done, my = sy / n_done;
+        const double cov = sxy / n_done - mx * my;
+        const double vx  = sx2 / n_done - mx * mx;
+        const double vy  = sy2 / n_done - my * my;
+        const double r   = cov / std::sqrt(std::max(1e-30, vx * vy));
+        std::printf("eval: MSE=%.6e Pearson r=%.4f over %d examples\n", mse, r, n_done);
+        return 0;
+    }
+
+    // Training loop.
+    const int steps_per_epoch = (n_examples + batch - 1) / batch;
+    for (int epoch = 0; epoch < epochs; ++epoch) {
+        std::shuffle(perm.begin(), perm.end(), rng);
+        double epoch_loss = 0.0;
+        int seen = 0;
+        for (int s = 0; s < steps_per_epoch; ++s) {
+            const int start = s * batch;
+            const int B_actual = std::min(batch, n_examples - start);
+            X_batch_host.resize(static_cast<std::size_t>(B_actual) * in_dim);
+            Y_target_host.resize(static_cast<std::size_t>(B_actual));
+            for (int b = 0; b < B_actual; ++b) {
+                const int idx = perm[static_cast<std::size_t>(start + b)];
+                const float* src = &X_flat[static_cast<std::size_t>(idx) * in_dim];
+                std::copy(src, src + in_dim,
+                          X_batch_host.begin() + static_cast<std::ptrdiff_t>(b) * in_dim);
+                Y_target_host[static_cast<std::size_t>(b)] =
+                    Y_flat[static_cast<std::size_t>(idx)];
+            }
+            brotensor::upload(X_batch_host.data(), B_actual, in_dim, X_BD);
+            head.forward(X_BD, Y_pred_B1);
+            Y_pred_host.resize(static_cast<std::size_t>(B_actual));
+            brotensor::download(Y_pred_B1, Y_pred_host.data());
+
+            // MSE: loss = 0.5 * (pred - target)^2 / B_actual ; dY = (pred - target) / B_actual.
+            dY_host.resize(static_cast<std::size_t>(B_actual));
+            double batch_loss = 0.0;
+            const float inv_B = 1.0f / static_cast<float>(B_actual);
+            for (int b = 0; b < B_actual; ++b) {
+                const float d = Y_pred_host[static_cast<std::size_t>(b)] -
+                                Y_target_host[static_cast<std::size_t>(b)];
+                dY_host[static_cast<std::size_t>(b)] = d * inv_B;
+                batch_loss += 0.5 * d * d;
+            }
+            brotensor::upload(dY_host.data(), B_actual, 1, dY_B1);
+            head.backward_and_step(dY_B1);
+            epoch_loss += batch_loss;
+            seen += B_actual;
+        }
+        std::printf("  epoch %d: avg loss = %.6e (over %d examples)\n",
+                    epoch, epoch_loss / seen, seen);
+    }
+
+    head.save(out_path);
+    std::printf("Wrote %s\n", out_path);
+    return 0;
+}
+
 #endif  // BRODIFFUSION_HAS_BROGAMEAGENT
 
 }  // namespace
@@ -679,6 +933,14 @@ int main(int argc, char** argv) {
             return run_sd_mcts(argc, argv);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "sd-mcts: %s\n", e.what());
+            return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "value-head") == 0) {
+        try {
+            return run_value_head(argc, argv);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "value-head: %s\n", e.what());
             return 1;
         }
     }

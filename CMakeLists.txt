@@ -128,6 +128,7 @@ if(BRODIFFUSION_HAS_BROGAMEAGENT)
     target_sources(brodiffusion PRIVATE
         src/cifar_mcts.cpp
         src/sd_mcts.cpp
+        src/value_head.cpp
     )
     target_link_libraries(brodiffusion PUBLIC brogameagent::brogameagent)
     target_compile_definitions(brodiffusion PUBLIC BRODIFFUSION_HAS_BROGAMEAGENT=1)
