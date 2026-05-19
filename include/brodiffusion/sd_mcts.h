@@ -108,10 +108,27 @@ public:
         int action;
         float score;
         std::vector<float> image;   // (3 * H * W) FP32 in [-1, 1]
+
+        // Snapshots of the latent (downloaded host-side, FP32) at the start
+        // of each decision interval — i.e. step_index = 0, decision_interval,
+        // 2*decision_interval, … Only populated when enumerate_actions is
+        // called with `capture_latents = true`. Length D where D is the
+        // number of decision boundaries in the schedule (= number of
+        // intervals = ceil(n_steps / decision_interval)). Each entry has
+        // C_lat * H_lat * W_lat = 4 * (H/8) * (W/8) floats.
+        //
+        // Intended use: training data for a value head that internalises
+        // MCTS — pairs (latent_snapshot[t], bias_pattern[a]) → score lets
+        // a small head learn to score candidate biases without rollouts.
+        // The bias patterns are deterministic in (cfg_.seed, action), so
+        // the training side can reconstruct them from the action index.
+        std::vector<std::vector<float>> decision_latents;
+        std::vector<int>                decision_step_indices;
     };
     std::vector<RolloutResult> enumerate_actions(
         const std::string& prompt,
-        const pipeline::GenerateOptions& opts);
+        const pipeline::GenerateOptions& opts,
+        bool capture_latents = false);
 
 private:
     pipeline::Pipeline&       pipe_;

@@ -207,7 +207,8 @@ std::vector<float> Sampler::generate(const std::string& prompt,
 }
 
 std::vector<Sampler::RolloutResult> Sampler::enumerate_actions(
-    const std::string& prompt, const pipeline::GenerateOptions& opts) {
+    const std::string& prompt, const pipeline::GenerateOptions& opts,
+    bool capture_latents) {
 
     pipeline::PipelineState outer = pipe_.prime(prompt, opts);
 
@@ -237,15 +238,33 @@ std::vector<Sampler::RolloutResult> Sampler::enumerate_actions(
     std::vector<RolloutResult> results;
     results.reserve(static_cast<std::size_t>(cfg_.branching_factor));
 
+    auto snapshot_latent = [](const pipeline::PipelineState& s,
+                              std::vector<float>& out) {
+        const std::size_t n = s.latent.size();
+        std::vector<std::uint16_t> bits(n);
+        bt::download_fp16(s.latent, bits.data());
+        out.resize(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            out[i] = bt::fp16_bits_to_fp32(bits[i]);
+        }
+    };
+
     for (int a = 0; a < cfg_.branching_factor; ++a) {
         bias_vec[static_cast<std::size_t>(bias_idx)] =
             &bias_patterns[static_cast<std::size_t>(a)];
         pipeline::PipelineState s = outer.clone();
-        while (s.step_index < s.n_steps) {
-            pipe_.step_once(s, opts, /*trace_out=*/nullptr, &bias_vec);
-        }
         RolloutResult r;
         r.action = a;
+
+        while (s.step_index < s.n_steps) {
+            if (capture_latents &&
+                (s.step_index % cfg_.decision_interval) == 0) {
+                r.decision_step_indices.push_back(s.step_index);
+                r.decision_latents.emplace_back();
+                snapshot_latent(s, r.decision_latents.back());
+            }
+            pipe_.step_once(s, opts, /*trace_out=*/nullptr, &bias_vec);
+        }
         r.image  = pipe_.decode(s);
         r.score  = scorer_(r.image, opts.height, opts.width);
         results.push_back(std::move(r));

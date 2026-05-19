@@ -415,10 +415,12 @@ int run_sd_mcts(int argc, char** argv) {
     const char* bias_s      = arg_after(argc, argv, "--bias-magnitude");
     const char* cpuct_s     = arg_after(argc, argv, "--c-puct");
     const char* clip_path   = arg_after(argc, argv, "--clip");
+    const char* trace_dir   = arg_after(argc, argv, "--enumerate-trace-out");
     bool enumerate_only = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--enumerate") == 0) enumerate_only = true;
     }
+    if (trace_dir) enumerate_only = true;
 
     if (!text_path || !unet_path || !vae_path ||
         !vocab_path || !merges_path || !prompt || !out_path) {
@@ -428,11 +430,24 @@ int run_sd_mcts(int argc, char** argv) {
             "         [--negative <text>] [--steps N] [--cfg F] [--width N] [--height N]\n"
             "         [--seed N] [--branching B] [--iters N] [--decision-interval N]\n"
             "         [--bias-magnitude F] [--c-puct F] [--enumerate]\n"
+            "         [--enumerate-trace-out <dir>]\n"
             "\n"
             "  --enumerate  Skip MCTS. Run B trajectories (one per action) to\n"
             "               terminal, score each, write all B images with their\n"
             "               scores. Diagnostic for whether the action space\n"
             "               actually steers and whether the scorer discriminates.\n"
+            "  --enumerate-trace-out <dir>\n"
+            "               Implies --enumerate. Also writes per-action binary\n"
+            "               traces to <dir>/trace_a<N>.bin. Format (little-endian):\n"
+            "                 i32 magic = 0x42445354 ('BDST')\n"
+            "                 i32 version = 1\n"
+            "                 i32 action, i32 D, i32 C_lat, i32 H_lat, i32 W_lat\n"
+            "                 f32 score, u64 seed\n"
+            "                 D × { i32 step_index; (C_lat*H_lat*W_lat) f32 latent }\n"
+            "               Bias pattern per action is deterministic and can be\n"
+            "               regenerated host-side from (seed, action) by drawing\n"
+            "               Lq*Lk samples from N(0, bias_magnitude) using mt19937_64\n"
+            "               seeded with (seed XOR (0xA77B1A5 * (action+1))).\n"
             "\n"
             "If --clip is supplied, the scorer is CLIP score (cosine similarity\n"
             "between the projected image embedding and the projected prompt\n"
@@ -517,7 +532,7 @@ int run_sd_mcts(int argc, char** argv) {
     using clk = std::chrono::high_resolution_clock;
     auto t0 = clk::now();
     if (enumerate_only) {
-        auto rollouts = sampler.enumerate_actions(prompt, opts);
+        auto rollouts = sampler.enumerate_actions(prompt, opts, /*capture_latents=*/trace_dir != nullptr);
         auto t1 = clk::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         std::printf("Enumeration done in %.1f ms (%.1f ms/action)\n",
@@ -550,6 +565,56 @@ int run_sd_mcts(int argc, char** argv) {
             f.write(reinterpret_cast<const char*>(rgb.data()),
                     static_cast<std::streamsize>(rgb.size()));
             std::printf("  wrote %s\n", fn.c_str());
+
+            if (trace_dir && !r.decision_latents.empty()) {
+                const int D = static_cast<int>(r.decision_latents.size());
+                const int C_lat = 4;
+                const int H_lat = opts.height / 8;
+                const int W_lat = opts.width  / 8;
+                const std::size_t per_dec = static_cast<std::size_t>(C_lat) *
+                                            H_lat * W_lat;
+                if (r.decision_latents.front().size() != per_dec) {
+                    std::fprintf(stderr,
+                        "sd-mcts: latent snapshot size %zu != expected %zu\n",
+                        r.decision_latents.front().size(), per_dec);
+                    return 1;
+                }
+                const std::string tfn = std::string(trace_dir) +
+                                        "/trace_a" + std::to_string(r.action) + ".bin";
+                std::ofstream tf(tfn, std::ios::binary | std::ios::trunc);
+                if (!tf) {
+                    std::fprintf(stderr, "sd-mcts: cannot open trace output %s "
+                                 "(does dir exist?)\n", tfn.c_str());
+                    return 1;
+                }
+                auto w_i32 = [&](std::int32_t v) {
+                    tf.write(reinterpret_cast<const char*>(&v), sizeof(v));
+                };
+                auto w_u64 = [&](std::uint64_t v) {
+                    tf.write(reinterpret_cast<const char*>(&v), sizeof(v));
+                };
+                auto w_f32 = [&](float v) {
+                    tf.write(reinterpret_cast<const char*>(&v), sizeof(v));
+                };
+                w_i32(0x42445354);   // 'BDST' little-endian
+                w_i32(1);
+                w_i32(r.action);
+                w_i32(D);
+                w_i32(C_lat);
+                w_i32(H_lat);
+                w_i32(W_lat);
+                w_f32(r.score);
+                w_u64(opts.seed);
+                for (int d = 0; d < D; ++d) {
+                    w_i32(r.decision_step_indices[static_cast<std::size_t>(d)]);
+                    tf.write(reinterpret_cast<const char*>(
+                                 r.decision_latents[static_cast<std::size_t>(d)].data()),
+                             static_cast<std::streamsize>(per_dec * sizeof(float)));
+                }
+                std::printf("  wrote %s (%d decisions, %.1f KB)\n",
+                            tfn.c_str(), D,
+                            static_cast<double>(per_dec * sizeof(float) * D) / 1024.0);
+            }
         }
         return 0;
     }
