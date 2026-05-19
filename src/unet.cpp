@@ -1078,6 +1078,12 @@ int UNet::num_xattn_blocks() const {
     return n;
 }
 
+std::vector<int> UNet::layer_strides() const {
+    // SD1.5 schedule: down 0/1/2 (2 transformers each), mid (1), up 1/2/3
+    // (3 transformers each). Strides relative to the top latent resolution.
+    return {1,1, 2,2, 4,4, 8, 4,4,4, 2,2,2, 1,1,1};
+}
+
 void UNet::prime_xattn_cache(const bt::GpuTensor& ctx,
                              CrossAttnKVCache& cache) {
     if (conv_in_W_.size() == 0) fail("prime_xattn_cache: weights not loaded");

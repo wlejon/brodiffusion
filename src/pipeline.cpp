@@ -173,7 +173,9 @@ PipelineState Pipeline::prime(std::string_view prompt,
 }
 
 void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
-                         unet::UNet::CrossAttnTrace* trace_out) {
+                         unet::UNet::CrossAttnTrace* trace_out,
+                         const std::vector<const bt::GpuTensor*>*
+                             attn_logit_biases) {
     if (state.step_index >= state.n_steps) {
         fail("step_once: step_index (" + std::to_string(state.step_index) +
              ") >= n_steps (" + std::to_string(state.n_steps) + ")");
@@ -186,14 +188,22 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
     const float t = static_cast<float>(t_int);
     const int n_lat = cfg_.unet.in_channels * state.H_lat * state.W_lat;
 
+    // Trace mode is forced if either the caller wants a trace OR is injecting
+    // attention biases (forward_trace is the only path that accepts biases).
+    const bool trace_mode = (trace_out != nullptr) || (attn_logit_biases != nullptr);
+
     // ── UNet forward ──────────────────────────────────────────────────────
-    if (trace_out) {
-        // Trace mode: forward_trace bypasses K/V cache + INT8 + LCM cond_proj.
-        // We capture the conditional pass only; CFG uncond (if any) still uses
-        // the fast cached path.
+    if (trace_mode) {
+        // forward_trace bypasses K/V cache + INT8 + LCM cond_proj. We capture
+        // the conditional pass only; CFG uncond (if any) still uses the fast
+        // cached path. Use a scratch trace when the caller asked for biases
+        // but not the trace itself.
+        unet::UNet::CrossAttnTrace scratch_trace;
+        unet::UNet::CrossAttnTrace* trace_dst =
+            trace_out ? trace_out : &scratch_trace;
         unet_.forward_trace(state.latent, state.H_lat, state.W_lat, t,
-                            ctx_cond_, /*attn_logit_biases=*/nullptr,
-                            trace_out, noise_pred_cond_);
+                            ctx_cond_, attn_logit_biases,
+                            trace_dst, noise_pred_cond_);
         if (do_cfg) {
             unet_.forward(state.latent, state.H_lat, state.W_lat, t,
                           ctx_uncond_, xattn_cache_uncond_, noise_pred_uncond_);

@@ -144,9 +144,20 @@ public:
     // states from the same prime() call. Calling apply_lora() between
     // prime() and step_once() leaves the cache stale — re-prime() to refresh.
     PipelineState prime(std::string_view prompt, const GenerateOptions& opts);
+    // If `attn_logit_biases` is non-null, trace mode is used and the bias
+    // vector is forwarded to UNet::forward_trace (length must equal
+    // unet().num_xattn_blocks(); per-entry nulls allowed for no-bias layers).
+    // When biases are supplied, trace_out may still be null — the trace is
+    // computed but discarded.
     void step_once(PipelineState& state, const GenerateOptions& opts,
-                   unet::UNet::CrossAttnTrace* trace_out = nullptr);
+                   unet::UNet::CrossAttnTrace* trace_out = nullptr,
+                   const std::vector<const brotensor::GpuTensor*>*
+                       attn_logit_biases = nullptr);
     std::vector<float> decode(const PipelineState& state);
+
+    // Accessors for research callers (e.g. tree search needs xattn block count
+    // to size the bias vector).
+    const unet::UNet& unet() const { return unet_; }
 
     const PipelineConfig& config() const { return cfg_; }
 

@@ -215,6 +215,14 @@ public:
     // size of any cache returned by prime_xattn_cache.
     int num_xattn_blocks() const;
 
+    // Per-Transformer2D-block spatial stride (relative to H_lat, W_lat), in
+    // traversal order. SD1.5 schedule is hard-coded: down stages 0/1/2 each
+    // emit 2 transformers, mid emits 1, up stages 1/2/3 each emit 3.
+    std::vector<int> layer_strides() const;
+
+    // Text-encoder context length (Lk) for cross-attention. SD1.5 / CLIP: 77.
+    int context_length() const { return 77; }
+
     // Fold a LoRA delta into the base FP16 weight identified by `target_path`.
     // `target_path` is a diffusers path *within* the UNet (no "unet." prefix),
     // e.g. "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q" or
