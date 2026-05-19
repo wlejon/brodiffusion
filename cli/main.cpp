@@ -913,7 +913,7 @@ int run_value_head(int argc, char** argv) {
     for (const auto& e : fs::directory_iterator(traces_dir)) {
         const auto& p = e.path();
         const auto stem = p.stem().string();
-        if (stem.rfind("trace_a", 0) == 0 && p.extension() == ".bin") {
+        if (stem.rfind("trace_", 0) == 0 && p.extension() == ".bin") {
             files.push_back(p);
         }
     }
