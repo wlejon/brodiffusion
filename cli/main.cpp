@@ -398,6 +398,49 @@ int run_cifar_mcts(int argc, char** argv) {
     return 0;
 }
 
+// Write one trace file in the BDST/v1 format documented in the sd-mcts
+// --enumerate-trace-out help text. Returns false on I/O failure (and prints
+// the error to stderr). `path` is the full destination filename.
+bool write_trace_file(const std::string& path,
+                      int action, int D, int C_lat, int H_lat, int W_lat,
+                      float score, std::uint64_t seed,
+                      const std::vector<int>& step_indices,
+                      const std::vector<std::vector<float>>& latents) {
+    std::ofstream tf(path, std::ios::binary | std::ios::trunc);
+    if (!tf) {
+        std::fprintf(stderr, "trace write: cannot open %s (does dir exist?)\n",
+                     path.c_str());
+        return false;
+    }
+    auto w_i32 = [&](std::int32_t v) {
+        tf.write(reinterpret_cast<const char*>(&v), sizeof(v));
+    };
+    auto w_u64 = [&](std::uint64_t v) {
+        tf.write(reinterpret_cast<const char*>(&v), sizeof(v));
+    };
+    auto w_f32 = [&](float v) {
+        tf.write(reinterpret_cast<const char*>(&v), sizeof(v));
+    };
+    const std::size_t per_dec =
+        static_cast<std::size_t>(C_lat) * H_lat * W_lat;
+    w_i32(0x42445354);   // 'BDST'
+    w_i32(1);
+    w_i32(action);
+    w_i32(D);
+    w_i32(C_lat);
+    w_i32(H_lat);
+    w_i32(W_lat);
+    w_f32(score);
+    w_u64(seed);
+    for (int d = 0; d < D; ++d) {
+        w_i32(step_indices[static_cast<std::size_t>(d)]);
+        tf.write(reinterpret_cast<const char*>(
+                     latents[static_cast<std::size_t>(d)].data()),
+                 static_cast<std::streamsize>(per_dec * sizeof(float)));
+    }
+    return static_cast<bool>(tf);
+}
+
 int run_sd_mcts(int argc, char** argv) {
     const char* text_path   = arg_after(argc, argv, "--text");
     const char* unet_path   = arg_after(argc, argv, "--unet");
@@ -574,46 +617,16 @@ int run_sd_mcts(int argc, char** argv) {
                 const int C_lat = 4;
                 const int H_lat = opts.height / 8;
                 const int W_lat = opts.width  / 8;
-                const std::size_t per_dec = static_cast<std::size_t>(C_lat) *
-                                            H_lat * W_lat;
-                if (r.decision_latents.front().size() != per_dec) {
-                    std::fprintf(stderr,
-                        "sd-mcts: latent snapshot size %zu != expected %zu\n",
-                        r.decision_latents.front().size(), per_dec);
-                    return 1;
-                }
                 const std::string tfn = std::string(trace_dir) +
                                         "/trace_a" + std::to_string(r.action) + ".bin";
-                std::ofstream tf(tfn, std::ios::binary | std::ios::trunc);
-                if (!tf) {
-                    std::fprintf(stderr, "sd-mcts: cannot open trace output %s "
-                                 "(does dir exist?)\n", tfn.c_str());
+                if (!write_trace_file(tfn, r.action, D, C_lat, H_lat, W_lat,
+                                      r.score, opts.seed,
+                                      r.decision_step_indices,
+                                      r.decision_latents)) {
                     return 1;
                 }
-                auto w_i32 = [&](std::int32_t v) {
-                    tf.write(reinterpret_cast<const char*>(&v), sizeof(v));
-                };
-                auto w_u64 = [&](std::uint64_t v) {
-                    tf.write(reinterpret_cast<const char*>(&v), sizeof(v));
-                };
-                auto w_f32 = [&](float v) {
-                    tf.write(reinterpret_cast<const char*>(&v), sizeof(v));
-                };
-                w_i32(0x42445354);   // 'BDST' little-endian
-                w_i32(1);
-                w_i32(r.action);
-                w_i32(D);
-                w_i32(C_lat);
-                w_i32(H_lat);
-                w_i32(W_lat);
-                w_f32(r.score);
-                w_u64(opts.seed);
-                for (int d = 0; d < D; ++d) {
-                    w_i32(r.decision_step_indices[static_cast<std::size_t>(d)]);
-                    tf.write(reinterpret_cast<const char*>(
-                                 r.decision_latents[static_cast<std::size_t>(d)].data()),
-                             static_cast<std::streamsize>(per_dec * sizeof(float)));
-                }
+                const std::size_t per_dec =
+                    static_cast<std::size_t>(C_lat) * H_lat * W_lat;
                 std::printf("  wrote %s (%d decisions, %.1f KB)\n",
                             tfn.c_str(), D,
                             static_cast<double>(per_dec * sizeof(float) * D) / 1024.0);
@@ -658,6 +671,194 @@ int run_sd_mcts(int argc, char** argv) {
     std::printf("Wrote %s\n", out_path);
     return 0;
 }
+int run_sd_mcts_collect(int argc, char** argv) {
+    namespace sm = brodiffusion::sd_mcts;
+
+    const char* text_path    = arg_after(argc, argv, "--text");
+    const char* unet_path    = arg_after(argc, argv, "--unet");
+    const char* vae_path     = arg_after(argc, argv, "--vae");
+    const char* vocab_path   = arg_after(argc, argv, "--vocab");
+    const char* merges_path  = arg_after(argc, argv, "--merges");
+    const char* clip_path    = arg_after(argc, argv, "--clip");
+    const char* prompts_file = arg_after(argc, argv, "--prompts-file");
+    const char* out_dir      = arg_after(argc, argv, "--out-dir");
+    const char* seeds_s      = arg_after(argc, argv, "--seeds");
+    const char* start_seed_s = arg_after(argc, argv, "--start-seed");
+    const char* steps_s      = arg_after(argc, argv, "--steps");
+    const char* width_s      = arg_after(argc, argv, "--width");
+    const char* height_s     = arg_after(argc, argv, "--height");
+    const char* branch_s     = arg_after(argc, argv, "--branching");
+    const char* di_s         = arg_after(argc, argv, "--decision-interval");
+    const char* bias_s       = arg_after(argc, argv, "--bias-magnitude");
+
+    if (!text_path || !unet_path || !vae_path || !vocab_path || !merges_path ||
+        !clip_path || !prompts_file || !out_dir) {
+        std::fprintf(stderr,
+            "sd-mcts-collect: --text, --unet, --vae, --vocab, --merges, --clip,\n"
+            "                 --prompts-file, --out-dir are required\n"
+            "                 [--seeds N=3] [--start-seed N=0]\n"
+            "                 [--steps N] [--width N] [--height N]\n"
+            "                 [--branching B] [--decision-interval N]\n"
+            "                 [--bias-magnitude F]\n"
+            "\n"
+            "Loads SD1.5 + CLIP once, then for each (prompt, seed) pair calls\n"
+            "sd-mcts enumerate with latent capture and writes one trace file per\n"
+            "action to <out-dir>/trace_p<promptIdx>_s<seed>_a<action>.bin in the\n"
+            "same BDST/v1 format as sd-mcts --enumerate-trace-out.\n");
+        return 2;
+    }
+
+    // ── Read prompts file (one prompt per non-empty, non-# line). ────────
+    std::vector<std::string> prompts;
+    {
+        std::ifstream pf(prompts_file);
+        if (!pf) {
+            std::fprintf(stderr, "cannot open prompts file: %s\n", prompts_file);
+            return 1;
+        }
+        std::string line;
+        while (std::getline(pf, line)) {
+            // Trim CR (Windows line endings) and leading/trailing whitespace.
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ' ||
+                                     line.back() == '\t')) line.pop_back();
+            std::size_t start = 0;
+            while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+                ++start;
+            if (start) line.erase(0, start);
+            if (line.empty() || line[0] == '#') continue;
+            prompts.push_back(line);
+        }
+    }
+    if (prompts.empty()) {
+        std::fprintf(stderr, "no prompts in %s\n", prompts_file);
+        return 1;
+    }
+
+    pl::GenerateOptions opts_base;
+    if (steps_s)  opts_base.num_inference_steps = std::atoi(steps_s);
+    if (width_s)  opts_base.width  = std::atoi(width_s);
+    if (height_s) opts_base.height = std::atoi(height_s);
+
+    sm::Config mcfg;
+    if (branch_s) mcfg.branching_factor  = std::atoi(branch_s);
+    if (di_s)     mcfg.decision_interval = std::atoi(di_s);
+    if (bias_s)   mcfg.bias_magnitude    = static_cast<float>(std::atof(bias_s));
+
+    const int n_seeds = seeds_s ? std::atoi(seeds_s) : 3;
+    const std::uint64_t start_seed = start_seed_s
+        ? static_cast<std::uint64_t>(std::strtoull(start_seed_s, nullptr, 10)) : 0;
+
+    if (!std::filesystem::exists(out_dir)) {
+        std::filesystem::create_directories(out_dir);
+    }
+
+    brotensor::cuda_init();
+
+    auto tok = clip::Tokenizer::load(vocab_path, merges_path);
+    pl::PipelineConfig cfg;
+    pl::Pipeline pipeline(cfg, std::move(tok));
+    std::printf("Loading SD1.5 weights …\n");
+    auto text_file = st::File::open(text_path);
+    auto unet_file = st::File::open(unet_path);
+    auto vae_file  = st::File::open(vae_path);
+    pipeline.load_weights(text_file, unet_file, vae_file);
+
+    sm::Sampler sampler(pipeline, mcfg);
+
+    // CLIP scorer shares the same vocab/merges as the pipeline tokenizer.
+    std::printf("Loading CLIP weights …\n");
+    clip::Tokenizer clip_tok = clip::Tokenizer::load(vocab_path, merges_path);
+    clip::TextEncoder clip_text(clip::TextEncoderConfig{});
+    brodiffusion::clip_image::ImageEncoder clip_img(
+        brodiffusion::clip_image::ImageEncoderConfig{});
+    auto clip_file = st::File::open(clip_path);
+    clip_text.load_weights(clip_file, "text_model.");
+    clip_img.load_weights(clip_file);
+    brodiffusion::clip_score::CLIPScorer clip_scr(clip_tok, clip_text, clip_img);
+    clip_scr.load_projections(clip_file);
+    sampler.set_scorer([&](const std::vector<float>& img, int H, int W) {
+        return clip_scr.score(img, H, W);
+    });
+
+    const int total_runs = static_cast<int>(prompts.size()) * n_seeds;
+    std::printf("sd-mcts-collect: %zu prompts × %d seeds = %d runs, "
+                "B=%d, decision-interval=%d, bias-mag=%.2f, steps=%d, %dx%d\n",
+                prompts.size(), n_seeds, total_runs,
+                mcfg.branching_factor, mcfg.decision_interval,
+                static_cast<double>(mcfg.bias_magnitude),
+                opts_base.num_inference_steps,
+                opts_base.width, opts_base.height);
+
+    using clk = std::chrono::high_resolution_clock;
+    const auto t0 = clk::now();
+    int run_idx = 0;
+    for (std::size_t pi = 0; pi < prompts.size(); ++pi) {
+        const std::string& prompt = prompts[pi];
+        clip_scr.set_prompt(prompt);
+        for (int si = 0; si < n_seeds; ++si) {
+            const std::uint64_t seed = start_seed + static_cast<std::uint64_t>(si);
+            pl::GenerateOptions opts = opts_base;
+            opts.seed = seed;
+            mcfg.seed = seed;
+            // Re-bind the sampler's config: simplest way is a fresh sampler,
+            // but we can keep the one we have if sd-mcts seed mutation is
+            // limited to enumerate_actions's bias-pattern generation, which
+            // reads cfg_.seed. Build a fresh sampler per run to be safe.
+            sm::Sampler this_sampler(pipeline, mcfg);
+            this_sampler.set_scorer([&](const std::vector<float>& img, int H, int W) {
+                return clip_scr.score(img, H, W);
+            });
+
+            const auto t_run0 = clk::now();
+            auto rollouts = this_sampler.enumerate_actions(prompt, opts, /*capture_latents=*/true);
+            const auto t_run1 = clk::now();
+            const double ms = std::chrono::duration<double, std::milli>(t_run1 - t_run0).count();
+
+            const int C_lat = 4;
+            const int H_lat = opts.height / 8;
+            const int W_lat = opts.width  / 8;
+
+            char tag[64];
+            std::snprintf(tag, sizeof(tag), "p%04zu_s%llu",
+                          pi, static_cast<unsigned long long>(seed));
+
+            double sum_score = 0.0;
+            float min_score = rollouts.empty() ? 0.0f : rollouts.front().score;
+            float max_score = min_score;
+            for (const auto& r : rollouts) {
+                const int D = static_cast<int>(r.decision_latents.size());
+                const std::string tfn = std::string(out_dir) + "/trace_" + tag +
+                                        "_a" + std::to_string(r.action) + ".bin";
+                if (!write_trace_file(tfn, r.action, D, C_lat, H_lat, W_lat,
+                                      r.score, seed,
+                                      r.decision_step_indices,
+                                      r.decision_latents)) {
+                    return 1;
+                }
+                sum_score += r.score;
+                if (r.score < min_score) min_score = r.score;
+                if (r.score > max_score) max_score = r.score;
+            }
+            const double mean_score = rollouts.empty() ? 0.0
+                : sum_score / static_cast<double>(rollouts.size());
+
+            ++run_idx;
+            const double elapsed = std::chrono::duration<double>(clk::now() - t0).count();
+            const double eta = elapsed * (total_runs - run_idx) / std::max(1, run_idx);
+            std::printf("[%d/%d] p%zu s%llu (%.1fs) score mean=%.4f spread=%.4f  ETA %.0fs  prompt=%.60s\n",
+                        run_idx, total_runs, pi,
+                        static_cast<unsigned long long>(seed),
+                        ms / 1000.0, mean_score, max_score - min_score,
+                        eta, prompt.c_str());
+            std::fflush(stdout);
+        }
+    }
+    const double total_s = std::chrono::duration<double>(clk::now() - t0).count();
+    std::printf("Done in %.1fs (%.1fs/run avg). Trace files in %s\n",
+                total_s, total_s / std::max(1, total_runs), out_dir);
+    return 0;
+}
+
 int run_value_head(int argc, char** argv) {
     namespace vh = brodiffusion::value_head;
     namespace fs = std::filesystem;
@@ -933,6 +1134,14 @@ int main(int argc, char** argv) {
             return run_sd_mcts(argc, argv);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "sd-mcts: %s\n", e.what());
+            return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "sd-mcts-collect") == 0) {
+        try {
+            return run_sd_mcts_collect(argc, argv);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "sd-mcts-collect: %s\n", e.what());
             return 1;
         }
     }
