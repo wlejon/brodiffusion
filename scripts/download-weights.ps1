@@ -33,7 +33,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet("sd15", "lcm-dreamshaper")]
+    [ValidateSet("sd15", "lcm-dreamshaper", "cifar10", "clip-vit-l-14")]
     [string]$Model  = "sd15",
     [string]$Repo   = "",
     [string]$OutDir = ""
@@ -53,6 +53,33 @@ switch ($Model) {
             "tokenizer/merges.txt"
         )
         # No fallback list: the SD1.5 mirror is known to ship fp16 variants.
+        $fallback = @{}
+    }
+    "cifar10" {
+        # Unconditional pixel-space DDPM trained on CIFAR-10 by google. UNet2DModel
+        # format (no text encoder, no VAE — single safetensors file). Used for
+        # MCTS / tree-search experiments via brogameagent.
+        if (-not $Repo)   { $Repo   = "google/ddpm-cifar10-32" }
+        if (-not $OutDir) { $OutDir = "$PSScriptRoot/../weights/cifar10-ddpm" }
+        $files = @(
+            "diffusion_pytorch_model.safetensors",
+            "config.json",
+            "scheduler_config.json"
+        )
+        $fallback = @{}
+    }
+    "clip-vit-l-14" {
+        # OpenAI CLIP ViT-L/14 (the full model — vision + text + both
+        # projections). Used by `sd-mcts --clip ...` as the reward signal
+        # (CLIP score). Same architecture's text branch is what SD1.5 uses
+        # under the hood; we still load this separately so the scorer
+        # doesn't contend with the SD pipeline's mid-generation text-encoder
+        # state.
+        if (-not $Repo)   { $Repo   = "openai/clip-vit-large-patch14" }
+        if (-not $OutDir) { $OutDir = "$PSScriptRoot/../weights/clip-vit-l-14" }
+        $files = @(
+            "model.safetensors"
+        )
         $fallback = @{}
     }
     "lcm-dreamshaper" {

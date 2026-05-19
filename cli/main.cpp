@@ -1,3 +1,10 @@
+#include "brodiffusion/cifar_pipeline.h"
+#if BRODIFFUSION_HAS_BROGAMEAGENT
+#include "brodiffusion/cifar_mcts.h"
+#include "brodiffusion/clip_image.h"
+#include "brodiffusion/clip_score.h"
+#include "brodiffusion/sd_mcts.h"
+#endif
 #include "brodiffusion/pipeline.h"
 #include "brodiffusion/safetensors.h"
 #include "brodiffusion/tokenizer.h"
@@ -13,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -226,6 +234,364 @@ int run_txt2img(int argc, char** argv) {
 }
 
 
+int run_cifar_sample(int argc, char** argv) {
+    const char* unet_path = arg_after(argc, argv, "--unet");
+    const char* out_path  = arg_after(argc, argv, "--out");
+    const char* steps_s   = arg_after(argc, argv, "--steps");
+    const char* seed_s    = arg_after(argc, argv, "--seed");
+    const char* size_s    = arg_after(argc, argv, "--size");
+
+    if (!unet_path || !out_path) {
+        std::fprintf(stderr,
+            "cifar-sample: --unet <safetensors> --out <ppm> are required\n"
+            "             [--steps N] [--seed N] [--size N]\n");
+        return 2;
+    }
+
+    namespace cif = brodiffusion::cifar_pipeline;
+    cif::GenerateOptions opts;
+    if (steps_s) opts.num_inference_steps = std::atoi(steps_s);
+    if (seed_s)  opts.seed = static_cast<std::uint64_t>(std::strtoull(seed_s, nullptr, 10));
+    if (size_s) {
+        opts.height = std::atoi(size_s);
+        opts.width  = std::atoi(size_s);
+    }
+
+    brotensor::cuda_init();
+
+    cif::PipelineConfig cfg;  // defaults match google/ddpm-cifar10-32
+    cif::Pipeline pipeline(cfg);
+
+    std::printf("Loading UNet: %s\n", unet_path);
+    auto unet_file = st::File::open(unet_path);
+    pipeline.load_weights(unet_file);
+
+    std::printf("Sampling %dx%d, %d steps, seed=%llu\n",
+                opts.width, opts.height, opts.num_inference_steps,
+                static_cast<unsigned long long>(opts.seed));
+
+    using clk = std::chrono::high_resolution_clock;
+    auto t0 = clk::now();
+    auto img = pipeline.generate(opts);  // (3 * H * W) NCHW FP32 in [-1, 1]
+    auto t1 = clk::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::printf("Done in %.1f ms (%.2f ms/step)\n", ms, ms / opts.num_inference_steps);
+
+    const int H = opts.height, W = opts.width;
+    const int plane = H * W;
+    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(3) * plane);
+    for (int i = 0; i < plane; ++i) {
+        for (int c = 0; c < 3; ++c) {
+            float v = (img[c * plane + i] + 1.0f) * 127.5f;
+            v = std::clamp(v, 0.0f, 255.0f);
+            rgb[3 * i + c] = static_cast<std::uint8_t>(v + 0.5f);
+        }
+    }
+
+    std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        std::fprintf(stderr, "cifar-sample: cannot open output %s\n", out_path);
+        return 1;
+    }
+    f << "P6\n" << W << " " << H << "\n255\n";
+    f.write(reinterpret_cast<const char*>(rgb.data()),
+            static_cast<std::streamsize>(rgb.size()));
+    std::printf("Wrote %s\n", out_path);
+    return 0;
+}
+
+#if BRODIFFUSION_HAS_BROGAMEAGENT
+int run_cifar_mcts(int argc, char** argv) {
+    const char* unet_path = arg_after(argc, argv, "--unet");
+    const char* out_path  = arg_after(argc, argv, "--out");
+    const char* steps_s   = arg_after(argc, argv, "--steps");
+    const char* seed_s    = arg_after(argc, argv, "--seed");
+    const char* size_s    = arg_after(argc, argv, "--size");
+    const char* branch_s  = arg_after(argc, argv, "--branching");
+    const char* iters_s   = arg_after(argc, argv, "--iters");
+    const char* di_s      = arg_after(argc, argv, "--decision-interval");
+
+    if (!unet_path || !out_path) {
+        std::fprintf(stderr,
+            "cifar-mcts: --unet <safetensors> --out <ppm> are required\n"
+            "           [--steps N] [--seed N] [--size N]\n"
+            "           [--branching B] [--iters N] [--decision-interval N]\n"
+            "\n"
+            "Default scorer is mean luminance (smoke-test only — override in\n"
+            "code with Sampler::set_scorer for real experiments).\n");
+        return 2;
+    }
+
+    namespace cif = brodiffusion::cifar_pipeline;
+    namespace cm  = brodiffusion::cifar_mcts;
+
+    cif::GenerateOptions opts;
+    if (steps_s) opts.num_inference_steps = std::atoi(steps_s);
+    if (seed_s)  opts.seed = static_cast<std::uint64_t>(std::strtoull(seed_s, nullptr, 10));
+    if (size_s) {
+        opts.height = std::atoi(size_s);
+        opts.width  = std::atoi(size_s);
+    }
+
+    cm::Config mcfg;
+    if (branch_s) mcfg.branching_factor  = std::atoi(branch_s);
+    if (iters_s)  mcfg.iterations        = std::atoi(iters_s);
+    if (di_s)     mcfg.decision_interval = std::atoi(di_s);
+    mcfg.seed = opts.seed;
+
+    brotensor::cuda_init();
+
+    cif::PipelineConfig cfg;
+    cif::Pipeline pipeline(cfg);
+
+    std::printf("Loading UNet: %s\n", unet_path);
+    auto unet_file = st::File::open(unet_path);
+    pipeline.load_weights(unet_file);
+
+    cm::Sampler sampler(pipeline, mcfg);
+
+    const int decisions = (opts.num_inference_steps + mcfg.decision_interval - 1)
+                          / mcfg.decision_interval;
+    std::printf("MCTS-guided sample: %dx%d, %d steps, B=%d iters=%d, "
+                "decision-interval=%d (≈%d decisions), seed=%llu\n",
+                opts.width, opts.height, opts.num_inference_steps,
+                mcfg.branching_factor, mcfg.iterations, mcfg.decision_interval,
+                decisions, static_cast<unsigned long long>(opts.seed));
+
+    using clk = std::chrono::high_resolution_clock;
+    auto t0 = clk::now();
+    auto img = sampler.generate(opts);
+    auto t1 = clk::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::printf("Done in %.1f ms (%.2f ms/decision avg)\n",
+                ms, ms / std::max(1, static_cast<int>(sampler.last_decisions().size())));
+
+    // Per-decision summary.
+    for (std::size_t i = 0; i < sampler.last_decisions().size(); ++i) {
+        const auto& d = sampler.last_decisions()[i];
+        std::printf("  decision %zu @step=%d: action=%d visits=%d tree=%d\n",
+                    i, d.step_index_before, d.best_action, d.best_visits, d.tree_size);
+    }
+
+    const int H = opts.height, W = opts.width;
+    const int plane = H * W;
+    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(3) * plane);
+    for (int i = 0; i < plane; ++i) {
+        for (int c = 0; c < 3; ++c) {
+            float v = (img[c * plane + i] + 1.0f) * 127.5f;
+            v = std::clamp(v, 0.0f, 255.0f);
+            rgb[3 * i + c] = static_cast<std::uint8_t>(v + 0.5f);
+        }
+    }
+    std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        std::fprintf(stderr, "cifar-mcts: cannot open output %s\n", out_path);
+        return 1;
+    }
+    f << "P6\n" << W << " " << H << "\n255\n";
+    f.write(reinterpret_cast<const char*>(rgb.data()),
+            static_cast<std::streamsize>(rgb.size()));
+    std::printf("Wrote %s\n", out_path);
+    return 0;
+}
+
+int run_sd_mcts(int argc, char** argv) {
+    const char* text_path   = arg_after(argc, argv, "--text");
+    const char* unet_path   = arg_after(argc, argv, "--unet");
+    const char* vae_path    = arg_after(argc, argv, "--vae");
+    const char* vocab_path  = arg_after(argc, argv, "--vocab");
+    const char* merges_path = arg_after(argc, argv, "--merges");
+    const char* prompt      = arg_after(argc, argv, "--prompt");
+    const char* out_path    = arg_after(argc, argv, "--out");
+    const char* neg         = arg_after(argc, argv, "--negative");
+    const char* steps_s     = arg_after(argc, argv, "--steps");
+    const char* cfg_s       = arg_after(argc, argv, "--cfg");
+    const char* width_s     = arg_after(argc, argv, "--width");
+    const char* height_s    = arg_after(argc, argv, "--height");
+    const char* seed_s      = arg_after(argc, argv, "--seed");
+    const char* branch_s    = arg_after(argc, argv, "--branching");
+    const char* iters_s     = arg_after(argc, argv, "--iters");
+    const char* di_s        = arg_after(argc, argv, "--decision-interval");
+    const char* bias_s      = arg_after(argc, argv, "--bias-magnitude");
+    const char* cpuct_s     = arg_after(argc, argv, "--c-puct");
+    const char* clip_path   = arg_after(argc, argv, "--clip");
+    bool enumerate_only = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--enumerate") == 0) enumerate_only = true;
+    }
+
+    if (!text_path || !unet_path || !vae_path ||
+        !vocab_path || !merges_path || !prompt || !out_path) {
+        std::fprintf(stderr,
+            "sd-mcts: --text, --unet, --vae, --vocab, --merges, --prompt, --out are required\n"
+            "         [--clip <openai-clip-vit-l-14.safetensors>]\n"
+            "         [--negative <text>] [--steps N] [--cfg F] [--width N] [--height N]\n"
+            "         [--seed N] [--branching B] [--iters N] [--decision-interval N]\n"
+            "         [--bias-magnitude F] [--c-puct F] [--enumerate]\n"
+            "\n"
+            "  --enumerate  Skip MCTS. Run B trajectories (one per action) to\n"
+            "               terminal, score each, write all B images with their\n"
+            "               scores. Diagnostic for whether the action space\n"
+            "               actually steers and whether the scorer discriminates.\n"
+            "\n"
+            "If --clip is supplied, the scorer is CLIP score (cosine similarity\n"
+            "between the projected image embedding and the projected prompt\n"
+            "embedding). Without it the default is mean luminance — a smoke\n"
+            "test only; meaningless on 512x512 SD outputs.\n");
+        return 2;
+    }
+
+    pl::GenerateOptions opts;
+    if (neg)      opts.negative_prompt = neg;
+    if (steps_s)  opts.num_inference_steps = std::atoi(steps_s);
+    if (cfg_s)    opts.guidance_scale = static_cast<float>(std::atof(cfg_s));
+    if (width_s)  opts.width  = std::atoi(width_s);
+    if (height_s) opts.height = std::atoi(height_s);
+    if (seed_s)   opts.seed = static_cast<std::uint64_t>(std::strtoull(seed_s, nullptr, 10));
+
+    namespace sm = brodiffusion::sd_mcts;
+    sm::Config mcfg;
+    if (branch_s) mcfg.branching_factor  = std::atoi(branch_s);
+    if (iters_s)  mcfg.iterations        = std::atoi(iters_s);
+    if (di_s)     mcfg.decision_interval = std::atoi(di_s);
+    if (bias_s)   mcfg.bias_magnitude    = static_cast<float>(std::atof(bias_s));
+    if (cpuct_s)  mcfg.c_puct            = static_cast<float>(std::atof(cpuct_s));
+    mcfg.seed = opts.seed;
+
+    brotensor::cuda_init();
+
+    auto tok = clip::Tokenizer::load(vocab_path, merges_path);
+    pl::PipelineConfig cfg;  // defaults: DDIM scheduler, vanilla SD1.5 UNet.
+    pl::Pipeline pipeline(cfg, std::move(tok));
+
+    std::printf("Loading weights:\n  text: %s\n  unet: %s\n  vae:  %s\n",
+                text_path, unet_path, vae_path);
+    auto text_file = st::File::open(text_path);
+    auto unet_file = st::File::open(unet_path);
+    auto vae_file  = st::File::open(vae_path);
+    pipeline.load_weights(text_file, unet_file, vae_file);
+
+    sm::Sampler sampler(pipeline, mcfg);
+
+    // Optional CLIP-score scorer. We give the scorer its OWN tokenizer +
+    // text encoder so the pipeline's text encoder is undisturbed (it's
+    // mid-generation across MCTS branches; reusing it for prompt scoring
+    // would race with the cross-attn cache). Memory cost: ~250 MB extra
+    // FP16 weights, fine on a 24 GB card.
+    std::unique_ptr<clip::Tokenizer>             clip_tok;
+    std::unique_ptr<clip::TextEncoder>           clip_text;
+    std::unique_ptr<brodiffusion::clip_image::ImageEncoder> clip_img;
+    std::unique_ptr<brodiffusion::clip_score::CLIPScorer>   clip_scr;
+    if (clip_path) {
+        std::printf("Loading CLIP weights: %s\n", clip_path);
+        clip_tok  = std::make_unique<clip::Tokenizer>(
+            clip::Tokenizer::load(vocab_path, merges_path));
+        clip_text = std::make_unique<clip::TextEncoder>(clip::TextEncoderConfig{});
+        clip_img  = std::make_unique<brodiffusion::clip_image::ImageEncoder>(
+            brodiffusion::clip_image::ImageEncoderConfig{});
+        auto clip_file = st::File::open(clip_path);
+        clip_text->load_weights(clip_file, "text_model.");
+        clip_img->load_weights(clip_file);
+        clip_scr = std::make_unique<brodiffusion::clip_score::CLIPScorer>(
+            *clip_tok, *clip_text, *clip_img);
+        clip_scr->load_projections(clip_file);
+        clip_scr->set_prompt(prompt);
+        sampler.set_scorer([&](const std::vector<float>& img, int H, int W) {
+            return clip_scr->score(img, H, W);
+        });
+        std::printf("Scorer: CLIP score (active prompt cached)\n");
+    } else {
+        std::printf("Scorer: mean luminance (smoke test — NOT a real reward)\n");
+    }
+
+    const int decisions = (opts.num_inference_steps + mcfg.decision_interval - 1)
+                          / mcfg.decision_interval;
+    std::printf("SD MCTS-guided sample: %dx%d, %d steps, CFG=%.1f, "
+                "B=%d iters=%d, decision-interval=%d (=~%d decisions), seed=%llu\n",
+                opts.width, opts.height, opts.num_inference_steps,
+                static_cast<double>(opts.guidance_scale),
+                mcfg.branching_factor, mcfg.iterations, mcfg.decision_interval,
+                decisions, static_cast<unsigned long long>(opts.seed));
+    std::printf("Prompt: %s\n", prompt);
+
+    using clk = std::chrono::high_resolution_clock;
+    auto t0 = clk::now();
+    if (enumerate_only) {
+        auto rollouts = sampler.enumerate_actions(prompt, opts);
+        auto t1 = clk::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::printf("Enumeration done in %.1f ms (%.1f ms/action)\n",
+                    ms, ms / std::max(1, static_cast<int>(rollouts.size())));
+        const int H = opts.height, W = opts.width;
+        const int plane = H * W;
+        const std::string base = out_path;
+        // Strip trailing .ppm if present so we can insert "_aN" before it.
+        std::string stem = base;
+        if (stem.size() > 4 && stem.compare(stem.size() - 4, 4, ".ppm") == 0) {
+            stem.resize(stem.size() - 4);
+        }
+        for (const auto& r : rollouts) {
+            std::printf("  action %d: score=%.6f\n", r.action, r.score);
+            std::vector<std::uint8_t> rgb(static_cast<std::size_t>(3) * plane);
+            for (int i = 0; i < plane; ++i) {
+                for (int c = 0; c < 3; ++c) {
+                    float v = (r.image[c * plane + i] + 1.0f) * 127.5f;
+                    v = std::clamp(v, 0.0f, 255.0f);
+                    rgb[3 * i + c] = static_cast<std::uint8_t>(v + 0.5f);
+                }
+            }
+            const std::string fn = stem + "_a" + std::to_string(r.action) + ".ppm";
+            std::ofstream f(fn, std::ios::binary | std::ios::trunc);
+            if (!f) {
+                std::fprintf(stderr, "sd-mcts: cannot open output %s\n", fn.c_str());
+                return 1;
+            }
+            f << "P6\n" << W << " " << H << "\n255\n";
+            f.write(reinterpret_cast<const char*>(rgb.data()),
+                    static_cast<std::streamsize>(rgb.size()));
+            std::printf("  wrote %s\n", fn.c_str());
+        }
+        return 0;
+    }
+    auto img = sampler.generate(prompt, opts);
+    auto t1 = clk::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::printf("Done in %.1f ms (%.2f ms/decision avg)\n",
+                ms, ms / std::max(1, static_cast<int>(sampler.last_decisions().size())));
+
+    for (std::size_t i = 0; i < sampler.last_decisions().size(); ++i) {
+        const auto& d = sampler.last_decisions()[i];
+        std::printf("  decision %zu @step=%d: action=%d visits=%d tree=%d  visit_dist=[",
+                    i, d.step_index_before, d.best_action, d.best_visits, d.tree_size);
+        for (std::size_t j = 0; j < d.root_visits.size(); ++j) {
+            std::printf("%s%.2f", j == 0 ? "" : ",", d.root_visits[j]);
+        }
+        std::printf("]\n");
+    }
+
+    const int H = opts.height, W = opts.width;
+    const int plane = H * W;
+    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(3) * plane);
+    for (int i = 0; i < plane; ++i) {
+        for (int c = 0; c < 3; ++c) {
+            float v = (img[c * plane + i] + 1.0f) * 127.5f;
+            v = std::clamp(v, 0.0f, 255.0f);
+            rgb[3 * i + c] = static_cast<std::uint8_t>(v + 0.5f);
+        }
+    }
+    std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        std::fprintf(stderr, "sd-mcts: cannot open output %s\n", out_path);
+        return 1;
+    }
+    f << "P6\n" << W << " " << H << "\n255\n";
+    f.write(reinterpret_cast<const char*>(rgb.data()),
+            static_cast<std::streamsize>(rgb.size()));
+    std::printf("Wrote %s\n", out_path);
+    return 0;
+}
+#endif  // BRODIFFUSION_HAS_BROGAMEAGENT
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -233,6 +599,32 @@ int main(int argc, char** argv) {
     if (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-v") == 0) {
         std::printf("brodiffusion %s\n", brodiffusion::version_string());
         return 0;
+    }
+#if BRODIFFUSION_HAS_BROGAMEAGENT
+    if (std::strcmp(argv[1], "cifar-mcts") == 0) {
+        try {
+            return run_cifar_mcts(argc, argv);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "cifar-mcts: %s\n", e.what());
+            return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "sd-mcts") == 0) {
+        try {
+            return run_sd_mcts(argc, argv);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "sd-mcts: %s\n", e.what());
+            return 1;
+        }
+    }
+#endif
+    if (std::strcmp(argv[1], "cifar-sample") == 0) {
+        try {
+            return run_cifar_sample(argc, argv);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "cifar-sample: %s\n", e.what());
+            return 1;
+        }
     }
     if (std::strcmp(argv[1], "txt2img") == 0) {
         try {

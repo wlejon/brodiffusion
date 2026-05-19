@@ -69,6 +69,20 @@ if(NOT TARGET brotensor)
     endif()
 endif()
 
+# Optional: brogameagent for the MCTS-guided CIFAR sampler. Only enables the
+# `cifar-mcts` code path; the rest of brodiffusion compiles without it.
+set(BROGAMEAGENT_DIR "${CMAKE_SOURCE_DIR}/../brogameagent" CACHE PATH
+    "Path to standalone brogameagent repo (used by cifar-mcts; missing path disables)")
+set(BRODIFFUSION_HAS_BROGAMEAGENT OFF)
+if(NOT TARGET brogameagent)
+    if(EXISTS "${BROGAMEAGENT_DIR}/CMakeLists.txt")
+        add_subdirectory("${BROGAMEAGENT_DIR}" "${CMAKE_BINARY_DIR}/brogameagent" EXCLUDE_FROM_ALL)
+        set(BRODIFFUSION_HAS_BROGAMEAGENT ON)
+    endif()
+else()
+    set(BRODIFFUSION_HAS_BROGAMEAGENT ON)
+endif()
+
 # --- brodiffusion library ---
 
 add_library(brodiffusion STATIC)
@@ -103,13 +117,28 @@ target_sources(brodiffusion PRIVATE
     src/lcm_scheduler.cpp
     src/lora.cpp
     src/pipeline.cpp
+    src/ddpm_scheduler.cpp
+    src/ddpm_unet.cpp
+    src/cifar_pipeline.cpp
+    src/clip_image.cpp
+    src/clip_score.cpp
 )
+
+if(BRODIFFUSION_HAS_BROGAMEAGENT)
+    target_sources(brodiffusion PRIVATE
+        src/cifar_mcts.cpp
+        src/sd_mcts.cpp
+    )
+    target_link_libraries(brodiffusion PUBLIC brogameagent::brogameagent)
+    target_compile_definitions(brodiffusion PUBLIC BRODIFFUSION_HAS_BROGAMEAGENT=1)
+endif()
 
 if(BROTENSOR_WITH_CUDA)
     target_sources(brodiffusion PRIVATE
         src/fused_resblock.cu
         src/fused_transformer.cu
         src/optim.cu
+        src/ddpm_pad.cu
     )
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(brodiffusion PUBLIC CUDA::cudart)
