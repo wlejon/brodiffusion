@@ -4,7 +4,7 @@
 //
 // Pairs with brodiffusion/clip.h's text encoder (which is the same ViT-L/14
 // architecture's text branch). Used by clip_score.h to score VAE-decoded
-// SD outputs against a prompt — the reward signal for sd_mcts experiments.
+// SD outputs against a prompt.
 //
 // Architecture (default config matches openai/clip-vit-large-patch14):
 //   patch_embed:  conv2d 3 -> 1024, k=14 s=14 (no bias)             -> 256 tokens

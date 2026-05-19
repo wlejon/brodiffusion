@@ -28,12 +28,16 @@ option(BROTENSOR_WITH_METAL "Build GPU backend (Metal)" OFF)
 # brodiffusion ships SD1.5-specific fused CUDA kernels (e.g. fused_resblock.cu);
 # enable the CUDA language only when CUDA is the selected backend.
 if(BROTENSOR_WITH_CUDA)
-    enable_language(CUDA)
-    set(CMAKE_CUDA_STANDARD 17)
-    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    # CMAKE_CUDA_ARCHITECTURES MUST be set before enable_language(CUDA) —
+    # enable_language initializes it to nvcc's default (52 on Windows) if
+    # unset, after which the (NOT DEFINED) guard would silently skip the
+    # `native` override and we'd end up targeting Maxwell.
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CMAKE_CUDA_ARCHITECTURES native)
     endif()
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 endif()
 
 # --- Siblings: bromath (header-only) + brotensor (GPU ops) ---
@@ -67,20 +71,6 @@ if(NOT TARGET brotensor)
             "brotensor not found at ${BROTENSOR_DIR} or third_party/brotensor. "
             "Clone the brotensor repo next to this repo, or override with -DBROTENSOR_DIR=...")
     endif()
-endif()
-
-# Optional: brogameagent for the MCTS-guided CIFAR sampler. Only enables the
-# `cifar-mcts` code path; the rest of brodiffusion compiles without it.
-set(BROGAMEAGENT_DIR "${CMAKE_SOURCE_DIR}/../brogameagent" CACHE PATH
-    "Path to standalone brogameagent repo (used by cifar-mcts; missing path disables)")
-set(BRODIFFUSION_HAS_BROGAMEAGENT OFF)
-if(NOT TARGET brogameagent)
-    if(EXISTS "${BROGAMEAGENT_DIR}/CMakeLists.txt")
-        add_subdirectory("${BROGAMEAGENT_DIR}" "${CMAKE_BINARY_DIR}/brogameagent" EXCLUDE_FROM_ALL)
-        set(BRODIFFUSION_HAS_BROGAMEAGENT ON)
-    endif()
-else()
-    set(BRODIFFUSION_HAS_BROGAMEAGENT ON)
 endif()
 
 # --- brodiffusion library ---
@@ -117,29 +107,15 @@ target_sources(brodiffusion PRIVATE
     src/lcm_scheduler.cpp
     src/lora.cpp
     src/pipeline.cpp
-    src/ddpm_scheduler.cpp
-    src/ddpm_unet.cpp
-    src/cifar_pipeline.cpp
     src/clip_image.cpp
     src/clip_score.cpp
 )
-
-if(BRODIFFUSION_HAS_BROGAMEAGENT)
-    target_sources(brodiffusion PRIVATE
-        src/cifar_mcts.cpp
-        src/sd_mcts.cpp
-        src/value_head.cpp
-    )
-    target_link_libraries(brodiffusion PUBLIC brogameagent::brogameagent)
-    target_compile_definitions(brodiffusion PUBLIC BRODIFFUSION_HAS_BROGAMEAGENT=1)
-endif()
 
 if(BROTENSOR_WITH_CUDA)
     target_sources(brodiffusion PRIVATE
         src/fused_resblock.cu
         src/fused_transformer.cu
         src/optim.cu
-        src/ddpm_pad.cu
     )
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(brodiffusion PUBLIC CUDA::cudart)

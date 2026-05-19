@@ -1,7 +1,7 @@
 #pragma once
 
 // CLIP score: cosine similarity between a CLIP-projected image and a
-// CLIP-projected prompt. The natural off-the-shelf reward for sd_mcts.
+// CLIP-projected prompt.
 //
 // Wraps:
 //   - the existing clip::Tokenizer + clip::TextEncoder (text branch)
@@ -9,13 +9,11 @@
 //   - text_projection (768, 768)            (text  -> shared space)
 //   - visual_projection (768, 1024)         (image -> shared space)
 //
-// Usage in an sd_mcts run:
+// Usage:
 //   CLIPScorer scorer(tokenizer, text_encoder, image_encoder);
 //   scorer.load_projections(clip_full_safetensors_file);
 //   scorer.set_prompt("a photo of an astronaut riding a horse");
-//   sampler.set_scorer([&](const std::vector<float>& img, int H, int W) {
-//       return scorer.score(img, H, W);
-//   });
+//   float s = scorer.score(img, H, W);
 //
 // `score()` is callable as many times as you like after set_prompt(); the
 // text-side projection is cached on the active prompt.
