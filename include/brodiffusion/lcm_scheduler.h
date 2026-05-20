@@ -80,14 +80,14 @@ public:
     //   noise:       (1, C*H*W) FP16 — fresh standard-Gaussian noise produced
     //                by the caller for this step. Ignored on the final step
     //                (the final step is deterministic). Must outlive the call.
-    //   scratch:     FP16 GpuTensor reused across steps; resized as needed.
+    //   scratch:     FP16 Tensor reused across steps; resized as needed.
     //
-    // Caller is responsible for cuda_sync() before reading sample to host.
-    void step(const brotensor::GpuTensor& noise_pred,
+    // Caller is responsible for sync_all() before reading sample to host.
+    void step(const brotensor::Tensor& noise_pred,
               int step_index,
-              brotensor::GpuTensor& sample,
-              const brotensor::GpuTensor& noise,
-              brotensor::GpuTensor& scratch) const;
+              brotensor::Tensor& sample,
+              const brotensor::Tensor& noise,
+              brotensor::Tensor& scratch) const;
 
     const LCMConfig& config() const { return cfg_; }
 

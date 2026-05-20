@@ -44,11 +44,10 @@
 //   GroupNorm(C_out) -> SiLU -> Conv3x3
 //   + (1x1 conv shortcut if C_in != C_out)
 //
-// Caller is responsible for cuda_sync() before reading the output. All
+// Caller is responsible for sync_all() before reading the output. All
 // weights and activations are FP16 — convert host-side if your checkpoint
 // ships FP32 weights.
 
-#include "brotensor/device_buffer.h"
 #include "brotensor/tensor.h"
 
 #include <array>
@@ -122,20 +121,20 @@ public:
     //   timestep:              continuous timestep value (typically in [0, 1000)).
     //   encoder_hidden_states: (L_text, cross_attention_dim) FP16, e.g. CLIP output.
     //   out:                   (1, out_channels * H * W) FP16, resized as needed.
-    void forward(const brotensor::GpuTensor& sample,
+    void forward(const brotensor::Tensor& sample,
                  int H, int W,
                  float timestep,
-                 const brotensor::GpuTensor& encoder_hidden_states,
-                 brotensor::GpuTensor& out);
+                 const brotensor::Tensor& encoder_hidden_states,
+                 brotensor::Tensor& out);
 
     // Cached cross-attention K/V for a single context tensor — one (K, V) pair
     // per Transformer2D block, FP16, layout matching
-    // brotensor::flash_attention_forward_gpu's K/V args (Lk, C). The text
+    // brotensor::flash_attention_forward's K/V args (Lk, C). The text
     // context is fixed across all denoising steps so projecting K/V once per
     // generate() per CFG branch eliminates 16 × steps × 2 redundant matmuls.
     struct CrossAttnKVCacheEntry {
-        brotensor::GpuTensor K;  // (Lk, C)
-        brotensor::GpuTensor V;  // (Lk, C)
+        brotensor::Tensor K;  // (Lk, C)
+        brotensor::Tensor V;  // (Lk, C)
     };
     using CrossAttnKVCache = std::vector<CrossAttnKVCacheEntry>;
 
@@ -145,24 +144,24 @@ public:
     // resolution) and Lk is the text-context length (77 for SD1.5/CLIP). The
     // trace-mode forward overload below populates this vector for downstream
     // research consumers (cross-attention tree search, attention scoring).
-    using CrossAttnTrace = std::vector<brotensor::GpuTensor>;
+    using CrossAttnTrace = std::vector<brotensor::Tensor>;
 
     // Populate `cache` with one (K, V) pair per Transformer2D block (in the
     // same traversal order the forward pass visits them: down blocks,
     // mid block, up blocks). `cache` is resized as needed.
-    void prime_xattn_cache(const brotensor::GpuTensor& ctx,
+    void prime_xattn_cache(const brotensor::Tensor& ctx,
                            CrossAttnKVCache& cache);
 
     // Variant of forward that uses a pre-primed K/V cache built from the
     // same `encoder_hidden_states` (or, more precisely, from a ctx with the
     // exact tokens the cache was primed against). Cross-attention layers
     // skip the K/V projection step; self-attention is unchanged.
-    void forward(const brotensor::GpuTensor& sample,
+    void forward(const brotensor::Tensor& sample,
                  int H, int W,
                  float timestep,
-                 const brotensor::GpuTensor& encoder_hidden_states,
+                 const brotensor::Tensor& encoder_hidden_states,
                  const CrossAttnKVCache& xattn_cache,
-                 brotensor::GpuTensor& out);
+                 brotensor::Tensor& out);
 
     // LCM guidance-scale-embedding forward.
     //
@@ -175,16 +174,16 @@ public:
     //
     // The non-LCM overloads above will throw if the UNet was built with
     // `time_cond_proj_dim > 0`; this overload will throw if it was 0.
-    void forward(const brotensor::GpuTensor& sample,
+    void forward(const brotensor::Tensor& sample,
                  int H, int W,
                  float timestep,
                  float guidance_scale_embedding,
-                 const brotensor::GpuTensor& encoder_hidden_states,
+                 const brotensor::Tensor& encoder_hidden_states,
                  const CrossAttnKVCache& xattn_cache,
-                 brotensor::GpuTensor& out);
+                 brotensor::Tensor& out);
 
     // Trace-mode forward. Routes each cross-attention (`attn2`) call through
-    // brotensor::cross_attention_forward_with_attn_gpu so the head-averaged
+    // brotensor::cross_attention_forward_with_attn so the head-averaged
     // softmax map can be observed and an optional per-layer FP32 pre-softmax
     // logit bias can be injected. Self-attention (`attn1`) still uses the
     // fast flash path.
@@ -194,22 +193,22 @@ public:
     // that layer.
     //
     // `attn_logit_biases`, if non-null, must have length num_xattn_blocks();
-    // entry `i` is either null (no bias) or a (Lq_i, Lk) FP32 GpuTensor added
+    // entry `i` is either null (no bias) or a (Lq_i, Lk) FP32 Tensor added
     // to the scaled QKᵀ scores before softmax at layer i.
     //
     // Trace mode currently does NOT use the K/V cache (the with-attn brotensor
     // op has no cached variant yet) — K/V are reprojected from `ctx` at every
     // layer. Acceptable cost for experiment-mode tree search; if it bottlenecks
-    // we'll ask brotensor for `..._q_with_kv_cached_with_attn_gpu`.
+    // we'll ask brotensor for `..._q_with_kv_cached_with_attn`.
     //
     // INT8 (quantize_weights) is not supported in trace mode and will throw.
-    void forward_trace(const brotensor::GpuTensor& sample,
+    void forward_trace(const brotensor::Tensor& sample,
                        int H, int W,
                        float timestep,
-                       const brotensor::GpuTensor& encoder_hidden_states,
-                       const std::vector<const brotensor::GpuTensor*>* attn_logit_biases,
+                       const brotensor::Tensor& encoder_hidden_states,
+                       const std::vector<const brotensor::Tensor*>* attn_logit_biases,
                        CrossAttnTrace* trace_out,
-                       brotensor::GpuTensor& out);
+                       brotensor::Tensor& out);
 
     // Number of Transformer2D (cross-attn) blocks in the model — matches the
     // size of any cache returned by prime_xattn_cache.
@@ -262,44 +261,44 @@ private:
     // finalize_weights() when quantize_weights is true; .W_int8.size() == 0
     // means this layer is still using its FP16 weight.
     struct QWeight {
-        brotensor::GpuTensor W_int8;   // INT8 (out, in)
-        brotensor::GpuTensor scales;   // FP32 (out, 1)
+        brotensor::Tensor W_int8;   // INT8 (out, in)
+        brotensor::Tensor scales;   // FP32 (out, 1)
         bool active() const { return W_int8.size() > 0; }
     };
     struct Resnet {
-        brotensor::GpuTensor n1g, n1b, W1, b1;
-        brotensor::GpuTensor temb_W, temb_b;
-        brotensor::GpuTensor n2g, n2b, W2, b2;
-        brotensor::GpuTensor Ws, bs;
+        brotensor::Tensor n1g, n1b, W1, b1;
+        brotensor::Tensor temb_W, temb_b;
+        brotensor::Tensor n2g, n2b, W2, b2;
+        brotensor::Tensor Ws, bs;
         // INT8 counterparts (populated by finalize_weights when enabled).
         QWeight W1_q, W2_q, Ws_q;
         bool has_shortcut = false;
         int  C_in = 0, C_out = 0;
     };
     struct AttnFFN {
-        brotensor::GpuTensor n1g, n1b;
-        brotensor::GpuTensor Wq1, Wk1, Wv1, Wo1, bo1;
-        brotensor::GpuTensor n2g, n2b;
-        brotensor::GpuTensor Wq2, Wk2, Wv2, Wo2, bo2;
-        brotensor::GpuTensor n3g, n3b;
-        brotensor::GpuTensor ff1_W, ff1_b;
-        brotensor::GpuTensor ff2_W, ff2_b;
+        brotensor::Tensor n1g, n1b;
+        brotensor::Tensor Wq1, Wk1, Wv1, Wo1, bo1;
+        brotensor::Tensor n2g, n2b;
+        brotensor::Tensor Wq2, Wk2, Wv2, Wo2, bo2;
+        brotensor::Tensor n3g, n3b;
+        brotensor::Tensor ff1_W, ff1_b;
+        brotensor::Tensor ff2_W, ff2_b;
         // INT8 counterparts.
         QWeight Wq1_q, Wk1_q, Wv1_q, Wo1_q;
         QWeight Wq2_q, Wk2_q, Wv2_q, Wo2_q;
         QWeight ff1_q, ff2_q;
     };
     struct Transformer2D {
-        brotensor::GpuTensor gn_g, gn_b;
-        brotensor::GpuTensor pi_W, pi_b;
-        brotensor::GpuTensor po_W, po_b;
+        brotensor::Tensor gn_g, gn_b;
+        brotensor::Tensor pi_W, pi_b;
+        brotensor::Tensor po_W, po_b;
         QWeight pi_q, po_q;
         std::vector<AttnFFN> blocks;
         int  C = 0;
         int  num_heads = 0;
     };
     struct SampleConv {
-        brotensor::GpuTensor W, b;
+        brotensor::Tensor W, b;
         QWeight W_q;
     };
     struct DownBlock {
@@ -331,93 +330,94 @@ private:
                            int C, int num_heads, Transformer2D& t);
 
     void apply_resnet_(const Resnet& r, int H, int W,
-                       brotensor::GpuTensor& x, brotensor::GpuTensor& tmp);
+                       brotensor::Tensor& x, brotensor::Tensor& tmp);
     // If `cache_entry` is non-null, its (K, V) replace the cross-attn K/V
     // projections (must have been primed against the same `ctx`).
     void apply_transformer_(const Transformer2D& t,
-                            const brotensor::GpuTensor& ctx,
+                            const brotensor::Tensor& ctx,
                             const CrossAttnKVCacheEntry* cache_entry,
                             int H, int W,
-                            brotensor::GpuTensor& x,
+                            brotensor::Tensor& x,
                             // Trace plumbing. Both null = fast path (existing
                             // behaviour). When trace_out_entry is non-null,
-                            // attn2 is routed through cross_attention_forward_
-                            // with_attn_gpu and AttnAvg is written to
+                            // attn2 is routed through
+                            // cross_attention_forward_with_attn and AttnAvg
+                            // is written to
                             // *trace_out_entry. attn_logit_bias is an optional
                             // FP32 (Lq, Lk) pre-softmax bias passed straight
                             // through to the brotensor op.
-                            brotensor::GpuTensor* trace_out_entry = nullptr,
-                            const brotensor::GpuTensor* attn_logit_bias = nullptr);
+                            brotensor::Tensor* trace_out_entry = nullptr,
+                            const brotensor::Tensor* attn_logit_bias = nullptr);
     // Shared forward worker; xattn_cache may be null (legacy path) or point
     // at a cache with exactly num_xattn_blocks() entries. If `gs_emb` is
     // non-null the LCM cond_proj path is used (requires time_cond_proj_dim>0);
     // otherwise the vanilla SD1.5 time-embedding path is used. `trace_out`
     // and `attn_logit_biases` (both optional) wire the trace-mode plumbing
     // for cross-attention research; see UNet::forward_trace.
-    void forward_impl_(const brotensor::GpuTensor& sample,
+    void forward_impl_(const brotensor::Tensor& sample,
                        int H, int W,
                        float timestep,
                        const float* gs_emb,
-                       const brotensor::GpuTensor& encoder_hidden_states,
+                       const brotensor::Tensor& encoder_hidden_states,
                        const CrossAttnKVCache* xattn_cache,
-                       const std::vector<const brotensor::GpuTensor*>* attn_logit_biases,
+                       const std::vector<const brotensor::Tensor*>* attn_logit_biases,
                        CrossAttnTrace* trace_out,
-                       brotensor::GpuTensor& out);
+                       brotensor::Tensor& out);
     // Returns a pointer to the FP16 base weight identified by `target_path`
     // (a diffusers tail within the UNet, e.g. "down_blocks.0.attentions.0.
     // transformer_blocks.0.attn1.to_q"). Returns nullptr if the path doesn't
     // match a recognized LoRA-patchable layer.
-    brotensor::GpuTensor* lora_target_(const std::string& target_path);
+    brotensor::Tensor* lora_target_(const std::string& target_path);
     // Sub-dispatchers used by lora_target_. `sub` is the diffusers path tail
     // remaining after the block-level prefix has been consumed.
-    static brotensor::GpuTensor* resolve_transformer_target_(Transformer2D& tr,
+    static brotensor::Tensor* resolve_transformer_target_(Transformer2D& tr,
                                                               const std::string& sub);
-    static brotensor::GpuTensor* resolve_resnet_target_(Resnet& r,
+    static brotensor::Tensor* resolve_resnet_target_(Resnet& r,
                                                         const std::string& tail);
 
-    void apply_conv3x3_(const brotensor::GpuTensor& W,
-                        const brotensor::GpuTensor& b,
+    void apply_conv3x3_(const brotensor::Tensor& W,
+                        const brotensor::Tensor& b,
                         int C_in, int C_out, int H, int W_,
                         int stride, int pad,
-                        const brotensor::GpuTensor& in,
-                        brotensor::GpuTensor& out);
+                        const brotensor::Tensor& in,
+                        brotensor::Tensor& out);
     // INT8 variant; called when the supplied QWeight is active.
     void apply_conv3x3_q_(const QWeight& Wq,
-                          const brotensor::GpuTensor& b,
+                          const brotensor::Tensor& b,
                           int C_in, int C_out, int H, int W_,
                           int stride, int pad,
-                          const brotensor::GpuTensor& in,
-                          brotensor::GpuTensor& out);
+                          const brotensor::Tensor& in,
+                          brotensor::Tensor& out);
     // Helper used by finalize_weights() to quantise a single FP16 weight in
     // place: downloads the FP16 weight, runs quantize_int8_per_row_host,
-    // uploads INT8 + scales, then frees the FP16 GpuTensor.
-    void quantize_weight_inplace_(brotensor::GpuTensor& W_fp16, QWeight& q);
+    // uploads INT8 + scales, then frees the FP16 Tensor.
+    void quantize_weight_inplace_(brotensor::Tensor& W_fp16, QWeight& q);
 
     UNetConfig cfg_;
     bool finalized_ = false;
     int time_embed_dim_ = 0;
     int freq_dim_       = 0;
 
-    brotensor::GpuTensor conv_in_W_,  conv_in_b_;
-    brotensor::GpuTensor te_l1_W_, te_l1_b_, te_l2_W_, te_l2_b_;
+    brotensor::Tensor conv_in_W_,  conv_in_b_;
+    brotensor::Tensor te_l1_W_, te_l1_b_, te_l2_W_, te_l2_b_;
     // cond_proj weight (LCM only; empty when time_cond_proj_dim == 0).
-    brotensor::GpuTensor te_cond_W_;
+    brotensor::Tensor te_cond_W_;
     std::vector<DownBlock> down_blocks_;
     MidBlock               mid_;
     std::vector<UpBlock>   up_blocks_;
-    brotensor::GpuTensor norm_out_g_, norm_out_b_;
-    brotensor::GpuTensor conv_out_W_, conv_out_b_;
+    brotensor::Tensor norm_out_g_, norm_out_b_;
+    brotensor::Tensor conv_out_W_, conv_out_b_;
 
-    brotensor::GpuTensor x_, y_;
-    brotensor::GpuTensor freq_emb_, temb_a_, temb_b_, temb_silu_, temb_proj_;
+    brotensor::Tensor x_, y_;
+    brotensor::Tensor freq_emb_, temb_a_, temb_b_, temb_silu_, temb_proj_;
     // LCM scratch: w_emb_ holds the sinusoidal guidance-scale embedding,
     // temb_cond_ holds cond_proj(w_emb_); both unused when time_cond_proj_dim==0.
-    brotensor::GpuTensor w_emb_, temb_cond_;
-    brotensor::GpuTensor cat_buf_;
-    brotensor::GpuTensor gn_, seq_, proj_in_seq_, tseq_, ln_;
-    brotensor::GpuTensor attn_proj_;
-    brotensor::GpuTensor ff_mid_, ff_act_, ff_out_;
-    brotensor::GpuTensor proj_out_seq_, proj_out_nchw_;
+    brotensor::Tensor w_emb_, temb_cond_;
+    brotensor::Tensor cat_buf_;
+    brotensor::Tensor gn_, seq_, proj_in_seq_, tseq_, ln_;
+    brotensor::Tensor attn_proj_;
+    brotensor::Tensor ff_mid_, ff_act_, ff_out_;
+    brotensor::Tensor proj_out_seq_, proj_out_nchw_;
 };
 
 }  // namespace brodiffusion::unet

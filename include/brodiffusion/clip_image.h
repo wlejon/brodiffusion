@@ -80,41 +80,41 @@ public:
                       bool pre_layrnorm_alt = true);
 
     // Forward pass.
-    //   pixels: (1, 3 * 224 * 224) FP16 GpuTensor, mean/std-normalised in
+    //   pixels: (1, 3 * 224 * 224) FP16 Tensor, mean/std-normalised in
     //           CLIP space (see clip_score::preprocess for the host-side
     //           pipeline that produces this).
     //   cls_out: (1, hidden_dim) FP16, *post_layernorm(CLS token)*.
     //            Resized as needed. This is the input to the visual
     //            projection that produces the final cross-modal embedding.
-    void forward(const brotensor::GpuTensor& pixels,
-                 brotensor::GpuTensor& cls_out);
+    void forward(const brotensor::Tensor& pixels,
+                 brotensor::Tensor& cls_out);
 
     const ImageEncoderConfig& config() const { return cfg_; }
 
 private:
     struct Layer {
-        brotensor::GpuTensor ln1_g, ln1_b;
-        brotensor::GpuTensor Wq, bq, Wk, bk, Wv, bv, Wo, bo;
-        brotensor::GpuTensor ln2_g, ln2_b;
-        brotensor::GpuTensor fc1_W, fc1_b, fc2_W, fc2_b;
+        brotensor::Tensor ln1_g, ln1_b;
+        brotensor::Tensor Wq, bq, Wk, bk, Wv, bv, Wo, bo;
+        brotensor::Tensor ln2_g, ln2_b;
+        brotensor::Tensor fc1_W, fc1_b, fc2_W, fc2_b;
     };
 
     ImageEncoderConfig cfg_;
 
-    brotensor::GpuTensor patch_W_;       // (D, 3 * P * P)  — conv2d filter
-    brotensor::GpuTensor class_embed_;   // (1, D)          — broadcast into row 0
-    brotensor::GpuTensor position_embed_;// (T, D)
-    brotensor::GpuTensor pre_g_, pre_b_;
+    brotensor::Tensor patch_W_;       // (D, 3 * P * P)  — conv2d filter
+    brotensor::Tensor class_embed_;   // (1, D)          — broadcast into row 0
+    brotensor::Tensor position_embed_;// (T, D)
+    brotensor::Tensor pre_g_, pre_b_;
     std::vector<Layer>   layers_;
-    brotensor::GpuTensor post_g_, post_b_;
+    brotensor::Tensor post_g_, post_b_;
 
     // Scratch buffers reused across calls.
-    brotensor::GpuTensor patch_nchw_;    // (1, D * G * G)
-    brotensor::GpuTensor seq_;           // (T, D) residual stream
-    brotensor::GpuTensor ln_out_;
-    brotensor::GpuTensor proj_out_;
-    brotensor::GpuTensor ffn_mid_, ffn_act_, ffn_out_;
-    brotensor::GpuTensor post_;          // (T, D)
+    brotensor::Tensor patch_nchw_;    // (1, D * G * G)
+    brotensor::Tensor seq_;           // (T, D) residual stream
+    brotensor::Tensor ln_out_;
+    brotensor::Tensor proj_out_;
+    brotensor::Tensor ffn_mid_, ffn_act_, ffn_out_;
+    brotensor::Tensor post_;          // (T, D)
 };
 
 }  // namespace brodiffusion::clip_image

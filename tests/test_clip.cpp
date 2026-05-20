@@ -109,10 +109,15 @@ bool is_finite_fp16(uint16_t bits) {
 
 int main() {
     try {
-        bt::cuda_init();
+        bt::init();
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "cuda_init failed: %s\n", e.what());
+        std::fprintf(stderr, "init failed: %s\n", e.what());
         return 1;
+    }
+    if (!bt::is_available(bt::Device::CUDA) &&
+        !bt::is_available(bt::Device::Metal)) {
+        std::fprintf(stderr, "no GPU backend — skipping GPU test\n");
+        return 0;
     }
 
     clip::TextEncoderConfig cfg;
@@ -173,17 +178,17 @@ int main() {
         enc.load_weights(file, "text_model.");
 
         std::vector<int32_t> ids = {1, 2, 3, 0};
-        bt::GpuTensor out;
+        bt::Tensor out;
         enc.forward(ids.data(), out);
-        bt::cuda_sync();
+        bt::sync_all();
 
         CHECK(out.rows == P);
         CHECK(out.cols == D);
         CHECK(out.dtype == bt::Dtype::FP16);
 
         out_bits1.resize(static_cast<std::size_t>(out.size()));
-        bt::download_fp16(out, out_bits1.data());
-        bt::cuda_sync();
+        out.copy_to_host_fp16(out_bits1.data());
+        bt::sync_all();
 
         int nonfinite = 0;
         for (uint16_t v : out_bits1) if (!is_finite_fp16(v)) ++nonfinite;
@@ -191,10 +196,10 @@ int main() {
 
         // Second forward — must be byte-identical for a deterministic graph.
         enc.forward(ids.data(), out);
-        bt::cuda_sync();
+        bt::sync_all();
         out_bits2.resize(out_bits1.size());
-        bt::download_fp16(out, out_bits2.data());
-        bt::cuda_sync();
+        out.copy_to_host_fp16(out_bits2.data());
+        bt::sync_all();
         CHECK(std::memcmp(out_bits1.data(), out_bits2.data(),
                           out_bits1.size() * 2) == 0);
     }

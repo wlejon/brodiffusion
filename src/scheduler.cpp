@@ -1,4 +1,5 @@
 #include "brodiffusion/scheduler.h"
+#include "brodiffusion/detail/device.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
@@ -58,10 +59,10 @@ void DDIM::set_timesteps(int num_inference_steps) {
     }
 }
 
-void DDIM::step(const bt::GpuTensor& noise_pred,
+void DDIM::step(const bt::Tensor& noise_pred,
                 int step_index,
-                bt::GpuTensor& sample,
-                bt::GpuTensor& scratch) const {
+                bt::Tensor& sample,
+                bt::Tensor& scratch) const {
     if (timesteps_.empty()) fail("set_timesteps() not called");
     if (step_index < 0 || step_index >= static_cast<int>(timesteps_.size())) {
         fail("step_index out of range");
@@ -92,14 +93,12 @@ void DDIM::step(const bt::GpuTensor& noise_pred,
     const float A = sqrt_at_prev / sqrt_at;
     const float B = sqrt_1mat_prev - sqrt_at_prev * sqrt_1mat / sqrt_at;
 
-    if (scratch.rows != noise_pred.rows || scratch.cols != noise_pred.cols ||
-        scratch.dtype != bt::Dtype::FP16) {
-        scratch.resize(noise_pred.rows, noise_pred.cols, bt::Dtype::FP16);
-    }
-    bt::copy_d2d_gpu(noise_pred, 0, scratch, 0, noise_pred.size());
-    bt::scale_inplace_gpu(scratch, B);
-    bt::scale_inplace_gpu(sample, A);
-    bt::add_inplace_gpu(sample, scratch);
+    detail::resize_like(scratch, noise_pred.rows, noise_pred.cols,
+                        bt::Dtype::FP16, noise_pred.device);
+    bt::copy_d2d(noise_pred, 0, scratch, 0, noise_pred.size());
+    bt::scale_inplace(scratch, B);
+    bt::scale_inplace(sample, A);
+    bt::add_inplace(sample, scratch);
 }
 
 }  // namespace brodiffusion::scheduler

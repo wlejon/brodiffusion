@@ -1,4 +1,5 @@
 #include "brodiffusion/lcm_scheduler.h"
+#include "brodiffusion/detail/device.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
@@ -79,11 +80,11 @@ void LCM::set_timesteps(int num_inference_steps) {
     }
 }
 
-void LCM::step(const bt::GpuTensor& noise_pred,
+void LCM::step(const bt::Tensor& noise_pred,
                int step_index,
-               bt::GpuTensor& sample,
-               const bt::GpuTensor& noise,
-               bt::GpuTensor& scratch) const {
+               bt::Tensor& sample,
+               const bt::Tensor& noise,
+               bt::Tensor& scratch) const {
     if (timesteps_.empty()) fail("set_timesteps() not called");
     if (step_index < 0 || step_index >= static_cast<int>(timesteps_.size())) {
         fail("step_index out of range");
@@ -127,10 +128,8 @@ void LCM::step(const bt::GpuTensor& noise_pred,
     const float c_skip   = sigma2 / denom;
     const float c_out    = scaled_t / std::sqrt(denom);
 
-    if (scratch.rows != noise_pred.rows || scratch.cols != noise_pred.cols ||
-        scratch.dtype != bt::Dtype::FP16) {
-        scratch.resize(noise_pred.rows, noise_pred.cols, bt::Dtype::FP16);
-    }
+    detail::resize_like(scratch, noise_pred.rows, noise_pred.cols,
+                        bt::Dtype::FP16, noise_pred.device);
 
     // Compute predicted_x0 = (sample - sqrt(1-a_t)*noise_pred) / sqrt(a_t).
     // CRITICAL: do the subtraction in small-magnitude space first, THEN
@@ -140,18 +139,18 @@ void LCM::step(const bt::GpuTensor& noise_pred,
     // matters — in FP16 we'd lose ~10 bits of precision to catastrophic
     // cancellation, which compounds across LCM's few denoising steps.
     //   scratch = -sqrt_1mat * noise_pred
-    bt::copy_d2d_gpu(noise_pred, 0, scratch, 0, noise_pred.size());
-    bt::scale_inplace_gpu(scratch, -sqrt_1mat);
+    bt::copy_d2d(noise_pred, 0, scratch, 0, noise_pred.size());
+    bt::scale_inplace(scratch, -sqrt_1mat);
     //   scratch += sample           (small-magnitude subtraction)
-    bt::add_inplace_gpu(scratch, sample);
+    bt::add_inplace(scratch, sample);
     //   scratch *= 1/sqrt_at        (predicted_x0)
-    bt::scale_inplace_gpu(scratch, 1.0f / sqrt_at);
+    bt::scale_inplace(scratch, 1.0f / sqrt_at);
 
     // denoised = c_out * predicted_x0 + c_skip * sample. In place: sample
     // becomes denoised via   sample = c_skip*sample + c_out*scratch.
-    bt::scale_inplace_gpu(sample, c_skip);
-    bt::scale_inplace_gpu(scratch, c_out);
-    bt::add_inplace_gpu(sample, scratch);
+    bt::scale_inplace(sample, c_skip);
+    bt::scale_inplace(scratch, c_out);
+    bt::add_inplace(sample, scratch);
 
     // Final step: sample = denoised (no re-noising).
     // Otherwise:  sample = sqrt(a_t_prev)*denoised + sqrt(1 - a_t_prev)*noise.
@@ -160,10 +159,10 @@ void LCM::step(const bt::GpuTensor& noise_pred,
         if (noise.rows != sample.rows || noise.cols != sample.cols) {
             fail("noise shape mismatch");
         }
-        bt::scale_inplace_gpu(sample, sqrt_at_prev);
-        bt::copy_d2d_gpu(noise, 0, scratch, 0, noise.size());
-        bt::scale_inplace_gpu(scratch, sqrt_1mat_prev);
-        bt::add_inplace_gpu(sample, scratch);
+        bt::scale_inplace(sample, sqrt_at_prev);
+        bt::copy_d2d(noise, 0, scratch, 0, noise.size());
+        bt::scale_inplace(scratch, sqrt_1mat_prev);
+        bt::add_inplace(sample, scratch);
     }
 }
 

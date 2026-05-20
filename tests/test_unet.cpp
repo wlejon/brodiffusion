@@ -178,10 +178,15 @@ void emit_transformer(Builder& b, const std::string& p, int C, int ctx_dim,
 
 int main() {
     try {
-        bt::cuda_init();
+        bt::init();
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "cuda_init failed: %s\n", e.what());
+        std::fprintf(stderr, "init failed: %s\n", e.what());
         return 1;
+    }
+    if (!bt::is_available(bt::Device::CUDA) &&
+        !bt::is_available(bt::Device::Metal)) {
+        std::fprintf(stderr, "no GPU backend — skipping GPU test\n");
+        return 0;
     }
 
     un::UNetConfig cfg;
@@ -319,9 +324,8 @@ int main() {
             float v = (static_cast<float>(i % 5) - 2.0f) * 0.1f;
             latent_h[i] = bt::fp32_to_fp16_bits(v);
         }
-        bt::GpuTensor latent;
-        bt::upload_fp16(latent_h.data(),
-                        1, cfg.in_channels * H * W, latent);
+        bt::Tensor latent = bt::Tensor::from_host_fp16(
+            latent_h.data(), 1, cfg.in_channels * H * W);
 
         // Synthesize a text context (L_text, cross_attention_dim) FP16.
         std::vector<uint16_t> ctx_h(
@@ -330,30 +334,30 @@ int main() {
             float v = (static_cast<float>(i % 7) - 3.0f) * 0.05f;
             ctx_h[i] = bt::fp32_to_fp16_bits(v);
         }
-        bt::GpuTensor ctx;
-        bt::upload_fp16(ctx_h.data(), L_text, ctx_dim, ctx);
+        bt::Tensor ctx;
+        ctx = brotensor::Tensor::from_host_fp16(ctx_h.data(), L_text, ctx_dim);
 
-        bt::GpuTensor out;
+        bt::Tensor out;
         net.forward(latent, H, W, /*timestep=*/500.0f, ctx, out);
-        bt::cuda_sync();
+        bt::sync_all();
 
         CHECK(out.rows == 1);
         CHECK(out.cols == out_elems);
         CHECK(out.dtype == bt::Dtype::FP16);
 
         bits1.resize(static_cast<std::size_t>(out_elems));
-        bt::download_fp16(out, bits1.data());
-        bt::cuda_sync();
+        out.copy_to_host_fp16(bits1.data());
+        bt::sync_all();
 
         int nonfinite = 0;
         for (uint16_t v : bits1) if (!is_finite_fp16(v)) ++nonfinite;
         CHECK(nonfinite == 0);
 
         net.forward(latent, H, W, 500.0f, ctx, out);
-        bt::cuda_sync();
+        bt::sync_all();
         bits2.resize(bits1.size());
-        bt::download_fp16(out, bits2.data());
-        bt::cuda_sync();
+        out.copy_to_host_fp16(bits2.data());
+        bt::sync_all();
         CHECK(std::memcmp(bits1.data(), bits2.data(), bits1.size() * 2) == 0);
 
         // ── trace-mode forward ────────────────────────────────────────────
@@ -365,20 +369,20 @@ int main() {
         un::UNet::CrossAttnTrace trace;
         net.forward_trace(latent, H, W, 500.0f, ctx,
                           /*attn_logit_biases=*/nullptr, &trace, out);
-        bt::cuda_sync();
+        bt::sync_all();
 
         const int n_xattn = net.num_xattn_blocks();
         CHECK(static_cast<int>(trace.size()) == n_xattn);
 
         // Verify each trace entry: (Lq, Lk=L_text), softmax row-sum ~= 1.
         for (int i = 0; i < n_xattn; ++i) {
-            const bt::GpuTensor& m = trace[static_cast<std::size_t>(i)];
+            const bt::Tensor& m = trace[static_cast<std::size_t>(i)];
             CHECK(m.dtype == bt::Dtype::FP16);
             CHECK(m.cols == L_text);
             CHECK(m.rows > 0);
             std::vector<uint16_t> hb(static_cast<std::size_t>(m.rows * m.cols));
-            bt::download_fp16(m, hb.data());
-            bt::cuda_sync();
+            m.copy_to_host_fp16(hb.data());
+            bt::sync_all();
             // Each row of (Lq, Lk) is a softmax over Lk keys.
             for (int r = 0; r < m.rows; ++r) {
                 float s = 0.0f;
@@ -392,8 +396,8 @@ int main() {
 
         // Trace-path output should match the fast-path output closely.
         std::vector<uint16_t> bits_trace(bits1.size());
-        bt::download_fp16(out, bits_trace.data());
-        bt::cuda_sync();
+        out.copy_to_host_fp16(bits_trace.data());
+        bt::sync_all();
         int nonfinite_trace = 0;
         float max_abs_diff = 0.0f;
         for (std::size_t k = 0; k < bits1.size(); ++k) {

@@ -1,6 +1,6 @@
 // SD1.5-specific fused resblock forward.
 //
-// Variant of brotensor's resblock_forward_gpu that folds:
+// Variant of brotensor's resblock_forward that folds:
 //   * per-channel t_emb shift into conv1's epilogue
 //   * residual (or skip) add into conv2's epilogue
 //
@@ -20,6 +20,8 @@
 // in brodiffusion.
 
 #include "brodiffusion/fused_resblock.h"
+#include "brodiffusion/detail/cuda_check.cuh"
+#include "brodiffusion/detail/device.h"
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -321,23 +323,23 @@ inline void launch_conv3x3_fused(const __half* X, const __half* Wt,
     dim3 grid((C_out + BN - 1) / BN, (M + BM - 1) / BM);
     conv3x3_fused_epilogue_kernel<<<grid, block>>>(
         X, Wt, bias, shift, skip, Y, C_in, H, W, C_out);
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
 }
 
 } // anonymous namespace
 
 
 void fused_resblock_forward(
-    const bt::GpuTensor& X,
-    const bt::GpuTensor& gn1_g, const bt::GpuTensor& gn1_b,
-    const bt::GpuTensor& W1,    const bt::GpuTensor& b1,
-    const bt::GpuTensor& t_emb_shift,
-    const bt::GpuTensor& gn2_g, const bt::GpuTensor& gn2_b,
-    const bt::GpuTensor& W2,    const bt::GpuTensor& b2,
-    const bt::GpuTensor* Wskip, const bt::GpuTensor* bskip,
+    const bt::Tensor& X,
+    const bt::Tensor& gn1_g, const bt::Tensor& gn1_b,
+    const bt::Tensor& W1,    const bt::Tensor& b1,
+    const bt::Tensor& t_emb_shift,
+    const bt::Tensor& gn2_g, const bt::Tensor& gn2_b,
+    const bt::Tensor& W2,    const bt::Tensor& b2,
+    const bt::Tensor* Wskip, const bt::Tensor* bskip,
     int C_in, int C_out, int H, int W,
     int num_groups, float eps,
-    bt::GpuTensor& Y) {
+    bt::Tensor& Y) {
     if (X.dtype != bt::Dtype::FP16) {
         throw std::runtime_error("fused_resblock_forward: X must be FP16");
     }
@@ -350,9 +352,7 @@ void fused_resblock_forward(
     const int spatial = H * W;
     const int N = 1;
     const int out_cols = C_out * spatial;
-    if (Y.rows != N || Y.cols != out_cols || Y.dtype != bt::Dtype::FP16) {
-        Y.resize(N, out_cols, bt::Dtype::FP16);
-    }
+    detail::resize_like(Y, N, out_cols, bt::Dtype::FP16, X.device);
     if (spatial == 0) return;
 
     // Validate t_emb_shift shape: accept (1, C_out), (C_out, 1), or flat C_out.
@@ -361,98 +361,98 @@ void fused_resblock_forward(
         throw std::runtime_error("fused_resblock_forward: t_emb_shift must be FP16, length C_out");
     }
 
-    thread_local static bt::GpuTensor h1;
-    thread_local static bt::GpuTensor h2;
-    thread_local static bt::GpuTensor h3;
-    thread_local static bt::GpuTensor skip_buf;
-    h1.resize(N, C_in  * spatial, bt::Dtype::FP16);
-    h2.resize(N, C_out * spatial, bt::Dtype::FP16);
-    h3.resize(N, C_out * spatial, bt::Dtype::FP16);
+    thread_local static bt::Tensor h1;
+    thread_local static bt::Tensor h2;
+    thread_local static bt::Tensor h3;
+    thread_local static bt::Tensor skip_buf;
+    detail::resize_like(h1, N, C_in  * spatial, bt::Dtype::FP16, X.device);
+    detail::resize_like(h2, N, C_out * spatial, bt::Dtype::FP16, X.device);
+    detail::resize_like(h3, N, C_out * spatial, bt::Dtype::FP16, X.device);
 
     // GN1 + SiLU on X -> h1.
     {
         dim3 grid(num_groups, 1, 1);
         gn_silu_n1_kernel<<<grid, GN_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<const __half*>(gn1_g.data_fp16()),
-            reinterpret_cast<const __half*>(gn1_b.data_fp16()),
-            reinterpret_cast<__half*>(h1.data_fp16()),
+            reinterpret_cast<const __half*>(X.data),
+            reinterpret_cast<const __half*>(gn1_g.data),
+            reinterpret_cast<const __half*>(gn1_b.data),
+            reinterpret_cast<__half*>(h1.data),
             C_in, spatial, C_in / num_groups, eps);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
     }
 
     // conv1 (3x3 s1 p1) + bias + t_emb_shift -> h2.
     launch_conv3x3_fused(
-        reinterpret_cast<const __half*>(h1.data_fp16()),
-        reinterpret_cast<const __half*>(W1.data_fp16()),
-        reinterpret_cast<const __half*>(b1.data_fp16()),
-        reinterpret_cast<const __half*>(t_emb_shift.data_fp16()),
+        reinterpret_cast<const __half*>(h1.data),
+        reinterpret_cast<const __half*>(W1.data),
+        reinterpret_cast<const __half*>(b1.data),
+        reinterpret_cast<const __half*>(t_emb_shift.data),
         /*skip=*/nullptr,
-        reinterpret_cast<__half*>(h2.data_fp16()),
+        reinterpret_cast<__half*>(h2.data),
         C_in, H, W, C_out);
 
     // GN2 + SiLU on h2 -> h3.
     {
         dim3 grid(num_groups, 1, 1);
         gn_silu_n1_kernel<<<grid, GN_BLOCK>>>(
-            reinterpret_cast<const __half*>(h2.data_fp16()),
-            reinterpret_cast<const __half*>(gn2_g.data_fp16()),
-            reinterpret_cast<const __half*>(gn2_b.data_fp16()),
-            reinterpret_cast<__half*>(h3.data_fp16()),
+            reinterpret_cast<const __half*>(h2.data),
+            reinterpret_cast<const __half*>(gn2_g.data),
+            reinterpret_cast<const __half*>(gn2_b.data),
+            reinterpret_cast<__half*>(h3.data),
             C_out, spatial, C_out / num_groups, eps);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
     }
 
     // 1x1 skip if needed, via brotensor's conv2d (WMMA path).
     const __half* skip_ptr = nullptr;
     if (Wskip != nullptr) {
-        bt::conv2d_forward_gpu(X, *Wskip, bskip,
+        bt::conv2d_forward(X, *Wskip, bskip,
                                N, C_in, H, W,
                                C_out, 1, 1,
                                /*stride*/1, 1,
                                /*pad*/0, 0,
                                /*dil*/1, 1,
                                skip_buf);
-        skip_ptr = reinterpret_cast<const __half*>(skip_buf.data_fp16());
+        skip_ptr = reinterpret_cast<const __half*>(skip_buf.data);
     } else {
         // skip == X directly (C_in == C_out).
-        skip_ptr = reinterpret_cast<const __half*>(X.data_fp16());
+        skip_ptr = reinterpret_cast<const __half*>(X.data);
     }
 
     // conv2 (3x3 s1 p1) + bias + skip -> Y (no shift on conv2).
     launch_conv3x3_fused(
-        reinterpret_cast<const __half*>(h3.data_fp16()),
-        reinterpret_cast<const __half*>(W2.data_fp16()),
-        reinterpret_cast<const __half*>(b2.data_fp16()),
+        reinterpret_cast<const __half*>(h3.data),
+        reinterpret_cast<const __half*>(W2.data),
+        reinterpret_cast<const __half*>(b2.data),
         /*shift=*/nullptr,
         skip_ptr,
-        reinterpret_cast<__half*>(Y.data_fp16()),
+        reinterpret_cast<__half*>(Y.data),
         C_out, H, W, C_out);
 }
 
 // ─── INT8 (W8A16) overload ────────────────────────────────────────────────
 //
-// Delegates to brotensor::resblock_forward_int8w_fp16_gpu, which mirrors the
+// Delegates to brotensor::resblock_forward_int8w_fp16, which mirrors the
 // FP16 fusion (GN+SiLU kernels, WMMA INT8 convs, t_emb add, residual fold) in
 // one op-layer call. The earlier brodiffusion-side composition lost the
 // epilogue-fusion launches and ran ~1.5x slower than FP16; this delegation
 // closes that gap.
 void fused_resblock_forward(
-    const bt::GpuTensor& X,
-    const bt::GpuTensor& gn1_g, const bt::GpuTensor& gn1_b,
-    const bt::GpuTensor& W1_int8, const bt::GpuTensor& W1_scales,
-    const bt::GpuTensor& b1,
-    const bt::GpuTensor& t_emb_shift,
-    const bt::GpuTensor& gn2_g, const bt::GpuTensor& gn2_b,
-    const bt::GpuTensor& W2_int8, const bt::GpuTensor& W2_scales,
-    const bt::GpuTensor& b2,
-    const bt::GpuTensor* Wskip_int8,
-    const bt::GpuTensor* Wskip_scales,
-    const bt::GpuTensor* bskip,
+    const bt::Tensor& X,
+    const bt::Tensor& gn1_g, const bt::Tensor& gn1_b,
+    const bt::Tensor& W1_int8, const bt::Tensor& W1_scales,
+    const bt::Tensor& b1,
+    const bt::Tensor& t_emb_shift,
+    const bt::Tensor& gn2_g, const bt::Tensor& gn2_b,
+    const bt::Tensor& W2_int8, const bt::Tensor& W2_scales,
+    const bt::Tensor& b2,
+    const bt::Tensor* Wskip_int8,
+    const bt::Tensor* Wskip_scales,
+    const bt::Tensor* bskip,
     int C_in, int C_out, int H, int W,
     int num_groups, float eps,
-    bt::GpuTensor& Y) {
-    bt::resblock_forward_int8w_fp16_gpu(
+    bt::Tensor& Y) {
+    bt::resblock_forward_int8w_fp16(
         X,
         gn1_g, gn1_b,
         W1_int8, W1_scales, &b1,

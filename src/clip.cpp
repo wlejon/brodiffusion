@@ -2,6 +2,7 @@
 #include "brodiffusion/safetensors.h"
 
 #include "brotensor/ops.h"
+#include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
 #include <cctype>
@@ -24,12 +25,12 @@ namespace {
     throw std::runtime_error("clip::TextEncoder: " + msg);
 }
 
-// Upload a safetensors view as a FP16 GpuTensor. Accepts F16 source (used
+// Upload a safetensors view as a FP16 Tensor. Accepts F16 source (used
 // as-is) or F32 source (converted host-side); SD1.5 full checkpoints ship
 // as F32. Asserts the expected (rows, cols) shape; permits the source tensor
 // to be 1-D (treated as (n, 1)) or 2-D.
 void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
-                         bt::GpuTensor& dst, const char* name) {
+                         bt::Tensor& dst, const char* name) {
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
         fail(std::string(name) + ": expected F16 or F32, got " +
              st::dtype_name(v.dtype));
@@ -41,6 +42,15 @@ void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
              std::to_string(v.numel()) + " elements)");
     }
     st::upload_fp16(v, rows, cols, dst);
+}
+
+// Build a device-resident INT32 buffer holding `n` token/position ids.
+// brotensor has no from_host path for INT32, so stage on the host then
+// migrate to the default device.
+bt::Tensor make_idx_device(const int32_t* host, int n) {
+    bt::Tensor cpu = bt::Tensor::empty_on(bt::Device::CPU, n, 1, bt::Dtype::INT32);
+    std::memcpy(cpu.host_raw_mut(), host, static_cast<std::size_t>(n) * sizeof(int32_t));
+    return cpu.to(bt::default_device());
 }
 
 const st::TensorView& need(const st::File& f, const std::string& key) {
@@ -113,12 +123,12 @@ void TextEncoder::load_weights(const st::File& f, const std::string& prefix) {
     // Position-id buffer is fixed [0, 1, ..., P-1]. Upload once.
     std::vector<int32_t> positions(static_cast<std::size_t>(P));
     for (int i = 0; i < P; ++i) positions[static_cast<std::size_t>(i)] = i;
-    positions_dev_.upload(positions.data(), positions.size());
+    positions_dev_ = make_idx_device(positions.data(), P);
 }
 
 // ─── forward ───────────────────────────────────────────────────────────────
 
-void TextEncoder::forward(const int32_t* ids, bt::GpuTensor& out) {
+void TextEncoder::forward(const int32_t* ids, bt::Tensor& out) {
     if (!ids) fail("forward: ids pointer is null");
     if (token_embed_.size() == 0) fail("forward: weights not loaded");
     if (positions_dev_.empty()) fail("forward: position buffer not initialised");
@@ -127,13 +137,17 @@ void TextEncoder::forward(const int32_t* ids, bt::GpuTensor& out) {
     const int H = cfg_.num_heads;
 
     // Upload token IDs and run embedding lookups.
-    ids_dev_.upload(ids, static_cast<std::size_t>(L));
+    ids_dev_ = make_idx_device(ids, L);
 
-    bt::embedding_lookup_forward_gpu(token_embed_,    ids_dev_.device_ptr(),       L, tok_emb_);
-    bt::embedding_lookup_forward_gpu(position_embed_, positions_dev_.device_ptr(), L, pos_emb_);
+    bt::embedding_lookup_forward(token_embed_,
+                                 static_cast<const int32_t*>(ids_dev_.data),
+                                 L, tok_emb_);
+    bt::embedding_lookup_forward(position_embed_,
+                                 static_cast<const int32_t*>(positions_dev_.data),
+                                 L, pos_emb_);
 
     // x = tok_emb + pos_emb  (in tok_emb_, which we then alias as x_).
-    bt::add_inplace_gpu(tok_emb_, pos_emb_);
+    bt::add_inplace(tok_emb_, pos_emb_);
 
     // Move the residual stream into x_ via a clone — we want a stable name
     // and we'll be feeding x_ into the per-layer code repeatedly.
@@ -141,10 +155,10 @@ void TextEncoder::forward(const int32_t* ids, bt::GpuTensor& out) {
 
     for (auto& layer : layers_) {
         // ── self-attention block ──────────────────────────────────────────
-        bt::layernorm_forward_inference_batched_fp16_gpu(
+        bt::layernorm_forward_inference_batched_fp16(
             x_, layer.ln1_gamma, layer.ln1_beta, ln_out_, cfg_.layer_norm_eps);
 
-        bt::flash_attention_qkvo_forward_gpu(
+        bt::flash_attention_qkvo_forward(
             ln_out_, /*Ctx=*/nullptr,
             layer.Wq, &layer.bq,
             layer.Wk, &layer.bk,
@@ -152,20 +166,20 @@ void TextEncoder::forward(const int32_t* ids, bt::GpuTensor& out) {
             layer.Wo, &layer.bo,
             /*d_mask=*/nullptr, H, /*causal=*/true,
             proj_out_);
-        bt::add_inplace_gpu(x_, proj_out_);
+        bt::add_inplace(x_, proj_out_);
 
         // ── MLP block ─────────────────────────────────────────────────────
-        bt::layernorm_forward_inference_batched_fp16_gpu(
+        bt::layernorm_forward_inference_batched_fp16(
             x_, layer.ln2_gamma, layer.ln2_beta, ln_out_, cfg_.layer_norm_eps);
 
-        bt::linear_forward_batched_fp16_gpu(layer.fc1_W, &layer.fc1_b, ln_out_, ffn_mid_);
-        bt::quick_gelu_forward_gpu(ffn_mid_, ffn_act_);
-        bt::linear_forward_batched_fp16_gpu(layer.fc2_W, &layer.fc2_b, ffn_act_, ffn_out_);
+        bt::linear_forward_batched_fp16(layer.fc1_W, &layer.fc1_b, ln_out_, ffn_mid_);
+        bt::quick_gelu_forward(ffn_mid_, ffn_act_);
+        bt::linear_forward_batched_fp16(layer.fc2_W, &layer.fc2_b, ffn_act_, ffn_out_);
 
-        bt::add_inplace_gpu(x_, ffn_out_);
+        bt::add_inplace(x_, ffn_out_);
     }
 
-    bt::layernorm_forward_inference_batched_fp16_gpu(
+    bt::layernorm_forward_inference_batched_fp16(
         x_, final_gamma_, final_beta_, out, cfg_.layer_norm_eps);
 }
 
@@ -198,7 +212,7 @@ bool parse_clip_target_(const std::string& target_path,
 }
 
 void upload_view_fp16(const st::TensorView& v, int rows, int cols,
-                      bt::GpuTensor& dst, const std::string& tag) {
+                      bt::Tensor& dst, const std::string& tag) {
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
         throw std::runtime_error("clip::TextEncoder: lora " + tag +
             ": expected F16 or F32, got " + st::dtype_name(v.dtype));
@@ -228,7 +242,7 @@ void TextEncoder::apply_lora_delta(const std::string& target_path,
              " out of range");
     }
     Layer& L = layers_[static_cast<std::size_t>(layer_idx)];
-    bt::GpuTensor* W = nullptr;
+    bt::Tensor* W = nullptr;
     if (proj == "q_proj")        W = &L.Wq;
     else if (proj == "k_proj")   W = &L.Wk;
     else if (proj == "v_proj")   W = &L.Wv;
@@ -258,14 +272,14 @@ void TextEncoder::apply_lora_delta(const std::string& target_path,
              target_path + "'");
     }
 
-    bt::GpuTensor down_g, up_g;
+    bt::Tensor down_g, up_g;
     upload_view_fp16(lora_down, rank,   W_cols, down_g, target_path + ".lora_down");
     upload_view_fp16(lora_up,   W_rows, rank,   up_g,   target_path + ".lora_up");
 
-    bt::GpuTensor delta;
-    bt::matmul_gpu(up_g, down_g, delta);
-    bt::scale_inplace_gpu(delta, scale_total);
-    bt::add_inplace_gpu(*W, delta);
+    bt::Tensor delta;
+    bt::matmul(up_g, down_g, delta);
+    bt::scale_inplace(delta, scale_total);
+    bt::add_inplace(*W, delta);
 }
 
 }  // namespace brodiffusion::clip

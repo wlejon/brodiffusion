@@ -408,7 +408,7 @@ const TensorView& File::get(std::string_view name) const {
 
 // ─── Upload ────────────────────────────────────────────────────────────────
 
-void upload(const TensorView& view, int rows, int cols, brotensor::GpuTensor& dst) {
+void upload(const TensorView& view, int rows, int cols, brotensor::Tensor& dst) {
     if (rows <= 0 || cols <= 0) {
         throw std::runtime_error("safetensors::upload: rows/cols must be positive");
     }
@@ -420,10 +420,10 @@ void upload(const TensorView& view, int rows, int cols, brotensor::GpuTensor& ds
             "safetensors::upload: byte count mismatch for tensor '" + view.name + "'");
     }
     if (view.dtype == Dtype::F32) {
-        brotensor::upload(reinterpret_cast<const float*>(view.data), rows, cols, dst);
+        dst = brotensor::Tensor::from_host(reinterpret_cast<const float*>(view.data), rows, cols);
     } else if (view.dtype == Dtype::F16) {
-        brotensor::upload_fp16(reinterpret_cast<const uint16_t*>(view.data),
-                               rows, cols, dst);
+        dst = brotensor::Tensor::from_host_fp16(
+            reinterpret_cast<const uint16_t*>(view.data), rows, cols);
     } else {
         throw std::runtime_error(
             std::string("safetensors::upload: unsupported dtype ") +
@@ -431,7 +431,7 @@ void upload(const TensorView& view, int rows, int cols, brotensor::GpuTensor& ds
     }
 }
 
-void upload_fp16(const TensorView& view, int rows, int cols, brotensor::GpuTensor& dst) {
+void upload_fp16(const TensorView& view, int rows, int cols, brotensor::Tensor& dst) {
     if (rows <= 0 || cols <= 0) {
         throw std::runtime_error("safetensors::upload_fp16: rows/cols must be positive");
     }
@@ -442,15 +442,15 @@ void upload_fp16(const TensorView& view, int rows, int cols, brotensor::GpuTenso
             "safetensors::upload_fp16: byte count mismatch for tensor '" + view.name + "'");
     }
     if (view.dtype == Dtype::F16) {
-        brotensor::upload_fp16(reinterpret_cast<const uint16_t*>(view.data),
-                               rows, cols, dst);
+        dst = brotensor::Tensor::from_host_fp16(
+            reinterpret_cast<const uint16_t*>(view.data), rows, cols);
     } else if (view.dtype == Dtype::F32) {
         const float* src = reinterpret_cast<const float*>(view.data);
         std::vector<uint16_t> tmp(n);
         for (std::size_t i = 0; i < n; ++i) {
             tmp[i] = brotensor::fp32_to_fp16_bits(src[i]);
         }
-        brotensor::upload_fp16(tmp.data(), rows, cols, dst);
+        dst = brotensor::Tensor::from_host_fp16(tmp.data(), rows, cols);
     } else {
         throw std::runtime_error(
             std::string("safetensors::upload_fp16: unsupported dtype ") +

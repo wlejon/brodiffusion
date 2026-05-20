@@ -56,10 +56,15 @@ int main() {
     CHECK(lcm.init_noise_sigma() == 1.0f);
 
     try {
-        bt::cuda_init();
+        bt::init();
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "cuda_init failed: %s\n", e.what());
+        std::fprintf(stderr, "init failed: %s\n", e.what());
         return 1;
+    }
+    if (!bt::is_available(bt::Device::CUDA) &&
+        !bt::is_available(bt::Device::Metal)) {
+        std::fprintf(stderr, "no GPU backend — skipping GPU test\n");
+        return 0;
     }
 
     const int C = 4, H = 8, W = 8;
@@ -75,9 +80,9 @@ int main() {
             pred_bits[i]   = bt::fp32_to_fp16_bits(0.1f * nrm(rng));
         }
 
-        bt::GpuTensor sample, noise_pred, noise, scratch;
-        bt::upload_fp16(latent_bits.data(), 1, n, sample);
-        bt::upload_fp16(pred_bits.data(),   1, n, noise_pred);
+        bt::Tensor sample, noise_pred, noise, scratch;
+        sample = brotensor::Tensor::from_host_fp16(latent_bits.data(), 1, n);
+        noise_pred = brotensor::Tensor::from_host_fp16(pred_bits.data(),   1, n);
 
         sc::LCM s;
         s.set_timesteps(4);
@@ -86,12 +91,12 @@ int main() {
             for (int k = 0; k < n; ++k) {
                 noise_bits[k] = bt::fp32_to_fp16_bits(nrm(rng));
             }
-            bt::upload_fp16(noise_bits.data(), 1, n, noise);
+            noise = brotensor::Tensor::from_host_fp16(noise_bits.data(), 1, n);
             s.step(noise_pred, i, sample, noise, scratch);
         }
-        bt::cuda_sync();
+        bt::sync_all();
         out_bits.resize(n);
-        bt::download_fp16(sample, out_bits.data());
+        sample.copy_to_host_fp16(out_bits.data());
     };
 
     std::vector<std::uint16_t> out_a, out_b;

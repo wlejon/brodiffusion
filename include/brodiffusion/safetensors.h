@@ -24,7 +24,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace brotensor { struct GpuTensor; }
+namespace brotensor { struct Tensor; }
 
 namespace brodiffusion::safetensors {
 
@@ -87,7 +87,7 @@ private:
     std::unordered_map<std::string, std::size_t> index_;
 };
 
-// Upload a tensor view as a 2D (rows, cols) GpuTensor.
+// Upload a tensor view as a 2D (rows, cols) Tensor.
 //
 // brotensor is 2D-only by design; higher-rank tensors (e.g. conv weights
 // [Cout, Cin, kH, kW]) are flattened by the caller to whatever 2D layout the
@@ -99,13 +99,13 @@ private:
 //   - dst is resized to (rows, cols) at the matching brotensor::Dtype
 //
 // Throws std::runtime_error if the byte count or dtype is wrong.
-void upload(const TensorView& view, int rows, int cols, brotensor::GpuTensor& dst);
+void upload(const TensorView& view, int rows, int cols, brotensor::Tensor& dst);
 
-// Like upload(), but always produces an FP16 GpuTensor. If the source view is
+// Like upload(), but always produces an FP16 Tensor. If the source view is
 // F32, it is converted host-side via brotensor::fp32_to_fp16_bits before
 // upload (the SD1.5 full checkpoints ship as F32; their "fp16" sub-variants
 // are diffusers-only). If the source is F16, it's uploaded as-is.
-void upload_fp16(const TensorView& view, int rows, int cols, brotensor::GpuTensor& dst);
+void upload_fp16(const TensorView& view, int rows, int cols, brotensor::Tensor& dst);
 
 // ─── Writer ────────────────────────────────────────────────────────────────
 //

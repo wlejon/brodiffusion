@@ -18,12 +18,15 @@ endif()
 
 # --- GPU backend selection ---
 #
-# brodiffusion is inference-only and runs entirely on brotensor's GPU ops.
-# Backend choice is brotensor's (mutually exclusive CUDA xor Metal); we just
-# forward whichever the user passed on the cmake line. If neither is set,
-# brotensor's own CMake will FATAL_ERROR with the right message.
-option(BROTENSOR_WITH_CUDA  "Build GPU backend (CUDA)"  OFF)
-option(BROTENSOR_WITH_METAL "Build GPU backend (Metal)" OFF)
+# brotensor always builds its CPU backend; CUDA and Metal are additive and
+# mutually exclusive. brodiffusion forwards whichever the user passed on the
+# cmake line. With neither set, brodiffusion still configures and builds as a
+# CPU-only library: it links fine, but the diffusion path (conv2d, group_norm,
+# attention) is GPU-only in brotensor, so reaching it throws at runtime.
+# brodiffusion's own SD1.5-specific fused CUDA kernels are likewise replaced
+# by throwing stubs (src/cpu_stubs.cpp) on a non-CUDA build.
+option(BROTENSOR_WITH_CUDA  "Build the CUDA GPU backend"  OFF)
+option(BROTENSOR_WITH_METAL "Build the Metal GPU backend" OFF)
 
 # brodiffusion ships SD1.5-specific fused CUDA kernels (e.g. fused_resblock.cu);
 # enable the CUDA language only when CUDA is the selected backend.
@@ -112,6 +115,7 @@ target_sources(brodiffusion PRIVATE
 )
 
 if(BROTENSOR_WITH_CUDA)
+    # Real SD1.5-tuned fused kernels + the FP16 Adam optimizer plumbing.
     target_sources(brodiffusion PRIVATE
         src/fused_resblock.cu
         src/fused_transformer.cu
@@ -119,6 +123,10 @@ if(BROTENSOR_WITH_CUDA)
     )
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(brodiffusion PUBLIC CUDA::cudart)
+else()
+    # CPU-only (or Metal) build: no CUDA kernels. Throwing stubs keep the
+    # library and CLI linkable; anything that reaches them throws.
+    target_sources(brodiffusion PRIVATE src/cpu_stubs.cpp)
 endif()
 
 # --- CLI ---

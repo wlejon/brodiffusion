@@ -264,10 +264,15 @@ void write_fixture(const std::filesystem::path& path,
 }  // namespace
 
 int main() {
-    try { bt::cuda_init(); }
+    try { bt::init(); }
     catch (const std::exception& e) {
-        std::fprintf(stderr, "cuda_init failed: %s\n", e.what());
+        std::fprintf(stderr, "init failed: %s\n", e.what());
         return 1;
+    }
+    if (!bt::is_available(bt::Device::CUDA) &&
+        !bt::is_available(bt::Device::Metal)) {
+        std::fprintf(stderr, "no GPU backend — skipping GPU test\n");
+        return 0;
     }
 
     un::UNetConfig cfg;
@@ -316,13 +321,13 @@ int main() {
         CHECK(net.is_finalized());
         net.finalize_weights();              // idempotent
 
-        bt::GpuTensor latent, ctx, out;
-        bt::upload_fp16(latent_h.data(), 1, cfg.in_channels * H * W, latent);
-        bt::upload_fp16(ctx_h.data(), L_text, ctx_dim, ctx);
+        bt::Tensor latent, ctx, out;
+        latent = brotensor::Tensor::from_host_fp16(latent_h.data(), 1, cfg.in_channels * H * W);
+        ctx = brotensor::Tensor::from_host_fp16(ctx_h.data(), L_text, ctx_dim);
         net.forward(latent, H, W, 500.0f, ctx, out);
-        bt::cuda_sync();
-        bt::download_fp16(out, bits_fp16.data());
-        bt::cuda_sync();
+        bt::sync_all();
+        out.copy_to_host_fp16(bits_fp16.data());
+        bt::sync_all();
     }
 
     // ── INT8 (W8A16) quantised ─────────────────────────────────────────────
@@ -336,13 +341,13 @@ int main() {
         net.finalize_weights();
         CHECK(net.is_finalized());
 
-        bt::GpuTensor latent, ctx, out;
-        bt::upload_fp16(latent_h.data(), 1, cfg.in_channels * H * W, latent);
-        bt::upload_fp16(ctx_h.data(), L_text, ctx_dim, ctx);
+        bt::Tensor latent, ctx, out;
+        latent = brotensor::Tensor::from_host_fp16(latent_h.data(), 1, cfg.in_channels * H * W);
+        ctx = brotensor::Tensor::from_host_fp16(ctx_h.data(), L_text, ctx_dim);
         net.forward(latent, H, W, 500.0f, ctx, out);
-        bt::cuda_sync();
-        bt::download_fp16(out, bits_int8.data());
-        bt::cuda_sync();
+        bt::sync_all();
+        out.copy_to_host_fp16(bits_int8.data());
+        bt::sync_all();
     }
 
     // ── Compare ───────────────────────────────────────────────────────────

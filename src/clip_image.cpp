@@ -1,5 +1,6 @@
 #include "brodiffusion/clip_image.h"
 #include "brodiffusion/safetensors.h"
+#include "brodiffusion/detail/device.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
@@ -21,7 +22,7 @@ namespace {
 }
 
 void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
-                         bt::GpuTensor& dst, const char* name) {
+                         bt::Tensor& dst, const char* name) {
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
         fail(std::string(name) + ": expected F16 or F32, got " +
              st::dtype_name(v.dtype));
@@ -134,7 +135,7 @@ void ImageEncoder::load_weights(const st::File& f,
 
 // ─── forward ───────────────────────────────────────────────────────────────
 
-void ImageEncoder::forward(const bt::GpuTensor& pixels, bt::GpuTensor& cls_out) {
+void ImageEncoder::forward(const bt::Tensor& pixels, bt::Tensor& cls_out) {
     if (patch_W_.size() == 0) fail("forward: weights not loaded");
 
     const int D = cfg_.hidden_dim;
@@ -148,7 +149,7 @@ void ImageEncoder::forward(const bt::GpuTensor& pixels, bt::GpuTensor& cls_out) 
 
     // ── patch embed: (1, 3*S*S) -> (1, D*G*G) via stride-P conv2d ──────────
     // No bias on patch_embedding in HF CLIP.
-    bt::conv2d_forward_gpu(pixels, patch_W_, /*bias=*/nullptr,
+    bt::conv2d_forward(pixels, patch_W_, /*bias=*/nullptr,
                            /*N=*/1, C, S, S, D, P, P,
                            /*stride_h=*/P, /*stride_w=*/P,
                            /*pad_h=*/0, /*pad_w=*/0,
@@ -158,53 +159,53 @@ void ImageEncoder::forward(const bt::GpuTensor& pixels, bt::GpuTensor& cls_out) 
     // ── reshape NCHW -> sequence: (1, D*G*G) -> (G*G, D) ───────────────────
     // Reuse ln_out_ as the (256, D) holding buffer for the patch sequence —
     // we'll copy it into seq_ rows [1..T-1] in the next step.
-    bt::nchw_to_sequence_gpu(patch_nchw_, /*N=*/1, /*C=*/D, /*H=*/G, /*W=*/G, ln_out_);
+    bt::nchw_to_sequence(patch_nchw_, /*N=*/1, /*C=*/D, /*H=*/G, /*W=*/G, ln_out_);
 
     // ── build (T, D) sequence: [CLS; patches] + position_embed ─────────────
-    seq_.resize(T, D, bt::Dtype::FP16);
+    detail::resize_like(seq_, T, D, bt::Dtype::FP16, pixels.device);
     // Row 0 = class_embedding.
-    bt::copy_d2d_gpu(class_embed_, /*src_off=*/0,
+    bt::copy_d2d(class_embed_, /*src_off=*/0,
                      seq_,         /*dst_off=*/0,
                      /*count=*/D);
     // Rows 1..T-1 = patch sequence.
-    bt::copy_d2d_gpu(ln_out_, /*src_off=*/0,
+    bt::copy_d2d(ln_out_, /*src_off=*/0,
                      seq_,    /*dst_off=*/D,
                      /*count=*/(T - 1) * D);
     // x += position_embed.
-    bt::add_inplace_gpu(seq_, position_embed_);
+    bt::add_inplace(seq_, position_embed_);
 
     // ── pre-LN over the full sequence ──────────────────────────────────────
-    bt::layernorm_forward_inference_batched_fp16_gpu(
+    bt::layernorm_forward_inference_batched_fp16(
         seq_, pre_g_, pre_b_, ln_out_, eps);
     seq_ = ln_out_.clone();
 
     // ── 24 transformer layers (non-causal, biased Q/K/V/O, QuickGELU MLP) ──
     for (auto& L : layers_) {
-        bt::layernorm_forward_inference_batched_fp16_gpu(
+        bt::layernorm_forward_inference_batched_fp16(
             seq_, L.ln1_g, L.ln1_b, ln_out_, eps);
 
-        bt::flash_attention_qkvo_forward_gpu(
+        bt::flash_attention_qkvo_forward(
             ln_out_, /*Ctx=*/nullptr,
             L.Wq, &L.bq, L.Wk, &L.bk, L.Wv, &L.bv, L.Wo, &L.bo,
             /*d_mask=*/nullptr, H, /*causal=*/false,
             proj_out_);
-        bt::add_inplace_gpu(seq_, proj_out_);
+        bt::add_inplace(seq_, proj_out_);
 
-        bt::layernorm_forward_inference_batched_fp16_gpu(
+        bt::layernorm_forward_inference_batched_fp16(
             seq_, L.ln2_g, L.ln2_b, ln_out_, eps);
-        bt::linear_forward_batched_fp16_gpu(L.fc1_W, &L.fc1_b, ln_out_, ffn_mid_);
-        bt::quick_gelu_forward_gpu(ffn_mid_, ffn_act_);
-        bt::linear_forward_batched_fp16_gpu(L.fc2_W, &L.fc2_b, ffn_act_, ffn_out_);
-        bt::add_inplace_gpu(seq_, ffn_out_);
+        bt::linear_forward_batched_fp16(L.fc1_W, &L.fc1_b, ln_out_, ffn_mid_);
+        bt::quick_gelu_forward(ffn_mid_, ffn_act_);
+        bt::linear_forward_batched_fp16(L.fc2_W, &L.fc2_b, ffn_act_, ffn_out_);
+        bt::add_inplace(seq_, ffn_out_);
     }
 
     // ── post-LN, then take CLS row 0 ──────────────────────────────────────
     // HF CLIPVisionTransformer applies post_layernorm to the *pooled* CLS
     // output only. Copy row 0 first, LN that 1×D row, emit.
-    cls_out.resize(1, D, bt::Dtype::FP16);
-    bt::copy_d2d_gpu(seq_, /*src_off=*/0, cls_out, /*dst_off=*/0, /*count=*/D);
+    detail::resize_like(cls_out, 1, D, bt::Dtype::FP16, seq_.device);
+    bt::copy_d2d(seq_, /*src_off=*/0, cls_out, /*dst_off=*/0, /*count=*/D);
     // In-place LN on cls_out by writing through ln_out_.
-    bt::layernorm_forward_inference_batched_fp16_gpu(
+    bt::layernorm_forward_inference_batched_fp16(
         cls_out, post_g_, post_b_, ln_out_, eps);
     cls_out = ln_out_.clone();
 }

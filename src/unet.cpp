@@ -2,8 +2,10 @@
 #include "brodiffusion/safetensors.h"
 #include "brodiffusion/fused_resblock.h"
 #include "brodiffusion/fused_transformer.h"
+#include "brodiffusion/detail/device.h"
 
 #include "brotensor/ops.h"
+#include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
 #include <cctype>
@@ -17,7 +19,9 @@
 #include <utility>
 #include <vector>
 
+#ifdef BROTENSOR_HAS_CUDA
 #include <cuda_runtime.h>
+#endif
 
 namespace brodiffusion::unet {
 
@@ -39,7 +43,7 @@ const st::TensorView& need(const st::File& f, const std::string& key) {
 // Accepts F16 (used as-is) or F32 (converted host-side); SD1.5 full
 // checkpoints ship as F32.
 void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
-                         bt::GpuTensor& dst, const char* name) {
+                         bt::Tensor& dst, const char* name) {
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
         fail(std::string(name) + ": expected F16 or F32, got " + st::dtype_name(v.dtype));
     }
@@ -346,22 +350,22 @@ void UNet::load_weights(const st::File& f, const std::string& prefix) {
 
 // ─── per-block forward helpers ─────────────────────────────────────────────
 
-void UNet::apply_conv3x3_(const bt::GpuTensor& W, const bt::GpuTensor& b,
+void UNet::apply_conv3x3_(const bt::Tensor& W, const bt::Tensor& b,
                           int C_in, int C_out, int H, int W_,
                           int stride, int pad,
-                          const bt::GpuTensor& in, bt::GpuTensor& out) {
-    bt::conv2d_forward_gpu(in, W, &b,
+                          const bt::Tensor& in, bt::Tensor& out) {
+    bt::conv2d_forward(in, W, &b,
                            /*N=*/1, C_in, H, W_,
                            C_out, /*kH=*/3, /*kW=*/3,
                            stride, stride, pad, pad, /*dil=*/1, 1,
                            out);
 }
 
-void UNet::apply_conv3x3_q_(const QWeight& Wq, const bt::GpuTensor& b,
+void UNet::apply_conv3x3_q_(const QWeight& Wq, const bt::Tensor& b,
                             int C_in, int C_out, int H, int W_,
                             int stride, int pad,
-                            const bt::GpuTensor& in, bt::GpuTensor& out) {
-    bt::conv2d_int8w_fp16_forward_gpu(in, Wq.W_int8, Wq.scales, &b,
+                            const bt::Tensor& in, bt::Tensor& out) {
+    bt::conv2d_int8w_fp16_forward(in, Wq.W_int8, Wq.scales, &b,
                                       /*N=*/1, C_in, H, W_,
                                       C_out, /*kH=*/3, /*kW=*/3,
                                       stride, stride, pad, pad, /*dil=*/1, 1,
@@ -369,15 +373,15 @@ void UNet::apply_conv3x3_q_(const QWeight& Wq, const bt::GpuTensor& b,
 }
 
 void UNet::apply_resnet_(const Resnet& r, int H, int W,
-                         bt::GpuTensor& x, bt::GpuTensor& tmp) {
+                         bt::Tensor& x, bt::Tensor& tmp) {
     // Per-resblock time-emb projection: silu(temb) -> Linear -> (1, C_out).
-    bt::linear_forward_batched_fp16_gpu(r.temb_W, &r.temb_b, temb_silu_, temb_proj_);
+    bt::linear_forward_batched_fp16(r.temb_W, &r.temb_b, temb_silu_, temb_proj_);
 
     if (r.W1_q.active()) {
         const QWeight* skip_q = r.has_shortcut ? &r.Ws_q : nullptr;
-        const bt::GpuTensor* skip_b = r.has_shortcut ? &r.bs : nullptr;
-        const bt::GpuTensor* skip_W_int8   = skip_q ? &skip_q->W_int8 : nullptr;
-        const bt::GpuTensor* skip_W_scales = skip_q ? &skip_q->scales : nullptr;
+        const bt::Tensor* skip_b = r.has_shortcut ? &r.bs : nullptr;
+        const bt::Tensor* skip_W_int8   = skip_q ? &skip_q->W_int8 : nullptr;
+        const bt::Tensor* skip_W_scales = skip_q ? &skip_q->scales : nullptr;
         brodiffusion::fused_resblock_forward(x,
                                              r.n1g, r.n1b,
                                              r.W1_q.W_int8, r.W1_q.scales, r.b1,
@@ -389,8 +393,8 @@ void UNet::apply_resnet_(const Resnet& r, int H, int W,
                                              cfg_.norm_num_groups, cfg_.eps,
                                              tmp);
     } else {
-        const bt::GpuTensor* skip_W = r.has_shortcut ? &r.Ws : nullptr;
-        const bt::GpuTensor* skip_b = r.has_shortcut ? &r.bs : nullptr;
+        const bt::Tensor* skip_W = r.has_shortcut ? &r.Ws : nullptr;
+        const bt::Tensor* skip_b = r.has_shortcut ? &r.bs : nullptr;
         brodiffusion::fused_resblock_forward(x,
                                              r.n1g, r.n1b,
                                              r.W1, r.b1,
@@ -406,13 +410,13 @@ void UNet::apply_resnet_(const Resnet& r, int H, int W,
 }
 
 void UNet::apply_transformer_(const Transformer2D& t,
-                              const bt::GpuTensor& ctx,
+                              const bt::Tensor& ctx,
                               const CrossAttnKVCacheEntry* cache_entry,
-                              int H, int W, bt::GpuTensor& x,
-                              bt::GpuTensor* trace_out_entry,
-                              const bt::GpuTensor* attn_logit_bias) {
+                              int H, int W, bt::Tensor& x,
+                              bt::Tensor* trace_out_entry,
+                              const bt::Tensor* attn_logit_bias) {
     // Trace mode is incompatible with the cached K/V fast path because
-    // brotensor's cross_attention_forward_with_attn_gpu reprojects K/V from
+    // brotensor's cross_attention_forward_with_attn reprojects K/V from
     // ctx every call. forward_trace() already ensures no cache is passed.
     if (trace_out_entry != nullptr && cache_entry != nullptr) {
         fail("apply_transformer_: trace_out_entry and cache_entry are "
@@ -425,28 +429,28 @@ void UNet::apply_transformer_(const Transformer2D& t,
     // 2. GroupNorm in NCHW. Diffusers' Transformer2DModel uses eps=1e-6 on
     //    this outer GroupNorm (distinct from the 1e-5 used on the ResNet
     //    GroupNorms); hard-code it here rather than relying on cfg_.eps.
-    bt::group_norm_forward_gpu(x, t.gn_g, t.gn_b,
+    bt::group_norm_forward(x, t.gn_g, t.gn_b,
                                1, C, H, W, cfg_.norm_num_groups, 1e-6f, gn_);
 
     // 3. NCHW -> (L, C) sequence.
-    bt::nchw_to_sequence_gpu(gn_, 1, C, H, W, seq_);
+    bt::nchw_to_sequence(gn_, 1, C, H, W, seq_);
 
     // 4. proj_in: 1x1 conv ≡ Linear over C.
     if (t.pi_q.active()) {
-        bt::linear_forward_batched_int8w_fp16_gpu(
+        bt::linear_forward_batched_int8w_fp16(
             t.pi_q.W_int8, t.pi_q.scales, &t.pi_b, seq_, proj_in_seq_);
     } else {
-        bt::linear_forward_batched_fp16_gpu(t.pi_W, &t.pi_b, seq_, proj_in_seq_);
+        bt::linear_forward_batched_fp16(t.pi_W, &t.pi_b, seq_, proj_in_seq_);
     }
 
     // 5. transformer blocks (always 1 for SD1.5).
     tseq_ = proj_in_seq_.clone();
     for (const AttnFFN& blk : t.blocks) {
         // ── self-attention (Q/K/V bias-less, Wo biased) ───────────────────
-        bt::layernorm_forward_inference_batched_fp16_gpu(
+        bt::layernorm_forward_inference_batched_fp16(
             tseq_, blk.n1g, blk.n1b, ln_, cfg_.eps);
         if (blk.Wq1_q.active()) {
-            bt::flash_attention_qkvo_int8w_fp16_gpu(
+            bt::flash_attention_qkvo_int8w_fp16(
                 ln_, /*Ctx=*/nullptr,
                 blk.Wq1_q.W_int8, blk.Wq1_q.scales, /*bq=*/nullptr,
                 blk.Wk1_q.W_int8, blk.Wk1_q.scales, /*bk=*/nullptr,
@@ -455,7 +459,7 @@ void UNet::apply_transformer_(const Transformer2D& t,
                 /*d_mask=*/nullptr, H_heads, /*causal=*/false,
                 attn_proj_);
         } else {
-            bt::flash_attention_qkvo_forward_gpu(
+            bt::flash_attention_qkvo_forward(
                 ln_, /*Ctx=*/nullptr,
                 blk.Wq1, /*bq=*/nullptr,
                 blk.Wk1, /*bk=*/nullptr,
@@ -467,14 +471,14 @@ void UNet::apply_transformer_(const Transformer2D& t,
         brodiffusion::add_inplace_fp16_vec(tseq_, attn_proj_);
 
         // ── cross-attention (K, V from `ctx` — possibly cached) ───────────
-        bt::layernorm_forward_inference_batched_fp16_gpu(
+        bt::layernorm_forward_inference_batched_fp16(
             tseq_, blk.n2g, blk.n2b, ln_, cfg_.eps);
         if (trace_out_entry) {
-            // Trace path: brotensor's cross_attention_forward_with_attn_gpu
+            // Trace path: brotensor's cross_attention_forward_with_attn
             // writes the FP16 head-averaged softmax map to AttnAvg. No Wo
             // bias is supported by that op, so we manually add bo2 after.
             // (forward_trace already guards against INT8.)
-            bt::cross_attention_forward_with_attn_gpu(
+            bt::cross_attention_forward_with_attn(
                 ln_, ctx,
                 blk.Wq2, blk.Wk2, blk.Wv2, blk.Wo2,
                 /*d_mask=*/nullptr,
@@ -487,14 +491,14 @@ void UNet::apply_transformer_(const Transformer2D& t,
             // K/V already projected from `ctx` upstream — skip the two
             // per-step matmuls and feed the cached buffers straight in.
             if (blk.Wq2_q.active()) {
-                bt::flash_attention_q_with_kv_cached_int8w_fp16_gpu(
+                bt::flash_attention_q_with_kv_cached_int8w_fp16(
                     ln_, cache_entry->K, cache_entry->V,
                     blk.Wq2_q.W_int8, blk.Wq2_q.scales, /*bq=*/nullptr,
                     blk.Wo2_q.W_int8, blk.Wo2_q.scales, &blk.bo2,
                     /*d_mask=*/nullptr, H_heads, /*causal=*/false,
                     attn_proj_);
             } else {
-                bt::flash_attention_q_with_kv_cached_forward_gpu(
+                bt::flash_attention_q_with_kv_cached_forward(
                     ln_, cache_entry->K, cache_entry->V,
                     blk.Wq2, /*bq=*/nullptr,
                     blk.Wo2, &blk.bo2,
@@ -503,7 +507,7 @@ void UNet::apply_transformer_(const Transformer2D& t,
             }
         } else {
             if (blk.Wq2_q.active()) {
-                bt::flash_attention_qkvo_int8w_fp16_gpu(
+                bt::flash_attention_qkvo_int8w_fp16(
                     ln_, &ctx,
                     blk.Wq2_q.W_int8, blk.Wq2_q.scales, /*bq=*/nullptr,
                     blk.Wk2_q.W_int8, blk.Wk2_q.scales, /*bk=*/nullptr,
@@ -512,7 +516,7 @@ void UNet::apply_transformer_(const Transformer2D& t,
                     /*d_mask=*/nullptr, H_heads, /*causal=*/false,
                     attn_proj_);
             } else {
-                bt::flash_attention_qkvo_forward_gpu(
+                bt::flash_attention_qkvo_forward(
                     ln_, &ctx,
                     blk.Wq2, /*bq=*/nullptr,
                     blk.Wk2, /*bk=*/nullptr,
@@ -525,7 +529,7 @@ void UNet::apply_transformer_(const Transformer2D& t,
         brodiffusion::add_inplace_fp16_vec(tseq_, attn_proj_);
 
         // ── feed-forward (GEGLU) ──────────────────────────────────────────
-        bt::layernorm_forward_inference_batched_fp16_gpu(
+        bt::layernorm_forward_inference_batched_fp16(
             tseq_, blk.n3g, blk.n3b, ln_, cfg_.eps);
         // Fused FF1 + exact-GEGLU: skips the (B, 2*D) intermediate of FF1.
         // SD1.5's BasicTransformerBlock uses F.gelu(approximate=False).
@@ -536,27 +540,27 @@ void UNet::apply_transformer_(const Transformer2D& t,
             brodiffusion::fused_linear_geglu(ln_, blk.ff1_W, blk.ff1_b, ff_act_);
         }
         if (blk.ff2_q.active()) {
-            bt::linear_forward_batched_int8w_fp16_gpu(
+            bt::linear_forward_batched_int8w_fp16(
                 blk.ff2_q.W_int8, blk.ff2_q.scales, &blk.ff2_b, ff_act_, ff_out_);
         } else {
-            bt::linear_forward_batched_fp16_gpu(blk.ff2_W, &blk.ff2_b, ff_act_, ff_out_);
+            bt::linear_forward_batched_fp16(blk.ff2_W, &blk.ff2_b, ff_act_, ff_out_);
         }
         brodiffusion::add_inplace_fp16_vec(tseq_, ff_out_);
     }
 
     // 6. proj_out: 1x1 conv ≡ Linear.
     if (t.po_q.active()) {
-        bt::linear_forward_batched_int8w_fp16_gpu(
+        bt::linear_forward_batched_int8w_fp16(
             t.po_q.W_int8, t.po_q.scales, &t.po_b, tseq_, proj_out_seq_);
     } else {
-        bt::linear_forward_batched_fp16_gpu(t.po_W, &t.po_b, tseq_, proj_out_seq_);
+        bt::linear_forward_batched_fp16(t.po_W, &t.po_b, tseq_, proj_out_seq_);
     }
 
     // 7. seq -> NCHW.
-    bt::sequence_to_nchw_gpu(proj_out_seq_, 1, C, H, W, proj_out_nchw_);
+    bt::sequence_to_nchw(proj_out_seq_, 1, C, H, W, proj_out_nchw_);
 
     // 8. residual add.
-    bt::add_inplace_gpu(x, proj_out_nchw_);
+    bt::add_inplace(x, proj_out_nchw_);
 }
 
 // ─── forward ───────────────────────────────────────────────────────────────
@@ -603,11 +607,11 @@ void compute_sinusoidal_emb_fp16(float t, int dim,
 
 }  // namespace
 
-void UNet::forward(const bt::GpuTensor& sample,
+void UNet::forward(const bt::Tensor& sample,
                    int H, int W,
                    float timestep,
-                   const bt::GpuTensor& encoder_hidden_states,
-                   bt::GpuTensor& out) {
+                   const bt::Tensor& encoder_hidden_states,
+                   bt::Tensor& out) {
     if (cfg_.time_cond_proj_dim > 0) {
         fail("forward: UNet built with time_cond_proj_dim>0 requires the "
              "guidance_scale_embedding overload");
@@ -617,12 +621,12 @@ void UNet::forward(const bt::GpuTensor& sample,
                   /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr, out);
 }
 
-void UNet::forward(const bt::GpuTensor& sample,
+void UNet::forward(const bt::Tensor& sample,
                    int H, int W,
                    float timestep,
-                   const bt::GpuTensor& encoder_hidden_states,
+                   const bt::Tensor& encoder_hidden_states,
                    const CrossAttnKVCache& xattn_cache,
-                   bt::GpuTensor& out) {
+                   bt::Tensor& out) {
     if (cfg_.time_cond_proj_dim > 0) {
         fail("forward: UNet built with time_cond_proj_dim>0 requires the "
              "guidance_scale_embedding overload");
@@ -637,13 +641,13 @@ void UNet::forward(const bt::GpuTensor& sample,
                   /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr, out);
 }
 
-void UNet::forward(const bt::GpuTensor& sample,
+void UNet::forward(const bt::Tensor& sample,
                    int H, int W,
                    float timestep,
                    float guidance_scale_embedding,
-                   const bt::GpuTensor& encoder_hidden_states,
+                   const bt::Tensor& encoder_hidden_states,
                    const CrossAttnKVCache& xattn_cache,
-                   bt::GpuTensor& out) {
+                   bt::Tensor& out) {
     if (cfg_.time_cond_proj_dim <= 0) {
         fail("forward(guidance_scale_embedding): UNet built with "
              "time_cond_proj_dim=0; LCM cond_proj path unavailable");
@@ -658,16 +662,16 @@ void UNet::forward(const bt::GpuTensor& sample,
                   /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr, out);
 }
 
-void UNet::forward_trace(const bt::GpuTensor& sample,
+void UNet::forward_trace(const bt::Tensor& sample,
                          int H, int W,
                          float timestep,
-                         const bt::GpuTensor& encoder_hidden_states,
-                         const std::vector<const bt::GpuTensor*>* attn_logit_biases,
+                         const bt::Tensor& encoder_hidden_states,
+                         const std::vector<const bt::Tensor*>* attn_logit_biases,
                          CrossAttnTrace* trace_out,
-                         bt::GpuTensor& out) {
+                         bt::Tensor& out) {
     if (cfg_.quantize_weights) {
         fail("forward_trace: INT8 quantize_weights not yet supported in trace "
-             "mode (brotensor::cross_attention_forward_with_attn_gpu is FP16 "
+             "mode (brotensor::cross_attention_forward_with_attn is FP16 "
              "only)");
     }
     if (cfg_.time_cond_proj_dim > 0) {
@@ -699,7 +703,7 @@ void UNet::forward_trace(const bt::GpuTensor& sample,
 
 namespace {
 
-// Local resolution: walks the UNet to find the GpuTensor* for a diffusers
+// Local resolution: walks the UNet to find the Tensor* for a diffusers
 // target path. Lives in the .cpp so it can touch private struct fields via
 // the UNet method `lora_target_` below.
 
@@ -726,7 +730,7 @@ bool match_dotted_int(const std::string& s, std::size_t& pos,
 
 }  // namespace
 
-bt::GpuTensor* UNet::resolve_transformer_target_(Transformer2D& tr,
+bt::Tensor* UNet::resolve_transformer_target_(Transformer2D& tr,
                                                   const std::string& sub) {
     if (sub == "proj_in")  return &tr.pi_W;
     if (sub == "proj_out") return &tr.po_W;
@@ -748,7 +752,7 @@ bt::GpuTensor* UNet::resolve_transformer_target_(Transformer2D& tr,
     return nullptr;
 }
 
-bt::GpuTensor* UNet::resolve_resnet_target_(Resnet& r, const std::string& tail) {
+bt::Tensor* UNet::resolve_resnet_target_(Resnet& r, const std::string& tail) {
     if (tail == "conv1")          return &r.W1;
     if (tail == "conv2")          return &r.W2;
     if (tail == "conv_shortcut")  return r.has_shortcut ? &r.Ws : nullptr;
@@ -756,7 +760,7 @@ bt::GpuTensor* UNet::resolve_resnet_target_(Resnet& r, const std::string& tail) 
     return nullptr;
 }
 
-bt::GpuTensor* UNet::lora_target_(const std::string& target_path) {
+bt::Tensor* UNet::lora_target_(const std::string& target_path) {
     // Branch on the top-level block segment.
     if (target_path.rfind("down_blocks.", 0) == 0) {
         std::size_t pos = 0;
@@ -857,11 +861,11 @@ u.transformers[static_cast<std::size_t>(j)],
 
 namespace {
 
-// Upload an arbitrary 2-D safetensors view (F16 or F32) as a FP16 GpuTensor
+// Upload an arbitrary 2-D safetensors view (F16 or F32) as a FP16 Tensor
 // of shape (rows, cols). Convolutional LoRA layouts (rank, C, kH, kW) flatten
 // to (rank, C*kH*kW) — the caller is responsible for picking rows/cols.
 void upload_view_fp16(const st::TensorView& v, int rows, int cols,
-                      bt::GpuTensor& dst, const std::string& tag) {
+                      bt::Tensor& dst, const std::string& tag) {
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
         throw std::runtime_error("unet::UNet: lora " + tag +
             ": expected F16 or F32, got " + st::dtype_name(v.dtype));
@@ -964,7 +968,7 @@ void UNet::apply_lora_delta(const std::string& target_path,
              "applied before quantisation/finalisation (the FP16 base weights "
              "are no longer in memory)");
     }
-    bt::GpuTensor* W = lora_target_(target_path);
+    bt::Tensor* W = lora_target_(target_path);
     if (!W) {
         fail("apply_lora_delta: unknown target '" + target_path + "'");
     }
@@ -977,20 +981,20 @@ void UNet::apply_lora_delta(const std::string& target_path,
     const LoraShape s = resolve_lora_shape(lora_down, lora_up, W_rows, W_cols,
                                            target_path);
 
-    // Upload as FP16 GpuTensors. lora_down: (rank, in_dim);
+    // Upload as FP16 Tensors. lora_down: (rank, in_dim);
     // lora_up: (out_dim, rank).
-    bt::GpuTensor down_g, up_g;
+    bt::Tensor down_g, up_g;
     upload_view_fp16(lora_down, s.rank,    s.in_dim, down_g, target_path + ".lora_down");
     upload_view_fp16(lora_up,   s.out_dim, s.rank,   up_g,   target_path + ".lora_up");
 
     // delta = up @ down — shape (out_dim, in_dim) = W shape.
-    bt::GpuTensor delta;
-    bt::matmul_gpu(up_g, down_g, delta);
-    bt::scale_inplace_gpu(delta, scale_total);
-    bt::add_inplace_gpu(*W, delta);
+    bt::Tensor delta;
+    bt::matmul(up_g, down_g, delta);
+    bt::scale_inplace(delta, scale_total);
+    bt::add_inplace(*W, delta);
 }
 
-void UNet::quantize_weight_inplace_(bt::GpuTensor& W_fp16, QWeight& q) {
+void UNet::quantize_weight_inplace_(bt::Tensor& W_fp16, QWeight& q) {
     if (W_fp16.size() == 0) return;             // nothing to quantise
     if (W_fp16.dtype != bt::Dtype::FP16) {
         fail("quantize_weight_inplace_: weight is not FP16");
@@ -1000,23 +1004,28 @@ void UNet::quantize_weight_inplace_(bt::GpuTensor& W_fp16, QWeight& q) {
 
     std::vector<uint16_t> host_fp16(static_cast<std::size_t>(out) *
                                     static_cast<std::size_t>(in));
-    bt::download_fp16(W_fp16, host_fp16.data());
+    W_fp16.copy_to_host_fp16(host_fp16.data());
 
     std::vector<int8_t> host_int8(host_fp16.size());
     std::vector<float>  host_scales(static_cast<std::size_t>(out));
     bt::quantize_int8_per_row_host(host_fp16.data(), out, in,
                                    host_int8.data(), host_scales.data());
 
-    // Upload INT8 weights.
-    q.W_int8.resize(out, in, bt::Dtype::INT8);
-    cudaMemcpy(q.W_int8.data, host_int8.data(),
-               static_cast<std::size_t>(out) * static_cast<std::size_t>(in),
-               cudaMemcpyHostToDevice);
-    // Upload FP32 scales.
-    bt::upload(host_scales.data(), out, 1, q.scales);
+    // Upload INT8 weights: brotensor has no from_host path for INT8, so
+    // stage the quantised bytes on the host then migrate to W_fp16's device.
+    {
+        bt::Tensor cpu_int8 = bt::Tensor::empty_on(
+            bt::Device::CPU, out, in, bt::Dtype::INT8);
+        std::memcpy(cpu_int8.host_raw_mut(), host_int8.data(),
+                    static_cast<std::size_t>(out) * static_cast<std::size_t>(in));
+        q.W_int8 = cpu_int8.to(W_fp16.device);
+    }
+    // Upload FP32 scales onto the same device as the INT8 weights.
+    q.scales = brotensor::Tensor::from_host_on(W_fp16.device,
+                                               host_scales.data(), out, 1);
 
     // Free original FP16 storage by replacing with default-constructed tensor.
-    W_fp16 = bt::GpuTensor();
+    W_fp16 = bt::Tensor();
 }
 
 void UNet::finalize_weights() {
@@ -1084,7 +1093,7 @@ std::vector<int> UNet::layer_strides() const {
     return {1,1, 2,2, 4,4, 8, 4,4,4, 2,2,2, 1,1,1};
 }
 
-void UNet::prime_xattn_cache(const bt::GpuTensor& ctx,
+void UNet::prime_xattn_cache(const bt::Tensor& ctx,
                              CrossAttnKVCache& cache) {
     if (conv_in_W_.size() == 0) fail("prime_xattn_cache: weights not loaded");
     const int n = num_xattn_blocks();
@@ -1096,13 +1105,13 @@ void UNet::prime_xattn_cache(const bt::GpuTensor& ctx,
         const AttnFFN& blk = t.blocks[0];
         CrossAttnKVCacheEntry& e = cache[static_cast<std::size_t>(idx++)];
         if (blk.Wk2_q.active()) {
-            bt::flash_attention_project_kv_int8w_fp16_gpu(
+            bt::flash_attention_project_kv_int8w_fp16(
                 ctx,
                 blk.Wk2_q.W_int8, blk.Wk2_q.scales, /*bk=*/nullptr,
                 blk.Wv2_q.W_int8, blk.Wv2_q.scales, /*bv=*/nullptr,
                 e.K, e.V);
         } else {
-            bt::flash_attention_project_kv_gpu(
+            bt::flash_attention_project_kv(
                 ctx,
                 blk.Wk2, /*bk=*/nullptr,
                 blk.Wv2, /*bv=*/nullptr,
@@ -1123,37 +1132,50 @@ void UNet::prime_xattn_cache(const bt::GpuTensor& ctx,
     if (idx != n) fail("internal: prime_xattn_cache traversal mismatch");
 }
 
-void UNet::forward_impl_(const bt::GpuTensor& sample,
+void UNet::forward_impl_(const bt::Tensor& sample,
                          int H, int W,
                          float timestep,
                          const float* gs_emb,
-                         const bt::GpuTensor& encoder_hidden_states,
+                         const bt::Tensor& encoder_hidden_states,
                          const CrossAttnKVCache* xattn_cache,
-                         const std::vector<const bt::GpuTensor*>* attn_logit_biases,
+                         const std::vector<const bt::Tensor*>* attn_logit_biases,
                          CrossAttnTrace* trace_out,
-                         bt::GpuTensor& out) {
+                         bt::Tensor& out) {
     if (conv_in_W_.size() == 0) fail("forward: weights not loaded");
 
     // ── Optional GPU profiling (env: UNET_PROF=1) ───────────────────────────
+    // CUDA-event based; compiled out entirely on non-CUDA builds.
+#ifdef BROTENSOR_HAS_CUDA
     const bool prof_enabled = (std::getenv("UNET_PROF") != nullptr);
+#else
+    const bool prof_enabled = false;
+#endif
     struct ProfBlock {
+#ifdef BROTENSOR_HAS_CUDA
         cudaEvent_t s{}, e{};
+#endif
         float ms_accum{0.0f};
     };
     ProfBlock pb_conv_in, pb_down_res, pb_down_xform, pb_down_samp;
     ProfBlock pb_mid, pb_up_res, pb_up_xform, pb_up_samp, pb_conv_out;
     ProfBlock* pb_all[] = {&pb_conv_in, &pb_down_res, &pb_down_xform, &pb_down_samp,
                            &pb_mid, &pb_up_res, &pb_up_xform, &pb_up_samp, &pb_conv_out};
+    (void)pb_all;
+#ifdef BROTENSOR_HAS_CUDA
     if (prof_enabled) {
         for (auto* p : pb_all) {
             cudaEventCreate(&p->s);
             cudaEventCreate(&p->e);
         }
     }
-    auto prof_begin = [&](ProfBlock& p) {
+#endif
+    auto prof_begin = [&]([[maybe_unused]] ProfBlock& p) {
+#ifdef BROTENSOR_HAS_CUDA
         if (prof_enabled) cudaEventRecord(p.s);
+#endif
     };
-    auto prof_end = [&](ProfBlock& p) {
+    auto prof_end = [&]([[maybe_unused]] ProfBlock& p) {
+#ifdef BROTENSOR_HAS_CUDA
         if (prof_enabled) {
             cudaEventRecord(p.e);
             cudaEventSynchronize(p.e);
@@ -1161,6 +1183,7 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
             cudaEventElapsedTime(&ms, p.s, p.e);
             p.ms_accum += ms;
         }
+#endif
     };
 
     const int nb      = static_cast<int>(cfg_.block_out_channels.size());
@@ -1169,7 +1192,7 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
     // ── 1. Build the time embedding ────────────────────────────────────────
     std::vector<uint16_t> sin_bits;
     compute_sinusoidal_emb_fp16(timestep, freq_dim_, sin_bits);
-    bt::upload_fp16(sin_bits.data(), 1, freq_dim_, freq_emb_);
+    freq_emb_ = brotensor::Tensor::from_host_fp16(sin_bits.data(), 1, freq_dim_);
 
     // LCM cond_proj: add projected guidance-scale embedding to the freq_emb
     // *before* linear_1. Matches diffusers' TimestepEmbedding.forward:
@@ -1182,22 +1205,22 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
         // sinusoidal embedding.
         std::vector<uint16_t> w_bits;
         compute_guidance_scale_emb_fp16((*gs_emb) * 1000.0f, cfg_.time_cond_proj_dim, w_bits);
-        bt::upload_fp16(w_bits.data(), 1, cfg_.time_cond_proj_dim, w_emb_);
+        w_emb_ = brotensor::Tensor::from_host_fp16(w_bits.data(), 1, cfg_.time_cond_proj_dim);
         // cond_proj is bias-free: pass nullptr.
-        bt::linear_forward_batched_fp16_gpu(te_cond_W_, /*bias=*/nullptr,
+        bt::linear_forward_batched_fp16(te_cond_W_, /*bias=*/nullptr,
                                             w_emb_, temb_cond_);
-        bt::add_inplace_gpu(freq_emb_, temb_cond_);
+        bt::add_inplace(freq_emb_, temb_cond_);
     }
 
-    bt::linear_forward_batched_fp16_gpu(te_l1_W_, &te_l1_b_, freq_emb_, temb_a_);
-    bt::silu_forward_gpu(temb_a_, temb_a_);
-    bt::linear_forward_batched_fp16_gpu(te_l2_W_, &te_l2_b_, temb_a_, temb_b_);
+    bt::linear_forward_batched_fp16(te_l1_W_, &te_l1_b_, freq_emb_, temb_a_);
+    bt::silu_forward(temb_a_, temb_a_);
+    bt::linear_forward_batched_fp16(te_l2_W_, &te_l2_b_, temb_a_, temb_b_);
     // Master temb in temb_b_. Pre-compute SiLU once for reuse across resblocks.
-    bt::silu_forward_gpu(temb_b_, temb_silu_);
+    bt::silu_forward(temb_b_, temb_silu_);
 
     // Skip stack: each entry is a deep copy of the residual stream at push time.
     // Down-path xattn caches advance xattn_idx (kept in scope for mid + up).
-    std::vector<bt::GpuTensor> skips;
+    std::vector<bt::Tensor> skips;
     skips.reserve(static_cast<std::size_t>(nb) *
                   static_cast<std::size_t>(cfg_.layers_per_block + 1));
     int Hc = H, Wc = W;
@@ -1205,10 +1228,10 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
     auto cache_at = [&](int i) -> const CrossAttnKVCacheEntry* {
         return xattn_cache ? &(*xattn_cache)[static_cast<std::size_t>(i)] : nullptr;
     };
-    auto trace_at = [&](int i) -> bt::GpuTensor* {
+    auto trace_at = [&](int i) -> bt::Tensor* {
         return trace_out ? &(*trace_out)[static_cast<std::size_t>(i)] : nullptr;
     };
-    auto bias_at = [&](int i) -> const bt::GpuTensor* {
+    auto bias_at = [&](int i) -> const bt::Tensor* {
         return attn_logit_biases ? (*attn_logit_biases)[static_cast<std::size_t>(i)]
                                  : nullptr;
     };
@@ -1281,13 +1304,13 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
         const int layers = cfg_.layers_per_block + 1;
         for (int j = 0; j < layers; ++j) {
             // Channel-axis concat with popped skip.
-            bt::GpuTensor skip = std::move(skips.back());
+            bt::Tensor skip = std::move(skips.back());
             skips.pop_back();
             const int C_x_now    = x_.cols / (Hc * Wc);
             const int C_skip_now = skip.cols / (Hc * Wc);
             const std::vector<int> C_parts    = {C_x_now, C_skip_now};
-            const std::vector<const bt::GpuTensor*> parts = {&x_, &skip};
-            bt::concat_nchw_channels_gpu(parts, /*N=*/1, Hc, Wc, C_parts, cat_buf_);
+            const std::vector<const bt::Tensor*> parts = {&x_, &skip};
+            bt::concat_nchw_channels(parts, /*N=*/1, Hc, Wc, C_parts, cat_buf_);
             std::swap(x_, cat_buf_);
 
             prof_begin(pb_up_res);
@@ -1306,7 +1329,7 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
         }
         if (u.has_upsampler) {
             prof_begin(pb_up_samp);
-            bt::upsample_nearest_2x_gpu(x_, 1, u.C_out, Hc, Wc, y_);
+            bt::upsample_nearest_2x(x_, 1, u.C_out, Hc, Wc, y_);
             if (u.upsampler.W_q.active()) {
                 apply_conv3x3_q_(u.upsampler.W_q, u.upsampler.b,
                                  u.C_out, u.C_out, 2 * Hc, 2 * Wc,
@@ -1324,10 +1347,10 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
 
     // ── 6. conv_norm_out -> SiLU -> conv_out ───────────────────────────────
     prof_begin(pb_conv_out);
-    bt::group_norm_forward_gpu(x_, norm_out_g_, norm_out_b_,
+    bt::group_norm_forward(x_, norm_out_g_, norm_out_b_,
                                1, first_C, Hc, Wc, cfg_.norm_num_groups, cfg_.eps,
                                y_);
-    bt::silu_forward_gpu(y_, y_);
+    bt::silu_forward(y_, y_);
     apply_conv3x3_(conv_out_W_, conv_out_b_,
                    first_C, cfg_.out_channels, Hc, Wc,
                    /*stride=*/1, /*pad=*/1, y_, out);
@@ -1344,10 +1367,12 @@ void UNet::forward_impl_(const bt::GpuTensor& sample,
             pb_conv_in.ms_accum + pb_down_res.ms_accum + pb_down_xform.ms_accum +
             pb_down_samp.ms_accum + pb_mid.ms_accum + pb_up_res.ms_accum +
             pb_up_xform.ms_accum + pb_up_samp.ms_accum + pb_conv_out.ms_accum);
+#ifdef BROTENSOR_HAS_CUDA
         for (auto* p : pb_all) {
             cudaEventDestroy(p->s);
             cudaEventDestroy(p->e);
         }
+#endif
     }
 }
 

@@ -29,7 +29,7 @@ const st::TensorView& need(const st::File& f, const std::string& key) {
 // Accepts F16 (used as-is) or F32 (converted host-side); SD1.5 full
 // checkpoints ship as F32.
 void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
-                        bt::GpuTensor& dst, const char* name) {
+                        bt::Tensor& dst, const char* name) {
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
         fail(std::string(name) + ": expected F16 or F32, got " + st::dtype_name(v.dtype));
     }
@@ -194,10 +194,10 @@ void Decoder::load_weights(const st::File& f, const std::string& prefix) {
 // ─── per-block forward helpers ─────────────────────────────────────────────
 
 void Decoder::apply_resnet_(const Resnet& r, int H, int W,
-                            bt::GpuTensor& x, bt::GpuTensor& tmp) {
-    const bt::GpuTensor* skip_W = r.has_shortcut ? &r.short_W : nullptr;
-    const bt::GpuTensor* skip_b = r.has_shortcut ? &r.short_b : nullptr;
-    bt::resblock_forward_gpu(x,
+                            bt::Tensor& x, bt::Tensor& tmp) {
+    const bt::Tensor* skip_W = r.has_shortcut ? &r.short_W : nullptr;
+    const bt::Tensor* skip_b = r.has_shortcut ? &r.short_b : nullptr;
+    bt::resblock_forward(x,
                              r.norm1_g, r.norm1_b,
                              r.conv1_W, &r.conv1_b,
                              /*t_emb_shift=*/nullptr,
@@ -211,40 +211,40 @@ void Decoder::apply_resnet_(const Resnet& r, int H, int W,
 }
 
 void Decoder::apply_attention_(const Attention& a, int H, int W,
-                               bt::GpuTensor& x) {
+                               bt::Tensor& x) {
     // GroupNorm in NCHW.
-    bt::group_norm_forward_gpu(x, a.gn_g, a.gn_b,
+    bt::group_norm_forward(x, a.gn_g, a.gn_b,
                                1, a.C, H, W, cfg_.norm_num_groups, cfg_.eps,
                                ln_nchw_);
     // NCHW → (H*W, C) sequence.
-    bt::nchw_to_sequence_gpu(ln_nchw_, 1, a.C, H, W, seq_);
+    bt::nchw_to_sequence(ln_nchw_, 1, a.C, H, W, seq_);
     // Fused Q/K/V/O projections + non-causal single-head self-attention.
-    bt::flash_attention_qkvo_forward_gpu(
+    bt::flash_attention_qkvo_forward(
         seq_, /*Ctx=*/nullptr,
         a.Wq, &a.bq, a.Wk, &a.bk, a.Wv, &a.bv, a.Wo, &a.bo,
         /*d_mask=*/nullptr, cfg_.num_attention_heads, /*causal=*/false,
         proj_seq_);
     // Sequence → NCHW.
-    bt::sequence_to_nchw_gpu(proj_seq_, 1, a.C, H, W, attn_nchw_);
+    bt::sequence_to_nchw(proj_seq_, 1, a.C, H, W, attn_nchw_);
     // Residual add.
-    bt::add_inplace_gpu(x, attn_nchw_);
+    bt::add_inplace(x, attn_nchw_);
 }
 
 void Decoder::apply_upsample_(const UpsampleConv& u, int C, int H, int W,
-                              bt::GpuTensor& x, bt::GpuTensor& tmp) {
+                              bt::Tensor& x, bt::Tensor& tmp) {
     // 2x nearest-neighbour upsample, then 3x3 same-channel conv.
-    bt::upsample_nearest_2x_gpu(x, 1, C, H, W, tmp);
-    bt::conv2d_forward_gpu(tmp, u.W, &u.b,
+    bt::upsample_nearest_2x(x, 1, C, H, W, tmp);
+    bt::conv2d_forward(tmp, u.W, &u.b,
                            /*N=*/1, /*C_in=*/C, /*H=*/2 * H, /*W=*/2 * W,
                            /*C_out=*/C, /*kH=*/3, /*kW=*/3,
                            /*stride=*/1, 1, /*pad=*/1, 1, /*dil=*/1, 1,
                            x);
 }
 
-void Decoder::apply_conv3x3_(const bt::GpuTensor& W, const bt::GpuTensor& b,
+void Decoder::apply_conv3x3_(const bt::Tensor& W, const bt::Tensor& b,
                              int C_in, int C_out, int H, int W_,
-                             bt::GpuTensor& x_in, bt::GpuTensor& x_out) {
-    bt::conv2d_forward_gpu(x_in, W, &b,
+                             bt::Tensor& x_in, bt::Tensor& x_out) {
+    bt::conv2d_forward(x_in, W, &b,
                            /*N=*/1, C_in, H, W_,
                            C_out, /*kH=*/3, /*kW=*/3,
                            1, 1, /*pad=*/1, 1, 1, 1,
@@ -253,9 +253,9 @@ void Decoder::apply_conv3x3_(const bt::GpuTensor& W, const bt::GpuTensor& b,
 
 // ─── decode ────────────────────────────────────────────────────────────────
 
-void Decoder::decode(const bt::GpuTensor& latent,
+void Decoder::decode(const bt::Tensor& latent,
                      int H_lat, int W_lat,
-                     bt::GpuTensor& out) {
+                     bt::Tensor& out) {
     if (conv_in_W_.size() == 0) fail("decode: weights not loaded");
 
     const int first_C = cfg_.block_out_channels.front();
@@ -264,7 +264,7 @@ void Decoder::decode(const bt::GpuTensor& latent,
     // 1. Scale (latent /= scaling_factor).
     x_ = latent.clone();
     if (cfg_.scaling_factor != 1.0f) {
-        bt::scale_inplace_gpu(x_, 1.0f / cfg_.scaling_factor);
+        bt::scale_inplace(x_, 1.0f / cfg_.scaling_factor);
     }
 
     // 1b. post_quant_conv: 1x1 conv (in_channels -> in_channels). Applied by
@@ -273,7 +273,7 @@ void Decoder::decode(const bt::GpuTensor& latent,
     // "decoder." subtree), and skipping it produces images that match the
     // decoder output bit-for-bit but render with severe block/color artifacts.
     if (has_post_quant_conv_) {
-        bt::conv2d_forward_gpu(x_, post_quant_W_, &post_quant_b_,
+        bt::conv2d_forward(x_, post_quant_W_, &post_quant_b_,
                                /*N=*/1, cfg_.in_channels, H_lat, W_lat,
                                cfg_.in_channels, /*kH=*/1, /*kW=*/1,
                                1, 1, /*pad=*/0, 0, 1, 1,
@@ -306,10 +306,10 @@ void Decoder::decode(const bt::GpuTensor& latent,
     }
 
     // 5. conv_norm_out + SiLU.
-    bt::group_norm_forward_gpu(x_, norm_out_g_, norm_out_b_,
+    bt::group_norm_forward(x_, norm_out_g_, norm_out_b_,
                                1, first_C, H, W, cfg_.norm_num_groups, cfg_.eps,
                                y_);
-    bt::silu_forward_gpu(y_, y_);
+    bt::silu_forward(y_, y_);
 
     // 6. conv_out: first_C -> out_channels.
     apply_conv3x3_(conv_out_W_, conv_out_b_,

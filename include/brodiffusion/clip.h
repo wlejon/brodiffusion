@@ -18,7 +18,6 @@
 // FP32 weights, convert host-side before upload (brotensor provides the IEEE
 // 754 binary16 helpers).
 
-#include "brotensor/device_buffer.h"
 #include "brotensor/tensor.h"
 
 #include <cstdint>
@@ -74,10 +73,10 @@ public:
     // Forward pass on a length-L sequence of int32 token IDs. L must equal
     // cfg.max_position (CLIP is fixed-length).
     //   ids: host pointer to L int32 token IDs in [0, vocab_size).
-    //   out: (L, hidden_dim) FP16 GpuTensor, resized as needed.
-    // brotensor::cuda_init() must have been called once before any forward.
-    // The caller is responsible for cuda_sync() before reading `out` to host.
-    void forward(const int32_t* ids, brotensor::GpuTensor& out);
+    //   out: (L, hidden_dim) FP16 Tensor, resized as needed.
+    // brotensor::init() must have been called once before any forward.
+    // The caller is responsible for sync_all() before reading `out` to host.
+    void forward(const int32_t* ids, brotensor::Tensor& out);
 
     const TextEncoderConfig& config() const { return cfg_; }
 
@@ -94,28 +93,29 @@ public:
 
 private:
     struct Layer {
-        brotensor::GpuTensor ln1_gamma, ln1_beta;
-        brotensor::GpuTensor Wq, bq, Wk, bk, Wv, bv, Wo, bo;
-        brotensor::GpuTensor ln2_gamma, ln2_beta;
-        brotensor::GpuTensor fc1_W, fc1_b, fc2_W, fc2_b;
+        brotensor::Tensor ln1_gamma, ln1_beta;
+        brotensor::Tensor Wq, bq, Wk, bk, Wv, bv, Wo, bo;
+        brotensor::Tensor ln2_gamma, ln2_beta;
+        brotensor::Tensor fc1_W, fc1_b, fc2_W, fc2_b;
     };
 
     TextEncoderConfig cfg_;
 
     // Weights.
-    brotensor::GpuTensor token_embed_;     // (V, D)
-    brotensor::GpuTensor position_embed_;  // (P, D)
+    brotensor::Tensor token_embed_;     // (V, D)
+    brotensor::Tensor position_embed_;  // (P, D)
     std::vector<Layer>   layers_;
-    brotensor::GpuTensor final_gamma_, final_beta_;
+    brotensor::Tensor final_gamma_, final_beta_;
 
     // Per-call scratch (kept alive across calls to avoid realloc).
-    brotensor::DeviceBuffer<int32_t> ids_dev_;
-    brotensor::DeviceBuffer<int32_t> positions_dev_;   // [0..P-1] uploaded once
-    brotensor::GpuTensor tok_emb_, pos_emb_;
-    brotensor::GpuTensor x_;                            // residual stream
-    brotensor::GpuTensor ln_out_;
-    brotensor::GpuTensor proj_out_;
-    brotensor::GpuTensor ffn_mid_, ffn_act_, ffn_out_;
+    // Device-resident INT32 token-id / position-id buffers.
+    brotensor::Tensor ids_dev_;
+    brotensor::Tensor positions_dev_;   // [0..P-1] uploaded once
+    brotensor::Tensor tok_emb_, pos_emb_;
+    brotensor::Tensor x_;                            // residual stream
+    brotensor::Tensor ln_out_;
+    brotensor::Tensor proj_out_;
+    brotensor::Tensor ffn_mid_, ffn_act_, ffn_out_;
 };
 
 }  // namespace brodiffusion::clip

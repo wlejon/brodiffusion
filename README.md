@@ -39,17 +39,28 @@ FP16 weights with an FP32 master copy lives in `brodiffusion/optim.h`.
 
 ## Build
 
-brotensor requires exactly one GPU backend at configure time.
+brotensor always builds its CPU backend; CUDA and Metal are additive and
+mutually exclusive. brodiffusion forwards the choice:
 
 ```bash
-# CUDA (NVIDIA, any OS)
+# CUDA (NVIDIA, any OS) — the supported inference path.
 cmake -B build -DBROTENSOR_WITH_CUDA=ON
 cmake --build build --config Release
 
 # Metal (Apple)
 cmake -B build -DBROTENSOR_WITH_METAL=ON
 cmake --build build --config Release
+
+# CPU-only — configures and builds with no GPU backend.
+cmake -B build
+cmake --build build --config Release
 ```
+
+A CPU-only build compiles, links, and runs non-diffusion code (tokenizer,
+safetensors I/O, scheduler math), but the diffusion path itself is GPU-only
+in brotensor — conv2d / group_norm / attention have no CPU kernels, and
+brodiffusion's own fused CUDA kernels are replaced by throwing stubs. Use
+the CUDA build for actual image generation.
 
 ## Layout
 

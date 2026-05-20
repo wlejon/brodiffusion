@@ -101,7 +101,7 @@ void Pipeline::apply_lora(const safetensors::File& f, float scale) {
     }
 }
 
-void Pipeline::encode_prompt_(std::string_view prompt, bt::GpuTensor& out) {
+void Pipeline::encode_prompt_(std::string_view prompt, bt::Tensor& out) {
     std::vector<std::int32_t> ids = tokenizer_.encode(prompt);
     if (static_cast<int>(ids.size()) != cfg_.text_encoder.max_position) {
         fail("tokenizer returned " + std::to_string(ids.size()) +
@@ -160,7 +160,7 @@ PipelineState Pipeline::prime(std::string_view prompt,
     for (int i = 0; i < n_lat; ++i) {
         noise[i] = bt::fp32_to_fp16_bits(sigma * nrm(state.rng));
     }
-    bt::upload_fp16(noise.data(), 1, n_lat, state.latent);
+    state.latent = brotensor::Tensor::from_host_fp16(noise.data(), 1, n_lat);
 
     // 3. Set the timestep schedule (lives on the scheduler — shared across
     // all branches).
@@ -174,7 +174,7 @@ PipelineState Pipeline::prime(std::string_view prompt,
 
 void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
                          unet::UNet::CrossAttnTrace* trace_out,
-                         const std::vector<const bt::GpuTensor*>*
+                         const std::vector<const bt::Tensor*>*
                              attn_logit_biases) {
     if (state.step_index >= state.n_steps) {
         fail("step_once: step_index (" + std::to_string(state.step_index) +
@@ -227,9 +227,9 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
     }
     // CFG combine (DDIM only; LCM has no uncond branch).
     if (do_cfg) {
-        bt::scale_inplace_gpu(noise_pred_cond_, opts.guidance_scale);
-        bt::scale_inplace_gpu(noise_pred_uncond_, 1.0f - opts.guidance_scale);
-        bt::add_inplace_gpu(noise_pred_cond_, noise_pred_uncond_);
+        bt::scale_inplace(noise_pred_cond_, opts.guidance_scale);
+        bt::scale_inplace(noise_pred_uncond_, 1.0f - opts.guidance_scale);
+        bt::add_inplace(noise_pred_cond_, noise_pred_uncond_);
     }
 
     // ── Scheduler step ────────────────────────────────────────────────────
@@ -239,7 +239,7 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
         for (int k = 0; k < n_lat; ++k) {
             bits[k] = bt::fp32_to_fp16_bits(nrm(state.rng));
         }
-        bt::upload_fp16(bits.data(), 1, n_lat, noise_step_);
+        noise_step_ = brotensor::Tensor::from_host_fp16(bits.data(), 1, n_lat);
         std::get<scheduler::LCM>(scheduler_).step(
             noise_pred_cond_, i, state.latent, noise_step_, scratch_);
     } else {
@@ -251,11 +251,11 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
 
 std::vector<float> Pipeline::decode(const PipelineState& state) {
     vae_.decode(state.latent, state.H_lat, state.W_lat, decoded_);
-    bt::cuda_sync();
+    bt::sync_all();
     const int n_img = cfg_.vae.out_channels *
                        (state.H_lat * 8) * (state.W_lat * 8);
     std::vector<std::uint16_t> dec_bits(static_cast<std::size_t>(n_img));
-    bt::download_fp16(decoded_, dec_bits.data());
+    decoded_.copy_to_host_fp16(dec_bits.data());
     std::vector<float> out(static_cast<std::size_t>(n_img));
     for (int i = 0; i < n_img; ++i) {
         out[static_cast<std::size_t>(i)] =
@@ -274,7 +274,7 @@ std::vector<float> Pipeline::generate(std::string_view prompt,
     for (int i = 0; i < state.n_steps; ++i) {
         auto t0 = clk::now();
         step_once(state, opts, /*trace_out=*/nullptr);
-        if (prof) bt::cuda_sync();
+        if (prof) bt::sync_all();
         auto t1 = clk::now();
         unet_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
     }

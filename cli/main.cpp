@@ -163,7 +163,7 @@ int run_txt2img(int argc, char** argv) {
     if (height_s)opts.height = std::atoi(height_s);
     if (seed_s)  opts.seed = static_cast<std::uint64_t>(std::strtoull(seed_s, nullptr, 10));
 
-    brotensor::cuda_init();
+    brotensor::init();
 
     auto tok = clip::Tokenizer::load(vocab_path, merges_path);
 
@@ -268,7 +268,7 @@ int main(int argc, char** argv) {
             const int iters  = iters_s  ? std::atoi(iters_s)  : 5;
             const int warmup = warmup_s ? std::atoi(warmup_s) : 1;
 
-            brotensor::cuda_init();
+            brotensor::init();
             auto tok = clip::Tokenizer::load(vocab_path, merges_path);
             pl::PipelineConfig cfg;
             if (use_lcm) {

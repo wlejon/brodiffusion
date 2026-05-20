@@ -4,12 +4,12 @@
 //   1. fused_linear_geglu:
 //        Y(B, D) = a * gelu_exact(g)
 //        where T(B, 2D) = X @ W^T + b, a = T[:, :D], g = T[:, D:].
-//      Replaces (linear_forward_batched_fp16_gpu + geglu_exact_forward_gpu)
+//      Replaces (linear_forward_batched_fp16 + geglu_exact_forward)
 //      i.e. skips materialising the (B, 2D) FF1 intermediate (~10 MB at the
 //      bottom level), which is a real memory pass on the 4090.
 //
 //   2. add_inplace_fp16_vec:
-//        Vectorised FP16 elementwise add. brotensor's add_inplace_gpu FP16
+//        Vectorised FP16 elementwise add. brotensor's add_inplace FP16
 //        path goes through __half2float per element; we use __half2 adds and
 //        int4 vector loads, which matters because the transformer block does
 //        3 of these per call (self-attn residual, cross-attn residual, FF
@@ -19,6 +19,8 @@
 // SD1.5 inference shape constraints documented in the public header.
 
 #include "brodiffusion/fused_transformer.h"
+#include "brodiffusion/detail/cuda_check.cuh"
+#include "brodiffusion/detail/device.h"
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -300,10 +302,10 @@ __global__ void add_inplace_fp16_vec_kernel(__half* __restrict__ Y,
 } // anonymous namespace
 
 
-void fused_linear_geglu(const bt::GpuTensor& X,
-                        const bt::GpuTensor& W,
-                        const bt::GpuTensor& b,
-                        bt::GpuTensor& Y) {
+void fused_linear_geglu(const bt::Tensor& X,
+                        const bt::Tensor& W,
+                        const bt::Tensor& b,
+                        bt::Tensor& Y) {
     if (X.dtype != bt::Dtype::FP16 || W.dtype != bt::Dtype::FP16 ||
         b.dtype != bt::Dtype::FP16) {
         throw std::runtime_error("fused_linear_geglu: all inputs must be FP16");
@@ -321,9 +323,7 @@ void fused_linear_geglu(const bt::GpuTensor& X,
         throw std::runtime_error("fused_linear_geglu: bias length must equal W.rows");
     }
     const int D_out = two_D / 2;
-    if (Y.rows != B || Y.cols != D_out || Y.dtype != bt::Dtype::FP16) {
-        Y.resize(B, D_out, bt::Dtype::FP16);
-    }
+    detail::resize_like(Y, B, D_out, bt::Dtype::FP16, X.device);
     if (B == 0 || D_out == 0) return;
 
     // The vectorised WMMA path needs K and N_W (=2*D_out) multiples of 8.
@@ -335,19 +335,19 @@ void fused_linear_geglu(const bt::GpuTensor& X,
     dim3 block(THREADS_PER_CTA);
     dim3 grid((D_out + BN - 1) / BN, (B + BM - 1) / BM);
     fused_linear_geglu_kernel<<<grid, block>>>(
-        reinterpret_cast<const __half*>(X.data_fp16()),
-        reinterpret_cast<const __half*>(W.data_fp16()),
-        reinterpret_cast<const __half*>(b.data_fp16()),
-        reinterpret_cast<__half*>(Y.data_fp16()),
+        reinterpret_cast<const __half*>(X.data),
+        reinterpret_cast<const __half*>(W.data),
+        reinterpret_cast<const __half*>(b.data),
+        reinterpret_cast<__half*>(Y.data),
         B, D_out, D_in);
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
 }
 
-void fused_linear_geglu(const bt::GpuTensor& X,
-                        const bt::GpuTensor& W_int8,
-                        const bt::GpuTensor& W_scales,
-                        const bt::GpuTensor& b,
-                        bt::GpuTensor& Y) {
+void fused_linear_geglu(const bt::Tensor& X,
+                        const bt::Tensor& W_int8,
+                        const bt::Tensor& W_scales,
+                        const bt::Tensor& b,
+                        bt::Tensor& Y) {
     if (X.dtype != bt::Dtype::FP16 || b.dtype != bt::Dtype::FP16) {
         throw std::runtime_error("fused_linear_geglu(int8w): X and b must be FP16");
     }
@@ -370,16 +370,14 @@ void fused_linear_geglu(const bt::GpuTensor& X,
         throw std::runtime_error("fused_linear_geglu(int8w): bias length != W.rows");
     }
     const int D_out = two_D / 2;
-    if (Y.rows != B || Y.cols != D_out || Y.dtype != bt::Dtype::FP16) {
-        Y.resize(B, D_out, bt::Dtype::FP16);
-    }
+    detail::resize_like(Y, B, D_out, bt::Dtype::FP16, X.device);
     if (B == 0 || D_out == 0) return;
 
     // (B, in) @ dequant(W_int8)^T + b -> tmp (B, 2*D_out) FP16.
-    thread_local static bt::GpuTensor ff1_tmp;
-    bt::linear_forward_batched_int8w_fp16_gpu(W_int8, W_scales, &b, X, ff1_tmp);
+    thread_local static bt::Tensor ff1_tmp;
+    bt::linear_forward_batched_int8w_fp16(W_int8, W_scales, &b, X, ff1_tmp);
     // GEGLU (exact GELU, matches SD1.5 / diffusers default).
-    bt::geglu_exact_forward_gpu(ff1_tmp, Y);
+    bt::geglu_exact_forward(ff1_tmp, Y);
 }
 
 namespace {
@@ -398,7 +396,7 @@ __global__ void add_inplace_row_bias_fp16_kernel(__half* __restrict__ Y,
 
 }  // namespace
 
-void add_inplace_row_bias_fp16(bt::GpuTensor& Y, const bt::GpuTensor& bias) {
+void add_inplace_row_bias_fp16(bt::Tensor& Y, const bt::Tensor& bias) {
     if (Y.dtype != bt::Dtype::FP16 || bias.dtype != bt::Dtype::FP16) {
         throw std::runtime_error("add_inplace_row_bias_fp16: tensors must be FP16");
     }
@@ -409,13 +407,13 @@ void add_inplace_row_bias_fp16(bt::GpuTensor& Y, const bt::GpuTensor& bias) {
     constexpr int kThreads = 256;
     const int blocks = (Y.cols + kThreads - 1) / kThreads;
     add_inplace_row_bias_fp16_kernel<<<blocks, kThreads>>>(
-        reinterpret_cast<__half*>(Y.data_fp16()),
-        reinterpret_cast<const __half*>(bias.data_fp16()),
+        reinterpret_cast<__half*>(Y.data),
+        reinterpret_cast<const __half*>(bias.data),
         Y.rows, Y.cols);
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
 }
 
-void add_inplace_fp16_vec(bt::GpuTensor& Y, const bt::GpuTensor& X) {
+void add_inplace_fp16_vec(bt::Tensor& Y, const bt::Tensor& X) {
     if (Y.dtype != bt::Dtype::FP16 || X.dtype != bt::Dtype::FP16) {
         throw std::runtime_error("add_inplace_fp16_vec: both tensors must be FP16");
     }
@@ -424,7 +422,7 @@ void add_inplace_fp16_vec(bt::GpuTensor& Y, const bt::GpuTensor& X) {
     }
     const int n = Y.size();
     if (n == 0) return;
-    // Need 16-byte alignment for the int4 path. GpuTensor allocations from
+    // Need 16-byte alignment for the int4 path. Tensor allocations from
     // cudaMalloc are 256-byte aligned, so this always holds.
     constexpr int kThreads = 256;
     const int n_vec = n / 8;
@@ -433,9 +431,9 @@ void add_inplace_fp16_vec(bt::GpuTensor& Y, const bt::GpuTensor& X) {
     if (blocks < 1) blocks = 1;
     if (blocks > 65535) blocks = 65535;
     add_inplace_fp16_vec_kernel<<<blocks, kThreads>>>(
-        reinterpret_cast<__half*>(Y.data_fp16()),
-        reinterpret_cast<const __half*>(X.data_fp16()), n);
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        reinterpret_cast<__half*>(Y.data),
+        reinterpret_cast<const __half*>(X.data), n);
+    BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace brodiffusion

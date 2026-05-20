@@ -101,16 +101,16 @@ private:
 
     // Projection weights. Stored on GPU as FP16; same layout as a linear
     // layer's W (rows=out, cols=in).
-    brotensor::GpuTensor visual_proj_W_;   // (P, vision_D)
-    brotensor::GpuTensor text_proj_W_;     // (P, text_D)
+    brotensor::Tensor visual_proj_W_;   // (P, vision_D)
+    brotensor::Tensor text_proj_W_;     // (P, text_D)
 
     // Scratch.
-    brotensor::GpuTensor pixels_dev_;      // (1, 3*224*224) FP16
-    brotensor::GpuTensor img_cls_;         // (1, vision_D)
-    brotensor::GpuTensor img_proj_;        // (1, P)
-    brotensor::GpuTensor text_hidden_;     // (L, text_D) — TextEncoder output
-    brotensor::GpuTensor text_pooled_;     // (1, text_D)
-    brotensor::GpuTensor text_proj_;       // (1, P)
+    brotensor::Tensor pixels_dev_;      // (1, 3*224*224) FP16
+    brotensor::Tensor img_cls_;         // (1, vision_D)
+    brotensor::Tensor img_proj_;        // (1, P)
+    brotensor::Tensor text_hidden_;     // (L, text_D) — TextEncoder output
+    brotensor::Tensor text_pooled_;     // (1, text_D)
+    brotensor::Tensor text_proj_;       // (1, P)
 
     // Cached, L2-normalised, length projection_dim.
     std::vector<float> text_feat_;

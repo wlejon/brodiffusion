@@ -1,5 +1,6 @@
 #include "brodiffusion/clip_score.h"
 #include "brodiffusion/safetensors.h"
+#include "brodiffusion/detail/device.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -25,7 +26,7 @@ namespace {
 }
 
 void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
-                         bt::GpuTensor& dst, const char* name) {
+                         bt::Tensor& dst, const char* name) {
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
         fail(std::string(name) + ": expected F16 or F32, got " +
              st::dtype_name(v.dtype));
@@ -105,18 +106,18 @@ void CLIPScorer::set_prompt(std::string_view prompt) {
     text_enc_.forward(ids.data(), text_hidden_);  // (L, Dt) FP16
 
     // Pool: copy row eos_idx into text_pooled_ (1, Dt).
-    text_pooled_.resize(1, Dt, bt::Dtype::FP16);
-    bt::copy_d2d_gpu(text_hidden_, /*src_off=*/eos_idx * Dt,
+    detail::resize_like(text_pooled_, 1, Dt, bt::Dtype::FP16, text_hidden_.device);
+    bt::copy_d2d(text_hidden_, /*src_off=*/eos_idx * Dt,
                      text_pooled_,  /*dst_off=*/0,
                      /*count=*/Dt);
 
     // Project to shared space: (1, P) = text_pooled_ @ text_proj_W_.T
-    bt::linear_forward_batched_fp16_gpu(text_proj_W_, /*bias=*/nullptr,
+    bt::linear_forward_batched_fp16(text_proj_W_, /*bias=*/nullptr,
                                         text_pooled_, text_proj_);
 
-    bt::cuda_sync();
+    bt::sync_all();
     std::vector<std::uint16_t> bits(static_cast<std::size_t>(P));
-    bt::download_fp16(text_proj_, bits.data());
+    text_proj_.copy_to_host_fp16(bits.data());
 
     text_feat_.assign(static_cast<std::size_t>(P), 0.0f);
     for (int i = 0; i < P; ++i) {
@@ -136,16 +137,16 @@ float CLIPScorer::score(const std::vector<float>& image, int H, int W) {
     const int C  = image_enc_.config().in_channels;
     const int P  = cfg_.projection_dim;
 
-    bt::upload_fp16(pixel_bits.data(), 1, C * S * S, pixels_dev_);
+    pixels_dev_ = brotensor::Tensor::from_host_fp16(pixel_bits.data(), 1, C * S * S);
     image_enc_.forward(pixels_dev_, img_cls_);
 
     // (1, P) = img_cls_ @ visual_proj_W_.T
-    bt::linear_forward_batched_fp16_gpu(visual_proj_W_, /*bias=*/nullptr,
+    bt::linear_forward_batched_fp16(visual_proj_W_, /*bias=*/nullptr,
                                         img_cls_, img_proj_);
 
-    bt::cuda_sync();
+    bt::sync_all();
     std::vector<std::uint16_t> bits(static_cast<std::size_t>(P));
-    bt::download_fp16(img_proj_, bits.data());
+    img_proj_.copy_to_host_fp16(bits.data());
 
     std::vector<float> img_feat(static_cast<std::size_t>(P), 0.0f);
     for (int i = 0; i < P; ++i) {

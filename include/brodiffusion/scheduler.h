@@ -54,12 +54,12 @@ public:
     //   noise_pred: (1, C*H*W) FP16 — UNet output ε̂.
     //   step_index: index into timesteps() (0 = first step).
     //   sample:    (1, C*H*W) FP16 — current x_t, overwritten in place with x_{t-1}.
-    //   scratch:   FP16 GpuTensor reused across steps; resized as needed.
-    // Caller is responsible for cuda_sync() before reading sample to host.
-    void step(const brotensor::GpuTensor& noise_pred,
+    //   scratch:   FP16 Tensor reused across steps; resized as needed.
+    // Caller is responsible for sync_all() before reading sample to host.
+    void step(const brotensor::Tensor& noise_pred,
               int step_index,
-              brotensor::GpuTensor& sample,
-              brotensor::GpuTensor& scratch) const;
+              brotensor::Tensor& sample,
+              brotensor::Tensor& scratch) const;
 
     const DDIMConfig& config() const { return cfg_; }
 

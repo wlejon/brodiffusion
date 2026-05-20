@@ -83,30 +83,30 @@ public:
     // Decode latent → image.
     //   latent: (1, in_channels * H_lat * W_lat) FP16, NCHW with N=1.
     //   out:    (1, out_channels * 8*H_lat * 8*W_lat) FP16, resized as needed.
-    // Caller is responsible for cuda_sync() before reading.
-    void decode(const brotensor::GpuTensor& latent,
+    // Caller is responsible for sync_all() before reading.
+    void decode(const brotensor::Tensor& latent,
                 int H_lat, int W_lat,
-                brotensor::GpuTensor& out);
+                brotensor::Tensor& out);
 
     const DecoderConfig& config() const { return cfg_; }
 
 private:
     struct Resnet {
-        brotensor::GpuTensor norm1_g, norm1_b;
-        brotensor::GpuTensor conv1_W, conv1_b;
-        brotensor::GpuTensor norm2_g, norm2_b;
-        brotensor::GpuTensor conv2_W, conv2_b;
-        brotensor::GpuTensor short_W, short_b;
+        brotensor::Tensor norm1_g, norm1_b;
+        brotensor::Tensor conv1_W, conv1_b;
+        brotensor::Tensor norm2_g, norm2_b;
+        brotensor::Tensor conv2_W, conv2_b;
+        brotensor::Tensor short_W, short_b;
         bool has_shortcut = false;
         int  C_in = 0, C_out = 0;
     };
     struct Attention {
-        brotensor::GpuTensor gn_g, gn_b;
-        brotensor::GpuTensor Wq, bq, Wk, bk, Wv, bv, Wo, bo;
+        brotensor::Tensor gn_g, gn_b;
+        brotensor::Tensor Wq, bq, Wk, bk, Wv, bv, Wo, bo;
         int C = 0;
     };
     struct UpsampleConv {
-        brotensor::GpuTensor W, b;  // 3x3 same-channel
+        brotensor::Tensor W, b;  // 3x3 same-channel
     };
     struct UpBlock {
         std::vector<Resnet> resnets;
@@ -119,15 +119,15 @@ private:
                       const std::string& prefix,
                       int C_in, int C_out, Resnet& r);
     void apply_resnet_(const Resnet& r, int H, int W,
-                       brotensor::GpuTensor& x, brotensor::GpuTensor& tmp);
+                       brotensor::Tensor& x, brotensor::Tensor& tmp);
     void apply_attention_(const Attention& a, int H, int W,
-                          brotensor::GpuTensor& x);
+                          brotensor::Tensor& x);
     void apply_upsample_(const UpsampleConv& u, int C, int H, int W,
-                         brotensor::GpuTensor& x, brotensor::GpuTensor& tmp);
-    void apply_conv3x3_(const brotensor::GpuTensor& W,
-                        const brotensor::GpuTensor& b,
+                         brotensor::Tensor& x, brotensor::Tensor& tmp);
+    void apply_conv3x3_(const brotensor::Tensor& W,
+                        const brotensor::Tensor& b,
                         int C_in, int C_out, int H, int W_,
-                        brotensor::GpuTensor& x_in, brotensor::GpuTensor& x_out);
+                        brotensor::Tensor& x_in, brotensor::Tensor& x_out);
 
     DecoderConfig cfg_;
 
@@ -136,19 +136,19 @@ private:
     // a 1x1 conv (in_channels -> in_channels) applied between the latent scale
     // and the decoder proper. Optional: legacy/encoder-less checkpoints may
     // omit it (has_post_quant_conv_ == false).
-    brotensor::GpuTensor post_quant_W_, post_quant_b_;
+    brotensor::Tensor post_quant_W_, post_quant_b_;
     bool                 has_post_quant_conv_ = false;
-    brotensor::GpuTensor conv_in_W_,  conv_in_b_;
+    brotensor::Tensor conv_in_W_,  conv_in_b_;
     Resnet               mid_res0_,   mid_res1_;
     Attention            mid_attn_;
     std::vector<UpBlock> up_blocks_;
-    brotensor::GpuTensor norm_out_g_, norm_out_b_;
-    brotensor::GpuTensor conv_out_W_, conv_out_b_;
+    brotensor::Tensor norm_out_g_, norm_out_b_;
+    brotensor::Tensor conv_out_W_, conv_out_b_;
 
     // Scratch (re-used across decode calls).
-    brotensor::GpuTensor x_, y_;      // ping-pong residual stream
-    brotensor::GpuTensor seq_, proj_seq_, attn_nchw_;
-    brotensor::GpuTensor ln_nchw_;
+    brotensor::Tensor x_, y_;      // ping-pong residual stream
+    brotensor::Tensor seq_, proj_seq_, attn_nchw_;
+    brotensor::Tensor ln_nchw_;
 };
 
 }  // namespace brodiffusion::vae

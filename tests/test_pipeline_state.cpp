@@ -35,9 +35,9 @@ static int g_failures = 0;
 } while (0)
 
 int main() {
-    try { bt::cuda_init(); }
+    try { bt::init(); }
     catch (const std::exception& e) {
-        std::fprintf(stderr, "cuda_init failed: %s\n", e.what());
+        std::fprintf(stderr, "init failed: %s\n", e.what());
         return 1;
     }
 
@@ -50,7 +50,7 @@ int main() {
     }
 
     pl::PipelineState s0;
-    bt::upload_fp16(bits.data(), 1, N, s0.latent);
+    s0.latent = brotensor::Tensor::from_host_fp16(bits.data(), 1, N);
     s0.rng.seed(424242ULL);
     // Burn a few RNG draws to make the state non-trivial.
     std::normal_distribution<float> nrm(0.0f, 1.0f);
@@ -65,18 +65,18 @@ int main() {
 
     // 1. Latents bit-identical right after clone.
     std::vector<std::uint16_t> b0(N), b1(N);
-    bt::download_fp16(s0.latent, b0.data());
-    bt::download_fp16(s1.latent, b1.data());
-    bt::cuda_sync();
+    s0.latent.copy_to_host_fp16(b0.data());
+    s1.latent.copy_to_host_fp16(b1.data());
+    bt::sync_all();
     CHECK(std::memcmp(b0.data(), b1.data(), N * 2) == 0);
 
     // 2. Mutating clone latent does not affect original.
     std::vector<std::uint16_t> bumped(N, bt::fp32_to_fp16_bits(99.0f));
-    bt::upload_fp16(bumped.data(), 1, N, s1.latent);
+    s1.latent = brotensor::Tensor::from_host_fp16(bumped.data(), 1, N);
     std::vector<std::uint16_t> b0_after(N), b1_after(N);
-    bt::download_fp16(s0.latent, b0_after.data());
-    bt::download_fp16(s1.latent, b1_after.data());
-    bt::cuda_sync();
+    s0.latent.copy_to_host_fp16(b0_after.data());
+    s1.latent.copy_to_host_fp16(b1_after.data());
+    bt::sync_all();
     CHECK(std::memcmp(b0_after.data(), b0.data(), N * 2) == 0);
     CHECK(std::memcmp(b1_after.data(), bumped.data(), N * 2) == 0);
 

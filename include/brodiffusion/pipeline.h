@@ -54,7 +54,7 @@ struct PipelineConfig {
 // state, advance the clone differently from the original (different RNG, a
 // different attn_logit_bias, etc.), score, and pick a winner.
 struct PipelineState {
-    brotensor::GpuTensor latent;  // (1, C_lat * H_lat * W_lat) FP16
+    brotensor::Tensor latent;  // (1, C_lat * H_lat * W_lat) FP16
     std::mt19937_64 rng;          // initial-noise + per-step LCM noise stream
     int step_index = 0;           // 0-based: how many step_once() calls have run
     int n_steps    = 0;           // total scheduled steps for this generation
@@ -151,7 +151,7 @@ public:
     // computed but discarded.
     void step_once(PipelineState& state, const GenerateOptions& opts,
                    unet::UNet::CrossAttnTrace* trace_out = nullptr,
-                   const std::vector<const brotensor::GpuTensor*>*
+                   const std::vector<const brotensor::Tensor*>*
                        attn_logit_biases = nullptr);
     std::vector<float> decode(const PipelineState& state);
 
@@ -162,7 +162,7 @@ public:
     const PipelineConfig& config() const { return cfg_; }
 
 private:
-    void encode_prompt_(std::string_view prompt, brotensor::GpuTensor& out);
+    void encode_prompt_(std::string_view prompt, brotensor::Tensor& out);
 
     PipelineConfig     cfg_;
     clip::Tokenizer    tokenizer_;
@@ -172,14 +172,14 @@ private:
     std::variant<scheduler::DDIM, scheduler::LCM> scheduler_;
 
     // Scratch tensors kept alive across generate() calls.
-    brotensor::GpuTensor ctx_cond_, ctx_uncond_;
+    brotensor::Tensor ctx_cond_, ctx_uncond_;
     // Working buffers reused across step_once() calls. The current latent
     // lives on PipelineState, not here.
-    brotensor::GpuTensor noise_pred_cond_, noise_pred_uncond_;
-    brotensor::GpuTensor decoded_, scratch_;
+    brotensor::Tensor noise_pred_cond_, noise_pred_uncond_;
+    brotensor::Tensor decoded_, scratch_;
     // Per-step Gaussian noise used by LCM (resampled at every non-final step
     // from the same RNG stream as the initial latent noise). Unused in DDIM.
-    brotensor::GpuTensor noise_step_;
+    brotensor::Tensor noise_step_;
 
     // Cross-attention K/V projected from the text context once per generate(),
     // reused for all denoising steps. CFG (cond + uncond) keeps two caches.

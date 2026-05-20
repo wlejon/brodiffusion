@@ -235,9 +235,14 @@ void test_format_and_alpha() {
 
 void test_merge_math() {
     try {
-        bt::cuda_init();
+        bt::init();
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "cuda_init failed in test_merge_math: %s — skipping\n", e.what());
+        std::fprintf(stderr, "init failed in test_merge_math: %s — skipping\n", e.what());
+        return;
+    }
+    if (!bt::is_available(bt::Device::CUDA) &&
+        !bt::is_available(bt::Device::Metal)) {
+        std::fprintf(stderr, "no GPU backend — skipping test_merge_math\n");
         return;
     }
 
@@ -272,18 +277,18 @@ void test_merge_math() {
     auto down_bits = to_fp16(down);
     auto up_bits   = to_fp16(up);
 
-    bt::GpuTensor W, D, U, delta;
-    bt::upload_fp16(W_bits.data(),    OUT,  IN, W);
-    bt::upload_fp16(down_bits.data(), RANK, IN, D);
-    bt::upload_fp16(up_bits.data(),   OUT,  RANK, U);
+    bt::Tensor W, D, U, delta;
+    W = brotensor::Tensor::from_host_fp16(W_bits.data(),    OUT,  IN);
+    D = brotensor::Tensor::from_host_fp16(down_bits.data(), RANK, IN);
+    U = brotensor::Tensor::from_host_fp16(up_bits.data(),   OUT,  RANK);
 
-    bt::matmul_gpu(U, D, delta);                  // (OUT, IN)
-    bt::scale_inplace_gpu(delta, scale_total);
-    bt::add_inplace_gpu(W, delta);
+    bt::matmul(U, D, delta);                  // (OUT, IN)
+    bt::scale_inplace(delta, scale_total);
+    bt::add_inplace(W, delta);
 
     // Read back W and compare to expectation.
     std::vector<uint16_t> W_out_bits(static_cast<std::size_t>(OUT * IN));
-    bt::download_fp16(W, W_out_bits.data());
+    W.copy_to_host_fp16(W_out_bits.data());
 
     // Reference (fp32 host).
     std::vector<float> ref(OUT * IN, 0.0f);
