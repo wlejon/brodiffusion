@@ -1,5 +1,6 @@
 #include "brodiffusion/lora.h"
 
+#include "brodiffusion/detail/lora_internal.h"
 #include "brodiffusion/safetensors.h"
 
 #include "brotensor/tensor.h"
@@ -325,49 +326,6 @@ Format detect_format(const st::File& f) {
              "or 'unet.'/'text_encoder.' prefixes)");
     }
     return (kohya >= diffusers) ? Format::Kohya : Format::Diffusers;
-}
-
-std::vector<TargetPath> known_targets() {
-    // Enumerate SD1.5 default layout: 4 down/up blocks, layers_per_block=2,
-    // mid block. The full set is small enough (~80 paths) to inline.
-    std::vector<TargetPath> out;
-    static const char* tails[] = {
-        "attn1.to_q", "attn1.to_k", "attn1.to_v", "attn1.to_out.0",
-        "attn2.to_q", "attn2.to_k", "attn2.to_v", "attn2.to_out.0",
-        "ff.net.0.proj", "ff.net.2",
-    };
-    const int nb = 4;
-    const int lpb = 2;  // layers_per_block in SD1.5
-    for (int i = 0; i < nb - 1; ++i) {
-        for (int j = 0; j < lpb; ++j) {
-            for (const char* t : tails) {
-                out.push_back({"unet",
-                    "down_blocks." + std::to_string(i) + ".attentions." +
-                    std::to_string(j) + ".transformer_blocks.0." + t});
-            }
-        }
-    }
-    for (const char* t : tails) {
-        out.push_back({"unet", std::string("mid_block.attentions.0.transformer_blocks.0.") + t});
-    }
-    // Up blocks: index 0 has no attention; indices 1..nb-1 have it.
-    for (int i = 1; i < nb; ++i) {
-        for (int j = 0; j < lpb + 1; ++j) {
-            for (const char* t : tails) {
-                out.push_back({"unet",
-                    "up_blocks." + std::to_string(i) + ".attentions." +
-                    std::to_string(j) + ".transformer_blocks.0." + t});
-            }
-        }
-    }
-    // CLIP: 12 layers in SD1.5's ViT-L/14.
-    for (int i = 0; i < 12; ++i) {
-        for (const char* p : {"q_proj", "k_proj", "v_proj", "out_proj"}) {
-            out.push_back({"text_encoder",
-                "text_model.encoder.layers." + std::to_string(i) + ".self_attn." + p});
-        }
-    }
-    return out;
 }
 
 std::string diffusers_to_kohya_prefix(const std::string& domain,

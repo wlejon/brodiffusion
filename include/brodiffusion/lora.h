@@ -64,25 +64,4 @@ struct Triple {
 // rank metadata), and reported as a single grouped error otherwise.
 std::vector<Triple> enumerate(const safetensors::File& f);
 
-// Test-only helper: translate a diffusers path "unet.<path>" or
-// "text_encoder.text_model.<path>" into its kohya equivalent (lora_unet_<...>
-// or lora_te_<...>, with every '.' inside `<path>` replaced by '_').
-std::string diffusers_to_kohya_prefix(const std::string& domain,
-                                      const std::string& target_path);
-
-// Test-only helper: split a kohya key prefix and recover (domain, target_path)
-// using the inverse-map approach (enumerate expected diffusers paths and
-// match the underscored form). Returns true on success.
-bool kohya_to_diffusers(const std::string& kohya_prefix,
-                        std::string& domain,
-                        std::string& target_path);
-
-// Build the canonical list of diffusers target paths the loader recognizes,
-// keyed by domain. Used internally; exposed for tests.
-struct TargetPath {
-    std::string domain;       // "unet" or "text_encoder"
-    std::string path;         // diffusers path within the domain
-};
-std::vector<TargetPath> known_targets();
-
 }  // namespace brodiffusion::lora

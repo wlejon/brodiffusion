@@ -10,6 +10,7 @@
 //      to within FP16 tolerance.
 
 #include "brodiffusion/detail/compute.h"
+#include "brodiffusion/detail/lora_internal.h"
 #include "brodiffusion/lora.h"
 #include "brodiffusion/safetensors.h"
 
