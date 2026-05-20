@@ -1,10 +1,9 @@
 #include "brodiffusion/tokenizer.h"
 
-#include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -137,10 +136,14 @@ struct JsonReader {
         if (p >= end || *p < '0' || *p > '9') fail("expected integer");
         int64_t v = 0;
         while (p < end && *p >= '0' && *p <= '9') {
-            v = v * 10 + (*p - '0');
+            const int digit = *p - '0';
+            if (v > (INT64_MAX - digit) / 10) fail("integer out of range");
+            v = v * 10 + digit;
             ++p;
         }
-        return static_cast<int32_t>(neg ? -v : v);
+        v = neg ? -v : v;
+        if (v < INT32_MIN || v > INT32_MAX) fail("integer out of int32 range");
+        return static_cast<int32_t>(v);
     }
 };
 
@@ -186,11 +189,11 @@ load_merges_txt(const std::string& path) {
         // Strip trailing \r (Windows line endings).
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
-        if (first && line.size() >= 1 && line[0] == '#') {
+        // The first non-empty line of a merges.txt is a "#version" comment.
+        if (first) {
             first = false;
-            continue;
+            if (line[0] == '#') continue;
         }
-        first = false;
         auto sp = line.find(' ');
         if (sp == std::string::npos) {
             throw std::runtime_error("merges.txt: malformed line: '" + line + "'");

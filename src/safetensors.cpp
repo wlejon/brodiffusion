@@ -3,7 +3,7 @@
 #include "brodiffusion/detail/compute.h"
 #include "brotensor/tensor.h"
 
-#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -65,7 +65,13 @@ static Dtype parse_dtype(std::string_view s) {
 
 int64_t TensorView::numel() const {
     int64_t n = 1;
-    for (int64_t d : shape) n *= d;
+    for (int64_t d : shape) {
+        if (d < 0)
+            throw std::runtime_error("safetensors: negative dimension in tensor shape");
+        if (d != 0 && n > INT64_MAX / d)
+            throw std::runtime_error("safetensors: tensor element count overflows int64");
+        n *= d;
+    }
     return n;
 }
 
@@ -136,7 +142,9 @@ struct Parser {
         if (p >= end || *p < '0' || *p > '9') fail("expected integer");
         int64_t v = 0;
         while (p < end && *p >= '0' && *p <= '9') {
-            v = v * 10 + (*p - '0');
+            const int digit = *p - '0';
+            if (v > (INT64_MAX - digit) / 10) fail("integer out of range");
+            v = v * 10 + digit;
             ++p;
         }
         return neg ? -v : v;

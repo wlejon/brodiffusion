@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -59,8 +60,10 @@ int strip_suffix(const std::string& key, std::string& out_prefix) {
             return 2;
         }
     }
-    if (ends_with(key, ".alpha")) {
-        out_prefix = key.substr(0, key.size() - 6);
+    static const char* alpha_sfx = ".alpha";
+    if (ends_with(key, alpha_sfx)) {
+        out_prefix = key.substr(0, key.size() -
+                                   std::char_traits<char>::length(alpha_sfx));
         return 3;
     }
     return 0;
@@ -72,7 +75,9 @@ bool parse_uint(const std::string& s, std::size_t& pos, int& out) {
     if (pos >= s.size() || !std::isdigit(static_cast<unsigned char>(s[pos]))) return false;
     int v = 0;
     while (pos < s.size() && std::isdigit(static_cast<unsigned char>(s[pos]))) {
-        v = v * 10 + (s[pos] - '0');
+        const int digit = s[pos] - '0';
+        if (v > (INT_MAX - digit) / 10) return false;  // out of range
+        v = v * 10 + digit;
         ++pos;
     }
     out = v;
@@ -116,12 +121,10 @@ std::string match_resnet_tail_kohya(const std::string& tail) {
     return {};
 }
 
-const char* match_clip_proj_kohya(const std::string& proj) {
-    if (proj == "q_proj"   || proj == "k_proj" ||
-        proj == "v_proj"   || proj == "out_proj") {
-        return proj.c_str();  // same name in diffusers
-    }
-    return nullptr;
+// CLIP self-attn projection names are identical in kohya and diffusers.
+bool is_clip_proj_name(const std::string& proj) {
+    return proj == "q_proj" || proj == "k_proj" ||
+           proj == "v_proj" || proj == "out_proj";
 }
 
 // After the kohya block prefix (e.g. "lora_unet_down_blocks_3_") parse one of:
@@ -230,11 +233,10 @@ bool parse_kohya_prefix(const std::string& p,
         if (rest.compare(pos, sa.size(), sa) != 0) return false;
         pos += sa.size();
         std::string proj = rest.substr(pos);
-        const char* p_diff = match_clip_proj_kohya(proj);
-        if (!p_diff) return false;
+        if (!is_clip_proj_name(proj)) return false;
         domain = "text_encoder";
         target_path = "text_model.encoder.layers." + std::to_string(i) +
-                      ".self_attn." + std::string(p_diff);
+                      ".self_attn." + proj;
         return true;
     }
     return false;
