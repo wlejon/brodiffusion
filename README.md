@@ -1,7 +1,7 @@
 # brodiffusion
 
 Diffusion-model inference for the bro stack. Pure C++20, built on
-[brotensor](../brotensor) (tensor + compute kernels) and [bromath](../bromath)
+[brotensor](https://github.com/wlejon/brotensor) (tensor + compute kernels) and [bromath](https://github.com/wlejon/bromath)
 (scalar / RNG / color helpers). Runs **CPU-by-default and on a GPU when one is
 available** — FP32 on the CPU backend, FP16 on a GPU — with the device chosen
 at runtime.
@@ -10,13 +10,7 @@ Target model: **Stable Diffusion 1.5** text-to-image. CLIP text encoder,
 safetensors weight loading, DDIM / LCM schedulers, classifier-free guidance,
 LoRA merging, and VAE decode.
 
-brotensor owns the compute kernels. brodiffusion is the scaffolding around them:
-graph wiring (U-Net / VAE / CLIP), weight loading, the CLIP BPE tokenizer,
-schedulers, conditioning, and a handful of SD1.5-tuned fused kernels. Output
-stops at RGB pixels in host memory — image encoding (PNG/JPEG) is the
-consumer's job (bro's image-api on integration).
-
-QuickJS / JS bindings live in [bro](../bro) once the library is integrated.
+QuickJS / JS bindings live in [bro](https://github.com/wlejon/bro) once the library is integrated.
 This repo stays a pure C++ library + CLI.
 
 ## Status
@@ -40,10 +34,6 @@ runs under `ctest`.
 | `brodiffusion/pipeline.h` | high-level txt2img pipeline + step-wise (`prime`/`step_once`/`decode`) API |
 | `brodiffusion/fused_resblock.h`, `fused_transformer.h` | SD1.5-tuned fused kernels (CUDA, with CPU fallbacks) |
 | `brodiffusion/optim.h` | mixed-precision Adam (FP16 weights, FP32 master copy) for fine-tuning |
-
-The step-wise pipeline API (`PipelineState`, `prime`/`step_once`/`decode`,
-cross-attention traces) supports research uses such as cross-attention tree
-search. INT8 (W8A16) U-Net weight quantization is GPU-only.
 
 ## Build
 
@@ -81,14 +71,11 @@ CMake options:
 | `BRODIFFUSION_TESTS` | `ON` | Build the test suite (only runs when brodiffusion is the top-level project) |
 | `BRODIFFUSION_INSTALL` | `OFF` | Generate `install` / `find_package` targets |
 
-When brodiffusion is consumed as a sibling repo (via `add_subdirectory`, the
-way [bro](../bro) consumes it), the CLI, tests, and install targets are all off
-by default — only the `brodiffusion` static library is built.
 
 ## Layout
 
-Standalone sibling of [bro](../bro), [bromath](../bromath), and
-[brotensor](../brotensor). The build auto-detects siblings at `../<name>`:
+Standalone sibling of [bro](https://github.com/wlejon/bro), [bromath](https://github.com/wlejon/bromath), and
+[brotensor](https://github.com/wlejon/brotensor). The build auto-detects siblings at `../<name>`:
 
 ```
 projects/
@@ -100,7 +87,6 @@ projects/
 CMake first looks for siblings at `../bromath` and `../brotensor`; if not
 found, it falls back to `third_party/bromath` and `third_party/brotensor`
 submodules. Override paths with `-DBROMATH_DIR=...` / `-DBROTENSOR_DIR=...`.
-See `bro/docs/multi-repo-workflow.md` for the broader picture.
 
 ## Weights
 
@@ -160,12 +146,3 @@ cmake --build build --config Release
 cd build && ctest -C Release --output-on-failure
 ```
 
-## Out of scope
-
-- **GPU compute kernels** — live in brotensor; brodiffusion only adds a few
-  SD1.5-specific *fused* kernels on top.
-- **Geometric / scalar math** — lives in bromath.
-- **Image encoding (PNG/JPEG)** — the consumer's responsibility; bro's
-  image-api handles it on integration. The library returns FP32 RGB host
-  buffers.
-- **QuickJS / JS bindings** — live in bro.
