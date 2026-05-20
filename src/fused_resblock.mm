@@ -414,8 +414,7 @@ void launch_conv3x3_fused(const bt::Tensor& Xt, const bt::Tensor& Wtt,
         [enc dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
              threadsPerThreadgroup:MTLSizeMake(THREADS_PER_TG, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -448,8 +447,7 @@ void launch_gn_silu(const bt::Tensor& Xt, const bt::Tensor& gammat,
         [enc dispatchThreadgroups:MTLSizeMake(num_groups, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(GN_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

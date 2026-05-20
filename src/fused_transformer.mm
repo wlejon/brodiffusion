@@ -457,8 +457,7 @@ void detail::fused_linear_geglu_metal(const bt::Tensor& X,
         [enc dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
              threadsPerThreadgroup:MTLSizeMake(THREADS_PER_TG, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -490,8 +489,7 @@ void detail::add_inplace_vec_metal(bt::Tensor& Y, const bt::Tensor& X) {
         [enc dispatchThreads:MTLSizeMake(n, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -526,8 +524,7 @@ void detail::add_inplace_row_bias_metal(bt::Tensor& Y, const bt::Tensor& bias) {
         [enc dispatchThreads:MTLSizeMake(p.cols, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
