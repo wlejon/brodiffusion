@@ -15,9 +15,9 @@ This repo stays a pure C++ library + CLI.
 
 ## Status
 
-Functional SD1.5 text-to-image inference on the CPU (FP32) and CUDA (FP16)
-backends. The library builds CPU-only by default; a 12-executable test suite
-runs under `ctest`.
+Functional SD1.5 text-to-image inference on the CPU (FP32), CUDA (FP16), and
+Metal (FP16) backends. The library builds CPU-only by default; a 12-executable
+test suite runs under `ctest`.
 
 | Header | Purpose |
 |---|---|
@@ -32,7 +32,7 @@ runs under `ctest`.
 | `brodiffusion/lcm_scheduler.h` | LCM (latent-consistency) sampler for distilled checkpoints |
 | `brodiffusion/lora.h` | LoRA merging — kohya-ss/A1111 and diffusers/PEFT key conventions |
 | `brodiffusion/pipeline.h` | high-level txt2img pipeline + step-wise (`prime`/`step_once`/`decode`) API |
-| `brodiffusion/fused_resblock.h`, `fused_transformer.h` | SD1.5-tuned fused kernels (CUDA, with CPU fallbacks) |
+| `brodiffusion/fused_resblock.h`, `fused_transformer.h` | SD1.5-tuned fused kernels (CUDA + Metal, with CPU fallbacks) |
 | `brodiffusion/optim.h` | mixed-precision Adam (FP16 weights, FP32 master copy) for fine-tuning |
 
 ## Build
@@ -55,11 +55,12 @@ cmake --build build --config Release
 ```
 
 brodiffusion runs the full diffusion pipeline on whichever backend brotensor
-resolves at runtime: a CPU-only build generates images in FP32, and a CUDA
-build uses the FP16 GPU kernels when a device is present. brodiffusion's fused
-ops dispatch the same way — a GPU kernel when the input is device-resident, an
-FP32 fallback (`src/fused.cpp`) on CPU. INT8 (`--quantize-unet`) weight
-quantization remains GPU-only; it is ignored on the CPU backend.
+resolves at runtime: a CPU-only build generates images in FP32, and a CUDA or
+Metal build uses the FP16 GPU kernels when a device is present. brodiffusion's
+fused ops dispatch the same way — the CUDA or Metal kernel when the input is
+device-resident, an FP32 fallback (`src/fused.cpp`) on CPU. INT8
+(`--quantize-unet`) weight quantization remains GPU-only; it is ignored on the
+CPU backend.
 
 CMake options:
 

@@ -1,14 +1,20 @@
 // FP16-weight Adam optimizer plumbing. See include/brodiffusion/optim.h.
+//
+// Backend-agnostic: composed entirely from device-polymorphic brotensor ops
+// (cast / add_inplace / adam_step), so the same translation unit serves the
+// CPU, CUDA, and Metal backends. The earlier implementation was a CUDA-only
+// .cu with hand-written FP16<->FP32 cast kernels; brotensor::cast now supplies
+// that primitive on every backend.
+//
+// AdamFP16 is a training-time component. Inference-only consumers never
+// register a parameter, so this TU links cleanly into a CPU-only build even
+// though brotensor's CPU backend is FP32-first.
 
 #include "brodiffusion/optim.h"
-#include "brodiffusion/detail/cuda_check.cuh"
 #include "brodiffusion/detail/device.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
-
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 
 #include <stdexcept>
 #include <utility>
@@ -17,53 +23,6 @@ namespace brodiffusion::optim {
 
 namespace bt = ::brotensor;
 
-namespace {
-
-__global__ void cast_h2f_k(const __half* src, float* dst, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __half2float(src[i]);
-}
-__global__ void cast_f2h_k(const float* src, __half* dst, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __float2half(src[i]);
-}
-__global__ void acc_h2f_k(float* dst, const __half* src, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] += __half2float(src[i]);
-}
-__global__ void acc_f2f_k(float* dst, const float* src, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] += src[i];
-}
-
-void cast_h_to_f(const bt::Tensor& src, bt::Tensor& dst) {
-    detail::resize_like(dst, src.rows, src.cols, bt::Dtype::FP32, src.device);
-    int n = src.size();
-    if (n == 0) return;
-    cast_h2f_k<<<(n + 255) / 256, 256>>>(
-        reinterpret_cast<const __half*>(src.data),
-        static_cast<float*>(dst.data), n);
-    BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
-}
-
-void cast_f_to_h(const bt::Tensor& src, bt::Tensor& dst) {
-    // Compare full shape, not just element count: a same-size but
-    // differently-shaped dst must still be reshaped, since callers rely on
-    // dst's rows/cols metadata.
-    if (dst.rows != src.rows || dst.cols != src.cols ||
-        dst.dtype != bt::Dtype::FP16 || dst.device != src.device) {
-        detail::resize_like(dst, src.rows, src.cols, bt::Dtype::FP16, src.device);
-    }
-    int n = src.size();
-    if (n == 0) return;
-    cast_f2h_k<<<(n + 255) / 256, 256>>>(
-        static_cast<const float*>(src.data),
-        reinterpret_cast<__half*>(dst.data), n);
-    BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
-}
-
-}  // namespace
-
 int AdamFP16::register_param(bt::Tensor& p, std::string name) {
     if (p.dtype != bt::Dtype::FP16) {
         throw std::runtime_error("AdamFP16: parameter must be FP16");
@@ -71,7 +30,9 @@ int AdamFP16::register_param(bt::Tensor& p, std::string name) {
     Slot s;
     s.p_fp16 = &p;
     s.name   = std::move(name);
-    cast_h_to_f(p, s.p_fp32);
+    // FP32 master copy derived from the FP16 weight.
+    bt::cast(p, s.p_fp32, bt::Dtype::FP32);
+    // Grad accumulator + Adam moments, all FP32, zero-initialised on-device.
     detail::resize_like(s.g_fp32, p.rows, p.cols, bt::Dtype::FP32, p.device);
     s.g_fp32.zero();
     detail::resize_like(s.m_fp32, p.rows, p.cols, bt::Dtype::FP32, p.device);
@@ -98,15 +59,14 @@ void AdamFP16::accumulate_fp16(int handle, const bt::Tensor& dW) {
         throw std::runtime_error("AdamFP16: handle out of range");
     }
     auto& g = slots_[static_cast<std::size_t>(handle)].g_fp32;
-    int n = g.size();
-    if (dW.size() != n) {
+    if (dW.size() != g.size()) {
         throw std::runtime_error("AdamFP16::accumulate_fp16: shape mismatch");
     }
-    if (n == 0) return;
-    acc_h2f_k<<<(n + 255) / 256, 256>>>(
-        static_cast<float*>(g.data),
-        reinterpret_cast<const __half*>(dW.data), n);
-    BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
+    if (g.size() == 0) return;
+    // Up-cast the FP16 grad to FP32, then accumulate.
+    thread_local bt::Tensor tmp;
+    bt::cast(dW, tmp, bt::Dtype::FP32);
+    bt::add_inplace(g, tmp);
 }
 
 void AdamFP16::accumulate_fp32(int handle, const bt::Tensor& dW) {
@@ -114,30 +74,27 @@ void AdamFP16::accumulate_fp32(int handle, const bt::Tensor& dW) {
         throw std::runtime_error("AdamFP16: handle out of range");
     }
     auto& g = slots_[static_cast<std::size_t>(handle)].g_fp32;
-    int n = g.size();
-    if (dW.size() != n) {
+    if (dW.size() != g.size()) {
         throw std::runtime_error("AdamFP16::accumulate_fp32: shape mismatch");
     }
-    if (n == 0) return;
-    acc_f2f_k<<<(n + 255) / 256, 256>>>(
-        static_cast<float*>(g.data),
-        static_cast<const float*>(dW.data), n);
-    BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
+    if (g.size() == 0) return;
+    bt::add_inplace(g, dW);
 }
 
 void AdamFP16::step(const AdamHyperParams& hp) {
     ++step_n_;
     for (auto& s : slots_) {
         bt::adam_step(s.p_fp32, s.g_fp32, s.m_fp32, s.v_fp32,
-                          hp.lr, hp.beta1, hp.beta2, hp.eps, step_n_);
-        cast_f_to_h(s.p_fp32, *s.p_fp16);
+                      hp.lr, hp.beta1, hp.beta2, hp.eps, step_n_);
+        // Write the updated FP32 master back into the live FP16 weight.
+        bt::cast(s.p_fp32, *s.p_fp16, bt::Dtype::FP16);
     }
 }
 
 void AdamFP16::reset_state() {
     step_n_ = 0;
     for (auto& s : slots_) {
-        cast_h_to_f(*s.p_fp16, s.p_fp32);
+        bt::cast(*s.p_fp16, s.p_fp32, bt::Dtype::FP32);
         s.g_fp32.zero();
         s.m_fp32.zero();
         s.v_fp32.zero();

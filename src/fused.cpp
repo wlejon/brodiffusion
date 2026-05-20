@@ -13,7 +13,6 @@
 
 #include "brodiffusion/fused_resblock.h"
 #include "brodiffusion/fused_transformer.h"
-#include "brodiffusion/optim.h"
 #include "brodiffusion/detail/fused_backend.h"
 
 #include "brotensor/ops.h"
@@ -102,9 +101,16 @@ void fused_resblock_forward(
     int C_in, int C_out, int H, int W,
     int num_groups, float eps,
     bt::Tensor& Y) {
-#ifdef BROTENSOR_HAS_CUDA
+#if defined(BROTENSOR_HAS_CUDA)
     if (on_gpu(X)) {
         detail::fused_resblock_forward_cuda(
+            X, gn1_g, gn1_b, W1, b1, t_emb_shift, gn2_g, gn2_b, W2, b2,
+            Wskip, bskip, C_in, C_out, H, W, num_groups, eps, Y);
+        return;
+    }
+#elif defined(BROTENSOR_HAS_METAL)
+    if (on_gpu(X)) {
+        detail::fused_resblock_forward_metal(
             X, gn1_g, gn1_b, W1, b1, t_emb_shift, gn2_g, gn2_b, W2, b2,
             Wskip, bskip, C_in, C_out, H, W, num_groups, eps, Y);
         return;
@@ -135,12 +141,23 @@ void fused_resblock_forward(  // W8A16 — GPU-only
     [[maybe_unused]] int H, [[maybe_unused]] int W,
     [[maybe_unused]] int num_groups, [[maybe_unused]] float eps,
     [[maybe_unused]] bt::Tensor& Y) {
-#ifdef BROTENSOR_HAS_CUDA
+#if defined(BROTENSOR_HAS_CUDA)
     if (on_gpu(X)) {
         detail::fused_resblock_forward_cuda(
             X, gn1_g, gn1_b, W1_int8, W1_scales, b1, t_emb_shift, gn2_g, gn2_b,
             W2_int8, W2_scales, b2, Wskip_int8, Wskip_scales, bskip,
             C_in, C_out, H, W, num_groups, eps, Y);
+        return;
+    }
+#elif defined(BROTENSOR_HAS_METAL)
+    if (on_gpu(X)) {
+        // No brodiffusion-tuned Metal kernel for the W8A16 resblock — route
+        // straight to brotensor's INT8 resblock op (already has a Metal impl).
+        bt::resblock_forward_int8w_fp16(
+            X, gn1_g, gn1_b, W1_int8, W1_scales, &b1, &t_emb_shift,
+            gn2_g, gn2_b, W2_int8, W2_scales, &b2,
+            Wskip_int8, Wskip_scales, bskip,
+            /*N=*/1, C_in, C_out, H, W, num_groups, eps, Y);
         return;
     }
 #endif
@@ -149,9 +166,14 @@ void fused_resblock_forward(  // W8A16 — GPU-only
 
 void fused_linear_geglu(const bt::Tensor& X, const bt::Tensor& W,
                         const bt::Tensor& b, bt::Tensor& Y) {
-#ifdef BROTENSOR_HAS_CUDA
+#if defined(BROTENSOR_HAS_CUDA)
     if (on_gpu(X)) {
         detail::fused_linear_geglu_cuda(X, W, b, Y);
+        return;
+    }
+#elif defined(BROTENSOR_HAS_METAL)
+    if (on_gpu(X)) {
+        detail::fused_linear_geglu_metal(X, W, b, Y);
         return;
     }
 #endif
@@ -163,9 +185,18 @@ void fused_linear_geglu([[maybe_unused]] const bt::Tensor& X,       // W8A16
                         [[maybe_unused]] const bt::Tensor& W_scales,
                         [[maybe_unused]] const bt::Tensor& b,
                         [[maybe_unused]] bt::Tensor& Y) {
-#ifdef BROTENSOR_HAS_CUDA
+#if defined(BROTENSOR_HAS_CUDA)
     if (on_gpu(X)) {
         detail::fused_linear_geglu_cuda(X, W_int8, W_scales, b, Y);
+        return;
+    }
+#elif defined(BROTENSOR_HAS_METAL)
+    if (on_gpu(X)) {
+        // (B, in) @ dequant(W_int8)^T + b -> FP16 (B, 2*D_out), then GEGLU.
+        // brotensor's INT8 linear + exact-GEGLU both have Metal kernels.
+        thread_local bt::Tensor ff1_tmp;
+        bt::linear_forward_batched_int8w_fp16(W_int8, W_scales, &b, X, ff1_tmp);
+        bt::geglu_exact_forward(ff1_tmp, Y);
         return;
     }
 #endif
@@ -173,9 +204,14 @@ void fused_linear_geglu([[maybe_unused]] const bt::Tensor& X,       // W8A16
 }
 
 void add_inplace_vec(bt::Tensor& Y, const bt::Tensor& X) {
-#ifdef BROTENSOR_HAS_CUDA
+#if defined(BROTENSOR_HAS_CUDA)
     if (on_gpu(Y)) {
         detail::add_inplace_vec_cuda(Y, X);
+        return;
+    }
+#elif defined(BROTENSOR_HAS_METAL)
+    if (on_gpu(Y)) {
+        detail::add_inplace_vec_metal(Y, X);
         return;
     }
 #endif
@@ -183,9 +219,14 @@ void add_inplace_vec(bt::Tensor& Y, const bt::Tensor& X) {
 }
 
 void add_inplace_row_bias(bt::Tensor& Y, const bt::Tensor& bias) {
-#ifdef BROTENSOR_HAS_CUDA
+#if defined(BROTENSOR_HAS_CUDA)
     if (on_gpu(Y)) {
         detail::add_inplace_row_bias_cuda(Y, bias);
+        return;
+    }
+#elif defined(BROTENSOR_HAS_METAL)
+    if (on_gpu(Y)) {
+        detail::add_inplace_row_bias_metal(Y, bias);
         return;
     }
 #endif
@@ -193,32 +234,3 @@ void add_inplace_row_bias(bt::Tensor& Y, const bt::Tensor& bias) {
 }
 
 }  // namespace brodiffusion
-
-// ─── AdamFP16: training-only, GPU-only ─────────────────────────────────────
-//
-// The mixed-precision Adam optimizer (src/optim.cu) is part of the training
-// path, not inference, and has no CPU fallback. On a CPU-only build its
-// methods throw; a CUDA build gets the real implementation from optim.cu.
-#ifndef BROTENSOR_HAS_CUDA
-namespace brodiffusion::optim {
-
-namespace {
-[[noreturn]] void no_cpu_adam(const char* what) {
-    throw std::runtime_error(
-        std::string("brodiffusion: ") + what +
-        " is training-only and requires a CUDA build "
-        "(-DBROTENSOR_WITH_CUDA=ON).");
-}
-}  // namespace
-
-int  AdamFP16::register_param(brotensor::Tensor&, std::string) { no_cpu_adam("AdamFP16"); }
-int  AdamFP16::find(const std::string&) const { return -1; }
-void AdamFP16::zero_grads() { no_cpu_adam("AdamFP16::zero_grads"); }
-void AdamFP16::accumulate_fp16(int, const brotensor::Tensor&) { no_cpu_adam("AdamFP16::accumulate_fp16"); }
-void AdamFP16::accumulate_fp32(int, const brotensor::Tensor&) { no_cpu_adam("AdamFP16::accumulate_fp32"); }
-void AdamFP16::step(const AdamHyperParams&) { no_cpu_adam("AdamFP16::step"); }
-void AdamFP16::reset_state() { no_cpu_adam("AdamFP16::reset_state"); }
-const brotensor::Tensor& AdamFP16::master(int) const { no_cpu_adam("AdamFP16::master"); }
-
-}  // namespace brodiffusion::optim
-#endif  // !BROTENSOR_HAS_CUDA

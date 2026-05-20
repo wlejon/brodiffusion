@@ -44,6 +44,15 @@ if(BROTENSOR_WITH_CUDA)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 endif()
 
+# brodiffusion ships SD1.5-specific fused Metal kernels (fused_resblock.mm,
+# fused_transformer.mm); enable Objective-C++ only when Metal is selected.
+if(BROTENSOR_WITH_METAL)
+    if(NOT APPLE)
+        message(FATAL_ERROR "BROTENSOR_WITH_METAL requires an Apple platform.")
+    endif()
+    enable_language(OBJCXX)
+endif()
+
 # --- Siblings: bromath (header-only) + brotensor (GPU ops) ---
 #
 # Prefer standalone repos at ../<name>; fall back to third_party/ submodules.
@@ -114,18 +123,41 @@ target_sources(brodiffusion PRIVATE
     src/clip_image.cpp
     src/clip_score.cpp
     src/fused.cpp
+    src/optim.cpp
 )
 
+# SD1.5-tuned fused GPU kernels. fused.cpp dispatches a GPU-resident tensor to
+# the CUDA or Metal kernel for the active backend and falls back to a
+# brotensor-op composition on CPU. The optimizer (src/optim.cpp, always built)
+# is backend-agnostic — it is composed from device-polymorphic brotensor ops.
 if(BROTENSOR_WITH_CUDA)
-    # SD1.5-tuned fused CUDA kernels (selected at runtime for GPU-resident
-    # tensors by src/fused.cpp) + the FP16 Adam optimizer plumbing.
     target_sources(brodiffusion PRIVATE
         src/fused_resblock.cu
         src/fused_transformer.cu
-        src/optim.cu
     )
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(brodiffusion PUBLIC CUDA::cudart)
+endif()
+
+if(BROTENSOR_WITH_METAL)
+    # Metal mirrors of the fused CUDA kernels — Objective-C++ (.mm) compiled
+    # with ARC. They reach brotensor's Metal device + buffer pool through the
+    # public <brotensor/metal_interop.h> surface.
+    target_sources(brodiffusion PRIVATE
+        src/fused_resblock.mm
+        src/fused_transformer.mm
+    )
+    set_source_files_properties(
+        src/fused_resblock.mm
+        src/fused_transformer.mm
+        PROPERTIES
+            COMPILE_FLAGS "-fobjc-arc"
+            LANGUAGE OBJCXX
+    )
+    target_link_libraries(brodiffusion PUBLIC
+        "-framework Foundation"
+        "-framework Metal"
+    )
 endif()
 
 # --- CLI ---

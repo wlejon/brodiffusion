@@ -57,4 +57,35 @@ void add_inplace_vec_cuda(brotensor::Tensor& Y, const brotensor::Tensor& X);
 void add_inplace_row_bias_cuda(brotensor::Tensor& Y,
                                const brotensor::Tensor& bias);
 
+// ─── Metal entry points ────────────────────────────────────────────────────
+//
+// Defined in src/fused_resblock.mm / src/fused_transformer.mm — compiled only
+// in a Metal build. simdgroup-matrix transliterations of the CUDA kernels
+// above; the public brodiffusion::fused_* dispatchers (src/fused.cpp) route
+// Metal-resident tensors here. Only the FP16 path has a brodiffusion-tuned
+// Metal kernel — the W8A16 path dispatches straight to brotensor's INT8 ops
+// (which already have Metal kernels), so there is no INT8 *_metal overload.
+
+void fused_resblock_forward_metal(
+    const brotensor::Tensor& X,
+    const brotensor::Tensor& gn1_g, const brotensor::Tensor& gn1_b,
+    const brotensor::Tensor& W1,    const brotensor::Tensor& b1,
+    const brotensor::Tensor& t_emb_shift,
+    const brotensor::Tensor& gn2_g, const brotensor::Tensor& gn2_b,
+    const brotensor::Tensor& W2,    const brotensor::Tensor& b2,
+    const brotensor::Tensor* Wskip, const brotensor::Tensor* bskip,
+    int C_in, int C_out, int H, int W,
+    int num_groups, float eps,
+    brotensor::Tensor& Y);
+
+void fused_linear_geglu_metal(const brotensor::Tensor& X,
+                              const brotensor::Tensor& W,
+                              const brotensor::Tensor& b,
+                              brotensor::Tensor& Y);
+
+void add_inplace_vec_metal(brotensor::Tensor& Y, const brotensor::Tensor& X);
+
+void add_inplace_row_bias_metal(brotensor::Tensor& Y,
+                                const brotensor::Tensor& bias);
+
 }  // namespace brodiffusion::detail
