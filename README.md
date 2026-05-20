@@ -6,18 +6,10 @@ Diffusion-model inference for the bro stack. Pure C++20, built on
 available** — FP32 on the CPU backend, FP16 on a GPU — with the device chosen
 at runtime.
 
-Target model: **Stable Diffusion 1.5** text-to-image. CLIP text encoder,
-safetensors weight loading, DDIM / LCM schedulers, classifier-free guidance,
-LoRA merging, and VAE decode.
-
-QuickJS / JS bindings live in [bro](https://github.com/wlejon/bro) once the library is integrated.
-This repo stays a pure C++ library + CLI.
-
 ## Status
 
 Functional SD1.5 text-to-image inference on the CPU (FP32), CUDA (FP16), and
-Metal (FP16) backends. The library builds CPU-only by default; a 12-executable
-test suite runs under `ctest`.
+Metal (FP16) backends. 
 
 | Header | Purpose |
 |---|---|
