@@ -27,7 +27,6 @@
 
 #include "brotensor/tensor.h"
 
-#include <cstdint>
 #include <string>
 #include <vector>
 

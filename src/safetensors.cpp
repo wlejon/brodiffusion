@@ -8,6 +8,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -559,10 +560,15 @@ void write_file(const std::string& path, const std::vector<WriteEntry>& entries)
     // Validate + compute offsets.
     std::vector<uint64_t> off_start(entries.size()), off_end(entries.size());
     uint64_t cursor = 0;
+    std::unordered_set<std::string> seen_names;
     for (std::size_t i = 0; i < entries.size(); ++i) {
         const WriteEntry& e = entries[i];
         if (e.name.empty()) {
             throw std::runtime_error("safetensors::write: empty tensor name");
+        }
+        if (!seen_names.insert(e.name).second) {
+            throw std::runtime_error("safetensors::write: duplicate tensor name '" +
+                                     e.name + "'");
         }
         if (!e.host_data && e.bytes > 0) {
             throw std::runtime_error("safetensors::write: '" + e.name + "' null data");

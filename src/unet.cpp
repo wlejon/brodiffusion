@@ -1081,7 +1081,14 @@ int UNet::num_xattn_blocks() const {
 std::vector<int> UNet::layer_strides() const {
     // SD1.5 schedule: down 0/1/2 (2 transformers each), mid (1), up 1/2/3
     // (3 transformers each). Strides relative to the top latent resolution.
-    return {1,1, 2,2, 4,4, 8, 4,4,4, 2,2,2, 1,1,1};
+    // Hard-coded for the stock SD1.5 UNet — reject any other block
+    // configuration rather than return a silently mismatched vector.
+    std::vector<int> strides = {1,1, 2,2, 4,4, 8, 4,4,4, 2,2,2, 1,1,1};
+    if (static_cast<int>(strides.size()) != num_xattn_blocks()) {
+        fail("layer_strides: hard-coded for the stock SD1.5 UNet; this UNet "
+             "has a non-standard block configuration");
+    }
+    return strides;
 }
 
 void UNet::prime_xattn_cache(const bt::Tensor& ctx,
@@ -1136,6 +1143,22 @@ void UNet::forward_impl_(const bt::Tensor& sample,
 
     const int nb      = static_cast<int>(cfg_.block_out_channels.size());
     const int first_C = cfg_.block_out_channels.front();
+
+    // Validate caller-supplied shapes up front — a mismatch otherwise fails
+    // deep inside a brotensor op with an opaque error.
+    if (H <= 0 || W <= 0) fail("forward: H and W must be positive");
+    const int hw_div = 1 << (nb - 1);
+    if (H % hw_div != 0 || W % hw_div != 0) {
+        fail("forward: H and W must each be divisible by " +
+             std::to_string(hw_div) + " (2^(num_blocks-1))");
+    }
+    if (sample.rows != 1 || sample.cols != cfg_.in_channels * H * W) {
+        fail("forward: sample must be (1, in_channels*H*W)");
+    }
+    if (encoder_hidden_states.cols != cfg_.cross_attention_dim) {
+        fail("forward: encoder_hidden_states width must equal "
+             "cross_attention_dim");
+    }
 
     // ── 1. Build the time embedding ────────────────────────────────────────
     std::vector<float> sin_vals;

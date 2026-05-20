@@ -257,6 +257,10 @@ void Decoder::decode(const bt::Tensor& latent,
                      int H_lat, int W_lat,
                      bt::Tensor& out) {
     if (conv_in_W_.size() == 0) fail("decode: weights not loaded");
+    if (H_lat <= 0 || W_lat <= 0) fail("decode: H_lat and W_lat must be positive");
+    if (latent.rows != 1 || latent.cols != cfg_.in_channels * H_lat * W_lat) {
+        fail("decode: latent must be (1, in_channels*H_lat*W_lat)");
+    }
 
     const int first_C = cfg_.block_out_channels.front();
     const int mid_C   = cfg_.block_out_channels.back();
