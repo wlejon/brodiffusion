@@ -30,7 +30,7 @@
 #include <string>
 #include <vector>
 
-namespace brodiffusion::safetensors { class File; }
+namespace brotensor::safetensors { class File; }
 
 namespace brodiffusion::clip_image {
 
@@ -76,7 +76,7 @@ public:
     // converted host-side on the fly. If `pre_layrnorm_alt` is true, the
     // loader accepts "pre_layernorm.*" as a fallback for the typo-fixed
     // variant some forks ship.
-    void load_weights(const brodiffusion::safetensors::File& f,
+    void load_weights(const brotensor::safetensors::File& f,
                       const std::string& prefix = "vision_model.",
                       bool pre_layrnorm_alt = true);
 

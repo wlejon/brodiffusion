@@ -11,7 +11,7 @@
 // the call to finalize_weights() differ. Also exercises the lora-after-finalize
 // guard and idempotent finalize_weights().
 
-#include "brodiffusion/safetensors.h"
+#include "brotensor/safetensors.h"
 #include "brodiffusion/unet.h"
 
 #include "brotensor/runtime.h"
@@ -30,7 +30,7 @@
 #include <vector>
 
 namespace un = brodiffusion::unet;
-namespace st = brodiffusion::safetensors;
+namespace st = brotensor::safetensors;
 namespace bt = brotensor;
 
 static int g_failures = 0;

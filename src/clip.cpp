@@ -1,5 +1,5 @@
 #include "brodiffusion/clip.h"
-#include "brodiffusion/safetensors.h"
+#include "brotensor/safetensors.h"
 #include "brodiffusion/detail/compute.h"
 
 #include "brotensor/ops.h"
@@ -16,7 +16,7 @@
 namespace brodiffusion::clip {
 
 namespace bt = ::brotensor;
-namespace st = ::brodiffusion::safetensors;
+namespace st = ::brotensor::safetensors;
 
 // Validate-and-upload a safetensors weight view at the compute dtype —
 // shared across the CLIP text / image encoders and the scorer.

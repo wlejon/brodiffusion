@@ -3,7 +3,7 @@
 #include "brodiffusion/clip.h"
 #include "brodiffusion/lcm_scheduler.h"
 #include "brodiffusion/lora.h"
-#include "brodiffusion/safetensors.h"
+#include "brotensor/safetensors.h"
 #include "brodiffusion/scheduler.h"
 #include "brodiffusion/tokenizer.h"
 #include "brodiffusion/unet.h"
@@ -55,14 +55,14 @@ Pipeline::Pipeline(const PipelineConfig& cfg, clip::Tokenizer tokenizer)
       vae_(cfg.vae),
       scheduler_(make_scheduler(cfg.scheduler)) {}
 
-void Pipeline::load_weights(const safetensors::File& f) {
+void Pipeline::load_weights(const brotensor::safetensors::File& f) {
     load_weights(f,
                  "cond_stage_model.transformer.text_model.",
                  "model.diffusion_model.",
                  "first_stage_model.decoder.");
 }
 
-void Pipeline::load_weights(const safetensors::File& f,
+void Pipeline::load_weights(const brotensor::safetensors::File& f,
                             const std::string& text_prefix,
                             const std::string& unet_prefix,
                             const std::string& vae_prefix) {
@@ -71,15 +71,15 @@ void Pipeline::load_weights(const safetensors::File& f,
     vae_.load_weights(f, vae_prefix);
 }
 
-void Pipeline::load_weights(const safetensors::File& text_file,
-                            const safetensors::File& unet_file,
-                            const safetensors::File& vae_file) {
+void Pipeline::load_weights(const brotensor::safetensors::File& text_file,
+                            const brotensor::safetensors::File& unet_file,
+                            const brotensor::safetensors::File& vae_file) {
     text_encoder_.load_weights(text_file, "text_model.");
     unet_.load_weights(unet_file, "");
     vae_.load_weights(vae_file, "decoder.");
 }
 
-void Pipeline::apply_lora(const safetensors::File& f, float scale) {
+void Pipeline::apply_lora(const brotensor::safetensors::File& f, float scale) {
     const std::vector<lora::Triple> triples = lora::enumerate(f);
     if (triples.empty()) {
         fail("apply_lora: no LoRA triples found in file");
@@ -87,8 +87,8 @@ void Pipeline::apply_lora(const safetensors::File& f, float scale) {
     for (const lora::Triple& t : triples) {
         const float scale_total = (static_cast<float>(t.alpha) /
                                    static_cast<float>(t.rank)) * scale;
-        const safetensors::TensorView& down = f.get(t.down_key);
-        const safetensors::TensorView& up   = f.get(t.up_key);
+        const brotensor::safetensors::TensorView& down = f.get(t.down_key);
+        const brotensor::safetensors::TensorView& up   = f.get(t.up_key);
         if (t.domain == "unet") {
             unet_.apply_lora_delta(t.target_path, down, up, scale_total);
         } else if (t.domain == "text_encoder") {

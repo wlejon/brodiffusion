@@ -12,7 +12,7 @@
 #include "brodiffusion/detail/compute.h"
 #include "brodiffusion/detail/lora_internal.h"
 #include "brodiffusion/lora.h"
-#include "brodiffusion/safetensors.h"
+#include "brotensor/safetensors.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -31,7 +31,7 @@
 #include <vector>
 
 namespace lora = brodiffusion::lora;
-namespace st   = brodiffusion::safetensors;
+namespace st   = brotensor::safetensors;
 namespace bt   = brotensor;
 
 static int g_failures = 0;

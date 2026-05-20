@@ -1,5 +1,5 @@
 #include "brodiffusion/vae.h"
-#include "brodiffusion/safetensors.h"
+#include "brotensor/safetensors.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
@@ -12,7 +12,7 @@
 namespace brodiffusion::vae {
 
 namespace bt = ::brotensor;
-namespace st = ::brodiffusion::safetensors;
+namespace st = ::brotensor::safetensors;
 
 namespace {
 

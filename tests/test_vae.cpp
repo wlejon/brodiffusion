@@ -10,7 +10,7 @@
 // vs the reference VAE is left to a future real-weights integration test.
 
 #include "brodiffusion/detail/compute.h"
-#include "brodiffusion/safetensors.h"
+#include "brotensor/safetensors.h"
 #include "brodiffusion/vae.h"
 
 #include "brotensor/runtime.h"
@@ -28,7 +28,7 @@
 #include <vector>
 
 namespace vae = brodiffusion::vae;
-namespace st  = brodiffusion::safetensors;
+namespace st  = brotensor::safetensors;
 namespace bt  = brotensor;
 
 static int g_failures = 0;

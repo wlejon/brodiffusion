@@ -23,12 +23,11 @@
 
 namespace brodiffusion {
 
-// FP16 on a GPU backend, FP32 on CPU. Resolved from brotensor's current
-// default device, so it tracks `set_default_device()` / `DeviceScope`.
+// FP16 on a GPU backend, FP32 on CPU. Thin forwarder to brotensor's own
+// compute-precision policy — kept as a brodiffusion-namespace name so the
+// pipeline's existing call sites stay unchanged.
 inline brotensor::Dtype compute_dtype() {
-    return brotensor::default_device() == brotensor::Device::CPU
-               ? brotensor::Dtype::FP32
-               : brotensor::Dtype::FP16;
+    return brotensor::compute_dtype();
 }
 
 namespace detail {

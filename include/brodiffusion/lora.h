@@ -30,7 +30,7 @@
 #include <string>
 #include <vector>
 
-namespace brodiffusion::safetensors { class File; struct TensorView; }
+namespace brotensor::safetensors { class File; struct TensorView; }
 
 namespace brodiffusion::lora {
 
@@ -41,7 +41,7 @@ enum class Format {
 
 // Inspect the file's keys and decide which naming convention dominates.
 // Throws if neither pattern is detected with at least one matching key.
-Format detect_format(const safetensors::File& f);
+Format detect_format(const brotensor::safetensors::File& f);
 
 // One LoRA target: a base weight in either the UNet or the CLIP text encoder
 // plus the (lora_down, lora_up) raw keys in the safetensors file and the
@@ -62,6 +62,6 @@ struct Triple {
 // supported attention/FF projections. Unknown or unsupported keys are
 // skipped silently if they look like LoRA bookkeeping (e.g. dora_scale,
 // rank metadata), and reported as a single grouped error otherwise.
-std::vector<Triple> enumerate(const safetensors::File& f);
+std::vector<Triple> enumerate(const brotensor::safetensors::File& f);
 
 }  // namespace brodiffusion::lora

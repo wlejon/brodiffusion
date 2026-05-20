@@ -25,7 +25,7 @@
 #include <string>
 #include <vector>
 
-namespace brodiffusion::safetensors { class File; }
+namespace brotensor::safetensors { class File; }
 
 namespace brodiffusion::vae {
 
@@ -79,7 +79,7 @@ public:
     //
     // Throws std::runtime_error on missing tensor, shape mismatch, or a
     // source dtype that is neither F16 nor F32.
-    void load_weights(const brodiffusion::safetensors::File& f,
+    void load_weights(const brotensor::safetensors::File& f,
                       const std::string& prefix = "decoder.");
 
     // Decode latent → image. Tensors carry the compute dtype (FP32 on CPU,
@@ -118,7 +118,7 @@ private:
         int  C_out = 0;
     };
 
-    void load_resnet_(const brodiffusion::safetensors::File& f,
+    void load_resnet_(const brotensor::safetensors::File& f,
                       const std::string& prefix,
                       int C_in, int C_out, Resnet& r);
     void apply_resnet_(const Resnet& r, int H, int W,

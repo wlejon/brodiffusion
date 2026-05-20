@@ -59,7 +59,7 @@
 #include <string>
 #include <vector>
 
-namespace brodiffusion::safetensors { class File; struct TensorView; }
+namespace brotensor::safetensors { class File; struct TensorView; }
 
 namespace brodiffusion::unet {
 
@@ -120,7 +120,7 @@ public:
     // Source tensors may be F16 or F32; they load at the compute dtype.
     // Throws std::runtime_error on missing names, shape mismatches, or a
     // source dtype that is neither F16 nor F32.
-    void load_weights(const brodiffusion::safetensors::File& f,
+    void load_weights(const brotensor::safetensors::File& f,
                       const std::string& prefix = "");
 
     // Forward pass. Activation tensors carry the compute dtype (FP32 on CPU,
@@ -247,8 +247,8 @@ public:
     // Must be called *after* `load_weights()`. May be called more than once
     // (e.g. to stack multiple LoRAs).
     void apply_lora_delta(const std::string& target_path,
-                          const brodiffusion::safetensors::TensorView& lora_down,
-                          const brodiffusion::safetensors::TensorView& lora_up,
+                          const brotensor::safetensors::TensorView& lora_down,
+                          const brotensor::safetensors::TensorView& lora_up,
                           float scale_total);
 
     // Finalize the UNet weights for inference. When the config has
@@ -335,10 +335,10 @@ private:
         int  C_out = 0;
     };
 
-    void load_resnet_(const brodiffusion::safetensors::File& f,
+    void load_resnet_(const brotensor::safetensors::File& f,
                       const std::string& prefix,
                       int C_in, int C_out, Resnet& r);
-    void load_transformer_(const brodiffusion::safetensors::File& f,
+    void load_transformer_(const brotensor::safetensors::File& f,
                            const std::string& prefix,
                            int C, int num_heads, Transformer2D& t);
 

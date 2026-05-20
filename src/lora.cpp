@@ -1,7 +1,7 @@
 #include "brodiffusion/lora.h"
 
 #include "brodiffusion/detail/lora_internal.h"
-#include "brodiffusion/safetensors.h"
+#include "brotensor/safetensors.h"
 
 #include "brotensor/tensor.h"
 
@@ -19,7 +19,7 @@
 
 namespace brodiffusion::lora {
 
-namespace st = ::brodiffusion::safetensors;
+namespace st = ::brotensor::safetensors;
 
 namespace {
 

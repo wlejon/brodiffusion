@@ -1,5 +1,5 @@
 #include "brodiffusion/unet.h"
-#include "brodiffusion/safetensors.h"
+#include "brotensor/safetensors.h"
 #include "brodiffusion/fused_resblock.h"
 #include "brodiffusion/fused_transformer.h"
 #include "brodiffusion/detail/device.h"
@@ -22,7 +22,7 @@
 namespace brodiffusion::unet {
 
 namespace bt = ::brotensor;
-namespace st = ::brodiffusion::safetensors;
+namespace st = ::brotensor::safetensors;
 
 namespace {
 

@@ -11,7 +11,7 @@
 
 #include "brodiffusion/clip.h"
 #include "brodiffusion/detail/compute.h"
-#include "brodiffusion/safetensors.h"
+#include "brotensor/safetensors.h"
 
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
@@ -28,7 +28,7 @@
 #include <vector>
 
 namespace clip = brodiffusion::clip;
-namespace st   = brodiffusion::safetensors;
+namespace st   = brotensor::safetensors;
 namespace bt   = brotensor;
 
 static int g_failures = 0;

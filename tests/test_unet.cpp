@@ -12,7 +12,7 @@
 // fidelity vs the reference UNet is left to a future real-weights test.
 
 #include "brodiffusion/detail/compute.h"
-#include "brodiffusion/safetensors.h"
+#include "brotensor/safetensors.h"
 #include "brodiffusion/unet.h"
 
 #include "brotensor/runtime.h"
@@ -31,7 +31,7 @@
 #include <vector>
 
 namespace un = brodiffusion::unet;
-namespace st = brodiffusion::safetensors;
+namespace st = brotensor::safetensors;
 namespace bt = brotensor;
 
 static int g_failures = 0;

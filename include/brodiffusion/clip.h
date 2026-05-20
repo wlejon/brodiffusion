@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-namespace brodiffusion::safetensors { class File; struct TensorView; }
+namespace brotensor::safetensors { class File; struct TensorView; }
 
 namespace brodiffusion::clip {
 
@@ -70,7 +70,7 @@ public:
     // Source tensors may be F16 or F32; they load at the compute dtype.
     // Throws std::runtime_error if a name is missing, shape mismatches the
     // config, or the source dtype is neither F16 nor F32.
-    void load_weights(const brodiffusion::safetensors::File& f,
+    void load_weights(const brotensor::safetensors::File& f,
                       const std::string& prefix = "text_model.");
 
     // Forward pass on a length-L sequence of int32 token IDs. L must equal
@@ -90,8 +90,8 @@ public:
     //     W += scale_total * (lora_up @ lora_down)
     // with `scale_total = (alpha / rank) * user_scale` baked in by the caller.
     void apply_lora_delta(const std::string& target_path,
-                          const brodiffusion::safetensors::TensorView& lora_down,
-                          const brodiffusion::safetensors::TensorView& lora_up,
+                          const brotensor::safetensors::TensorView& lora_down,
+                          const brotensor::safetensors::TensorView& lora_up,
                           float scale_total);
 
 private:

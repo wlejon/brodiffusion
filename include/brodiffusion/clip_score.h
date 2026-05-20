@@ -33,7 +33,7 @@
 #include <string_view>
 #include <vector>
 
-namespace brodiffusion::safetensors { class File; }
+namespace brotensor::safetensors { class File; }
 
 namespace brodiffusion::clip_score {
 
@@ -61,7 +61,7 @@ public:
     //
     // Some forks (e.g. an `open_clip` re-export) ship them under a model.
     // prefix — pass that as `prefix` if needed.
-    void load_projections(const safetensors::File& f,
+    void load_projections(const brotensor::safetensors::File& f,
                           const std::string& prefix = "");
 
     // Tokenize, encode, pool at EOS, project. Cache the projected text

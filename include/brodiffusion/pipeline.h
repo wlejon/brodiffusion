@@ -29,7 +29,7 @@
 #include <variant>
 #include <vector>
 
-namespace brodiffusion::safetensors { class File; }
+namespace brotensor::safetensors { class File; }
 
 namespace brodiffusion::pipeline {
 
@@ -91,20 +91,20 @@ public:
     //   "cond_stage_model.transformer.text_model." for CLIP
     //   "model.diffusion_model."                   for the U-Net
     //   "first_stage_model.decoder."               for the VAE decoder
-    void load_weights(const safetensors::File& f);
+    void load_weights(const brotensor::safetensors::File& f);
 
     // Load with explicit prefixes (e.g. when sub-modules ship in separate
     // diffusers exports).
-    void load_weights(const safetensors::File& f,
+    void load_weights(const brotensor::safetensors::File& f,
                       const std::string& text_prefix,
                       const std::string& unet_prefix,
                       const std::string& vae_prefix);
 
     // Load each module from its own diffusers-format safetensors file. Uses
     // the diffusers default prefixes ("text_model.", "", "decoder.").
-    void load_weights(const safetensors::File& text_file,
-                      const safetensors::File& unet_file,
-                      const safetensors::File& vae_file);
+    void load_weights(const brotensor::safetensors::File& text_file,
+                      const brotensor::safetensors::File& unet_file,
+                      const brotensor::safetensors::File& vae_file);
 
     // Merge a LoRA file's deltas into the base UNet and CLIP weights.
     //
@@ -121,7 +121,7 @@ public:
     // Accepts both kohya-ss/A1111 and diffusers/PEFT key conventions; the
     // format is auto-detected from the key prefixes. Throws if the file
     // contains LoRA tensors that don't map to a known SD1.5 target.
-    void apply_lora(const safetensors::File& f, float scale = 1.0f);
+    void apply_lora(const brotensor::safetensors::File& f, float scale = 1.0f);
 
     // Generate an image. Returns a freshly-allocated host buffer of
     // 3 * height * width FP32 values in NCHW (C=3, [-1, 1]).

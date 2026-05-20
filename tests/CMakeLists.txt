@@ -10,7 +10,6 @@ function(brodiffusion_add_test name)
 endfunction()
 
 brodiffusion_add_test(brodiffusion_test_smoke          test_smoke.cpp)
-brodiffusion_add_test(brodiffusion_test_safetensors    test_safetensors.cpp)
 brodiffusion_add_test(brodiffusion_test_tokenizer_clip test_tokenizer_clip.cpp)
 brodiffusion_add_test(brodiffusion_test_clip           test_clip.cpp)
 brodiffusion_add_test(brodiffusion_test_vae            test_vae.cpp)

@@ -1,5 +1,5 @@
 #include "brodiffusion/pipeline.h"
-#include "brodiffusion/safetensors.h"
+#include "brotensor/safetensors.h"
 #include "brodiffusion/tokenizer.h"
 #include "brodiffusion/version.h"
 
@@ -18,7 +18,7 @@
 #include <vector>
 
 namespace pl   = brodiffusion::pipeline;
-namespace st   = brodiffusion::safetensors;
+namespace st   = brotensor::safetensors;
 namespace clip = brodiffusion::clip;
 
 static int usage() {
