@@ -139,3 +139,6 @@ cmake --build build --config Release
 cd build && ctest -C Release --output-on-failure
 ```
 
+## License
+
+[MIT](LICENSE)
