@@ -8,14 +8,17 @@
 //      i.e. skips materialising the (B, 2D) FF1 intermediate (~10 MB at the
 //      bottom level), which is a real memory pass on the 4090.
 //
-//   2. add_inplace_fp16_vec:
+//   2. add_inplace_vec:
 //        Vectorised FP16 elementwise add. brotensor's add_inplace FP16
 //        path goes through __half2float per element; we use __half2 adds and
 //        int4 vector loads, which matters because the transformer block does
 //        3 of these per call (self-attn residual, cross-attn residual, FF
 //        residual), 16 transformer blocks per step.
 //
-// Both ops assume FP16 storage, FP32 accumulators where relevant, and the
+//   3. add_inplace_row_bias:
+//        Broadcast a per-column FP16 bias vector down every row of Y.
+//
+// All ops assume FP16 storage, FP32 accumulators where relevant, and the
 // SD1.5 inference shape constraints documented in the public header.
 
 #include "brodiffusion/fused_transformer.h"
@@ -399,10 +402,10 @@ __global__ void add_inplace_row_bias_fp16_kernel(__half* __restrict__ Y,
 
 void detail::add_inplace_row_bias_cuda(bt::Tensor& Y, const bt::Tensor& bias) {
     if (Y.dtype != bt::Dtype::FP16 || bias.dtype != bt::Dtype::FP16) {
-        throw std::runtime_error("add_inplace_row_bias_fp16: tensors must be FP16");
+        throw std::runtime_error("add_inplace_row_bias: tensors must be FP16");
     }
     if (static_cast<int>(bias.size()) != Y.cols) {
-        throw std::runtime_error("add_inplace_row_bias_fp16: bias.size() must equal Y.cols");
+        throw std::runtime_error("add_inplace_row_bias: bias.size() must equal Y.cols");
     }
     if (Y.cols == 0 || Y.rows == 0) return;
     constexpr int kThreads = 256;
@@ -416,10 +419,10 @@ void detail::add_inplace_row_bias_cuda(bt::Tensor& Y, const bt::Tensor& bias) {
 
 void detail::add_inplace_vec_cuda(bt::Tensor& Y, const bt::Tensor& X) {
     if (Y.dtype != bt::Dtype::FP16 || X.dtype != bt::Dtype::FP16) {
-        throw std::runtime_error("add_inplace_fp16_vec: both tensors must be FP16");
+        throw std::runtime_error("add_inplace_vec: both tensors must be FP16");
     }
     if (Y.rows != X.rows || Y.cols != X.cols) {
-        throw std::runtime_error("add_inplace_fp16_vec: shape mismatch");
+        throw std::runtime_error("add_inplace_vec: shape mismatch");
     }
     const int n = Y.size();
     if (n == 0) return;
