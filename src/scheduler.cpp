@@ -1,5 +1,6 @@
 #include "brodiffusion/scheduler.h"
 #include "brodiffusion/detail/device.h"
+#include "brodiffusion/detail/compute.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
@@ -67,8 +68,8 @@ void DDIM::step(const bt::Tensor& noise_pred,
     if (step_index < 0 || step_index >= static_cast<int>(timesteps_.size())) {
         fail("step_index out of range");
     }
-    if (noise_pred.dtype != bt::Dtype::FP16 || sample.dtype != bt::Dtype::FP16) {
-        fail("noise_pred and sample must be FP16");
+    if (noise_pred.dtype != sample.dtype) {
+        fail("noise_pred and sample must share a dtype");
     }
     if (noise_pred.rows != sample.rows || noise_pred.cols != sample.cols) {
         fail("noise_pred and sample shape mismatch");
@@ -94,7 +95,7 @@ void DDIM::step(const bt::Tensor& noise_pred,
     const float B = sqrt_1mat_prev - sqrt_at_prev * sqrt_1mat / sqrt_at;
 
     detail::resize_like(scratch, noise_pred.rows, noise_pred.cols,
-                        bt::Dtype::FP16, noise_pred.device);
+                        compute_dtype(), noise_pred.device);
     bt::copy_d2d(noise_pred, 0, scratch, 0, noise_pred.size());
     bt::scale_inplace(scratch, B);
     bt::scale_inplace(sample, A);

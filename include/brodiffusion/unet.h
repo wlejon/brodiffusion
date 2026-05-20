@@ -2,10 +2,13 @@
 
 // UNet2DConditionModel for SD1.5 (the noise-prediction backbone).
 //
-// Inference-only, FP16, batch size N = 1 (the forward path hard-codes N=1
+// Inference-only, batch size N = 1 (the forward path hard-codes N=1
 // throughout; the underlying brotensor ops support N > 1, so generalizing
-// is mostly a matter of plumbing the batch dim through). Architecture mirrors Hugging
-// Face's diffusers `UNet2DConditionModel` defaults for SD1.5:
+// is mostly a matter of plumbing the batch dim through). Runs on whichever
+// backend brotensor resolves at runtime — CPU by default, CUDA when
+// available — at that backend's compute dtype (FP32 on CPU, FP16 on a GPU).
+// Architecture mirrors Hugging Face's diffusers `UNet2DConditionModel`
+// defaults for SD1.5:
 //
 //   block_out_channels = [320, 640, 1280, 1280]
 //   layers_per_block   = 2
@@ -44,9 +47,10 @@
 //   GroupNorm(C_out) -> SiLU -> Conv3x3
 //   + (1x1 conv shortcut if C_in != C_out)
 //
-// Caller is responsible for sync_all() before reading the output. All
-// weights and activations are FP16 — convert host-side if your checkpoint
-// ships FP32 weights.
+// Caller is responsible for sync_all() before reading the output. Weights
+// and activations carry the compute dtype — FP32 on CPU, FP16 on a GPU
+// backend. The safetensors loader accepts F16 or F32 source weights and
+// converts as needed.
 
 #include "brotensor/tensor.h"
 
@@ -87,11 +91,15 @@ struct UNetConfig {
 
     // When true, finalize_weights() converts the big UNet weights (ResBlock
     // 3x3/1x1 conv weights, attention Q/K/V/O projections, transformer
-    // proj_in/proj_out, FF1/FF2 linears, down/upsampler 3x3 convs) from FP16
-    // to INT8 weight-only quantisation (W8A16). Small/sensitive layers
-    // (conv_in, conv_out, GroupNorm gain/bias, time embedding, cond_proj,
-    // per-resblock time_emb_proj, all biases) stay FP16. Per-output-row
+    // proj_in/proj_out, FF1/FF2 linears, down/upsampler 3x3 convs) to INT8
+    // weight-only quantisation (W8A16). Small/sensitive layers (conv_in,
+    // conv_out, GroupNorm gain/bias, time embedding, cond_proj, per-resblock
+    // time_emb_proj, all biases) keep their FP16 storage. Per-output-row
     // symmetric scales (matching brotensor::quantize_int8_per_row_host).
+    //
+    // INT8 (W8A16) quantization is GPU-only. On the CPU backend
+    // finalize_weights() prints a warning and ignores this flag, so the
+    // pipeline still runs end-to-end in FP32.
     bool quantize_weights = false;
 };
 
@@ -109,18 +117,20 @@ public:
     // `UNet2DConditionModel` convention. SD1.5 diffusers exports use an empty
     // prefix; SD1.5 full checkpoints typically use "model.diffusion_model.".
     //
-    // Every tensor must be FP16. Throws std::runtime_error on missing names,
-    // shape mismatches, or dtype mismatch.
+    // Source tensors may be F16 or F32; they load at the compute dtype.
+    // Throws std::runtime_error on missing names, shape mismatches, or a
+    // source dtype that is neither F16 nor F32.
     void load_weights(const brodiffusion::safetensors::File& f,
                       const std::string& prefix = "");
 
-    // Forward pass.
-    //   sample:                (1, in_channels * H * W) FP16 — noisy latent
+    // Forward pass. Activation tensors carry the compute dtype (FP32 on CPU,
+    // FP16 on a GPU backend).
+    //   sample:                (1, in_channels * H * W) — noisy latent
     //   H, W:                  spatial dims of `sample`. H and W must each be
     //                          divisible by 2^(num_blocks-1) (typically 8).
     //   timestep:              continuous timestep value (typically in [0, 1000)).
-    //   encoder_hidden_states: (L_text, cross_attention_dim) FP16, e.g. CLIP output.
-    //   out:                   (1, out_channels * H * W) FP16, resized as needed.
+    //   encoder_hidden_states: (L_text, cross_attention_dim), e.g. CLIP output.
+    //   out:                   (1, out_channels * H * W), resized as needed.
     void forward(const brotensor::Tensor& sample,
                  int H, int W,
                  float timestep,
@@ -128,7 +138,7 @@ public:
                  brotensor::Tensor& out);
 
     // Cached cross-attention K/V for a single context tensor — one (K, V) pair
-    // per Transformer2D block, FP16, layout matching
+    // per Transformer2D block, at the compute dtype, layout matching
     // brotensor::flash_attention_forward's K/V args (Lk, C). The text
     // context is fixed across all denoising steps so projecting K/V once per
     // generate() per CFG branch eliminates 16 × steps × 2 redundant matmuls.
@@ -140,7 +150,7 @@ public:
 
     // Head-averaged cross-attention softmax map per Transformer2D block, in the
     // same traversal order the forward pass visits them. Each entry has shape
-    // (Lq, Lk) FP16, where Lq is the layer's spatial token count (H*W at that
+    // (Lq, Lk) at the compute dtype, where Lq is the layer's spatial token count (H*W at that
     // resolution) and Lk is the text-context length (77 for SD1.5/CLIP). The
     // trace-mode forward overload below populates this vector for downstream
     // research consumers (cross-attention tree search, attention scoring).
@@ -222,7 +232,7 @@ public:
     // Text-encoder context length (Lk) for cross-attention. SD1.5 / CLIP: 77.
     int context_length() const { return 77; }
 
-    // Fold a LoRA delta into the base FP16 weight identified by `target_path`.
+    // Fold a LoRA delta into the base weight identified by `target_path`.
     // `target_path` is a diffusers path *within* the UNet (no "unet." prefix),
     // e.g. "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q" or
     // "ff.net.0.proj". Throws if the path is unknown or shapes don't match.
@@ -242,15 +252,18 @@ public:
                           float scale_total);
 
     // Finalize the UNet weights for inference. When the config has
-    // `quantize_weights == true` this converts the big linear / conv weights
-    // listed in UNetConfig::quantize_weights to INT8 (per-output-row symmetric
-    // FP32 scales) and frees the original FP16 storage. When
-    // `quantize_weights == false` this is a no-op except for marking the UNet
-    // finalized, after which apply_lora_delta() throws.
+    // `quantize_weights == true` and the weights are GPU-resident, this
+    // converts the big linear / conv weights listed in
+    // UNetConfig::quantize_weights to INT8 (per-output-row symmetric FP32
+    // scales) and frees the original weight storage. INT8 quantization is
+    // GPU-only: on the CPU backend it is skipped (with a warning) so the
+    // pipeline still runs in FP32. When `quantize_weights == false` this is a
+    // no-op except for marking the UNet finalized, after which
+    // apply_lora_delta() throws.
     //
     // Idempotent: a second call is a no-op. apply_lora_delta() must be called
-    // BEFORE finalize_weights() — once finalized, the FP16 storage backing the
-    // LoRA-patchable layers is gone.
+    // BEFORE finalize_weights() — once finalized, the weight storage backing
+    // the LoRA-patchable layers may be gone.
     void finalize_weights();
     bool is_finalized() const { return finalized_; }
 
@@ -363,7 +376,7 @@ private:
                        const std::vector<const brotensor::Tensor*>* attn_logit_biases,
                        CrossAttnTrace* trace_out,
                        brotensor::Tensor& out);
-    // Returns a pointer to the FP16 base weight identified by `target_path`
+    // Returns a pointer to the base weight identified by `target_path`
     // (a diffusers tail within the UNet, e.g. "down_blocks.0.attentions.0.
     // transformer_blocks.0.attn1.to_q"). Returns nullptr if the path doesn't
     // match a recognized LoRA-patchable layer.

@@ -9,12 +9,15 @@
 //      uses, and check `W' == W + (alpha/rank) * (up @ down) * user_scale`
 //      to within FP16 tolerance.
 
+#include "brodiffusion/detail/compute.h"
 #include "brodiffusion/lora.h"
 #include "brodiffusion/safetensors.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
+
+#include "test_compute.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -237,12 +240,8 @@ void test_merge_math() {
     try {
         bt::init();
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "init failed in test_merge_math: %s — skipping\n", e.what());
-        return;
-    }
-    if (!bt::is_available(bt::Device::CUDA) &&
-        !bt::is_available(bt::Device::Metal)) {
-        std::fprintf(stderr, "no GPU backend — skipping test_merge_math\n");
+        std::fprintf(stderr, "init failed in test_merge_math: %s\n", e.what());
+        ++g_failures;
         return;
     }
 
@@ -267,28 +266,18 @@ void test_merge_math() {
     const float scale_total =
         (alpha / static_cast<float>(RANK)) * user_scale;  // = 1.0
 
-    // Upload as FP16.
-    auto to_fp16 = [](const std::vector<float>& src) {
-        std::vector<uint16_t> dst(src.size());
-        for (std::size_t i = 0; i < src.size(); ++i) dst[i] = bt::fp32_to_fp16_bits(src[i]);
-        return dst;
-    };
-    auto W_bits    = to_fp16(W_base);
-    auto down_bits = to_fp16(down);
-    auto up_bits   = to_fp16(up);
-
+    // Upload at the pipeline compute dtype (FP32 on CPU, FP16 on GPU).
     bt::Tensor W, D, U, delta;
-    W = brotensor::Tensor::from_host_fp16(W_bits.data(),    OUT,  IN);
-    D = brotensor::Tensor::from_host_fp16(down_bits.data(), RANK, IN);
-    U = brotensor::Tensor::from_host_fp16(up_bits.data(),   OUT,  RANK);
+    W = bdtest::bd_upload(W_base, OUT,  IN);
+    D = bdtest::bd_upload(down,   RANK, IN);
+    U = bdtest::bd_upload(up,     OUT,  RANK);
 
     bt::matmul(U, D, delta);                  // (OUT, IN)
     bt::scale_inplace(delta, scale_total);
     bt::add_inplace(W, delta);
 
     // Read back W and compare to expectation.
-    std::vector<uint16_t> W_out_bits(static_cast<std::size_t>(OUT * IN));
-    W.copy_to_host_fp16(W_out_bits.data());
+    std::vector<float> W_out = bdtest::bd_download(W);
 
     // Reference (fp32 host).
     std::vector<float> ref(OUT * IN, 0.0f);
@@ -304,7 +293,7 @@ void test_merge_math() {
 
     float max_abs = 0.0f, max_diff = 0.0f;
     for (int i = 0; i < OUT * IN; ++i) {
-        const float got = bt::fp16_bits_to_fp32(W_out_bits[static_cast<std::size_t>(i)]);
+        const float got = W_out[static_cast<std::size_t>(i)];
         const float exp = ref[static_cast<std::size_t>(i)];
         max_abs = std::max(max_abs, std::abs(exp));
         max_diff = std::max(max_diff, std::abs(got - exp));

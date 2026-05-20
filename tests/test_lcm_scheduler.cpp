@@ -5,11 +5,14 @@
 // step() loop with fixed-seed noise produces a finite FP16 result that's
 // deterministic across runs.
 
+#include "brodiffusion/detail/compute.h"
 #include "brodiffusion/lcm_scheduler.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
+
+#include "test_compute.h"
 
 #include <cmath>
 #include <cstdint>
@@ -61,56 +64,47 @@ int main() {
         std::fprintf(stderr, "init failed: %s\n", e.what());
         return 1;
     }
-    if (!bt::is_available(bt::Device::CUDA) &&
-        !bt::is_available(bt::Device::Metal)) {
-        std::fprintf(stderr, "no GPU backend — skipping GPU test\n");
-        return 0;
-    }
-
     const int C = 4, H = 8, W = 8;
     const int n = C * H * W;
 
-    auto run_loop = [&](std::vector<std::uint16_t>& out_bits) {
+    auto run_loop = [&](std::vector<float>& out_vals) {
         std::mt19937 rng(0xCAFE);
         std::normal_distribution<float> nrm(0.0f, 1.0f);
 
-        std::vector<std::uint16_t> latent_bits(n), pred_bits(n);
+        std::vector<float> latent_vals(n), pred_vals(n);
         for (int i = 0; i < n; ++i) {
-            latent_bits[i] = bt::fp32_to_fp16_bits(nrm(rng));
-            pred_bits[i]   = bt::fp32_to_fp16_bits(0.1f * nrm(rng));
+            latent_vals[i] = nrm(rng);
+            pred_vals[i]   = 0.1f * nrm(rng);
         }
 
         bt::Tensor sample, noise_pred, noise, scratch;
-        sample = brotensor::Tensor::from_host_fp16(latent_bits.data(), 1, n);
-        noise_pred = brotensor::Tensor::from_host_fp16(pred_bits.data(),   1, n);
+        sample     = bdtest::bd_upload(latent_vals, 1, n);
+        noise_pred = bdtest::bd_upload(pred_vals,   1, n);
 
         sc::LCM s;
         s.set_timesteps(4);
-        std::vector<std::uint16_t> noise_bits(n);
+        std::vector<float> noise_vals(n);
         for (int i = 0; i < s.num_inference_steps(); ++i) {
             for (int k = 0; k < n; ++k) {
-                noise_bits[k] = bt::fp32_to_fp16_bits(nrm(rng));
+                noise_vals[k] = nrm(rng);
             }
-            noise = brotensor::Tensor::from_host_fp16(noise_bits.data(), 1, n);
+            noise = bdtest::bd_upload(noise_vals, 1, n);
             s.step(noise_pred, i, sample, noise, scratch);
         }
-        bt::sync_all();
-        out_bits.resize(n);
-        sample.copy_to_host_fp16(out_bits.data());
+        out_vals = bdtest::bd_download(sample);
     };
 
-    std::vector<std::uint16_t> out_a, out_b;
+    std::vector<float> out_a, out_b;
     run_loop(out_a);
     run_loop(out_b);
 
     // Deterministic across runs (same RNG seed, same sequence).
-    CHECK(std::memcmp(out_a.data(), out_b.data(), n * 2) == 0);
+    CHECK(out_a == out_b);
 
     // No Inf/NaN in the result.
     int n_bad = 0;
-    for (std::uint16_t b : out_a) {
-        const std::uint16_t exp = (b >> 10) & 0x1F;
-        if (exp == 0x1F) ++n_bad;
+    for (float v : out_a) {
+        if (!bdtest::bd_finite(v)) ++n_bad;
     }
     CHECK(n_bad == 0);
 

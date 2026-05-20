@@ -8,6 +8,7 @@
 #include "brodiffusion/tokenizer.h"
 #include "brodiffusion/unet.h"
 #include "brodiffusion/vae.h"
+#include "brodiffusion/detail/compute.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -156,11 +157,11 @@ PipelineState Pipeline::prime(std::string_view prompt,
     std::normal_distribution<float> nrm(0.0f, 1.0f);
     const float sigma = std::visit(
         [](const auto& s) { return s.init_noise_sigma(); }, scheduler_);
-    std::vector<std::uint16_t> noise(n_lat);
+    std::vector<float> noise(n_lat);
     for (int i = 0; i < n_lat; ++i) {
-        noise[i] = bt::fp32_to_fp16_bits(sigma * nrm(state.rng));
+        noise[i] = sigma * nrm(state.rng);
     }
-    state.latent = brotensor::Tensor::from_host_fp16(noise.data(), 1, n_lat);
+    state.latent = detail::upload_host(noise.data(), 1, n_lat);
 
     // 3. Set the timestep schedule (lives on the scheduler — shared across
     // all branches).
@@ -235,11 +236,11 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
     // ── Scheduler step ────────────────────────────────────────────────────
     if (is_lcm) {
         std::normal_distribution<float> nrm(0.0f, 1.0f);
-        std::vector<std::uint16_t> bits(static_cast<std::size_t>(n_lat));
+        std::vector<float> noise_vals(static_cast<std::size_t>(n_lat));
         for (int k = 0; k < n_lat; ++k) {
-            bits[k] = bt::fp32_to_fp16_bits(nrm(state.rng));
+            noise_vals[k] = nrm(state.rng);
         }
-        noise_step_ = brotensor::Tensor::from_host_fp16(bits.data(), 1, n_lat);
+        noise_step_ = detail::upload_host(noise_vals.data(), 1, n_lat);
         std::get<scheduler::LCM>(scheduler_).step(
             noise_pred_cond_, i, state.latent, noise_step_, scratch_);
     } else {
@@ -254,14 +255,19 @@ std::vector<float> Pipeline::decode(const PipelineState& state) {
     bt::sync_all();
     const int n_img = cfg_.vae.out_channels *
                        (state.H_lat * 8) * (state.W_lat * 8);
-    std::vector<std::uint16_t> dec_bits(static_cast<std::size_t>(n_img));
-    decoded_.copy_to_host_fp16(dec_bits.data());
-    std::vector<float> out(static_cast<std::size_t>(n_img));
-    for (int i = 0; i < n_img; ++i) {
-        out[static_cast<std::size_t>(i)] =
-            bt::fp16_bits_to_fp32(dec_bits[static_cast<std::size_t>(i)]);
+    // The decoded tensor carries the compute dtype — FP16 on a GPU backend,
+    // FP32 on CPU. Convert FP16 bits to float as needed.
+    if (decoded_.dtype == bt::Dtype::FP16) {
+        std::vector<std::uint16_t> dec_bits(static_cast<std::size_t>(n_img));
+        decoded_.copy_to_host_fp16(dec_bits.data());
+        std::vector<float> out(static_cast<std::size_t>(n_img));
+        for (int i = 0; i < n_img; ++i) {
+            out[static_cast<std::size_t>(i)] =
+                bt::fp16_bits_to_fp32(dec_bits[static_cast<std::size_t>(i)]);
+        }
+        return out;
     }
-    return out;
+    return decoded_.to_host_vector();
 }
 
 std::vector<float> Pipeline::generate(std::string_view prompt,

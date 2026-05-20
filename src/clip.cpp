@@ -1,5 +1,6 @@
 #include "brodiffusion/clip.h"
 #include "brodiffusion/safetensors.h"
+#include "brodiffusion/detail/compute.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -25,12 +26,12 @@ namespace {
     throw std::runtime_error("clip::TextEncoder: " + msg);
 }
 
-// Upload a safetensors view as a FP16 Tensor. Accepts F16 source (used
+// Upload a safetensors view at the compute dtype. Accepts F16 source (used
 // as-is) or F32 source (converted host-side); SD1.5 full checkpoints ship
 // as F32. Asserts the expected (rows, cols) shape; permits the source tensor
 // to be 1-D (treated as (n, 1)) or 2-D.
-void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
-                         bt::Tensor& dst, const char* name) {
+void upload_compute_checked(const st::TensorView& v, int rows, int cols,
+                            bt::Tensor& dst, const char* name) {
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
         fail(std::string(name) + ": expected F16 or F32, got " +
              st::dtype_name(v.dtype));
@@ -41,7 +42,7 @@ void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
              std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
              std::to_string(v.numel()) + " elements)");
     }
-    st::upload_fp16(v, rows, cols, dst);
+    st::upload_compute(v, rows, cols, dst);
 }
 
 // Build a device-resident INT32 buffer holding `n` token/position ids.
@@ -85,39 +86,39 @@ void TextEncoder::load_weights(const st::File& f, const std::string& prefix) {
     const int D = cfg_.hidden_dim;
     const int F = cfg_.intermediate_dim;
 
-    upload_fp16_checked(need(f, prefix + "embeddings.token_embedding.weight"),
+    upload_compute_checked(need(f, prefix + "embeddings.token_embedding.weight"),
                         V, D, token_embed_, "token_embedding");
-    upload_fp16_checked(need(f, prefix + "embeddings.position_embedding.weight"),
+    upload_compute_checked(need(f, prefix + "embeddings.position_embedding.weight"),
                         P, D, position_embed_, "position_embedding");
 
     for (int i = 0; i < cfg_.num_layers; ++i) {
         const std::string p = prefix + "encoder.layers." + std::to_string(i) + ".";
         Layer& L = layers_[static_cast<std::size_t>(i)];
 
-        upload_fp16_checked(need(f, p + "layer_norm1.weight"), D, 1, L.ln1_gamma, "ln1.weight");
-        upload_fp16_checked(need(f, p + "layer_norm1.bias"),   D, 1, L.ln1_beta,  "ln1.bias");
+        upload_compute_checked(need(f, p + "layer_norm1.weight"), D, 1, L.ln1_gamma, "ln1.weight");
+        upload_compute_checked(need(f, p + "layer_norm1.bias"),   D, 1, L.ln1_beta,  "ln1.bias");
 
-        upload_fp16_checked(need(f, p + "self_attn.q_proj.weight"), D, D, L.Wq, "q_proj.W");
-        upload_fp16_checked(need(f, p + "self_attn.q_proj.bias"),   D, 1, L.bq, "q_proj.b");
-        upload_fp16_checked(need(f, p + "self_attn.k_proj.weight"), D, D, L.Wk, "k_proj.W");
-        upload_fp16_checked(need(f, p + "self_attn.k_proj.bias"),   D, 1, L.bk, "k_proj.b");
-        upload_fp16_checked(need(f, p + "self_attn.v_proj.weight"), D, D, L.Wv, "v_proj.W");
-        upload_fp16_checked(need(f, p + "self_attn.v_proj.bias"),   D, 1, L.bv, "v_proj.b");
-        upload_fp16_checked(need(f, p + "self_attn.out_proj.weight"), D, D, L.Wo, "out_proj.W");
-        upload_fp16_checked(need(f, p + "self_attn.out_proj.bias"),   D, 1, L.bo, "out_proj.b");
+        upload_compute_checked(need(f, p + "self_attn.q_proj.weight"), D, D, L.Wq, "q_proj.W");
+        upload_compute_checked(need(f, p + "self_attn.q_proj.bias"),   D, 1, L.bq, "q_proj.b");
+        upload_compute_checked(need(f, p + "self_attn.k_proj.weight"), D, D, L.Wk, "k_proj.W");
+        upload_compute_checked(need(f, p + "self_attn.k_proj.bias"),   D, 1, L.bk, "k_proj.b");
+        upload_compute_checked(need(f, p + "self_attn.v_proj.weight"), D, D, L.Wv, "v_proj.W");
+        upload_compute_checked(need(f, p + "self_attn.v_proj.bias"),   D, 1, L.bv, "v_proj.b");
+        upload_compute_checked(need(f, p + "self_attn.out_proj.weight"), D, D, L.Wo, "out_proj.W");
+        upload_compute_checked(need(f, p + "self_attn.out_proj.bias"),   D, 1, L.bo, "out_proj.b");
 
-        upload_fp16_checked(need(f, p + "layer_norm2.weight"), D, 1, L.ln2_gamma, "ln2.weight");
-        upload_fp16_checked(need(f, p + "layer_norm2.bias"),   D, 1, L.ln2_beta,  "ln2.bias");
+        upload_compute_checked(need(f, p + "layer_norm2.weight"), D, 1, L.ln2_gamma, "ln2.weight");
+        upload_compute_checked(need(f, p + "layer_norm2.bias"),   D, 1, L.ln2_beta,  "ln2.bias");
 
-        upload_fp16_checked(need(f, p + "mlp.fc1.weight"), F, D, L.fc1_W, "fc1.W");
-        upload_fp16_checked(need(f, p + "mlp.fc1.bias"),   F, 1, L.fc1_b, "fc1.b");
-        upload_fp16_checked(need(f, p + "mlp.fc2.weight"), D, F, L.fc2_W, "fc2.W");
-        upload_fp16_checked(need(f, p + "mlp.fc2.bias"),   D, 1, L.fc2_b, "fc2.b");
+        upload_compute_checked(need(f, p + "mlp.fc1.weight"), F, D, L.fc1_W, "fc1.W");
+        upload_compute_checked(need(f, p + "mlp.fc1.bias"),   F, 1, L.fc1_b, "fc1.b");
+        upload_compute_checked(need(f, p + "mlp.fc2.weight"), D, F, L.fc2_W, "fc2.W");
+        upload_compute_checked(need(f, p + "mlp.fc2.bias"),   D, 1, L.fc2_b, "fc2.b");
     }
 
-    upload_fp16_checked(need(f, prefix + "final_layer_norm.weight"),
+    upload_compute_checked(need(f, prefix + "final_layer_norm.weight"),
                         D, 1, final_gamma_, "final_ln.weight");
-    upload_fp16_checked(need(f, prefix + "final_layer_norm.bias"),
+    upload_compute_checked(need(f, prefix + "final_layer_norm.bias"),
                         D, 1, final_beta_,  "final_ln.bias");
 
     // Position-id buffer is fixed [0, 1, ..., P-1]. Upload once.
@@ -155,7 +156,7 @@ void TextEncoder::forward(const int32_t* ids, bt::Tensor& out) {
 
     for (auto& layer : layers_) {
         // ── self-attention block ──────────────────────────────────────────
-        bt::layernorm_forward_inference_batched_fp16(
+        detail::layernorm_batched(
             x_, layer.ln1_gamma, layer.ln1_beta, ln_out_, cfg_.layer_norm_eps);
 
         bt::flash_attention_qkvo_forward(
@@ -169,17 +170,17 @@ void TextEncoder::forward(const int32_t* ids, bt::Tensor& out) {
         bt::add_inplace(x_, proj_out_);
 
         // ── MLP block ─────────────────────────────────────────────────────
-        bt::layernorm_forward_inference_batched_fp16(
+        detail::layernorm_batched(
             x_, layer.ln2_gamma, layer.ln2_beta, ln_out_, cfg_.layer_norm_eps);
 
-        bt::linear_forward_batched_fp16(layer.fc1_W, &layer.fc1_b, ln_out_, ffn_mid_);
+        detail::linear_batched(layer.fc1_W, &layer.fc1_b, ln_out_, ffn_mid_);
         bt::quick_gelu_forward(ffn_mid_, ffn_act_);
-        bt::linear_forward_batched_fp16(layer.fc2_W, &layer.fc2_b, ffn_act_, ffn_out_);
+        detail::linear_batched(layer.fc2_W, &layer.fc2_b, ffn_act_, ffn_out_);
 
         bt::add_inplace(x_, ffn_out_);
     }
 
-    bt::layernorm_forward_inference_batched_fp16(
+    detail::layernorm_batched(
         x_, final_gamma_, final_beta_, out, cfg_.layer_norm_eps);
 }
 
@@ -211,8 +212,8 @@ bool parse_clip_target_(const std::string& target_path,
             proj == "v_proj" || proj == "out_proj");
 }
 
-void upload_view_fp16(const st::TensorView& v, int rows, int cols,
-                      bt::Tensor& dst, const std::string& tag) {
+void upload_view_compute(const st::TensorView& v, int rows, int cols,
+                         bt::Tensor& dst, const std::string& tag) {
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
         throw std::runtime_error("clip::TextEncoder: lora " + tag +
             ": expected F16 or F32, got " + st::dtype_name(v.dtype));
@@ -223,7 +224,7 @@ void upload_view_fp16(const st::TensorView& v, int rows, int cols,
             ": shape numel mismatch (expected " + std::to_string(expected) +
             ", got " + std::to_string(v.numel()) + ")");
     }
-    st::upload_fp16(v, rows, cols, dst);
+    st::upload_compute(v, rows, cols, dst);
 }
 
 }  // namespace
@@ -273,8 +274,8 @@ void TextEncoder::apply_lora_delta(const std::string& target_path,
     }
 
     bt::Tensor down_g, up_g;
-    upload_view_fp16(lora_down, rank,   W_cols, down_g, target_path + ".lora_down");
-    upload_view_fp16(lora_up,   W_rows, rank,   up_g,   target_path + ".lora_up");
+    upload_view_compute(lora_down, rank,   W_cols, down_g, target_path + ".lora_down");
+    upload_view_compute(lora_up,   W_rows, rank,   up_g,   target_path + ".lora_up");
 
     bt::Tensor delta;
     bt::matmul(up_g, down_g, delta);

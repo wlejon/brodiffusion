@@ -3,6 +3,7 @@
 #include "brodiffusion/fused_resblock.h"
 #include "brodiffusion/fused_transformer.h"
 #include "brodiffusion/detail/device.h"
+#include "brodiffusion/detail/compute.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -41,9 +42,9 @@ const st::TensorView& need(const st::File& f, const std::string& key) {
 }
 
 // Accepts F16 (used as-is) or F32 (converted host-side); SD1.5 full
-// checkpoints ship as F32.
-void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
-                         bt::Tensor& dst, const char* name) {
+// checkpoints ship as F32. Uploads at the pipeline compute dtype.
+void upload_compute_checked(const st::TensorView& v, int rows, int cols,
+                            bt::Tensor& dst, const char* name) {
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
         fail(std::string(name) + ": expected F16 or F32, got " + st::dtype_name(v.dtype));
     }
@@ -53,7 +54,7 @@ void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
              std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
              std::to_string(v.numel()) + " elements)");
     }
-    st::upload_fp16(v, rows, cols, dst);
+    st::upload_compute(v, rows, cols, dst);
 }
 
 }  // namespace
@@ -108,28 +109,28 @@ UNet::~UNet() = default;
 
 void UNet::load_resnet_(const st::File& f, const std::string& p,
                         int C_in, int C_out, Resnet& r) {
-    upload_fp16_checked(need(f, p + "norm1.weight"), C_in,  1, r.n1g, "resnet.norm1.weight");
-    upload_fp16_checked(need(f, p + "norm1.bias"),   C_in,  1, r.n1b, "resnet.norm1.bias");
-    upload_fp16_checked(need(f, p + "conv1.weight"), C_out, C_in * 3 * 3, r.W1, "resnet.conv1.weight");
-    upload_fp16_checked(need(f, p + "conv1.bias"),   C_out, 1, r.b1, "resnet.conv1.bias");
+    upload_compute_checked(need(f, p + "norm1.weight"), C_in,  1, r.n1g, "resnet.norm1.weight");
+    upload_compute_checked(need(f, p + "norm1.bias"),   C_in,  1, r.n1b, "resnet.norm1.bias");
+    upload_compute_checked(need(f, p + "conv1.weight"), C_out, C_in * 3 * 3, r.W1, "resnet.conv1.weight");
+    upload_compute_checked(need(f, p + "conv1.bias"),   C_out, 1, r.b1, "resnet.conv1.bias");
 
-    upload_fp16_checked(need(f, p + "time_emb_proj.weight"),
+    upload_compute_checked(need(f, p + "time_emb_proj.weight"),
                         C_out, time_embed_dim_, r.temb_W, "resnet.time_emb_proj.weight");
-    upload_fp16_checked(need(f, p + "time_emb_proj.bias"),
+    upload_compute_checked(need(f, p + "time_emb_proj.bias"),
                         C_out, 1, r.temb_b, "resnet.time_emb_proj.bias");
 
-    upload_fp16_checked(need(f, p + "norm2.weight"), C_out, 1, r.n2g, "resnet.norm2.weight");
-    upload_fp16_checked(need(f, p + "norm2.bias"),   C_out, 1, r.n2b, "resnet.norm2.bias");
-    upload_fp16_checked(need(f, p + "conv2.weight"), C_out, C_out * 3 * 3, r.W2, "resnet.conv2.weight");
-    upload_fp16_checked(need(f, p + "conv2.bias"),   C_out, 1, r.b2, "resnet.conv2.bias");
+    upload_compute_checked(need(f, p + "norm2.weight"), C_out, 1, r.n2g, "resnet.norm2.weight");
+    upload_compute_checked(need(f, p + "norm2.bias"),   C_out, 1, r.n2b, "resnet.norm2.bias");
+    upload_compute_checked(need(f, p + "conv2.weight"), C_out, C_out * 3 * 3, r.W2, "resnet.conv2.weight");
+    upload_compute_checked(need(f, p + "conv2.bias"),   C_out, 1, r.b2, "resnet.conv2.bias");
 
     r.C_in = C_in;
     r.C_out = C_out;
     r.has_shortcut = (C_in != C_out);
     if (r.has_shortcut) {
-        upload_fp16_checked(need(f, p + "conv_shortcut.weight"),
+        upload_compute_checked(need(f, p + "conv_shortcut.weight"),
                             C_out, C_in, r.Ws, "resnet.conv_shortcut.weight");
-        upload_fp16_checked(need(f, p + "conv_shortcut.bias"),
+        upload_compute_checked(need(f, p + "conv_shortcut.bias"),
                             C_out, 1, r.bs, "resnet.conv_shortcut.bias");
     }
 }
@@ -139,14 +140,14 @@ void UNet::load_transformer_(const st::File& f, const std::string& p,
     t.C = C;
     t.num_heads = num_heads;
 
-    upload_fp16_checked(need(f, p + "norm.weight"), C, 1, t.gn_g, "tr.norm.weight");
-    upload_fp16_checked(need(f, p + "norm.bias"),   C, 1, t.gn_b, "tr.norm.bias");
+    upload_compute_checked(need(f, p + "norm.weight"), C, 1, t.gn_g, "tr.norm.weight");
+    upload_compute_checked(need(f, p + "norm.bias"),   C, 1, t.gn_b, "tr.norm.bias");
 
     // 1x1 convs flatten to (C, C). Stored as (C_out, C_in, 1, 1) in safetensors.
-    upload_fp16_checked(need(f, p + "proj_in.weight"),  C, C, t.pi_W, "tr.proj_in.weight");
-    upload_fp16_checked(need(f, p + "proj_in.bias"),    C, 1, t.pi_b, "tr.proj_in.bias");
-    upload_fp16_checked(need(f, p + "proj_out.weight"), C, C, t.po_W, "tr.proj_out.weight");
-    upload_fp16_checked(need(f, p + "proj_out.bias"),   C, 1, t.po_b, "tr.proj_out.bias");
+    upload_compute_checked(need(f, p + "proj_in.weight"),  C, C, t.pi_W, "tr.proj_in.weight");
+    upload_compute_checked(need(f, p + "proj_in.bias"),    C, 1, t.pi_b, "tr.proj_in.bias");
+    upload_compute_checked(need(f, p + "proj_out.weight"), C, C, t.po_W, "tr.proj_out.weight");
+    upload_compute_checked(need(f, p + "proj_out.bias"),   C, 1, t.po_b, "tr.proj_out.bias");
 
     // SD1.5 always uses a single BasicTransformerBlock per Transformer2DModel.
     t.blocks.clear();
@@ -156,36 +157,36 @@ void UNet::load_transformer_(const st::File& f, const std::string& p,
     const std::string b = p + "transformer_blocks.0.";
 
     // norm1 + self-attention (no Q/K/V bias).
-    upload_fp16_checked(need(f, b + "norm1.weight"), C, 1, blk.n1g, "tr.b.norm1.weight");
-    upload_fp16_checked(need(f, b + "norm1.bias"),   C, 1, blk.n1b, "tr.b.norm1.bias");
-    upload_fp16_checked(need(f, b + "attn1.to_q.weight"), C, C, blk.Wq1, "tr.b.attn1.to_q.weight");
-    upload_fp16_checked(need(f, b + "attn1.to_k.weight"), C, C, blk.Wk1, "tr.b.attn1.to_k.weight");
-    upload_fp16_checked(need(f, b + "attn1.to_v.weight"), C, C, blk.Wv1, "tr.b.attn1.to_v.weight");
-    upload_fp16_checked(need(f, b + "attn1.to_out.0.weight"), C, C, blk.Wo1, "tr.b.attn1.to_out.weight");
-    upload_fp16_checked(need(f, b + "attn1.to_out.0.bias"),   C, 1, blk.bo1, "tr.b.attn1.to_out.bias");
+    upload_compute_checked(need(f, b + "norm1.weight"), C, 1, blk.n1g, "tr.b.norm1.weight");
+    upload_compute_checked(need(f, b + "norm1.bias"),   C, 1, blk.n1b, "tr.b.norm1.bias");
+    upload_compute_checked(need(f, b + "attn1.to_q.weight"), C, C, blk.Wq1, "tr.b.attn1.to_q.weight");
+    upload_compute_checked(need(f, b + "attn1.to_k.weight"), C, C, blk.Wk1, "tr.b.attn1.to_k.weight");
+    upload_compute_checked(need(f, b + "attn1.to_v.weight"), C, C, blk.Wv1, "tr.b.attn1.to_v.weight");
+    upload_compute_checked(need(f, b + "attn1.to_out.0.weight"), C, C, blk.Wo1, "tr.b.attn1.to_out.weight");
+    upload_compute_checked(need(f, b + "attn1.to_out.0.bias"),   C, 1, blk.bo1, "tr.b.attn1.to_out.bias");
 
     // norm2 + cross-attention (no Q/K/V bias; K/V project from cross_attention_dim).
-    upload_fp16_checked(need(f, b + "norm2.weight"), C, 1, blk.n2g, "tr.b.norm2.weight");
-    upload_fp16_checked(need(f, b + "norm2.bias"),   C, 1, blk.n2b, "tr.b.norm2.bias");
-    upload_fp16_checked(need(f, b + "attn2.to_q.weight"), C, C, blk.Wq2, "tr.b.attn2.to_q.weight");
-    upload_fp16_checked(need(f, b + "attn2.to_k.weight"),
+    upload_compute_checked(need(f, b + "norm2.weight"), C, 1, blk.n2g, "tr.b.norm2.weight");
+    upload_compute_checked(need(f, b + "norm2.bias"),   C, 1, blk.n2b, "tr.b.norm2.bias");
+    upload_compute_checked(need(f, b + "attn2.to_q.weight"), C, C, blk.Wq2, "tr.b.attn2.to_q.weight");
+    upload_compute_checked(need(f, b + "attn2.to_k.weight"),
                         C, cfg_.cross_attention_dim, blk.Wk2, "tr.b.attn2.to_k.weight");
-    upload_fp16_checked(need(f, b + "attn2.to_v.weight"),
+    upload_compute_checked(need(f, b + "attn2.to_v.weight"),
                         C, cfg_.cross_attention_dim, blk.Wv2, "tr.b.attn2.to_v.weight");
-    upload_fp16_checked(need(f, b + "attn2.to_out.0.weight"), C, C, blk.Wo2, "tr.b.attn2.to_out.weight");
-    upload_fp16_checked(need(f, b + "attn2.to_out.0.bias"),   C, 1, blk.bo2, "tr.b.attn2.to_out.bias");
+    upload_compute_checked(need(f, b + "attn2.to_out.0.weight"), C, C, blk.Wo2, "tr.b.attn2.to_out.weight");
+    upload_compute_checked(need(f, b + "attn2.to_out.0.bias"),   C, 1, blk.bo2, "tr.b.attn2.to_out.bias");
 
     // norm3 + FF (GEGLU): Linear(C, 8C) -> split-and-multiply -> Linear(4C, C).
-    upload_fp16_checked(need(f, b + "norm3.weight"), C, 1, blk.n3g, "tr.b.norm3.weight");
-    upload_fp16_checked(need(f, b + "norm3.bias"),   C, 1, blk.n3b, "tr.b.norm3.bias");
+    upload_compute_checked(need(f, b + "norm3.weight"), C, 1, blk.n3g, "tr.b.norm3.weight");
+    upload_compute_checked(need(f, b + "norm3.bias"),   C, 1, blk.n3b, "tr.b.norm3.bias");
     const int ff_inner = 4 * C;
-    upload_fp16_checked(need(f, b + "ff.net.0.proj.weight"),
+    upload_compute_checked(need(f, b + "ff.net.0.proj.weight"),
                         2 * ff_inner, C, blk.ff1_W, "tr.b.ff.net.0.proj.weight");
-    upload_fp16_checked(need(f, b + "ff.net.0.proj.bias"),
+    upload_compute_checked(need(f, b + "ff.net.0.proj.bias"),
                         2 * ff_inner, 1, blk.ff1_b, "tr.b.ff.net.0.proj.bias");
-    upload_fp16_checked(need(f, b + "ff.net.2.weight"),
+    upload_compute_checked(need(f, b + "ff.net.2.weight"),
                         C, ff_inner, blk.ff2_W, "tr.b.ff.net.2.weight");
-    upload_fp16_checked(need(f, b + "ff.net.2.bias"),
+    upload_compute_checked(need(f, b + "ff.net.2.bias"),
                         C, 1, blk.ff2_b, "tr.b.ff.net.2.bias");
 }
 
@@ -195,19 +196,19 @@ void UNet::load_weights(const st::File& f, const std::string& prefix) {
     const int mid_C    = cfg_.block_out_channels.back();
 
     // conv_in: in_channels -> block_out_channels[0]
-    upload_fp16_checked(need(f, prefix + "conv_in.weight"),
+    upload_compute_checked(need(f, prefix + "conv_in.weight"),
                         first_C, cfg_.in_channels * 3 * 3, conv_in_W_, "conv_in.weight");
-    upload_fp16_checked(need(f, prefix + "conv_in.bias"),
+    upload_compute_checked(need(f, prefix + "conv_in.bias"),
                         first_C, 1, conv_in_b_, "conv_in.bias");
 
     // time_embedding: linear_1 (D, freq_dim) -> silu -> linear_2 (D, D).
-    upload_fp16_checked(need(f, prefix + "time_embedding.linear_1.weight"),
+    upload_compute_checked(need(f, prefix + "time_embedding.linear_1.weight"),
                         time_embed_dim_, freq_dim_, te_l1_W_, "te.linear_1.weight");
-    upload_fp16_checked(need(f, prefix + "time_embedding.linear_1.bias"),
+    upload_compute_checked(need(f, prefix + "time_embedding.linear_1.bias"),
                         time_embed_dim_, 1, te_l1_b_, "te.linear_1.bias");
-    upload_fp16_checked(need(f, prefix + "time_embedding.linear_2.weight"),
+    upload_compute_checked(need(f, prefix + "time_embedding.linear_2.weight"),
                         time_embed_dim_, time_embed_dim_, te_l2_W_, "te.linear_2.weight");
-    upload_fp16_checked(need(f, prefix + "time_embedding.linear_2.bias"),
+    upload_compute_checked(need(f, prefix + "time_embedding.linear_2.bias"),
                         time_embed_dim_, 1, te_l2_b_, "te.linear_2.bias");
 
     // LCM cond_proj: only present in distilled checkpoints. No bias term
@@ -216,7 +217,7 @@ void UNet::load_weights(const st::File& f, const std::string& prefix) {
     // *before* linear_1). Shape is (freq_dim_, cond_proj_dim), not
     // (time_embed_dim_, cond_proj_dim) — caught by Dreamshaper-7 LCM at load.
     if (cfg_.time_cond_proj_dim > 0) {
-        upload_fp16_checked(need(f, prefix + "time_embedding.cond_proj.weight"),
+        upload_compute_checked(need(f, prefix + "time_embedding.cond_proj.weight"),
                             freq_dim_, cfg_.time_cond_proj_dim,
                             te_cond_W_, "te.cond_proj.weight");
     }
@@ -255,10 +256,10 @@ void UNet::load_weights(const st::File& f, const std::string& prefix) {
         if (d.has_downsampler) {
             const std::string sp = prefix + "down_blocks." + std::to_string(i) +
                                    ".downsamplers.0.conv.";
-            upload_fp16_checked(need(f, sp + "weight"),
+            upload_compute_checked(need(f, sp + "weight"),
                                 C_out, C_out * 3 * 3, d.downsampler.W,
                                 "downsampler.conv.weight");
-            upload_fp16_checked(need(f, sp + "bias"),
+            upload_compute_checked(need(f, sp + "bias"),
                                 C_out, 1, d.downsampler.b,
                                 "downsampler.conv.bias");
         }
@@ -325,10 +326,10 @@ void UNet::load_weights(const st::File& f, const std::string& prefix) {
         if (u.has_upsampler) {
             const std::string sp = prefix + "up_blocks." + std::to_string(i) +
                                    ".upsamplers.0.conv.";
-            upload_fp16_checked(need(f, sp + "weight"),
+            upload_compute_checked(need(f, sp + "weight"),
                                 C_out, C_out * 3 * 3, u.upsampler.W,
                                 "upsampler.conv.weight");
-            upload_fp16_checked(need(f, sp + "bias"),
+            upload_compute_checked(need(f, sp + "bias"),
                                 C_out, 1, u.upsampler.b,
                                 "upsampler.conv.bias");
         }
@@ -338,13 +339,13 @@ void UNet::load_weights(const st::File& f, const std::string& prefix) {
 
     if (!skip_stack.empty()) fail("internal: skip stack not drained during weight load");
 
-    upload_fp16_checked(need(f, prefix + "conv_norm_out.weight"),
+    upload_compute_checked(need(f, prefix + "conv_norm_out.weight"),
                         first_C, 1, norm_out_g_, "conv_norm_out.weight");
-    upload_fp16_checked(need(f, prefix + "conv_norm_out.bias"),
+    upload_compute_checked(need(f, prefix + "conv_norm_out.bias"),
                         first_C, 1, norm_out_b_, "conv_norm_out.bias");
-    upload_fp16_checked(need(f, prefix + "conv_out.weight"),
+    upload_compute_checked(need(f, prefix + "conv_out.weight"),
                         cfg_.out_channels, first_C * 3 * 3, conv_out_W_, "conv_out.weight");
-    upload_fp16_checked(need(f, prefix + "conv_out.bias"),
+    upload_compute_checked(need(f, prefix + "conv_out.bias"),
                         cfg_.out_channels, 1, conv_out_b_, "conv_out.bias");
 }
 
@@ -375,7 +376,7 @@ void UNet::apply_conv3x3_q_(const QWeight& Wq, const bt::Tensor& b,
 void UNet::apply_resnet_(const Resnet& r, int H, int W,
                          bt::Tensor& x, bt::Tensor& tmp) {
     // Per-resblock time-emb projection: silu(temb) -> Linear -> (1, C_out).
-    bt::linear_forward_batched_fp16(r.temb_W, &r.temb_b, temb_silu_, temb_proj_);
+    detail::linear_batched(r.temb_W, &r.temb_b, temb_silu_, temb_proj_);
 
     if (r.W1_q.active()) {
         const QWeight* skip_q = r.has_shortcut ? &r.Ws_q : nullptr;
@@ -440,15 +441,14 @@ void UNet::apply_transformer_(const Transformer2D& t,
         bt::linear_forward_batched_int8w_fp16(
             t.pi_q.W_int8, t.pi_q.scales, &t.pi_b, seq_, proj_in_seq_);
     } else {
-        bt::linear_forward_batched_fp16(t.pi_W, &t.pi_b, seq_, proj_in_seq_);
+        detail::linear_batched(t.pi_W, &t.pi_b, seq_, proj_in_seq_);
     }
 
     // 5. transformer blocks (always 1 for SD1.5).
     tseq_ = proj_in_seq_.clone();
     for (const AttnFFN& blk : t.blocks) {
         // ── self-attention (Q/K/V bias-less, Wo biased) ───────────────────
-        bt::layernorm_forward_inference_batched_fp16(
-            tseq_, blk.n1g, blk.n1b, ln_, cfg_.eps);
+        detail::layernorm_batched(tseq_, blk.n1g, blk.n1b, ln_, cfg_.eps);
         if (blk.Wq1_q.active()) {
             bt::flash_attention_qkvo_int8w_fp16(
                 ln_, /*Ctx=*/nullptr,
@@ -468,14 +468,13 @@ void UNet::apply_transformer_(const Transformer2D& t,
                 /*d_mask=*/nullptr, H_heads, /*causal=*/false,
                 attn_proj_);
         }
-        brodiffusion::add_inplace_fp16_vec(tseq_, attn_proj_);
+        brodiffusion::add_inplace_vec(tseq_, attn_proj_);
 
         // ── cross-attention (K, V from `ctx` — possibly cached) ───────────
-        bt::layernorm_forward_inference_batched_fp16(
-            tseq_, blk.n2g, blk.n2b, ln_, cfg_.eps);
+        detail::layernorm_batched(tseq_, blk.n2g, blk.n2b, ln_, cfg_.eps);
         if (trace_out_entry) {
             // Trace path: brotensor's cross_attention_forward_with_attn
-            // writes the FP16 head-averaged softmax map to AttnAvg. No Wo
+            // writes the head-averaged softmax map to AttnAvg. No Wo
             // bias is supported by that op, so we manually add bo2 after.
             // (forward_trace already guards against INT8.)
             bt::cross_attention_forward_with_attn(
@@ -486,7 +485,7 @@ void UNet::apply_transformer_(const Transformer2D& t,
                 H_heads,
                 attn_proj_, *trace_out_entry);
             // Add output bias bo2 (per-column broadcast across rows of attn_proj_).
-            brodiffusion::add_inplace_row_bias_fp16(attn_proj_, blk.bo2);
+            brodiffusion::add_inplace_row_bias(attn_proj_, blk.bo2);
         } else if (cache_entry) {
             // K/V already projected from `ctx` upstream — skip the two
             // per-step matmuls and feed the cached buffers straight in.
@@ -526,11 +525,10 @@ void UNet::apply_transformer_(const Transformer2D& t,
                     attn_proj_);
             }
         }
-        brodiffusion::add_inplace_fp16_vec(tseq_, attn_proj_);
+        brodiffusion::add_inplace_vec(tseq_, attn_proj_);
 
         // ── feed-forward (GEGLU) ──────────────────────────────────────────
-        bt::layernorm_forward_inference_batched_fp16(
-            tseq_, blk.n3g, blk.n3b, ln_, cfg_.eps);
+        detail::layernorm_batched(tseq_, blk.n3g, blk.n3b, ln_, cfg_.eps);
         // Fused FF1 + exact-GEGLU: skips the (B, 2*D) intermediate of FF1.
         // SD1.5's BasicTransformerBlock uses F.gelu(approximate=False).
         if (blk.ff1_q.active()) {
@@ -543,9 +541,9 @@ void UNet::apply_transformer_(const Transformer2D& t,
             bt::linear_forward_batched_int8w_fp16(
                 blk.ff2_q.W_int8, blk.ff2_q.scales, &blk.ff2_b, ff_act_, ff_out_);
         } else {
-            bt::linear_forward_batched_fp16(blk.ff2_W, &blk.ff2_b, ff_act_, ff_out_);
+            detail::linear_batched(blk.ff2_W, &blk.ff2_b, ff_act_, ff_out_);
         }
-        brodiffusion::add_inplace_fp16_vec(tseq_, ff_out_);
+        brodiffusion::add_inplace_vec(tseq_, ff_out_);
     }
 
     // 6. proj_out: 1x1 conv ≡ Linear.
@@ -553,7 +551,7 @@ void UNet::apply_transformer_(const Transformer2D& t,
         bt::linear_forward_batched_int8w_fp16(
             t.po_q.W_int8, t.po_q.scales, &t.po_b, tseq_, proj_out_seq_);
     } else {
-        bt::linear_forward_batched_fp16(t.po_W, &t.po_b, tseq_, proj_out_seq_);
+        detail::linear_batched(t.po_W, &t.po_b, tseq_, proj_out_seq_);
     }
 
     // 7. seq -> NCHW.
@@ -574,8 +572,8 @@ namespace {
 // Callers should pre-multiply w by 1000 (diffusers does this before calling
 // the helper).
 //   Output layout: [sin(w*freq_0), ..., sin(w*freq_{H-1}), cos(w*freq_0), ...].
-void compute_guidance_scale_emb_fp16(float w, int dim,
-                                     std::vector<uint16_t>& out) {
+void compute_guidance_scale_emb(float w, int dim,
+                                std::vector<float>& out) {
     const int half = dim / 2;
     out.resize(static_cast<std::size_t>(dim));
     const float log_period = std::log(10000.0f);
@@ -583,16 +581,16 @@ void compute_guidance_scale_emb_fp16(float w, int dim,
     for (int i = 0; i < half; ++i) {
         const float freq = std::exp(-log_period * static_cast<float>(i) / denom);
         const float angle = w * freq;
-        out[static_cast<std::size_t>(i)]        = bt::fp32_to_fp16_bits(std::sin(angle));
-        out[static_cast<std::size_t>(i + half)] = bt::fp32_to_fp16_bits(std::cos(angle));
+        out[static_cast<std::size_t>(i)]        = std::sin(angle);
+        out[static_cast<std::size_t>(i + half)] = std::cos(angle);
     }
 }
 
 // Sinusoidal timestep embedding matching diffusers `get_timestep_embedding`
 // with flip_sin_to_cos=True, downscale_freq_shift=0, scale=1, max_period=10000.
 // Output layout: [cos(t*freq_0), ..., cos(t*freq_{H-1}), sin(t*freq_0), ...].
-void compute_sinusoidal_emb_fp16(float t, int dim,
-                                 std::vector<uint16_t>& out) {
+void compute_sinusoidal_emb(float t, int dim,
+                            std::vector<float>& out) {
     const int half = dim / 2;
     out.resize(static_cast<std::size_t>(dim));
     const float log_period = std::log(10000.0f);
@@ -600,8 +598,8 @@ void compute_sinusoidal_emb_fp16(float t, int dim,
         const float freq = std::exp(-log_period * static_cast<float>(i) /
                                      static_cast<float>(half));
         const float angle = t * freq;
-        out[static_cast<std::size_t>(i)]        = bt::fp32_to_fp16_bits(std::cos(angle));
-        out[static_cast<std::size_t>(i + half)] = bt::fp32_to_fp16_bits(std::sin(angle));
+        out[static_cast<std::size_t>(i)]        = std::cos(angle);
+        out[static_cast<std::size_t>(i + half)] = std::sin(angle);
     }
 }
 
@@ -676,7 +674,7 @@ void UNet::forward_trace(const bt::Tensor& sample,
     }
     if (cfg_.time_cond_proj_dim > 0) {
         fail("forward_trace: LCM cond_proj path not yet supported in trace "
-             "mode; use the FP16 vanilla SD1.5 path");
+             "mode; use the vanilla SD1.5 path");
     }
     const int n = num_xattn_blocks();
     if (attn_logit_biases &&
@@ -695,7 +693,7 @@ void UNet::forward_trace(const bt::Tensor& sample,
 
 // ─── LoRA merge ────────────────────────────────────────────────────────────
 //
-// Resolve a diffusers tensor path to the corresponding base FP16 weight
+// Resolve a diffusers tensor path to the corresponding base weight
 // pointer. Supports only the keys community LoRAs actually patch in SD1.5:
 // the eight attention projections and the two GEGLU FF projections inside
 // each Transformer2D's BasicTransformerBlock. Returns nullptr if the path
@@ -861,11 +859,12 @@ u.transformers[static_cast<std::size_t>(j)],
 
 namespace {
 
-// Upload an arbitrary 2-D safetensors view (F16 or F32) as a FP16 Tensor
-// of shape (rows, cols). Convolutional LoRA layouts (rank, C, kH, kW) flatten
-// to (rank, C*kH*kW) — the caller is responsible for picking rows/cols.
-void upload_view_fp16(const st::TensorView& v, int rows, int cols,
-                      bt::Tensor& dst, const std::string& tag) {
+// Upload an arbitrary 2-D safetensors view (F16 or F32) at the compute dtype
+// as a Tensor of shape (rows, cols). Convolutional LoRA layouts
+// (rank, C, kH, kW) flatten to (rank, C*kH*kW) — the caller is responsible
+// for picking rows/cols.
+void upload_view_compute(const st::TensorView& v, int rows, int cols,
+                         bt::Tensor& dst, const std::string& tag) {
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
         throw std::runtime_error("unet::UNet: lora " + tag +
             ": expected F16 or F32, got " + st::dtype_name(v.dtype));
@@ -876,11 +875,11 @@ void upload_view_fp16(const st::TensorView& v, int rows, int cols,
             ": shape numel mismatch (expected " + std::to_string(expected) +
             ", got " + std::to_string(v.numel()) + ")");
     }
-    st::upload_fp16(v, rows, cols, dst);
+    st::upload_compute(v, rows, cols, dst);
 }
 
-// Read an FP16 tensor back into host memory as fp32 (debug / numerical
-// merge path uses this only in tests). Not used here; merge happens
+// Read a compute-dtype tensor back into host memory as fp32 (debug /
+// numerical merge path uses this only in tests). Not used here; merge happens
 // entirely on-device via matmul + scale_inplace + add_inplace.
 
 // Compute the (rank, in_dim) and (out_dim, rank) shapes from the raw views.
@@ -965,7 +964,7 @@ void UNet::apply_lora_delta(const std::string& target_path,
                             float scale_total) {
     if (finalized_) {
         fail("apply_lora_delta: called after finalize_weights(); LoRA must be "
-             "applied before quantisation/finalisation (the FP16 base weights "
+             "applied before quantisation/finalisation (the base weights "
              "are no longer in memory)");
     }
     bt::Tensor* W = lora_target_(target_path);
@@ -981,11 +980,11 @@ void UNet::apply_lora_delta(const std::string& target_path,
     const LoraShape s = resolve_lora_shape(lora_down, lora_up, W_rows, W_cols,
                                            target_path);
 
-    // Upload as FP16 Tensors. lora_down: (rank, in_dim);
+    // Upload at the compute dtype. lora_down: (rank, in_dim);
     // lora_up: (out_dim, rank).
     bt::Tensor down_g, up_g;
-    upload_view_fp16(lora_down, s.rank,    s.in_dim, down_g, target_path + ".lora_down");
-    upload_view_fp16(lora_up,   s.out_dim, s.rank,   up_g,   target_path + ".lora_up");
+    upload_view_compute(lora_down, s.rank,    s.in_dim, down_g, target_path + ".lora_down");
+    upload_view_compute(lora_up,   s.out_dim, s.rank,   up_g,   target_path + ".lora_up");
 
     // delta = up @ down — shape (out_dim, in_dim) = W shape.
     bt::Tensor delta;
@@ -1033,6 +1032,15 @@ void UNet::finalize_weights() {
     finalized_ = true;
     if (!cfg_.quantize_weights) return;
     if (conv_in_W_.size() == 0) fail("finalize_weights: weights not loaded");
+    // INT8 (W8A16) weight quantization is GPU-only — the W8A16 ops have no CPU
+    // fallback. On the CPU backend, skip quantization so every QWeight stays
+    // inactive and all INT8 branches remain dead.
+    if (conv_in_W_.device == brotensor::Device::CPU) {
+        std::fprintf(stderr,
+            "brodiffusion: INT8 weight quantization is GPU-only; "
+            "ignoring --quantize-unet on the CPU backend.\n");
+        return;
+    }
 
     auto quant_resnet = [&](Resnet& r) {
         quantize_weight_inplace_(r.W1, r.W1_q);
@@ -1190,9 +1198,9 @@ void UNet::forward_impl_(const bt::Tensor& sample,
     const int first_C = cfg_.block_out_channels.front();
 
     // ── 1. Build the time embedding ────────────────────────────────────────
-    std::vector<uint16_t> sin_bits;
-    compute_sinusoidal_emb_fp16(timestep, freq_dim_, sin_bits);
-    freq_emb_ = brotensor::Tensor::from_host_fp16(sin_bits.data(), 1, freq_dim_);
+    std::vector<float> sin_vals;
+    compute_sinusoidal_emb(timestep, freq_dim_, sin_vals);
+    freq_emb_ = detail::upload_host(sin_vals.data(), 1, freq_dim_);
 
     // LCM cond_proj: add projected guidance-scale embedding to the freq_emb
     // *before* linear_1. Matches diffusers' TimestepEmbedding.forward:
@@ -1203,18 +1211,17 @@ void UNet::forward_impl_(const bt::Tensor& sample,
         if (cfg_.time_cond_proj_dim <= 0) fail("forward: internal: gs_emb without cond_proj");
         // diffusers' get_guidance_scale_embedding scales w by 1000 before the
         // sinusoidal embedding.
-        std::vector<uint16_t> w_bits;
-        compute_guidance_scale_emb_fp16((*gs_emb) * 1000.0f, cfg_.time_cond_proj_dim, w_bits);
-        w_emb_ = brotensor::Tensor::from_host_fp16(w_bits.data(), 1, cfg_.time_cond_proj_dim);
+        std::vector<float> w_vals;
+        compute_guidance_scale_emb((*gs_emb) * 1000.0f, cfg_.time_cond_proj_dim, w_vals);
+        w_emb_ = detail::upload_host(w_vals.data(), 1, cfg_.time_cond_proj_dim);
         // cond_proj is bias-free: pass nullptr.
-        bt::linear_forward_batched_fp16(te_cond_W_, /*bias=*/nullptr,
-                                            w_emb_, temb_cond_);
+        detail::linear_batched(te_cond_W_, /*bias=*/nullptr, w_emb_, temb_cond_);
         bt::add_inplace(freq_emb_, temb_cond_);
     }
 
-    bt::linear_forward_batched_fp16(te_l1_W_, &te_l1_b_, freq_emb_, temb_a_);
+    detail::linear_batched(te_l1_W_, &te_l1_b_, freq_emb_, temb_a_);
     bt::silu_forward(temb_a_, temb_a_);
-    bt::linear_forward_batched_fp16(te_l2_W_, &te_l2_b_, temb_a_, temb_b_);
+    detail::linear_batched(te_l2_W_, &te_l2_b_, temb_a_, temb_b_);
     // Master temb in temb_b_. Pre-compute SiLU once for reuse across resblocks.
     bt::silu_forward(temb_b_, temb_silu_);
 

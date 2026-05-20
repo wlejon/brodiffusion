@@ -20,8 +20,8 @@
 //
 // Numerics: image preprocessing (resize + normalize) runs on the host —
 // 512x512 -> 224x224 is ~150K floats per call, trivial. The transformer
-// forward is on the GPU, FP16. Cosine similarity is the final dot
-// product on 768 host floats.
+// forward runs at the pipeline compute dtype — FP32 on CPU, FP16 on a GPU
+// backend. Cosine similarity is the final dot product on 768 host floats.
 
 #include "brodiffusion/clip.h"
 #include "brodiffusion/clip_image.h"
@@ -89,23 +89,23 @@ public:
 
 private:
     // Host-side: resize input image to 224x224 (bilinear, per-channel) and
-    // CLIP-normalise. Output is interleaved planar NCHW FP16 bits, length
-    // 3 * 224 * 224, ready for upload via brotensor::upload_fp16.
-    std::vector<std::uint16_t> preprocess_(const std::vector<float>& image,
-                                           int H, int W) const;
+    // CLIP-normalise. Output is interleaved planar NCHW FP32 values, length
+    // 3 * 224 * 224, ready for upload at the compute dtype.
+    std::vector<float> preprocess_(const std::vector<float>& image,
+                                   int H, int W) const;
 
     const clip::Tokenizer&     tok_;
     clip::TextEncoder&         text_enc_;
     clip_image::ImageEncoder&  image_enc_;
     Config                     cfg_;
 
-    // Projection weights. Stored on GPU as FP16; same layout as a linear
-    // layer's W (rows=out, cols=in).
+    // Projection weights. Stored at the compute dtype on the active device;
+    // same layout as a linear layer's W (rows=out, cols=in).
     brotensor::Tensor visual_proj_W_;   // (P, vision_D)
     brotensor::Tensor text_proj_W_;     // (P, text_D)
 
     // Scratch.
-    brotensor::Tensor pixels_dev_;      // (1, 3*224*224) FP16
+    brotensor::Tensor pixels_dev_;      // (1, 3*224*224) at compute dtype
     brotensor::Tensor img_cls_;         // (1, vision_D)
     brotensor::Tensor img_proj_;        // (1, P)
     brotensor::Tensor text_hidden_;     // (L, text_D) — TextEncoder output

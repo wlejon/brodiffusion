@@ -1,5 +1,6 @@
 #include "brodiffusion/lcm_scheduler.h"
 #include "brodiffusion/detail/device.h"
+#include "brodiffusion/detail/compute.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
@@ -89,8 +90,8 @@ void LCM::step(const bt::Tensor& noise_pred,
     if (step_index < 0 || step_index >= static_cast<int>(timesteps_.size())) {
         fail("step_index out of range");
     }
-    if (noise_pred.dtype != bt::Dtype::FP16 || sample.dtype != bt::Dtype::FP16) {
-        fail("noise_pred and sample must be FP16");
+    if (noise_pred.dtype != sample.dtype) {
+        fail("noise_pred and sample must share a dtype");
     }
     if (noise_pred.rows != sample.rows || noise_pred.cols != sample.cols) {
         fail("noise_pred and sample shape mismatch");
@@ -129,7 +130,7 @@ void LCM::step(const bt::Tensor& noise_pred,
     const float c_out    = scaled_t / std::sqrt(denom);
 
     detail::resize_like(scratch, noise_pred.rows, noise_pred.cols,
-                        bt::Dtype::FP16, noise_pred.device);
+                        compute_dtype(), noise_pred.device);
 
     // Compute predicted_x0 = (sample - sqrt(1-a_t)*noise_pred) / sqrt(a_t).
     // CRITICAL: do the subtraction in small-magnitude space first, THEN
@@ -155,7 +156,7 @@ void LCM::step(const bt::Tensor& noise_pred,
     // Final step: sample = denoised (no re-noising).
     // Otherwise:  sample = sqrt(a_t_prev)*denoised + sqrt(1 - a_t_prev)*noise.
     if (!is_final) {
-        if (noise.dtype != bt::Dtype::FP16) fail("noise must be FP16");
+        if (noise.dtype != sample.dtype) fail("noise must share sample's dtype");
         if (noise.rows != sample.rows || noise.cols != sample.cols) {
             fail("noise shape mismatch");
         }

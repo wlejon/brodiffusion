@@ -13,9 +13,11 @@
 //   prediction_type       = "epsilon"
 //   timestep_spacing      = "leading"
 //
-// Math is host-side FP32; per-step GPU work is a copy + scale + add on the
-// FP16 sample/noise tensors. Single-batch (N=1) like the rest of the
-// inference path.
+// Math is host-side FP32; the per-step tensor work is a copy + scale + add on
+// the sample/noise tensors, run on whichever backend brotensor resolves at
+// runtime (CPU by default, CUDA when available) at that backend's compute
+// dtype — FP32 on CPU, FP16 on a GPU. Single-batch (N=1) like the rest of
+// the inference path.
 
 #include "brotensor/tensor.h"
 
@@ -50,11 +52,12 @@ public:
     const std::vector<int>& timesteps() const { return timesteps_; }
     int num_inference_steps() const { return static_cast<int>(timesteps_.size()); }
 
-    // Run one DDIM step.
-    //   noise_pred: (1, C*H*W) FP16 — UNet output ε̂.
+    // Run one DDIM step. All tensors carry the pipeline compute dtype (FP32
+    // on CPU, FP16 on a GPU backend) and must share it.
+    //   noise_pred: (1, C*H*W) — UNet output ε̂.
     //   step_index: index into timesteps() (0 = first step).
-    //   sample:    (1, C*H*W) FP16 — current x_t, overwritten in place with x_{t-1}.
-    //   scratch:   FP16 Tensor reused across steps; resized as needed.
+    //   sample:    (1, C*H*W) — current x_t, overwritten in place with x_{t-1}.
+    //   scratch:   Tensor reused across steps; resized as needed.
     // Caller is responsible for sync_all() before reading sample to host.
     void step(const brotensor::Tensor& noise_pred,
               int step_index,

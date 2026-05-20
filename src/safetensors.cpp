@@ -1,5 +1,6 @@
 #include "brodiffusion/safetensors.h"
 
+#include "brodiffusion/detail/compute.h"
 #include "brotensor/tensor.h"
 
 #include <algorithm>
@@ -455,6 +456,52 @@ void upload_fp16(const TensorView& view, int rows, int cols, brotensor::Tensor& 
         throw std::runtime_error(
             std::string("safetensors::upload_fp16: unsupported dtype ") +
             dtype_name(view.dtype) + " for tensor '" + view.name + "'");
+    }
+}
+
+void upload_compute(const TensorView& view, int rows, int cols,
+                    brotensor::Tensor& dst) {
+    if (rows <= 0 || cols <= 0) {
+        throw std::runtime_error("safetensors::upload_compute: rows/cols must be positive");
+    }
+    const std::size_t n = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+    const std::size_t expected = n * static_cast<std::size_t>(dtype_size_bytes(view.dtype));
+    if (expected != view.nbytes) {
+        throw std::runtime_error(
+            "safetensors::upload_compute: byte count mismatch for tensor '" + view.name + "'");
+    }
+    if (view.dtype != Dtype::F16 && view.dtype != Dtype::F32) {
+        throw std::runtime_error(
+            std::string("safetensors::upload_compute: unsupported dtype ") +
+            dtype_name(view.dtype) + " for tensor '" + view.name + "'");
+    }
+
+    // The compute dtype follows the active brotensor device: FP32 on the CPU
+    // backend, FP16 on a GPU backend. Convert the on-disk view as needed.
+    if (brodiffusion::compute_dtype() == brotensor::Dtype::FP32) {
+        if (view.dtype == Dtype::F32) {
+            dst = brotensor::Tensor::from_host(
+                reinterpret_cast<const float*>(view.data), rows, cols);
+        } else {  // F16 → FP32
+            const uint16_t* src = reinterpret_cast<const uint16_t*>(view.data);
+            std::vector<float> tmp(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                tmp[i] = brotensor::fp16_bits_to_fp32(src[i]);
+            }
+            dst = brotensor::Tensor::from_host(tmp.data(), rows, cols);
+        }
+    } else {  // FP16 compute
+        if (view.dtype == Dtype::F16) {
+            dst = brotensor::Tensor::from_host_fp16(
+                reinterpret_cast<const uint16_t*>(view.data), rows, cols);
+        } else {  // F32 → FP16
+            const float* src = reinterpret_cast<const float*>(view.data);
+            std::vector<uint16_t> tmp(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                tmp[i] = brotensor::fp32_to_fp16_bits(src[i]);
+            }
+            dst = brotensor::Tensor::from_host_fp16(tmp.data(), rows, cols);
+        }
     }
 }
 

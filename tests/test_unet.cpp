@@ -11,11 +11,14 @@
 // bit pattern, and determinism across two consecutive forwards. Numerical
 // fidelity vs the reference UNet is left to a future real-weights test.
 
+#include "brodiffusion/detail/compute.h"
 #include "brodiffusion/safetensors.h"
 #include "brodiffusion/unet.h"
 
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
+
+#include "test_compute.h"
 
 #include <cmath>
 #include <cstdint>
@@ -94,10 +97,6 @@ std::vector<uint16_t> fp16_seq(std::size_t n, float scale, std::size_t salt = 0)
         out[i] = bt::fp32_to_fp16_bits(s);
     }
     return out;
-}
-
-bool is_finite_fp16(uint16_t bits) {
-    return ((bits >> 10) & 0x1F) != 0x1F;
 }
 
 void emit_resnet(Builder& b, const std::string& p, int C_in, int C_out,
@@ -183,12 +182,6 @@ int main() {
         std::fprintf(stderr, "init failed: %s\n", e.what());
         return 1;
     }
-    if (!bt::is_available(bt::Device::CUDA) &&
-        !bt::is_available(bt::Device::Metal)) {
-        std::fprintf(stderr, "no GPU backend — skipping GPU test\n");
-        return 0;
-    }
-
     un::UNetConfig cfg;
     cfg.in_channels         = 4;
     cfg.out_channels        = 4;
@@ -311,31 +304,27 @@ int main() {
     const int L_text = 4;
     const int out_elems = cfg.out_channels * H * W;
 
-    std::vector<uint16_t> bits1, bits2;
+    std::vector<float> vals1, vals2;
     {
         auto file = st::File::open(path.string());
         un::UNet net(cfg);
         net.load_weights(file, "");
 
         // Synthesize a noisy latent (1, 4, 8, 8) with small varied values.
-        std::vector<uint16_t> latent_h(
+        std::vector<float> latent_h(
             static_cast<std::size_t>(cfg.in_channels) * H * W);
         for (std::size_t i = 0; i < latent_h.size(); ++i) {
-            float v = (static_cast<float>(i % 5) - 2.0f) * 0.1f;
-            latent_h[i] = bt::fp32_to_fp16_bits(v);
+            latent_h[i] = (static_cast<float>(i % 5) - 2.0f) * 0.1f;
         }
-        bt::Tensor latent = bt::Tensor::from_host_fp16(
-            latent_h.data(), 1, cfg.in_channels * H * W);
+        bt::Tensor latent =
+            bdtest::bd_upload(latent_h, 1, cfg.in_channels * H * W);
 
-        // Synthesize a text context (L_text, cross_attention_dim) FP16.
-        std::vector<uint16_t> ctx_h(
-            static_cast<std::size_t>(L_text) * ctx_dim);
+        // Synthesize a text context (L_text, cross_attention_dim).
+        std::vector<float> ctx_h(static_cast<std::size_t>(L_text) * ctx_dim);
         for (std::size_t i = 0; i < ctx_h.size(); ++i) {
-            float v = (static_cast<float>(i % 7) - 3.0f) * 0.05f;
-            ctx_h[i] = bt::fp32_to_fp16_bits(v);
+            ctx_h[i] = (static_cast<float>(i % 7) - 3.0f) * 0.05f;
         }
-        bt::Tensor ctx;
-        ctx = brotensor::Tensor::from_host_fp16(ctx_h.data(), L_text, ctx_dim);
+        bt::Tensor ctx = bdtest::bd_upload(ctx_h, L_text, ctx_dim);
 
         bt::Tensor out;
         net.forward(latent, H, W, /*timestep=*/500.0f, ctx, out);
@@ -343,22 +332,18 @@ int main() {
 
         CHECK(out.rows == 1);
         CHECK(out.cols == out_elems);
-        CHECK(out.dtype == bt::Dtype::FP16);
+        CHECK(out.dtype == brodiffusion::compute_dtype());
 
-        bits1.resize(static_cast<std::size_t>(out_elems));
-        out.copy_to_host_fp16(bits1.data());
-        bt::sync_all();
+        vals1 = bdtest::bd_download(out);
 
         int nonfinite = 0;
-        for (uint16_t v : bits1) if (!is_finite_fp16(v)) ++nonfinite;
+        for (float v : vals1) if (!bdtest::bd_finite(v)) ++nonfinite;
         CHECK(nonfinite == 0);
 
         net.forward(latent, H, W, 500.0f, ctx, out);
         bt::sync_all();
-        bits2.resize(bits1.size());
-        out.copy_to_host_fp16(bits2.data());
-        bt::sync_all();
-        CHECK(std::memcmp(bits1.data(), bits2.data(), bits1.size() * 2) == 0);
+        vals2 = bdtest::bd_download(out);
+        CHECK(vals1 == vals2);
 
         // ── trace-mode forward ────────────────────────────────────────────
         // Same inputs, same UNet — exercises forward_trace, asserts the
@@ -377,34 +362,27 @@ int main() {
         // Verify each trace entry: (Lq, Lk=L_text), softmax row-sum ~= 1.
         for (int i = 0; i < n_xattn; ++i) {
             const bt::Tensor& m = trace[static_cast<std::size_t>(i)];
-            CHECK(m.dtype == bt::Dtype::FP16);
+            CHECK(m.dtype == brodiffusion::compute_dtype());
             CHECK(m.cols == L_text);
             CHECK(m.rows > 0);
-            std::vector<uint16_t> hb(static_cast<std::size_t>(m.rows * m.cols));
-            m.copy_to_host_fp16(hb.data());
-            bt::sync_all();
+            std::vector<float> hb = bdtest::bd_download(m);
             // Each row of (Lq, Lk) is a softmax over Lk keys.
             for (int r = 0; r < m.rows; ++r) {
                 float s = 0.0f;
                 for (int c = 0; c < m.cols; ++c) {
-                    s += bt::fp16_bits_to_fp32(
-                        hb[static_cast<std::size_t>(r) * m.cols + c]);
+                    s += hb[static_cast<std::size_t>(r) * m.cols + c];
                 }
                 CHECK(s > 0.95f && s < 1.05f);
             }
         }
 
         // Trace-path output should match the fast-path output closely.
-        std::vector<uint16_t> bits_trace(bits1.size());
-        out.copy_to_host_fp16(bits_trace.data());
-        bt::sync_all();
+        std::vector<float> vals_trace = bdtest::bd_download(out);
         int nonfinite_trace = 0;
         float max_abs_diff = 0.0f;
-        for (std::size_t k = 0; k < bits1.size(); ++k) {
-            if (!is_finite_fp16(bits_trace[k])) ++nonfinite_trace;
-            const float va = bt::fp16_bits_to_fp32(bits1[k]);
-            const float vb = bt::fp16_bits_to_fp32(bits_trace[k]);
-            const float d = std::fabs(va - vb);
+        for (std::size_t k = 0; k < vals1.size(); ++k) {
+            if (!bdtest::bd_finite(vals_trace[k])) ++nonfinite_trace;
+            const float d = std::fabs(vals1[k] - vals_trace[k]);
             if (d > max_abs_diff) max_abs_diff = d;
         }
         CHECK(nonfinite_trace == 0);

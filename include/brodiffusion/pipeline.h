@@ -7,8 +7,10 @@
 // produces a raw FP32 RGB image in [-1, 1] (the VAE output range). Callers
 // clamp + rescale to uint8 / encode to PNG outside this library.
 //
-// Inference-only, FP16 throughout the GPU path, batch size N = 1. Classifier-
-// free guidance runs the U-Net twice per step (conditional + unconditional)
+// Inference-only, batch size N = 1. Runs on whichever backend brotensor
+// resolves at runtime — CPU by default, CUDA when a GPU is available — at
+// that backend's compute dtype (FP32 on CPU, FP16 on a GPU). Classifier-free
+// guidance runs the U-Net twice per step (conditional + unconditional)
 // rather than batching, since the rest of the inference stack is N=1.
 
 #include "brodiffusion/clip.h"
@@ -42,7 +44,7 @@ struct PipelineConfig {
     std::variant<scheduler::DDIMConfig, scheduler::LCMConfig> scheduler;
 };
 
-// Snapshot of mid-generation state. Cheap to fork — only the FP16 latent
+// Snapshot of mid-generation state. Cheap to fork — only the latent
 // carries device memory; the rest is host-side scalars / RNG state.
 //
 // The cross-attention K/V cache (which holds the projected text context) is
@@ -54,14 +56,15 @@ struct PipelineConfig {
 // state, advance the clone differently from the original (different RNG, a
 // different attn_logit_bias, etc.), score, and pick a winner.
 struct PipelineState {
-    brotensor::Tensor latent;  // (1, C_lat * H_lat * W_lat) FP16
+    brotensor::Tensor latent;  // (1, C_lat * H_lat * W_lat) at compute dtype
     std::mt19937_64 rng;          // initial-noise + per-step LCM noise stream
     int step_index = 0;           // 0-based: how many step_once() calls have run
     int n_steps    = 0;           // total scheduled steps for this generation
     int H_lat      = 0;
     int W_lat      = 0;
 
-    // Deep clone: copies latent on the GPU. RNG and ints are trivial copies.
+    // Deep clone: copies the latent on the active device. RNG and ints are
+    // trivial copies.
     PipelineState clone() const;
 };
 
@@ -134,9 +137,9 @@ public:
     //                 latent noise. Returns a state with step_index=0.
     // step_once():    advance one denoising step (mutates state). If
     //                 trace_out is non-null, the UNet forward runs in trace
-    //                 mode (no K/V cache reuse, FP16 only) and fills the
-    //                 attention-map trace. Throws if state is already at
-    //                 n_steps.
+    //                 mode (no K/V cache reuse, no INT8 quantization) and
+    //                 fills the attention-map trace. Throws if state is
+    //                 already at n_steps.
     // decode():       VAE-decode a state's latent to an FP32 host buffer
     //                 (same shape and units as generate()).
     //

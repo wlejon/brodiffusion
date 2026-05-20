@@ -2,9 +2,11 @@
 
 // VAE decoder for SD1.5 (AutoencoderKL, decoder branch only).
 //
-// Inference-only, FP16 throughout. Takes a latent (1, 4, H/8, W/8) and
-// produces a raw image tensor (1, 3, H, W) — the caller is responsible for
-// any post-processing (clamp to [-1, 1], rescale to uint8, etc.).
+// Inference-only. Runs on whichever backend brotensor resolves at runtime —
+// CPU by default, CUDA when available — at that backend's compute dtype (FP32
+// on CPU, FP16 on a GPU). Takes a latent (1, 4, H/8, W/8) and produces a raw
+// image tensor (1, 3, H, W) — the caller is responsible for any
+// post-processing (clamp to [-1, 1], rescale to uint8, etc.).
 //
 // Architecture follows Hugging Face's diffusers AutoencoderKL decoder:
 //   conv_in: in_channels (4) -> block_out_channels.back() (512)
@@ -54,7 +56,7 @@ public:
     // standalone diffusers VAE export; SD1.5 full checkpoints typically use
     // "first_stage_model.decoder." — pass that explicitly.
     //
-    // Required tensors (all FP16):
+    // Required tensors (F16 or F32 source; loaded at the compute dtype):
     //   {prefix}conv_in.{weight, bias}            Conv2d 3x3 (C_mid, in_ch, 3, 3)
     //   {prefix}mid_block.resnets.{0,1}.{...}     see ResnetWeights
     //   {prefix}mid_block.attentions.0.group_norm.{weight, bias}    (C_mid,)
@@ -75,14 +77,15 @@ public:
     //   conv2.{weight,bias}  Conv2d 3x3 (C_out, C_out, 3, 3)
     //   conv_shortcut.{weight,bias}  Conv2d 1x1 (C_out, C_in, 1, 1) — only when C_in != C_out
     //
-    // Throws std::runtime_error on missing tensor, shape mismatch, or wrong
-    // dtype (everything must be FP16).
+    // Throws std::runtime_error on missing tensor, shape mismatch, or a
+    // source dtype that is neither F16 nor F32.
     void load_weights(const brodiffusion::safetensors::File& f,
                       const std::string& prefix = "decoder.");
 
-    // Decode latent → image.
-    //   latent: (1, in_channels * H_lat * W_lat) FP16, NCHW with N=1.
-    //   out:    (1, out_channels * 8*H_lat * 8*W_lat) FP16, resized as needed.
+    // Decode latent → image. Tensors carry the compute dtype (FP32 on CPU,
+    // FP16 on a GPU backend).
+    //   latent: (1, in_channels * H_lat * W_lat), NCHW with N=1.
+    //   out:    (1, out_channels * 8*H_lat * 8*W_lat), resized as needed.
     // Caller is responsible for sync_all() before reading.
     void decode(const brotensor::Tensor& latent,
                 int H_lat, int W_lat,

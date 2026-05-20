@@ -1,6 +1,7 @@
 #include "brodiffusion/clip_image.h"
 #include "brodiffusion/safetensors.h"
 #include "brodiffusion/detail/device.h"
+#include "brodiffusion/detail/compute.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
@@ -21,8 +22,8 @@ namespace {
     throw std::runtime_error("clip_image::ImageEncoder: " + msg);
 }
 
-void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
-                         bt::Tensor& dst, const char* name) {
+void upload_compute_checked(const st::TensorView& v, int rows, int cols,
+                            bt::Tensor& dst, const char* name) {
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
         fail(std::string(name) + ": expected F16 or F32, got " +
              st::dtype_name(v.dtype));
@@ -33,7 +34,7 @@ void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
              std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
              std::to_string(v.numel()) + " elements)");
     }
-    st::upload_fp16(v, rows, cols, dst);
+    st::upload_compute(v, rows, cols, dst);
 }
 
 const st::TensorView* find_or(const st::File& f, const std::string& key) {
@@ -76,15 +77,15 @@ void ImageEncoder::load_weights(const st::File& f,
 
     // patch_embed conv: (D, C*P*P). HF stores (D, C, P, P) which is the
     // same C-contiguous layout brotensor's conv2d expects.
-    upload_fp16_checked(need(f, prefix + "embeddings.patch_embedding.weight"),
+    upload_compute_checked(need(f, prefix + "embeddings.patch_embedding.weight"),
                         D, C * P * P, patch_W_, "patch_embedding.weight");
 
     // class_embedding: (D,) stored 1-D in HF. Load as (1, D) row to ease
     // the copy into seq_ row 0.
-    upload_fp16_checked(need(f, prefix + "embeddings.class_embedding"),
+    upload_compute_checked(need(f, prefix + "embeddings.class_embedding"),
                         1, D, class_embed_, "class_embedding");
 
-    upload_fp16_checked(need(f, prefix + "embeddings.position_embedding.weight"),
+    upload_compute_checked(need(f, prefix + "embeddings.position_embedding.weight"),
                         T, D, position_embed_, "position_embedding");
 
     // pre_layrnorm is the upstream HF typo. Accept either spelling.
@@ -99,37 +100,37 @@ void ImageEncoder::load_weights(const st::File& f,
     if (!pre_g_v || !pre_b_v) {
         fail("missing pre_layrnorm/pre_layernorm weight/bias");
     }
-    upload_fp16_checked(*pre_g_v, D, 1, pre_g_, "pre_ln.weight");
-    upload_fp16_checked(*pre_b_v, D, 1, pre_b_, "pre_ln.bias");
+    upload_compute_checked(*pre_g_v, D, 1, pre_g_, "pre_ln.weight");
+    upload_compute_checked(*pre_b_v, D, 1, pre_b_, "pre_ln.bias");
 
     for (int i = 0; i < cfg_.num_layers; ++i) {
         const std::string p = prefix + "encoder.layers." + std::to_string(i) + ".";
         Layer& L = layers_[static_cast<std::size_t>(i)];
 
-        upload_fp16_checked(need(f, p + "layer_norm1.weight"), D, 1, L.ln1_g, "ln1.weight");
-        upload_fp16_checked(need(f, p + "layer_norm1.bias"),   D, 1, L.ln1_b, "ln1.bias");
+        upload_compute_checked(need(f, p + "layer_norm1.weight"), D, 1, L.ln1_g, "ln1.weight");
+        upload_compute_checked(need(f, p + "layer_norm1.bias"),   D, 1, L.ln1_b, "ln1.bias");
 
-        upload_fp16_checked(need(f, p + "self_attn.q_proj.weight"), D, D, L.Wq, "q_proj.W");
-        upload_fp16_checked(need(f, p + "self_attn.q_proj.bias"),   D, 1, L.bq, "q_proj.b");
-        upload_fp16_checked(need(f, p + "self_attn.k_proj.weight"), D, D, L.Wk, "k_proj.W");
-        upload_fp16_checked(need(f, p + "self_attn.k_proj.bias"),   D, 1, L.bk, "k_proj.b");
-        upload_fp16_checked(need(f, p + "self_attn.v_proj.weight"), D, D, L.Wv, "v_proj.W");
-        upload_fp16_checked(need(f, p + "self_attn.v_proj.bias"),   D, 1, L.bv, "v_proj.b");
-        upload_fp16_checked(need(f, p + "self_attn.out_proj.weight"), D, D, L.Wo, "out_proj.W");
-        upload_fp16_checked(need(f, p + "self_attn.out_proj.bias"),   D, 1, L.bo, "out_proj.b");
+        upload_compute_checked(need(f, p + "self_attn.q_proj.weight"), D, D, L.Wq, "q_proj.W");
+        upload_compute_checked(need(f, p + "self_attn.q_proj.bias"),   D, 1, L.bq, "q_proj.b");
+        upload_compute_checked(need(f, p + "self_attn.k_proj.weight"), D, D, L.Wk, "k_proj.W");
+        upload_compute_checked(need(f, p + "self_attn.k_proj.bias"),   D, 1, L.bk, "k_proj.b");
+        upload_compute_checked(need(f, p + "self_attn.v_proj.weight"), D, D, L.Wv, "v_proj.W");
+        upload_compute_checked(need(f, p + "self_attn.v_proj.bias"),   D, 1, L.bv, "v_proj.b");
+        upload_compute_checked(need(f, p + "self_attn.out_proj.weight"), D, D, L.Wo, "out_proj.W");
+        upload_compute_checked(need(f, p + "self_attn.out_proj.bias"),   D, 1, L.bo, "out_proj.b");
 
-        upload_fp16_checked(need(f, p + "layer_norm2.weight"), D, 1, L.ln2_g, "ln2.weight");
-        upload_fp16_checked(need(f, p + "layer_norm2.bias"),   D, 1, L.ln2_b, "ln2.bias");
+        upload_compute_checked(need(f, p + "layer_norm2.weight"), D, 1, L.ln2_g, "ln2.weight");
+        upload_compute_checked(need(f, p + "layer_norm2.bias"),   D, 1, L.ln2_b, "ln2.bias");
 
-        upload_fp16_checked(need(f, p + "mlp.fc1.weight"), F, D, L.fc1_W, "fc1.W");
-        upload_fp16_checked(need(f, p + "mlp.fc1.bias"),   F, 1, L.fc1_b, "fc1.b");
-        upload_fp16_checked(need(f, p + "mlp.fc2.weight"), D, F, L.fc2_W, "fc2.W");
-        upload_fp16_checked(need(f, p + "mlp.fc2.bias"),   D, 1, L.fc2_b, "fc2.b");
+        upload_compute_checked(need(f, p + "mlp.fc1.weight"), F, D, L.fc1_W, "fc1.W");
+        upload_compute_checked(need(f, p + "mlp.fc1.bias"),   F, 1, L.fc1_b, "fc1.b");
+        upload_compute_checked(need(f, p + "mlp.fc2.weight"), D, F, L.fc2_W, "fc2.W");
+        upload_compute_checked(need(f, p + "mlp.fc2.bias"),   D, 1, L.fc2_b, "fc2.b");
     }
 
-    upload_fp16_checked(need(f, prefix + "post_layernorm.weight"),
+    upload_compute_checked(need(f, prefix + "post_layernorm.weight"),
                         D, 1, post_g_, "post_ln.weight");
-    upload_fp16_checked(need(f, prefix + "post_layernorm.bias"),
+    upload_compute_checked(need(f, prefix + "post_layernorm.bias"),
                         D, 1, post_b_, "post_ln.bias");
 }
 
@@ -162,7 +163,7 @@ void ImageEncoder::forward(const bt::Tensor& pixels, bt::Tensor& cls_out) {
     bt::nchw_to_sequence(patch_nchw_, /*N=*/1, /*C=*/D, /*H=*/G, /*W=*/G, ln_out_);
 
     // ── build (T, D) sequence: [CLS; patches] + position_embed ─────────────
-    detail::resize_like(seq_, T, D, bt::Dtype::FP16, pixels.device);
+    detail::resize_like(seq_, T, D, compute_dtype(), pixels.device);
     // Row 0 = class_embedding.
     bt::copy_d2d(class_embed_, /*src_off=*/0,
                      seq_,         /*dst_off=*/0,
@@ -175,13 +176,13 @@ void ImageEncoder::forward(const bt::Tensor& pixels, bt::Tensor& cls_out) {
     bt::add_inplace(seq_, position_embed_);
 
     // ── pre-LN over the full sequence ──────────────────────────────────────
-    bt::layernorm_forward_inference_batched_fp16(
+    detail::layernorm_batched(
         seq_, pre_g_, pre_b_, ln_out_, eps);
     seq_ = ln_out_.clone();
 
     // ── 24 transformer layers (non-causal, biased Q/K/V/O, QuickGELU MLP) ──
     for (auto& L : layers_) {
-        bt::layernorm_forward_inference_batched_fp16(
+        detail::layernorm_batched(
             seq_, L.ln1_g, L.ln1_b, ln_out_, eps);
 
         bt::flash_attention_qkvo_forward(
@@ -191,21 +192,21 @@ void ImageEncoder::forward(const bt::Tensor& pixels, bt::Tensor& cls_out) {
             proj_out_);
         bt::add_inplace(seq_, proj_out_);
 
-        bt::layernorm_forward_inference_batched_fp16(
+        detail::layernorm_batched(
             seq_, L.ln2_g, L.ln2_b, ln_out_, eps);
-        bt::linear_forward_batched_fp16(L.fc1_W, &L.fc1_b, ln_out_, ffn_mid_);
+        detail::linear_batched(L.fc1_W, &L.fc1_b, ln_out_, ffn_mid_);
         bt::quick_gelu_forward(ffn_mid_, ffn_act_);
-        bt::linear_forward_batched_fp16(L.fc2_W, &L.fc2_b, ffn_act_, ffn_out_);
+        detail::linear_batched(L.fc2_W, &L.fc2_b, ffn_act_, ffn_out_);
         bt::add_inplace(seq_, ffn_out_);
     }
 
     // ── post-LN, then take CLS row 0 ──────────────────────────────────────
     // HF CLIPVisionTransformer applies post_layernorm to the *pooled* CLS
     // output only. Copy row 0 first, LN that 1×D row, emit.
-    detail::resize_like(cls_out, 1, D, bt::Dtype::FP16, seq_.device);
+    detail::resize_like(cls_out, 1, D, compute_dtype(), seq_.device);
     bt::copy_d2d(seq_, /*src_off=*/0, cls_out, /*dst_off=*/0, /*count=*/D);
     // In-place LN on cls_out by writing through ln_out_.
-    bt::layernorm_forward_inference_batched_fp16(
+    detail::layernorm_batched(
         cls_out, post_g_, post_b_, ln_out_, eps);
     cls_out = ln_out_.clone();
 }

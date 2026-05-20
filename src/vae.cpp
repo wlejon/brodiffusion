@@ -27,9 +27,9 @@ const st::TensorView& need(const st::File& f, const std::string& key) {
 }
 
 // Accepts F16 (used as-is) or F32 (converted host-side); SD1.5 full
-// checkpoints ship as F32.
-void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
-                        bt::Tensor& dst, const char* name) {
+// checkpoints ship as F32. Uploads at the pipeline compute dtype.
+void upload_compute_checked(const st::TensorView& v, int rows, int cols,
+                            bt::Tensor& dst, const char* name) {
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
         fail(std::string(name) + ": expected F16 or F32, got " + st::dtype_name(v.dtype));
     }
@@ -39,7 +39,7 @@ void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
              std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
              std::to_string(v.numel()) + ")");
     }
-    st::upload_fp16(v, rows, cols, dst);
+    st::upload_compute(v, rows, cols, dst);
 }
 
 }  // namespace
@@ -63,24 +63,24 @@ Decoder::~Decoder() = default;
 
 void Decoder::load_resnet_(const st::File& f, const std::string& p,
                            int C_in, int C_out, Resnet& r) {
-    upload_fp16_checked(need(f, p + "norm1.weight"), C_in, 1, r.norm1_g, "norm1.weight");
-    upload_fp16_checked(need(f, p + "norm1.bias"),   C_in, 1, r.norm1_b, "norm1.bias");
+    upload_compute_checked(need(f, p + "norm1.weight"), C_in, 1, r.norm1_g, "norm1.weight");
+    upload_compute_checked(need(f, p + "norm1.bias"),   C_in, 1, r.norm1_b, "norm1.bias");
     // conv1: (C_out, C_in * 3 * 3) — flattened as 2D for safetensors-upload.
-    upload_fp16_checked(need(f, p + "conv1.weight"), C_out, C_in * 3 * 3, r.conv1_W, "conv1.weight");
-    upload_fp16_checked(need(f, p + "conv1.bias"),   C_out, 1, r.conv1_b, "conv1.bias");
-    upload_fp16_checked(need(f, p + "norm2.weight"), C_out, 1, r.norm2_g, "norm2.weight");
-    upload_fp16_checked(need(f, p + "norm2.bias"),   C_out, 1, r.norm2_b, "norm2.bias");
-    upload_fp16_checked(need(f, p + "conv2.weight"), C_out, C_out * 3 * 3, r.conv2_W, "conv2.weight");
-    upload_fp16_checked(need(f, p + "conv2.bias"),   C_out, 1, r.conv2_b, "conv2.bias");
+    upload_compute_checked(need(f, p + "conv1.weight"), C_out, C_in * 3 * 3, r.conv1_W, "conv1.weight");
+    upload_compute_checked(need(f, p + "conv1.bias"),   C_out, 1, r.conv1_b, "conv1.bias");
+    upload_compute_checked(need(f, p + "norm2.weight"), C_out, 1, r.norm2_g, "norm2.weight");
+    upload_compute_checked(need(f, p + "norm2.bias"),   C_out, 1, r.norm2_b, "norm2.bias");
+    upload_compute_checked(need(f, p + "conv2.weight"), C_out, C_out * 3 * 3, r.conv2_W, "conv2.weight");
+    upload_compute_checked(need(f, p + "conv2.bias"),   C_out, 1, r.conv2_b, "conv2.bias");
 
     r.C_in = C_in;
     r.C_out = C_out;
     r.has_shortcut = (C_in != C_out);
     if (r.has_shortcut) {
         // conv_shortcut: 1x1 conv (C_out, C_in, 1, 1) — flattened to (C_out, C_in).
-        upload_fp16_checked(need(f, p + "conv_shortcut.weight"),
+        upload_compute_checked(need(f, p + "conv_shortcut.weight"),
                             C_out, C_in, r.short_W, "conv_shortcut.weight");
-        upload_fp16_checked(need(f, p + "conv_shortcut.bias"),
+        upload_compute_checked(need(f, p + "conv_shortcut.bias"),
                             C_out, 1, r.short_b, "conv_shortcut.bias");
     }
 }
@@ -108,16 +108,16 @@ void Decoder::load_weights(const st::File& f, const std::string& prefix) {
     has_post_quant_conv_ = (pqw != nullptr && pqb != nullptr);
     if (has_post_quant_conv_) {
         // 1x1 conv (in_channels, in_channels, 1, 1) -> 2D (in_channels, in_channels).
-        upload_fp16_checked(*pqw, cfg_.in_channels, cfg_.in_channels,
+        upload_compute_checked(*pqw, cfg_.in_channels, cfg_.in_channels,
                             post_quant_W_, "post_quant_conv.weight");
-        upload_fp16_checked(*pqb, cfg_.in_channels, 1,
+        upload_compute_checked(*pqb, cfg_.in_channels, 1,
                             post_quant_b_, "post_quant_conv.bias");
     }
 
     // conv_in: (mid_C, in_channels, 3, 3) → 2D (mid_C, in_channels * 9)
-    upload_fp16_checked(need(f, prefix + "conv_in.weight"),
+    upload_compute_checked(need(f, prefix + "conv_in.weight"),
                         mid_C, cfg_.in_channels * 3 * 3, conv_in_W_, "conv_in.weight");
-    upload_fp16_checked(need(f, prefix + "conv_in.bias"),
+    upload_compute_checked(need(f, prefix + "conv_in.bias"),
                         mid_C, 1, conv_in_b_, "conv_in.bias");
 
     // mid_block
@@ -125,8 +125,8 @@ void Decoder::load_weights(const st::File& f, const std::string& prefix) {
     load_resnet_(f, prefix + "mid_block.resnets.1.", mid_C, mid_C, mid_res1_);
 
     const std::string ap = prefix + "mid_block.attentions.0.";
-    upload_fp16_checked(need(f, ap + "group_norm.weight"), mid_C, 1, mid_attn_.gn_g, "attn.gn.w");
-    upload_fp16_checked(need(f, ap + "group_norm.bias"),   mid_C, 1, mid_attn_.gn_b, "attn.gn.b");
+    upload_compute_checked(need(f, ap + "group_norm.weight"), mid_C, 1, mid_attn_.gn_g, "attn.gn.w");
+    upload_compute_checked(need(f, ap + "group_norm.bias"),   mid_C, 1, mid_attn_.gn_b, "attn.gn.b");
     // Diffusers >=0.20 renamed the VAE mid-block attention tensors to match
     // the BasicTransformerBlock naming (to_q/to_k/to_v/to_out.0). The older
     // query/key/value/proj_attn names live on in legacy checkpoints — accept
@@ -138,14 +138,14 @@ void Decoder::load_weights(const st::File& f, const std::string& prefix) {
         if (v) return *v;
         fail("missing attention tensor '" + ap + primary + "' (also tried '" + ap + legacy + "')");
     };
-    upload_fp16_checked(need_alt("to_q.weight",     "query.weight"),     mid_C, mid_C, mid_attn_.Wq, "attn.q.w");
-    upload_fp16_checked(need_alt("to_q.bias",       "query.bias"),       mid_C, 1, mid_attn_.bq, "attn.q.b");
-    upload_fp16_checked(need_alt("to_k.weight",     "key.weight"),       mid_C, mid_C, mid_attn_.Wk, "attn.k.w");
-    upload_fp16_checked(need_alt("to_k.bias",       "key.bias"),         mid_C, 1, mid_attn_.bk, "attn.k.b");
-    upload_fp16_checked(need_alt("to_v.weight",     "value.weight"),     mid_C, mid_C, mid_attn_.Wv, "attn.v.w");
-    upload_fp16_checked(need_alt("to_v.bias",       "value.bias"),       mid_C, 1, mid_attn_.bv, "attn.v.b");
-    upload_fp16_checked(need_alt("to_out.0.weight", "proj_attn.weight"), mid_C, mid_C, mid_attn_.Wo, "attn.o.w");
-    upload_fp16_checked(need_alt("to_out.0.bias",   "proj_attn.bias"),   mid_C, 1, mid_attn_.bo, "attn.o.b");
+    upload_compute_checked(need_alt("to_q.weight",     "query.weight"),     mid_C, mid_C, mid_attn_.Wq, "attn.q.w");
+    upload_compute_checked(need_alt("to_q.bias",       "query.bias"),       mid_C, 1, mid_attn_.bq, "attn.q.b");
+    upload_compute_checked(need_alt("to_k.weight",     "key.weight"),       mid_C, mid_C, mid_attn_.Wk, "attn.k.w");
+    upload_compute_checked(need_alt("to_k.bias",       "key.bias"),         mid_C, 1, mid_attn_.bk, "attn.k.b");
+    upload_compute_checked(need_alt("to_v.weight",     "value.weight"),     mid_C, mid_C, mid_attn_.Wv, "attn.v.w");
+    upload_compute_checked(need_alt("to_v.bias",       "value.bias"),       mid_C, 1, mid_attn_.bv, "attn.v.b");
+    upload_compute_checked(need_alt("to_out.0.weight", "proj_attn.weight"), mid_C, mid_C, mid_attn_.Wo, "attn.o.w");
+    upload_compute_checked(need_alt("to_out.0.bias",   "proj_attn.bias"),   mid_C, 1, mid_attn_.bo, "attn.o.b");
     mid_attn_.C = mid_C;
 
     // up_blocks. Channel order is reversed: up_blocks[0] takes block_out_channels.back().
@@ -169,25 +169,25 @@ void Decoder::load_weights(const st::File& f, const std::string& prefix) {
         ub.has_upsampler = (i + 1 < nb);
         if (ub.has_upsampler) {
             const std::string up = prefix + "up_blocks." + std::to_string(i) + ".upsamplers.0.conv.";
-            upload_fp16_checked(need(f, up + "weight"),
+            upload_compute_checked(need(f, up + "weight"),
                                 C_block, C_block * 3 * 3, ub.upsampler.W,
                                 "upsampler.conv.weight");
-            upload_fp16_checked(need(f, up + "bias"),
+            upload_compute_checked(need(f, up + "bias"),
                                 C_block, 1, ub.upsampler.b,
                                 "upsampler.conv.bias");
         }
         C_prev = C_block;
     }
 
-    upload_fp16_checked(need(f, prefix + "conv_norm_out.weight"),
+    upload_compute_checked(need(f, prefix + "conv_norm_out.weight"),
                         first_C, 1, norm_out_g_, "conv_norm_out.weight");
-    upload_fp16_checked(need(f, prefix + "conv_norm_out.bias"),
+    upload_compute_checked(need(f, prefix + "conv_norm_out.bias"),
                         first_C, 1, norm_out_b_, "conv_norm_out.bias");
 
     // conv_out: (out_channels, first_C, 3, 3) → (out_channels, first_C * 9)
-    upload_fp16_checked(need(f, prefix + "conv_out.weight"),
+    upload_compute_checked(need(f, prefix + "conv_out.weight"),
                         cfg_.out_channels, first_C * 3 * 3, conv_out_W_, "conv_out.weight");
-    upload_fp16_checked(need(f, prefix + "conv_out.bias"),
+    upload_compute_checked(need(f, prefix + "conv_out.bias"),
                         cfg_.out_channels, 1, conv_out_b_, "conv_out.bias");
 }
 

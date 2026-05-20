@@ -1,6 +1,7 @@
 #include "brodiffusion/clip_score.h"
 #include "brodiffusion/safetensors.h"
 #include "brodiffusion/detail/device.h"
+#include "brodiffusion/detail/compute.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -25,8 +26,8 @@ namespace {
     throw std::runtime_error("clip_score::CLIPScorer: " + msg);
 }
 
-void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
-                         bt::Tensor& dst, const char* name) {
+void upload_compute_checked(const st::TensorView& v, int rows, int cols,
+                            bt::Tensor& dst, const char* name) {
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
         fail(std::string(name) + ": expected F16 or F32, got " +
              st::dtype_name(v.dtype));
@@ -37,7 +38,22 @@ void upload_fp16_checked(const st::TensorView& v, int rows, int cols,
              std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
              std::to_string(v.numel()) + " elements)");
     }
-    st::upload_fp16(v, rows, cols, dst);
+    st::upload_compute(v, rows, cols, dst);
+}
+
+// Download a compute-dtype tensor's contents into a host FP32 vector,
+// converting from FP16 bits on a GPU backend.
+std::vector<float> download_compute(const bt::Tensor& t) {
+    if (t.dtype == bt::Dtype::FP16) {
+        std::vector<std::uint16_t> bits(static_cast<std::size_t>(t.size()));
+        t.copy_to_host_fp16(bits.data());
+        std::vector<float> out(bits.size());
+        for (std::size_t i = 0; i < bits.size(); ++i) {
+            out[i] = bt::fp16_bits_to_fp32(bits[i]);
+        }
+        return out;
+    }
+    return t.to_host_vector();
 }
 
 const st::TensorView& need(const st::File& f, const std::string& key) {
@@ -71,9 +87,9 @@ void CLIPScorer::load_projections(const st::File& f, const std::string& prefix) 
     const int Dv = image_enc_.config().hidden_dim;
     const int Dt = text_enc_.config().hidden_dim;
 
-    upload_fp16_checked(need(f, prefix + "visual_projection.weight"),
+    upload_compute_checked(need(f, prefix + "visual_projection.weight"),
                         P, Dv, visual_proj_W_, "visual_projection.weight");
-    upload_fp16_checked(need(f, prefix + "text_projection.weight"),
+    upload_compute_checked(need(f, prefix + "text_projection.weight"),
                         P, Dt, text_proj_W_, "text_projection.weight");
 }
 
@@ -85,7 +101,6 @@ void CLIPScorer::set_prompt(std::string_view prompt) {
     auto ids = tok_.encode(prompt);
     const int L  = static_cast<int>(ids.size());
     const int Dt = text_enc_.config().hidden_dim;
-    const int P  = cfg_.projection_dim;
     if (L != text_enc_.config().max_position) {
         fail("set_prompt: tokenizer produced unexpected sequence length");
     }
@@ -103,27 +118,20 @@ void CLIPScorer::set_prompt(std::string_view prompt) {
         }
     }
 
-    text_enc_.forward(ids.data(), text_hidden_);  // (L, Dt) FP16
+    text_enc_.forward(ids.data(), text_hidden_);  // (L, Dt) at compute dtype
 
     // Pool: copy row eos_idx into text_pooled_ (1, Dt).
-    detail::resize_like(text_pooled_, 1, Dt, bt::Dtype::FP16, text_hidden_.device);
+    detail::resize_like(text_pooled_, 1, Dt, compute_dtype(), text_hidden_.device);
     bt::copy_d2d(text_hidden_, /*src_off=*/eos_idx * Dt,
                      text_pooled_,  /*dst_off=*/0,
                      /*count=*/Dt);
 
     // Project to shared space: (1, P) = text_pooled_ @ text_proj_W_.T
-    bt::linear_forward_batched_fp16(text_proj_W_, /*bias=*/nullptr,
-                                        text_pooled_, text_proj_);
+    detail::linear_batched(text_proj_W_, /*bias=*/nullptr,
+                           text_pooled_, text_proj_);
 
     bt::sync_all();
-    std::vector<std::uint16_t> bits(static_cast<std::size_t>(P));
-    text_proj_.copy_to_host_fp16(bits.data());
-
-    text_feat_.assign(static_cast<std::size_t>(P), 0.0f);
-    for (int i = 0; i < P; ++i) {
-        text_feat_[static_cast<std::size_t>(i)] =
-            bt::fp16_bits_to_fp32(bits[static_cast<std::size_t>(i)]);
-    }
+    text_feat_ = download_compute(text_proj_);
     l2_normalise_in_place(text_feat_);
 }
 
@@ -132,27 +140,20 @@ float CLIPScorer::score(const std::vector<float>& image, int H, int W) {
         fail("score: set_prompt was not called");
     }
 
-    auto pixel_bits = preprocess_(image, H, W);
+    auto pixel_vals = preprocess_(image, H, W);
     const int S  = image_enc_.config().image_size;
     const int C  = image_enc_.config().in_channels;
     const int P  = cfg_.projection_dim;
 
-    pixels_dev_ = brotensor::Tensor::from_host_fp16(pixel_bits.data(), 1, C * S * S);
+    pixels_dev_ = detail::upload_host(pixel_vals.data(), 1, C * S * S);
     image_enc_.forward(pixels_dev_, img_cls_);
 
     // (1, P) = img_cls_ @ visual_proj_W_.T
-    bt::linear_forward_batched_fp16(visual_proj_W_, /*bias=*/nullptr,
-                                        img_cls_, img_proj_);
+    detail::linear_batched(visual_proj_W_, /*bias=*/nullptr,
+                           img_cls_, img_proj_);
 
     bt::sync_all();
-    std::vector<std::uint16_t> bits(static_cast<std::size_t>(P));
-    img_proj_.copy_to_host_fp16(bits.data());
-
-    std::vector<float> img_feat(static_cast<std::size_t>(P), 0.0f);
-    for (int i = 0; i < P; ++i) {
-        img_feat[static_cast<std::size_t>(i)] =
-            bt::fp16_bits_to_fp32(bits[static_cast<std::size_t>(i)]);
-    }
+    std::vector<float> img_feat = download_compute(img_proj_);
     l2_normalise_in_place(img_feat);
 
     double dot = 0.0;
@@ -163,7 +164,7 @@ float CLIPScorer::score(const std::vector<float>& image, int H, int W) {
     return static_cast<float>(dot);
 }
 
-std::vector<std::uint16_t> CLIPScorer::preprocess_(
+std::vector<float> CLIPScorer::preprocess_(
     const std::vector<float>& image, int H, int W) const {
 
     const int S = image_enc_.config().image_size;       // 224
@@ -181,7 +182,7 @@ std::vector<std::uint16_t> CLIPScorer::preprocess_(
     const std::size_t plane_in  = static_cast<std::size_t>(H) * static_cast<std::size_t>(W);
     const std::size_t plane_out = static_cast<std::size_t>(S) * static_cast<std::size_t>(S);
 
-    std::vector<std::uint16_t> out(static_cast<std::size_t>(C) * plane_out);
+    std::vector<float> out(static_cast<std::size_t>(C) * plane_out);
 
     for (int c = 0; c < C; ++c) {
         const float* in_plane = image.data() + c * plane_in;
@@ -215,7 +216,7 @@ std::vector<std::uint16_t> CLIPScorer::preprocess_(
                 v = (v + 1.0f) * 0.5f;
                 v = (v - mean) * inv_std;
 
-                out[c * plane_out + y * S + x] = bt::fp32_to_fp16_bits(v);
+                out[c * plane_out + y * S + x] = v;
             }
         }
     }

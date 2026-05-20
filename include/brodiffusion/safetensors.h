@@ -107,6 +107,13 @@ void upload(const TensorView& view, int rows, int cols, brotensor::Tensor& dst);
 // are diffusers-only). If the source is F16, it's uploaded as-is.
 void upload_fp16(const TensorView& view, int rows, int cols, brotensor::Tensor& dst);
 
+// Upload a weight at the pipeline's compute dtype — FP32 on the CPU backend,
+// FP16 on a GPU backend (see brodiffusion::compute_dtype()). The source view
+// (F16 or F32) is converted host-side as needed. This is the loader the
+// model components use so a single checkpoint serves either backend.
+void upload_compute(const TensorView& view, int rows, int cols,
+                    brotensor::Tensor& dst);
+
 // ─── Writer ────────────────────────────────────────────────────────────────
 //
 // Minimal safetensors writer. Builds the JSON header in insertion order and

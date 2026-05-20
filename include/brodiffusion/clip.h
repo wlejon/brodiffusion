@@ -2,7 +2,9 @@
 
 // CLIP ViT-L/14 text encoder for SD1.5.
 //
-// Forward-only, FP16 throughout. Architecture (one layer):
+// Forward-only. Runs on whichever backend brotensor resolves at runtime —
+// CPU by default, CUDA when available — at that backend's compute dtype (FP32
+// on CPU, FP16 on a GPU). Architecture (one layer):
 //   x = LN1(x)
 //   q = x @ Wq + bq;  k = x @ Wk + bk;  v = x @ Wv + bv     (heads stacked)
 //   a = causal_self_attention(q, k, v)
@@ -14,9 +16,9 @@
 // hidden state (L, hidden_dim) — SD1.5 takes this directly as cross-attention
 // context; no projection or pooling.
 //
-// Weights are FP16. SD1.5 ships its text encoder in FP16 already; if you have
-// FP32 weights, convert host-side before upload (brotensor provides the IEEE
-// 754 binary16 helpers).
+// Weights load at the pipeline compute dtype. The safetensors loader accepts
+// either F16 or F32 source tensors and converts as needed for the active
+// backend.
 
 #include "brotensor/tensor.h"
 
@@ -65,22 +67,23 @@ public:
     //   {prefix}encoder.layers.{i}.mlp.fc2.{weight (D, FFN), bias (D,)}
     //   {prefix}final_layer_norm.{weight,bias}                 (D,)
     //
-    // Every tensor must be FP16. Throws std::runtime_error if a name is
-    // missing, shape mismatches the config, or dtype is wrong.
+    // Source tensors may be F16 or F32; they load at the compute dtype.
+    // Throws std::runtime_error if a name is missing, shape mismatches the
+    // config, or the source dtype is neither F16 nor F32.
     void load_weights(const brodiffusion::safetensors::File& f,
                       const std::string& prefix = "text_model.");
 
     // Forward pass on a length-L sequence of int32 token IDs. L must equal
     // cfg.max_position (CLIP is fixed-length).
     //   ids: host pointer to L int32 token IDs in [0, vocab_size).
-    //   out: (L, hidden_dim) FP16 Tensor, resized as needed.
+    //   out: (L, hidden_dim) Tensor at the compute dtype, resized as needed.
     // brotensor::init() must have been called once before any forward.
     // The caller is responsible for sync_all() before reading `out` to host.
     void forward(const int32_t* ids, brotensor::Tensor& out);
 
     const TextEncoderConfig& config() const { return cfg_; }
 
-    // Fold a LoRA delta into the base FP16 weight identified by `target_path`,
+    // Fold a LoRA delta into the base weight identified by `target_path`,
     // a diffusers path within the CLIP module (e.g.
     // "text_model.encoder.layers.0.self_attn.q_proj"). Same semantics as
     // brodiffusion::unet::UNet::apply_lora_delta: in-place

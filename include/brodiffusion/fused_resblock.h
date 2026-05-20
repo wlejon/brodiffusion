@@ -7,11 +7,15 @@
 // (or 1x1-skip) add into conv2's epilogue, cutting kernel launches per
 // resblock from ~8 to ~3-5.
 //
+// Runtime dispatcher (see src/fused.cpp): a GPU-resident input runs the
+// fused CUDA kernel below; a CPU-resident input delegates to the unfused
+// brotensor::resblock_forward in FP32. Same math either way.
+//
 // Restrictions (SD1.5-only):
 //   * N = 1 (single-image inference path)
 //   * conv1/conv2 are 3x3 stride 1 pad 1 dilation 1
 //   * conv = 1x1 skip only when C_in != C_out (handled by brotensor's path)
-//   * All tensors FP16.
+//   * FP16 on a GPU backend; FP32 on CPU.
 
 #include "brotensor/tensor.h"
 

@@ -4,10 +4,12 @@
 //
 // Hard-coded inference assumptions:
 //   * N=1 outer batch (B in these APIs is the flattened (1, L) sequence length).
-//   * FP16 storage, FP32 accumulators.
 //   * Shapes used by SD1.5 BasicTransformerBlock: D in {320, 640, 1280},
 //     L in {4096, 1024, 256, 64}, FF inner = 4 * D.
 //
+// These are runtime dispatchers (see src/fused.cpp): a GPU-resident input
+// runs the SD1.5-tuned fused CUDA kernel (FP16 storage, FP32 accumulators);
+// a CPU-resident input runs an FP32 fallback composed from brotensor ops.
 // Generic versions of these ops live in brotensor; SD1.5-tuned fusions
 // belong here.
 
@@ -26,7 +28,7 @@ namespace brodiffusion {
 // matches brotensor::geglu_exact_forward_fp16_kernel byte-for-byte modulo
 // FP32 accumulation differences (we never materialise the 2*D_out tile).
 //
-// W is (2*D_out, D_in), b is (2*D_out,). All tensors FP16.
+// W is (2*D_out, D_in), b is (2*D_out,).
 void fused_linear_geglu(const brotensor::Tensor& X,
                         const brotensor::Tensor& W,
                         const brotensor::Tensor& b,
@@ -45,18 +47,17 @@ void fused_linear_geglu(const brotensor::Tensor& X,
                         const brotensor::Tensor& b,
                         brotensor::Tensor& Y);
 
-// Vectorised FP16 elementwise add: Y[i] += X[i].
-// brotensor::add_inplace's FP16 kernel goes through __half2float per
-// element; this one uses __half2 vector adds (and int4 vector loads when
-// alignment allows). Same shape semantics: Y and X must match.
-void add_inplace_fp16_vec(brotensor::Tensor& Y, const brotensor::Tensor& X);
+// In-place elementwise add: Y[i] += X[i]. On a GPU backend this runs a
+// vectorised __half2 kernel; on CPU it routes to brotensor::add_inplace.
+// Same shape semantics: Y and X must match.
+void add_inplace_vec(brotensor::Tensor& Y, const brotensor::Tensor& X);
 
 // Per-column broadcast bias add: Y[i, j] += bias[j], where Y is (rows, cols)
-// FP16 row-major and bias is FP16 length cols (shape (cols,1) or (1,cols)
-// both accepted — we only look at size()). Used by trace-mode cross-attention
-// to fold the attn2.to_out bias that
+// row-major and bias has length cols (shape (cols,1) or (1,cols) both
+// accepted — we only look at size()). Used by trace-mode cross-attention to
+// fold the attn2.to_out bias that
 // brotensor::cross_attention_forward_with_attn does not accept as an input.
-void add_inplace_row_bias_fp16(brotensor::Tensor& Y,
-                               const brotensor::Tensor& bias);
+void add_inplace_row_bias(brotensor::Tensor& Y,
+                          const brotensor::Tensor& bias);
 
 } // namespace brodiffusion

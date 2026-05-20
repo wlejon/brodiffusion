@@ -271,7 +271,8 @@ int main() {
     }
     if (!bt::is_available(bt::Device::CUDA) &&
         !bt::is_available(bt::Device::Metal)) {
-        std::fprintf(stderr, "no GPU backend — skipping GPU test\n");
+        std::fprintf(stderr,
+                     "INT8 quantization is GPU-only — skipping\n");
         return 0;
     }
 

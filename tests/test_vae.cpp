@@ -9,11 +9,14 @@
 // pattern, and determinism across two consecutive decodes. Numerical accuracy
 // vs the reference VAE is left to a future real-weights integration test.
 
+#include "brodiffusion/detail/compute.h"
 #include "brodiffusion/safetensors.h"
 #include "brodiffusion/vae.h"
 
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
+
+#include "test_compute.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -98,10 +101,6 @@ std::vector<uint16_t> fp16_seq(std::size_t n, float scale, std::size_t salt = 0)
     return out;
 }
 
-bool is_finite_fp16(uint16_t bits) {
-    return ((bits >> 10) & 0x1F) != 0x1F;
-}
-
 // Emit one resnet's tensors under prefix p (already ending with ".").
 void emit_resnet(Builder& b, const std::string& p, int C_in, int C_out) {
     b.add(p + "norm1.weight", {C_in},  fp16_ones(C_in));
@@ -132,12 +131,6 @@ int main() {
         std::fprintf(stderr, "init failed: %s\n", e.what());
         return 1;
     }
-    if (!bt::is_available(bt::Device::CUDA) &&
-        !bt::is_available(bt::Device::Metal)) {
-        std::fprintf(stderr, "no GPU backend — skipping GPU test\n");
-        return 0;
-    }
-
     vae::DecoderConfig cfg;
     cfg.in_channels       = 4;
     cfg.out_channels      = 3;
@@ -213,21 +206,20 @@ int main() {
     const int W_out = W_lat * 8;
     const int out_elems = cfg.out_channels * H_out * W_out;
 
-    std::vector<uint16_t> bits1, bits2;
+    std::vector<float> vals1, vals2;
     {
         auto file = st::File::open(path.string());
         vae::Decoder dec(cfg);
         dec.load_weights(file, "decoder.");
 
         // Synthesize a latent (1, 4, 2, 2) with small varied values.
-        std::vector<uint16_t> latent_h(
+        std::vector<float> latent_h(
             static_cast<std::size_t>(cfg.in_channels) * H_lat * W_lat);
         for (std::size_t i = 0; i < latent_h.size(); ++i) {
-            float v = (static_cast<float>(i % 5) - 2.0f) * 0.1f;
-            latent_h[i] = bt::fp32_to_fp16_bits(v);
+            latent_h[i] = (static_cast<float>(i % 5) - 2.0f) * 0.1f;
         }
-        bt::Tensor latent = bt::Tensor::from_host_fp16(
-            latent_h.data(), 1, cfg.in_channels * H_lat * W_lat);
+        bt::Tensor latent =
+            bdtest::bd_upload(latent_h, 1, cfg.in_channels * H_lat * W_lat);
 
         bt::Tensor out;
         dec.decode(latent, H_lat, W_lat, out);
@@ -235,22 +227,18 @@ int main() {
 
         CHECK(out.rows == 1);
         CHECK(out.cols == out_elems);
-        CHECK(out.dtype == bt::Dtype::FP16);
+        CHECK(out.dtype == brodiffusion::compute_dtype());
 
-        bits1.resize(static_cast<std::size_t>(out_elems));
-        out.copy_to_host_fp16(bits1.data());
-        bt::sync_all();
+        vals1 = bdtest::bd_download(out);
 
         int nonfinite = 0;
-        for (uint16_t v : bits1) if (!is_finite_fp16(v)) ++nonfinite;
+        for (float v : vals1) if (!bdtest::bd_finite(v)) ++nonfinite;
         CHECK(nonfinite == 0);
 
         dec.decode(latent, H_lat, W_lat, out);
         bt::sync_all();
-        bits2.resize(bits1.size());
-        out.copy_to_host_fp16(bits2.data());
-        bt::sync_all();
-        CHECK(std::memcmp(bits1.data(), bits2.data(), bits1.size() * 2) == 0);
+        vals2 = bdtest::bd_download(out);
+        CHECK(vals1 == vals2);
     }
 
     std::error_code ec;

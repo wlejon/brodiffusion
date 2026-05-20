@@ -19,6 +19,7 @@
 // SD1.5 inference shape constraints documented in the public header.
 
 #include "brodiffusion/fused_transformer.h"
+#include "brodiffusion/detail/fused_backend.h"
 #include "brodiffusion/detail/cuda_check.cuh"
 #include "brodiffusion/detail/device.h"
 
@@ -302,7 +303,7 @@ __global__ void add_inplace_fp16_vec_kernel(__half* __restrict__ Y,
 } // anonymous namespace
 
 
-void fused_linear_geglu(const bt::Tensor& X,
+void detail::fused_linear_geglu_cuda(const bt::Tensor& X,
                         const bt::Tensor& W,
                         const bt::Tensor& b,
                         bt::Tensor& Y) {
@@ -343,7 +344,7 @@ void fused_linear_geglu(const bt::Tensor& X,
     BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
 }
 
-void fused_linear_geglu(const bt::Tensor& X,
+void detail::fused_linear_geglu_cuda(const bt::Tensor& X,
                         const bt::Tensor& W_int8,
                         const bt::Tensor& W_scales,
                         const bt::Tensor& b,
@@ -396,7 +397,7 @@ __global__ void add_inplace_row_bias_fp16_kernel(__half* __restrict__ Y,
 
 }  // namespace
 
-void add_inplace_row_bias_fp16(bt::Tensor& Y, const bt::Tensor& bias) {
+void detail::add_inplace_row_bias_cuda(bt::Tensor& Y, const bt::Tensor& bias) {
     if (Y.dtype != bt::Dtype::FP16 || bias.dtype != bt::Dtype::FP16) {
         throw std::runtime_error("add_inplace_row_bias_fp16: tensors must be FP16");
     }
@@ -413,7 +414,7 @@ void add_inplace_row_bias_fp16(bt::Tensor& Y, const bt::Tensor& bias) {
     BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
 }
 
-void add_inplace_fp16_vec(bt::Tensor& Y, const bt::Tensor& X) {
+void detail::add_inplace_vec_cuda(bt::Tensor& Y, const bt::Tensor& X) {
     if (Y.dtype != bt::Dtype::FP16 || X.dtype != bt::Dtype::FP16) {
         throw std::runtime_error("add_inplace_fp16_vec: both tensors must be FP16");
     }

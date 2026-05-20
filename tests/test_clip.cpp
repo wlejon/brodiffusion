@@ -10,10 +10,13 @@
 // that needs real CLIP weights and lives in a future integration test.
 
 #include "brodiffusion/clip.h"
+#include "brodiffusion/detail/compute.h"
 #include "brodiffusion/safetensors.h"
 
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
+
+#include "test_compute.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -98,11 +101,6 @@ std::vector<uint16_t> fp16_seq(std::size_t n, float scale = 0.01f, float offset 
     return out;
 }
 
-bool is_finite_fp16(uint16_t bits) {
-    // Exponent bits 10..14. All ones → Inf or NaN.
-    return ((bits >> 10) & 0x1F) != 0x1F;
-}
-
 }  // namespace
 
 // ─── test ──────────────────────────────────────────────────────────────────
@@ -114,12 +112,6 @@ int main() {
         std::fprintf(stderr, "init failed: %s\n", e.what());
         return 1;
     }
-    if (!bt::is_available(bt::Device::CUDA) &&
-        !bt::is_available(bt::Device::Metal)) {
-        std::fprintf(stderr, "no GPU backend — skipping GPU test\n");
-        return 0;
-    }
-
     clip::TextEncoderConfig cfg;
     cfg.vocab_size       = 8;
     cfg.max_position     = 4;
@@ -171,7 +163,7 @@ int main() {
     auto path = std::filesystem::temp_directory_path() / "brodiffusion_clip_test.safetensors";
     b.write(path);
 
-    std::vector<uint16_t> out_bits1, out_bits2;
+    std::vector<float> out_vals1, out_vals2;
     {
         auto file = st::File::open(path.string());
         clip::TextEncoder enc(cfg);
@@ -184,24 +176,19 @@ int main() {
 
         CHECK(out.rows == P);
         CHECK(out.cols == D);
-        CHECK(out.dtype == bt::Dtype::FP16);
+        CHECK(out.dtype == brodiffusion::compute_dtype());
 
-        out_bits1.resize(static_cast<std::size_t>(out.size()));
-        out.copy_to_host_fp16(out_bits1.data());
-        bt::sync_all();
+        out_vals1 = bdtest::bd_download(out);
 
         int nonfinite = 0;
-        for (uint16_t v : out_bits1) if (!is_finite_fp16(v)) ++nonfinite;
+        for (float v : out_vals1) if (!bdtest::bd_finite(v)) ++nonfinite;
         CHECK(nonfinite == 0);
 
-        // Second forward — must be byte-identical for a deterministic graph.
+        // Second forward — must be bitwise-identical for a deterministic graph.
         enc.forward(ids.data(), out);
         bt::sync_all();
-        out_bits2.resize(out_bits1.size());
-        out.copy_to_host_fp16(out_bits2.data());
-        bt::sync_all();
-        CHECK(std::memcmp(out_bits1.data(), out_bits2.data(),
-                          out_bits1.size() * 2) == 0);
+        out_vals2 = bdtest::bd_download(out);
+        CHECK(out_vals1 == out_vals2);
     }
 
     std::error_code ec;

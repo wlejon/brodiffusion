@@ -20,6 +20,7 @@
 // in brodiffusion.
 
 #include "brodiffusion/fused_resblock.h"
+#include "brodiffusion/detail/fused_backend.h"
 #include "brodiffusion/detail/cuda_check.cuh"
 #include "brodiffusion/detail/device.h"
 
@@ -329,7 +330,7 @@ inline void launch_conv3x3_fused(const __half* X, const __half* Wt,
 } // anonymous namespace
 
 
-void fused_resblock_forward(
+void detail::fused_resblock_forward_cuda(
     const bt::Tensor& X,
     const bt::Tensor& gn1_g, const bt::Tensor& gn1_b,
     const bt::Tensor& W1,    const bt::Tensor& b1,
@@ -437,7 +438,7 @@ void fused_resblock_forward(
 // one op-layer call. The earlier brodiffusion-side composition lost the
 // epilogue-fusion launches and ran ~1.5x slower than FP16; this delegation
 // closes that gap.
-void fused_resblock_forward(
+void detail::fused_resblock_forward_cuda(
     const bt::Tensor& X,
     const bt::Tensor& gn1_g, const bt::Tensor& gn1_b,
     const bt::Tensor& W1_int8, const bt::Tensor& W1_scales,
