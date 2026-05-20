@@ -13,16 +13,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
-
-#ifdef BROTENSOR_HAS_CUDA
-#include <cuda_runtime.h>
-#endif
 
 namespace brodiffusion::unet {
 
@@ -701,14 +696,6 @@ void UNet::forward_trace(const bt::Tensor& sample,
 
 namespace {
 
-// Local resolution: walks the UNet to find the Tensor* for a diffusers
-// target path. Lives in the .cpp so it can touch private struct fields via
-// the UNet method `lora_target_` below.
-
-}  // namespace
-
-namespace {
-
 // Parse "<head>.<int>(.|$)" — consume the integer immediately after a literal
 // head + dot. On success advances `pos` past the integer and returns true.
 bool match_dotted_int(const std::string& s, std::size_t& pos,
@@ -877,10 +864,6 @@ void upload_view_compute(const st::TensorView& v, int rows, int cols,
     }
     st::upload_compute(v, rows, cols, dst);
 }
-
-// Read a compute-dtype tensor back into host memory as fp32 (debug /
-// numerical merge path uses this only in tests). Not used here; merge happens
-// entirely on-device via matmul + scale_inplace + add_inplace.
 
 // Compute the (rank, in_dim) and (out_dim, rank) shapes from the raw views.
 // Validates against the base weight's (rows = out_dim, cols = in_dim) shape
@@ -1151,49 +1134,6 @@ void UNet::forward_impl_(const bt::Tensor& sample,
                          bt::Tensor& out) {
     if (conv_in_W_.size() == 0) fail("forward: weights not loaded");
 
-    // ── Optional GPU profiling (env: UNET_PROF=1) ───────────────────────────
-    // CUDA-event based; compiled out entirely on non-CUDA builds.
-#ifdef BROTENSOR_HAS_CUDA
-    const bool prof_enabled = (std::getenv("UNET_PROF") != nullptr);
-#else
-    const bool prof_enabled = false;
-#endif
-    struct ProfBlock {
-#ifdef BROTENSOR_HAS_CUDA
-        cudaEvent_t s{}, e{};
-#endif
-        float ms_accum{0.0f};
-    };
-    ProfBlock pb_conv_in, pb_down_res, pb_down_xform, pb_down_samp;
-    ProfBlock pb_mid, pb_up_res, pb_up_xform, pb_up_samp, pb_conv_out;
-    ProfBlock* pb_all[] = {&pb_conv_in, &pb_down_res, &pb_down_xform, &pb_down_samp,
-                           &pb_mid, &pb_up_res, &pb_up_xform, &pb_up_samp, &pb_conv_out};
-    (void)pb_all;
-#ifdef BROTENSOR_HAS_CUDA
-    if (prof_enabled) {
-        for (auto* p : pb_all) {
-            cudaEventCreate(&p->s);
-            cudaEventCreate(&p->e);
-        }
-    }
-#endif
-    auto prof_begin = [&]([[maybe_unused]] ProfBlock& p) {
-#ifdef BROTENSOR_HAS_CUDA
-        if (prof_enabled) cudaEventRecord(p.s);
-#endif
-    };
-    auto prof_end = [&]([[maybe_unused]] ProfBlock& p) {
-#ifdef BROTENSOR_HAS_CUDA
-        if (prof_enabled) {
-            cudaEventRecord(p.e);
-            cudaEventSynchronize(p.e);
-            float ms = 0.0f;
-            cudaEventElapsedTime(&ms, p.s, p.e);
-            p.ms_accum += ms;
-        }
-#endif
-    };
-
     const int nb      = static_cast<int>(cfg_.block_out_channels.size());
     const int first_C = cfg_.block_out_channels.front();
 
@@ -1245,11 +1185,9 @@ void UNet::forward_impl_(const bt::Tensor& sample,
 
     // ── 2. conv_in: in_channels -> first_C ─────────────────────────────────
     x_ = sample.clone();
-    prof_begin(pb_conv_in);
     apply_conv3x3_(conv_in_W_, conv_in_b_, cfg_.in_channels, first_C, H, W,
                    /*stride=*/1, /*pad=*/1, x_, y_);
     std::swap(x_, y_);
-    prof_end(pb_conv_in);
 
     skips.push_back(x_.clone());
 
@@ -1257,24 +1195,19 @@ void UNet::forward_impl_(const bt::Tensor& sample,
     for (int i = 0; i < nb; ++i) {
         DownBlock& d = down_blocks_[static_cast<std::size_t>(i)];
         for (int j = 0; j < cfg_.layers_per_block; ++j) {
-            prof_begin(pb_down_res);
             apply_resnet_(d.resnets[static_cast<std::size_t>(j)], Hc, Wc, x_, y_);
-            prof_end(pb_down_res);
             if (d.has_attention) {
-                prof_begin(pb_down_xform);
                 const int idx = xattn_idx++;
                 apply_transformer_(d.transformers[static_cast<std::size_t>(j)],
                                    encoder_hidden_states,
                                    cache_at(idx),
                                    Hc, Wc, x_,
                                    trace_at(idx), bias_at(idx));
-                prof_end(pb_down_xform);
             }
             skips.push_back(x_.clone());
         }
         if (d.has_downsampler) {
             // 3x3 stride-2 conv same-channels.
-            prof_begin(pb_down_samp);
             if (d.downsampler.W_q.active()) {
                 apply_conv3x3_q_(d.downsampler.W_q, d.downsampler.b,
                                  d.C_out, d.C_out, Hc, Wc,
@@ -1285,7 +1218,6 @@ void UNet::forward_impl_(const bt::Tensor& sample,
                                /*stride=*/2, /*pad=*/1, x_, y_);
             }
             std::swap(x_, y_);
-            prof_end(pb_down_samp);
             Hc /= 2;
             Wc /= 2;
             skips.push_back(x_.clone());
@@ -1293,7 +1225,6 @@ void UNet::forward_impl_(const bt::Tensor& sample,
     }
 
     // ── 4. mid_block: resnet -> transformer -> resnet ──────────────────────
-    prof_begin(pb_mid);
     apply_resnet_(mid_.r0, Hc, Wc, x_, y_);
     {
         const int idx = xattn_idx++;
@@ -1303,7 +1234,6 @@ void UNet::forward_impl_(const bt::Tensor& sample,
                            trace_at(idx), bias_at(idx));
     }
     apply_resnet_(mid_.r1, Hc, Wc, x_, y_);
-    prof_end(pb_mid);
 
     // ── 5. up_blocks ───────────────────────────────────────────────────────
     for (int i = 0; i < nb; ++i) {
@@ -1320,22 +1250,17 @@ void UNet::forward_impl_(const bt::Tensor& sample,
             bt::concat_nchw_channels(parts, /*N=*/1, Hc, Wc, C_parts, cat_buf_);
             std::swap(x_, cat_buf_);
 
-            prof_begin(pb_up_res);
             apply_resnet_(u.resnets[static_cast<std::size_t>(j)], Hc, Wc, x_, y_);
-            prof_end(pb_up_res);
             if (u.has_attention) {
-                prof_begin(pb_up_xform);
                 const int idx = xattn_idx++;
                 apply_transformer_(u.transformers[static_cast<std::size_t>(j)],
                                    encoder_hidden_states,
                                    cache_at(idx),
                                    Hc, Wc, x_,
                                    trace_at(idx), bias_at(idx));
-                prof_end(pb_up_xform);
             }
         }
         if (u.has_upsampler) {
-            prof_begin(pb_up_samp);
             bt::upsample_nearest_2x(x_, 1, u.C_out, Hc, Wc, y_);
             if (u.upsampler.W_q.active()) {
                 apply_conv3x3_q_(u.upsampler.W_q, u.upsampler.b,
@@ -1346,14 +1271,12 @@ void UNet::forward_impl_(const bt::Tensor& sample,
                                u.C_out, u.C_out, 2 * Hc, 2 * Wc,
                                /*stride=*/1, /*pad=*/1, y_, x_);
             }
-            prof_end(pb_up_samp);
             Hc *= 2;
             Wc *= 2;
         }
     }
 
     // ── 6. conv_norm_out -> SiLU -> conv_out ───────────────────────────────
-    prof_begin(pb_conv_out);
     bt::group_norm_forward(x_, norm_out_g_, norm_out_b_,
                                1, first_C, Hc, Wc, cfg_.norm_num_groups, cfg_.eps,
                                y_);
@@ -1361,26 +1284,6 @@ void UNet::forward_impl_(const bt::Tensor& sample,
     apply_conv3x3_(conv_out_W_, conv_out_b_,
                    first_C, cfg_.out_channels, Hc, Wc,
                    /*stride=*/1, /*pad=*/1, y_, out);
-    prof_end(pb_conv_out);
-
-    if (prof_enabled) {
-        std::fprintf(stderr,
-            "[UNET_PROF] conv_in=%.3f down_res=%.3f down_xform=%.3f down_samp=%.3f "
-            "mid=%.3f up_res=%.3f up_xform=%.3f up_samp=%.3f conv_out=%.3f "
-            "(ms, sum=%.3f)\n",
-            pb_conv_in.ms_accum, pb_down_res.ms_accum, pb_down_xform.ms_accum,
-            pb_down_samp.ms_accum, pb_mid.ms_accum, pb_up_res.ms_accum,
-            pb_up_xform.ms_accum, pb_up_samp.ms_accum, pb_conv_out.ms_accum,
-            pb_conv_in.ms_accum + pb_down_res.ms_accum + pb_down_xform.ms_accum +
-            pb_down_samp.ms_accum + pb_mid.ms_accum + pb_up_res.ms_accum +
-            pb_up_xform.ms_accum + pb_up_samp.ms_accum + pb_conv_out.ms_accum);
-#ifdef BROTENSOR_HAS_CUDA
-        for (auto* p : pb_all) {
-            cudaEventDestroy(p->s);
-            cudaEventDestroy(p->e);
-        }
-#endif
-    }
 }
 
 }  // namespace brodiffusion::unet

@@ -14,10 +14,7 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
-#include <chrono>
 #include <cstdint>
-#include <cstdlib>
-#include <cstdio>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -272,27 +269,11 @@ std::vector<float> Pipeline::decode(const PipelineState& state) {
 
 std::vector<float> Pipeline::generate(std::string_view prompt,
                                        const GenerateOptions& opts) {
-    const bool prof = std::getenv("BRODIFF_PROF") != nullptr;
-    using clk = std::chrono::high_resolution_clock;
-    double unet_ms = 0.0, vae_ms = 0.0;
-
     PipelineState state = prime(prompt, opts);
     for (int i = 0; i < state.n_steps; ++i) {
-        auto t0 = clk::now();
         step_once(state, opts, /*trace_out=*/nullptr);
-        if (prof) bt::sync_all();
-        auto t1 = clk::now();
-        unet_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
     }
-    auto tv0 = clk::now();
-    auto out = decode(state);
-    auto tv1 = clk::now();
-    vae_ms = std::chrono::duration<double, std::milli>(tv1 - tv0).count();
-    if (prof) {
-        std::fprintf(stderr, "    [prof] unet_total=%.1f ms  vae=%.1f ms\n", unet_ms, vae_ms);
-        std::fflush(stderr);
-    }
-    return out;
+    return decode(state);
 }
 
 }  // namespace brodiffusion::pipeline
