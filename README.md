@@ -83,14 +83,25 @@ submodules. Override paths with `-DBROMATH_DIR=...` / `-DBROTENSOR_DIR=...`.
 
 ## Weights
 
-Model weights are not bundled. `scripts/download-weights.ps1` fetches them via
-the Hugging Face CLI (`hf`) into `weights/<model>/`:
+Model weights are not bundled. A download script fetches them into
+`weights/<model>/` — `scripts/download-weights.sh` on macOS / Linux,
+`scripts/download-weights.ps1` on Windows:
+
+```bash
+# macOS / Linux — fetches straight from Hugging Face with curl (no hf CLI).
+scripts/download-weights.sh sd15             # SD1.5 components
+scripts/download-weights.sh lcm-dreamshaper  # LCM-distilled Dreamshaper-7
+scripts/download-weights.sh clip-vit-l-14    # OpenAI CLIP ViT-L/14
+```
 
 ```powershell
-pwsh scripts/download-weights.ps1 -Model sd15             # SD1.5 components
-pwsh scripts/download-weights.ps1 -Model lcm-dreamshaper  # LCM-distilled Dreamshaper-7
-pwsh scripts/download-weights.ps1 -Model clip-vit-l-14    # OpenAI CLIP ViT-L/14
+# Windows — uses the Hugging Face CLI (hf).
+pwsh scripts/download-weights.ps1 -Model sd15
+pwsh scripts/download-weights.ps1 -Model lcm-dreamshaper
+pwsh scripts/download-weights.ps1 -Model clip-vit-l-14
 ```
+
+For rate-limited repos, export `HF_TOKEN=hf_...` before running the `.sh`.
 
 Each model downloads diffusers-format component files — `text_encoder/`,
 `unet/`, `vae/`, and the `tokenizer/` `vocab.json` + `merges.txt`. The
