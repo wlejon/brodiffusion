@@ -76,8 +76,7 @@ void LCM::set_timesteps(int num_inference_steps) {
     timesteps_.resize(num_inference_steps);
     for (int i = 0; i < num_inference_steps; ++i) {
         const int j = (i * K) / num_inference_steps;
-        const int t = (K - j) * k - 1 + cfg_.steps_offset;
-        timesteps_[i] = t;
+        timesteps_[i] = (K - j) * k - 1;
     }
 }
 

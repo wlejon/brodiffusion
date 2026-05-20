@@ -27,6 +27,7 @@ DDIM::DDIM(const DDIMConfig& cfg) : cfg_(cfg) {
         cfg_.beta_end <= cfg_.beta_start) {
         fail("beta_start/beta_end invalid");
     }
+    if (cfg_.steps_offset < 0) fail("steps_offset must be non-negative");
 
     // scaled_linear betas: linspace(sqrt(b0), sqrt(b1), N)^2.
     const int N = cfg_.num_train_timesteps;

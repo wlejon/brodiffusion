@@ -14,7 +14,6 @@
 //                                              c_skip / c_out)
 //   prediction_type          = "epsilon"     (only mode supported)
 //   set_alpha_to_one         = false
-//   steps_offset             = 0             (differs from DDIM)
 //
 // `clip_sample` and `thresholding` from diffusers are NOT supported here;
 // LCM-Dreamshaper does not use them.
@@ -43,7 +42,6 @@ struct LCMConfig {
     int   original_inference_steps = 50;
     float timestep_scaling         = 10.0f;
     bool  set_alpha_to_one         = false;
-    int   steps_offset             = 0;
     // sigma_data is fixed at 0.5 for the LCM consistency parameterization in
     // diffusers; not exposed here.
 };
