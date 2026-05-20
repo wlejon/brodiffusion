@@ -1,6 +1,7 @@
 // FP16-weight Adam optimizer plumbing. See include/brodiffusion/optim.h.
 
 #include "brodiffusion/optim.h"
+#include "brodiffusion/detail/cuda_check.cuh"
 #include "brodiffusion/detail/device.h"
 
 #include "brotensor/ops.h"
@@ -42,10 +43,15 @@ void cast_h_to_f(const bt::Tensor& src, bt::Tensor& dst) {
     cast_h2f_k<<<(n + 255) / 256, 256>>>(
         reinterpret_cast<const __half*>(src.data),
         static_cast<float*>(dst.data), n);
+    BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
 }
 
 void cast_f_to_h(const bt::Tensor& src, bt::Tensor& dst) {
-    if (dst.size() != src.size() || dst.dtype != bt::Dtype::FP16) {
+    // Compare full shape, not just element count: a same-size but
+    // differently-shaped dst must still be reshaped, since callers rely on
+    // dst's rows/cols metadata.
+    if (dst.rows != src.rows || dst.cols != src.cols ||
+        dst.dtype != bt::Dtype::FP16 || dst.device != src.device) {
         detail::resize_like(dst, src.rows, src.cols, bt::Dtype::FP16, src.device);
     }
     int n = src.size();
@@ -53,6 +59,7 @@ void cast_f_to_h(const bt::Tensor& src, bt::Tensor& dst) {
     cast_f2h_k<<<(n + 255) / 256, 256>>>(
         static_cast<const float*>(src.data),
         reinterpret_cast<__half*>(dst.data), n);
+    BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace
@@ -99,6 +106,7 @@ void AdamFP16::accumulate_fp16(int handle, const bt::Tensor& dW) {
     acc_h2f_k<<<(n + 255) / 256, 256>>>(
         static_cast<float*>(g.data),
         reinterpret_cast<const __half*>(dW.data), n);
+    BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
 }
 
 void AdamFP16::accumulate_fp32(int handle, const bt::Tensor& dW) {
@@ -114,6 +122,7 @@ void AdamFP16::accumulate_fp32(int handle, const bt::Tensor& dW) {
     acc_f2f_k<<<(n + 255) / 256, 256>>>(
         static_cast<float*>(g.data),
         static_cast<const float*>(dW.data), n);
+    BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
 }
 
 void AdamFP16::step(const AdamHyperParams& hp) {
