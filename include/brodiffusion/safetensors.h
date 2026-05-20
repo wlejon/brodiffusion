@@ -114,6 +114,14 @@ void upload_fp16(const TensorView& view, int rows, int cols, brotensor::Tensor& 
 void upload_compute(const TensorView& view, int rows, int cols,
                     brotensor::Tensor& dst);
 
+// Like upload_compute(), but first validates the view: its dtype must be
+// F16 or F32 and its element count must equal rows*cols. Throws
+// std::runtime_error tagged with `name` (a caller-supplied label) and the
+// safetensors key on mismatch — the loader entry point the model
+// components use so a malformed checkpoint fails with a clear message.
+void upload_compute_checked(const TensorView& view, int rows, int cols,
+                            brotensor::Tensor& dst, const std::string& name);
+
 // ─── Writer ────────────────────────────────────────────────────────────────
 //
 // Minimal safetensors writer. Builds the JSON header in insertion order and

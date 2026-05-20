@@ -18,31 +18,16 @@ namespace brodiffusion::clip {
 namespace bt = ::brotensor;
 namespace st = ::brodiffusion::safetensors;
 
+// Validate-and-upload a safetensors weight view at the compute dtype —
+// shared across the CLIP text / image encoders and the scorer.
+using st::upload_compute_checked;
+
 // ─── helpers ───────────────────────────────────────────────────────────────
 
 namespace {
 
 [[noreturn]] void fail(const std::string& msg) {
     throw std::runtime_error("clip::TextEncoder: " + msg);
-}
-
-// Upload a safetensors view at the compute dtype. Accepts F16 source (used
-// as-is) or F32 source (converted host-side); SD1.5 full checkpoints ship
-// as F32. Asserts the expected (rows, cols) shape; permits the source tensor
-// to be 1-D (treated as (n, 1)) or 2-D.
-void upload_compute_checked(const st::TensorView& v, int rows, int cols,
-                            bt::Tensor& dst, const char* name) {
-    if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
-        fail(std::string(name) + ": expected F16 or F32, got " +
-             st::dtype_name(v.dtype));
-    }
-    int64_t expected = static_cast<int64_t>(rows) * static_cast<int64_t>(cols);
-    if (v.numel() != expected) {
-        fail(std::string(name) + ": shape mismatch (expected " +
-             std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
-             std::to_string(v.numel()) + " elements)");
-    }
-    st::upload_compute(v, rows, cols, dst);
 }
 
 // Build a device-resident INT32 buffer holding `n` token/position ids.
@@ -212,21 +197,6 @@ bool parse_clip_target_(const std::string& target_path,
             proj == "v_proj" || proj == "out_proj");
 }
 
-void upload_view_compute(const st::TensorView& v, int rows, int cols,
-                         bt::Tensor& dst, const std::string& tag) {
-    if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
-        throw std::runtime_error("clip::TextEncoder: lora " + tag +
-            ": expected F16 or F32, got " + st::dtype_name(v.dtype));
-    }
-    int64_t expected = static_cast<int64_t>(rows) * static_cast<int64_t>(cols);
-    if (v.numel() != expected) {
-        throw std::runtime_error("clip::TextEncoder: lora " + tag +
-            ": shape numel mismatch (expected " + std::to_string(expected) +
-            ", got " + std::to_string(v.numel()) + ")");
-    }
-    st::upload_compute(v, rows, cols, dst);
-}
-
 }  // namespace
 
 void TextEncoder::apply_lora_delta(const std::string& target_path,
@@ -274,8 +244,8 @@ void TextEncoder::apply_lora_delta(const std::string& target_path,
     }
 
     bt::Tensor down_g, up_g;
-    upload_view_compute(lora_down, rank,   W_cols, down_g, target_path + ".lora_down");
-    upload_view_compute(lora_up,   W_rows, rank,   up_g,   target_path + ".lora_up");
+    upload_compute_checked(lora_down, rank,   W_cols, down_g, target_path + ".lora_down");
+    upload_compute_checked(lora_up,   W_rows, rank,   up_g,   target_path + ".lora_up");
 
     bt::Tensor delta;
     bt::matmul(up_g, down_g, delta);

@@ -20,25 +20,13 @@ namespace brodiffusion::clip_score {
 namespace bt = ::brotensor;
 namespace st = ::brodiffusion::safetensors;
 
+// Validate-and-upload a safetensors weight view at the compute dtype.
+using st::upload_compute_checked;
+
 namespace {
 
 [[noreturn]] void fail(const std::string& msg) {
     throw std::runtime_error("clip_score::CLIPScorer: " + msg);
-}
-
-void upload_compute_checked(const st::TensorView& v, int rows, int cols,
-                            bt::Tensor& dst, const char* name) {
-    if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
-        fail(std::string(name) + ": expected F16 or F32, got " +
-             st::dtype_name(v.dtype));
-    }
-    int64_t expected = static_cast<int64_t>(rows) * static_cast<int64_t>(cols);
-    if (v.numel() != expected) {
-        fail(std::string(name) + ": shape mismatch (expected " +
-             std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
-             std::to_string(v.numel()) + " elements)");
-    }
-    st::upload_compute(v, rows, cols, dst);
 }
 
 // Download a compute-dtype tensor's contents into a host FP32 vector,

@@ -514,6 +514,24 @@ void upload_compute(const TensorView& view, int rows, int cols,
     }
 }
 
+void upload_compute_checked(const TensorView& view, int rows, int cols,
+                            brotensor::Tensor& dst, const std::string& name) {
+    if (view.dtype != Dtype::F16 && view.dtype != Dtype::F32) {
+        throw std::runtime_error(
+            name + " ('" + view.name + "'): expected F16 or F32, got " +
+            dtype_name(view.dtype));
+    }
+    const int64_t expected =
+        static_cast<int64_t>(rows) * static_cast<int64_t>(cols);
+    if (view.numel() != expected) {
+        throw std::runtime_error(
+            name + " ('" + view.name + "'): shape mismatch (expected " +
+            std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
+            std::to_string(view.numel()) + " elements)");
+    }
+    upload_compute(view, rows, cols, dst);
+}
+
 // ─── Writer ────────────────────────────────────────────────────────────────
 
 namespace {

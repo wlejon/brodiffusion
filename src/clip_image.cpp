@@ -6,7 +6,6 @@
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
 
-#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -16,29 +15,13 @@ namespace brodiffusion::clip_image {
 namespace bt = ::brotensor;
 namespace st = ::brodiffusion::safetensors;
 
+// Validate-and-upload a safetensors weight view at the compute dtype.
+using st::upload_compute_checked;
+
 namespace {
 
 [[noreturn]] void fail(const std::string& msg) {
     throw std::runtime_error("clip_image::ImageEncoder: " + msg);
-}
-
-void upload_compute_checked(const st::TensorView& v, int rows, int cols,
-                            bt::Tensor& dst, const char* name) {
-    if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
-        fail(std::string(name) + ": expected F16 or F32, got " +
-             st::dtype_name(v.dtype));
-    }
-    int64_t expected = static_cast<int64_t>(rows) * static_cast<int64_t>(cols);
-    if (v.numel() != expected) {
-        fail(std::string(name) + ": shape mismatch (expected " +
-             std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
-             std::to_string(v.numel()) + " elements)");
-    }
-    st::upload_compute(v, rows, cols, dst);
-}
-
-const st::TensorView* find_or(const st::File& f, const std::string& key) {
-    return f.find(key);
 }
 
 const st::TensorView& need(const st::File& f, const std::string& key) {
@@ -91,11 +74,11 @@ void ImageEncoder::load_weights(const st::File& f,
     // pre_layrnorm is the upstream HF typo. Accept either spelling.
     const std::string pre_key_typo = prefix + "pre_layrnorm.";
     const std::string pre_key_alt  = prefix + "pre_layernorm.";
-    const auto* pre_g_v = find_or(f, pre_key_typo + "weight");
-    const auto* pre_b_v = find_or(f, pre_key_typo + "bias");
+    const auto* pre_g_v = f.find(pre_key_typo + "weight");
+    const auto* pre_b_v = f.find(pre_key_typo + "bias");
     if (!pre_g_v && pre_layrnorm_alt) {
-        pre_g_v = find_or(f, pre_key_alt + "weight");
-        pre_b_v = find_or(f, pre_key_alt + "bias");
+        pre_g_v = f.find(pre_key_alt + "weight");
+        pre_b_v = f.find(pre_key_alt + "bias");
     }
     if (!pre_g_v || !pre_b_v) {
         fail("missing pre_layrnorm/pre_layernorm weight/bias");
