@@ -64,6 +64,14 @@ public:
     // ── Denoiser interface ────────────────────────────────────────────────
     void load_weights(const brotensor::safetensors::File& f,
                       const std::string& prefix = "") override;
+
+    // Load from a *sharded* safetensors set: every tensor is searched across
+    // all `shards` (the first match wins; a name missing in every shard
+    // throws). The single-File overload above is a one-element wrapper over
+    // this path. The Flux transformer ships sharded in diffusers format.
+    void load_weights(
+        const std::vector<const brotensor::safetensors::File*>& shards,
+        const std::string& prefix = "");
     void finalize_weights() override;
     PreparedConditioning prepare(const Conditioning& cond) override;
     void forward(const brotensor::Tensor& latent, int H_lat, int W_lat,

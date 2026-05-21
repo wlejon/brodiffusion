@@ -9,7 +9,8 @@
 # Usage:
 #   scripts/download-weights.sh [model] [--repo R] [--out-dir D] [--force]
 #
-#   model            sd15 (default) | lcm-dreamshaper | clip-vit-l-14
+#   model            sd15 (default) | lcm-dreamshaper | clip-vit-l-14 |
+#                    flux-schnell
 #   --repo R         override the Hugging Face repo id
 #   --out-dir D      override the output directory
 #   --force          re-download even if the file already exists
@@ -25,6 +26,12 @@
 #                    falls back to plain `.safetensors`. The upload helper
 #                    (`upload_fp16_checked`) accepts F32 and converts host-side.
 #   clip-vit-l-14    OpenAI CLIP ViT-L/14 (vision + text + both projections).
+#   flux-schnell     Flux.1-schnell diffusers components from
+#                    black-forest-labs/FLUX.1-schnell. The transformer and the
+#                    T5-XXL text encoder ship SHARDED — the script fetches each
+#                    `*.index.json` first, extracts the shard filenames from it,
+#                    and downloads each shard. NOTE: these weights are large
+#                    (~24 GB transformer + ~10 GB T5).
 #
 # Auth: the SD1.5 mirror is public and needs no token. For rate-limited repos,
 # export HF_TOKEN=hf_... and it will be sent as a bearer token.
@@ -46,12 +53,12 @@ FORCE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        sd15|lcm-dreamshaper|clip-vit-l-14) MODEL="$1"; shift ;;
+        sd15|lcm-dreamshaper|clip-vit-l-14|flux-schnell) MODEL="$1"; shift ;;
         --repo)    REPO="${2:?--repo needs a value}"; shift 2 ;;
         --out-dir) OUT_DIR="${2:?--out-dir needs a value}"; shift 2 ;;
         --force)   FORCE=1; shift ;;
         -h|--help)
-            sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) echo "error: unknown argument '$1' (try --help)" >&2; exit 2 ;;
     esac
@@ -91,6 +98,29 @@ case "$MODEL" in
         [ -n "$REPO" ]    || REPO="openai/clip-vit-large-patch14"
         [ -n "$OUT_DIR" ] || OUT_DIR="$REPO_ROOT/weights/clip-vit-l-14"
         FILES=( "model.safetensors" )
+        ;;
+    flux-schnell)
+        # Flux.1-schnell, diffusers format. The transformer + the T5-XXL text
+        # encoder ship sharded — only the `.index.json` weight-maps are listed
+        # here; the shard files themselves are discovered from those indexes
+        # below. NOTE: large download (~24 GB transformer + ~10 GB T5).
+        [ -n "$REPO" ]    || REPO="black-forest-labs/FLUX.1-schnell"
+        [ -n "$OUT_DIR" ] || OUT_DIR="$REPO_ROOT/weights/flux-schnell"
+        FILES=(
+            "model_index.json"
+            "scheduler/scheduler_config.json"
+            "transformer/config.json"
+            "transformer/diffusion_pytorch_model.safetensors.index.json"
+            "vae/config.json"
+            "vae/diffusion_pytorch_model.safetensors"
+            "text_encoder/config.json"
+            "text_encoder/model.safetensors"
+            "text_encoder_2/config.json"
+            "text_encoder_2/model.safetensors.index.json"
+            "tokenizer/vocab.json"
+            "tokenizer/merges.txt"
+            "tokenizer_2/tokenizer.json"
+        )
         ;;
 esac
 
@@ -153,6 +183,33 @@ for f in "${FILES[@]}"; do
             exit 1
         fi
     fi
+done
+
+# --- sharded components -----------------------------------------------------
+# For models whose components ship sharded (flux-schnell), the loop above
+# fetched the `*.index.json` weight-maps. Extract the shard filenames from
+# each index and fetch every shard.
+for idx in "$OUT_DIR"/transformer/*.index.json \
+           "$OUT_DIR"/text_encoder_2/*.index.json; do
+    [ -e "$idx" ] || continue
+    comp_dir="$(dirname "$idx")"
+    comp_rel="$(basename "$comp_dir")"
+    echo
+    echo "Expanding shards from ${idx#$OUT_DIR/}"
+    shards="$(grep -oE '[A-Za-z0-9_.-]+-[0-9]+-of-[0-9]+\.safetensors' "$idx" \
+              | sort -u)"
+    for s in $shards; do
+        dest="$OUT_DIR/$comp_rel/$s"
+        if [ "$FORCE" -eq 0 ] && [ -s "$dest" ]; then
+            echo "==> $comp_rel/$s  (cached, skipping)"
+            continue
+        fi
+        echo "==> $comp_rel/$s"
+        if ! fetch "$comp_rel/$s" "$dest"; then
+            echo "error: download failed for shard $comp_rel/$s" >&2
+            exit 1
+        fi
+    done
 done
 
 echo

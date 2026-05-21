@@ -27,11 +27,14 @@ namespace {
     throw std::runtime_error("dit::FluxDenoiser: " + msg);
 }
 
-const st::TensorView& need(const st::File& f, const std::string& key) {
-    const auto* v = f.find(key);
-    if (!v) throw std::runtime_error(
+// Find a tensor by name across one or more shards; first match wins.
+const st::TensorView& need(const std::vector<const st::File*>& shards,
+                           const std::string& key) {
+    for (const st::File* f : shards) {
+        if (const auto* v = f->find(key)) return *v;
+    }
+    throw std::runtime_error(
         "dit::FluxDenoiser: missing tensor '" + key + "'");
-    return *v;
 }
 
 // Concatenate two row-major tensors a (La, D) and b (Lb, D) into
@@ -86,6 +89,13 @@ bt::Dtype FluxDenoiser::compute_dtype() const {
 // ─── load_weights ──────────────────────────────────────────────────────────
 
 void FluxDenoiser::load_weights(const st::File& f, const std::string& prefix) {
+    const std::vector<const st::File*> shards = {&f};
+    load_weights(shards, prefix);
+}
+
+void FluxDenoiser::load_weights(const std::vector<const st::File*>& shards,
+                                const std::string& prefix) {
+    if (shards.empty()) fail("load_weights: no safetensors shards");
     const int D    = cfg_.inner_dim();
     const int IC   = cfg_.in_channels;
     const int JD   = cfg_.joint_attention_dim;
@@ -93,8 +103,9 @@ void FluxDenoiser::load_weights(const st::File& f, const std::string& prefix) {
     const int HD   = cfg_.attention_head_dim;
 
     auto load_lin = [&](const std::string& key, int out, int in, Linear& lin) {
-        upload_compute_checked(need(f, key + ".weight"), out, in, lin.W, key);
-        upload_compute_checked(need(f, key + ".bias"), out, 1, lin.b, key);
+        upload_compute_checked(need(shards, key + ".weight"), out, in, lin.W,
+                               key);
+        upload_compute_checked(need(shards, key + ".bias"), out, 1, lin.b, key);
     };
 
     load_lin(prefix + "x_embedder", D, IC, x_embedder_);
@@ -124,13 +135,13 @@ void FluxDenoiser::load_weights(const st::File& f, const std::string& prefix) {
         load_lin(p + "attn.add_v_proj", D, D, B.add_v);
         load_lin(p + "attn.to_out.0", D, D, B.to_out);
         load_lin(p + "attn.to_add_out", D, D, B.to_add_out);
-        upload_compute_checked(need(f, p + "attn.norm_q.weight"), HD, 1,
+        upload_compute_checked(need(shards, p + "attn.norm_q.weight"), HD, 1,
                                B.norm_q, "attn.norm_q");
-        upload_compute_checked(need(f, p + "attn.norm_k.weight"), HD, 1,
+        upload_compute_checked(need(shards, p + "attn.norm_k.weight"), HD, 1,
                                B.norm_k, "attn.norm_k");
-        upload_compute_checked(need(f, p + "attn.norm_added_q.weight"), HD, 1,
+        upload_compute_checked(need(shards, p + "attn.norm_added_q.weight"), HD, 1,
                                B.norm_added_q, "attn.norm_added_q");
-        upload_compute_checked(need(f, p + "attn.norm_added_k.weight"), HD, 1,
+        upload_compute_checked(need(shards, p + "attn.norm_added_k.weight"), HD, 1,
                                B.norm_added_k, "attn.norm_added_k");
         load_lin(p + "ff.net.0.proj", 4 * D, D, B.ff0);
         load_lin(p + "ff.net.2", D, 4 * D, B.ff2);
@@ -146,9 +157,9 @@ void FluxDenoiser::load_weights(const st::File& f, const std::string& prefix) {
         load_lin(p + "attn.to_q", D, D, B.to_q);
         load_lin(p + "attn.to_k", D, D, B.to_k);
         load_lin(p + "attn.to_v", D, D, B.to_v);
-        upload_compute_checked(need(f, p + "attn.norm_q.weight"), HD, 1,
+        upload_compute_checked(need(shards, p + "attn.norm_q.weight"), HD, 1,
                                B.norm_q, "attn.norm_q");
-        upload_compute_checked(need(f, p + "attn.norm_k.weight"), HD, 1,
+        upload_compute_checked(need(shards, p + "attn.norm_k.weight"), HD, 1,
                                B.norm_k, "attn.norm_k");
         load_lin(p + "proj_mlp", 4 * D, D, B.proj_mlp);
         load_lin(p + "proj_out", D, 5 * D, B.proj_out);

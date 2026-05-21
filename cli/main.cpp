@@ -27,6 +27,9 @@ static int usage() {
         "\n"
         "Usage:\n"
         "  brodiffusion --version\n"
+        "  brodiffusion txt2img --model <dir> --prompt <text> --out <ppm>\n"
+        "                       [--negative <text>] [--steps N] [--cfg F]\n"
+        "                       [--width N] [--height N] [--seed N]\n"
         "  brodiffusion txt2img --text <st> --unet <st> --vae <st>\n"
         "                       --vocab <vocab.json> --merges <merges.txt>\n"
         "                       --prompt <text> --out <ppm>\n"
@@ -39,6 +42,12 @@ static int usage() {
         "                       --vocab <vocab.json> --merges <merges.txt>\n"
         "                       [--steps N] [--iters N] [--warmup N]\n"
         "                       [--scheduler ddim|lcm] [--lora <path>[:<scale>]]...\n"
+        "\n"
+        "  --model <dir>    load a diffusers model directory (model_index.json +\n"
+        "                   component subdirs). Detects SD1.5 vs Flux automatically\n"
+        "                   and loads all weights + tokenizers; the explicit\n"
+        "                   --text/--unet/--vae/--vocab/--merges flags are then\n"
+        "                   unused. For a Flux model --steps defaults to 4.\n"
         "\n"
         "  --scheduler lcm  selects the LCM (Latent Consistency Model) scheduler;\n"
         "                   requires an LCM-distilled UNet checkpoint (e.g.\n"
@@ -105,7 +114,82 @@ std::vector<LoraSpec> collect_loras(int argc, char** argv) {
     return out;
 }
 
+// Convert a planar [-1,1] FP32 image (3*H*W NCHW) to an uncompressed PPM.
+int write_ppm(const char* out_path, const std::vector<float>& img,
+              int W, int H) {
+    const int plane = H * W;
+    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(3) * plane);
+    for (int i = 0; i < plane; ++i) {
+        for (int c = 0; c < 3; ++c) {
+            float v = (img[c * plane + i] + 1.0f) * 127.5f;
+            v = std::clamp(v, 0.0f, 255.0f);
+            rgb[3 * i + c] = static_cast<std::uint8_t>(v + 0.5f);
+        }
+    }
+    std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        std::fprintf(stderr, "txt2img: cannot open output %s\n", out_path);
+        return 1;
+    }
+    f << "P6\n" << W << " " << H << "\n255\n";
+    f.write(reinterpret_cast<const char*>(rgb.data()),
+            static_cast<std::streamsize>(rgb.size()));
+    std::printf("Wrote %s\n", out_path);
+    return 0;
+}
+
+// txt2img against a diffusers model directory (--model). Auto-detects SD1.5
+// vs Flux from the loaded config.
+int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
+    const char* prompt   = arg_after(argc, argv, "--prompt");
+    const char* out_path = arg_after(argc, argv, "--out");
+    const char* neg      = arg_after(argc, argv, "--negative");
+    const char* steps_s  = arg_after(argc, argv, "--steps");
+    const char* cfg_s    = arg_after(argc, argv, "--cfg");
+    const char* width_s  = arg_after(argc, argv, "--width");
+    const char* height_s = arg_after(argc, argv, "--height");
+    const char* seed_s   = arg_after(argc, argv, "--seed");
+
+    if (!prompt || !out_path) {
+        std::fprintf(stderr,
+            "txt2img: --model mode requires --prompt and --out\n");
+        return 2;
+    }
+
+    brotensor::init();
+
+    std::printf("Loading model directory: %s\n", model_dir);
+    pl::Pipeline pipeline = pl::Pipeline::from_model_dir(model_dir);
+    const bool is_flux =
+        pipeline.config().model_class == brodiffusion::ModelClass::Flux;
+    std::printf("Model class: %s\n", is_flux ? "Flux" : "StableDiffusion");
+
+    pl::GenerateOptions opts;
+    if (neg)      opts.negative_prompt = neg;
+    if (steps_s)  opts.num_inference_steps = std::atoi(steps_s);
+    else if (is_flux) opts.num_inference_steps = 4;  // flux-schnell default
+    if (cfg_s)    opts.guidance_scale = static_cast<float>(std::atof(cfg_s));
+    if (width_s)  opts.width  = std::atoi(width_s);
+    if (height_s) opts.height = std::atoi(height_s);
+    if (seed_s)   opts.seed =
+        static_cast<std::uint64_t>(std::strtoull(seed_s, nullptr, 10));
+
+    std::printf("Generating %dx%d, %d steps, CFG=%.1f, seed=%llu\n",
+                opts.width, opts.height, opts.num_inference_steps,
+                static_cast<double>(opts.guidance_scale),
+                static_cast<unsigned long long>(opts.seed));
+
+    auto img = pipeline.generate(prompt, opts);
+    return write_ppm(out_path, img, opts.width, opts.height);
+}
+
 int run_txt2img(int argc, char** argv) {
+    // --model <dir>: load a whole diffusers model directory and skip the
+    // explicit per-component file flags.
+    if (const char* model_dir = arg_after(argc, argv, "--model")) {
+        return run_txt2img_model_dir(argc, argv, model_dir);
+    }
+
     const char* text_path   = arg_after(argc, argv, "--text");
     const char* unet_path   = arg_after(argc, argv, "--unet");
     const char* vae_path    = arg_after(argc, argv, "--vae");
@@ -130,7 +214,8 @@ int run_txt2img(int argc, char** argv) {
     if (!text_path || !unet_path || !vae_path ||
         !vocab_path || !merges_path || !prompt || !out_path) {
         std::fprintf(stderr,
-            "txt2img: --text, --unet, --vae, --vocab, --merges, --prompt, --out are required\n");
+            "txt2img: --text, --unet, --vae, --vocab, --merges, --prompt, --out are required\n"
+            "         (or use --model <dir> --prompt <text> --out <ppm>)\n");
         return 2;
     }
 
@@ -204,29 +289,7 @@ int run_txt2img(int argc, char** argv) {
                 static_cast<unsigned long long>(opts.seed));
 
     auto img = pipeline.generate(prompt, opts);  // (3*H*W) NCHW, FP32 in [-1, 1]
-
-    // Convert planar [-1,1] FP32 → interleaved RGB8.
-    const int H = opts.height, W = opts.width;
-    const int plane = H * W;
-    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(3) * plane);
-    for (int i = 0; i < plane; ++i) {
-        for (int c = 0; c < 3; ++c) {
-            float v = (img[c * plane + i] + 1.0f) * 127.5f;
-            v = std::clamp(v, 0.0f, 255.0f);
-            rgb[3 * i + c] = static_cast<std::uint8_t>(v + 0.5f);
-        }
-    }
-
-    std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
-    if (!f) {
-        std::fprintf(stderr, "txt2img: cannot open output %s\n", out_path);
-        return 1;
-    }
-    f << "P6\n" << W << " " << H << "\n255\n";
-    f.write(reinterpret_cast<const char*>(rgb.data()),
-            static_cast<std::streamsize>(rgb.size()));
-    std::printf("Wrote %s\n", out_path);
-    return 0;
+    return write_ppm(out_path, img, opts.width, opts.height);
 }
 
 }  // namespace

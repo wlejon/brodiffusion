@@ -15,10 +15,14 @@
 
 #include "brodiffusion/clip.h"
 #include "brodiffusion/denoiser.h"
+#include "brodiffusion/dit/flux.h"
 #include "brodiffusion/flow_match_scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
+#include "brodiffusion/model_config.h"
 #include "brodiffusion/scheduler.h"
+#include "brodiffusion/t5.h"
 #include "brodiffusion/tokenizer.h"
+#include "brodiffusion/tokenizer_t5.h"
 #include "brodiffusion/unet.h"
 #include "brodiffusion/vae.h"
 
@@ -26,6 +30,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <string_view>
@@ -37,13 +42,19 @@ namespace brotensor::safetensors { class File; }
 namespace brodiffusion::pipeline {
 
 struct PipelineConfig {
-    unet::UNetConfig         unet;
+    // Which model family this pipeline runs. StableDiffusion uses the UNet
+    // denoiser + CLIP; Flux uses the DiT denoiser + CLIP (pooled) + T5.
+    ModelClass               model_class = ModelClass::StableDiffusion;
+    unet::UNetConfig         unet;          // StableDiffusion
+    dit::FluxConfig          flux;          // Flux
     vae::DecoderConfig       vae;
-    clip::TextEncoderConfig  text_encoder;
+    clip::TextEncoderConfig  text_encoder;  // CLIP — both classes
+    t5::T5Config             t5;            // Flux
+    int                      t5_max_length = 512;
     // DDIM (default, vanilla SD1.5) or LCM (latent-consistency, distilled
-    // checkpoints with unet.time_cond_proj_dim > 0). The pipeline branches on
-    // the active alternative; existing call sites that don't set this keep
-    // working unchanged.
+    // checkpoints with unet.time_cond_proj_dim > 0) or FlowMatch (Flux). The
+    // pipeline branches on the active alternative; existing call sites that
+    // don't set this keep working unchanged.
     std::variant<scheduler::DDIMConfig, scheduler::LCMConfig,
                  scheduler::FlowMatchConfig> scheduler;
 };
@@ -88,7 +99,26 @@ struct GenerateOptions {
 
 class Pipeline {
 public:
+    // StableDiffusion constructor: builds a UNet denoiser. Valid only when
+    // cfg.model_class == ModelClass::StableDiffusion.
     Pipeline(const PipelineConfig& cfg, clip::Tokenizer tokenizer);
+
+    // Flux constructor: builds a FluxDenoiser plus the second (T5) text
+    // encoder + tokenizer. Valid only when cfg.model_class == ModelClass::Flux.
+    Pipeline(const PipelineConfig& cfg, clip::Tokenizer clip_tok,
+             t5::Tokenizer t5_tok);
+
+    // Build a fully-loaded Pipeline from a diffusers model directory: reads the
+    // JSON configs, constructs the right sub-modules, loads all component
+    // weights and tokenizers. Supports StableDiffusion and Flux model
+    // directories. Pipeline is move-only; this returns by value.
+    static Pipeline from_model_dir(const std::string& model_dir);
+
+    // Move-only (owns move-only sub-modules; copies make no sense).
+    Pipeline(Pipeline&&) noexcept = default;
+    Pipeline& operator=(Pipeline&&) noexcept = default;
+    Pipeline(const Pipeline&) = delete;
+    Pipeline& operator=(const Pipeline&) = delete;
 
     // Load every sub-module's weights from a single safetensors file using
     // the prefixes used by an SD1.5 full checkpoint:
@@ -172,8 +202,11 @@ private:
     void encode_prompt_(std::string_view prompt, brotensor::Tensor& out);
 
     PipelineConfig            cfg_;
-    clip::Tokenizer           tokenizer_;
-    clip::TextEncoder         text_encoder_;
+    ModelClass                model_class_;
+    clip::Tokenizer           tokenizer_;       // CLIP — both classes
+    clip::TextEncoder         text_encoder_;    // CLIP — both classes
+    std::optional<t5::Tokenizer>   t5_tokenizer_;   // Flux only
+    std::optional<t5::TextEncoder> t5_encoder_;     // Flux only
     std::unique_ptr<Denoiser> denoiser_;
     vae::Decoder              vae_;
     std::variant<scheduler::DDIM, scheduler::LCM, scheduler::FlowMatch>

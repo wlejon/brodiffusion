@@ -16,6 +16,14 @@
 #                                   only fp32 is available, our upload helper
 #                                   (`upload_fp16_checked`) accepts F32 and
 #                                   converts host-side.
+# -Model flux-schnell               Flux.1-schnell diffusers components from
+#                                   black-forest-labs/FLUX.1-schnell. The
+#                                   transformer and the T5-XXL text encoder
+#                                   ship SHARDED — the script fetches each
+#                                   `*.index.json` weight-map first, extracts
+#                                   the shard filenames from it, and downloads
+#                                   each shard. NOTE: these weights are large
+#                                   (~24 GB transformer + ~10 GB T5).
 #
 # Authentication: requires `hf auth login` to have been run. The LCM
 # Dreamshaper repo is public but rate-limited without auth.
@@ -33,7 +41,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet("sd15", "lcm-dreamshaper", "clip-vit-l-14")]
+    [ValidateSet("sd15", "lcm-dreamshaper", "clip-vit-l-14", "flux-schnell")]
     [string]$Model  = "sd15",
     [string]$Repo   = "",
     [string]$OutDir = ""
@@ -87,6 +95,31 @@ switch ($Model) {
             "vae/diffusion_pytorch_model.fp16.safetensors"  = "vae/diffusion_pytorch_model.safetensors"
         }
     }
+    "flux-schnell" {
+        # Flux.1-schnell, diffusers format. The transformer + the T5-XXL text
+        # encoder ship sharded — only the `.index.json` weight-maps are listed
+        # here; the shard files themselves are discovered from those indexes
+        # after the main download loop. NOTE: large download
+        # (~24 GB transformer + ~10 GB T5).
+        if (-not $Repo)   { $Repo   = "black-forest-labs/FLUX.1-schnell" }
+        if (-not $OutDir) { $OutDir = "$PSScriptRoot/../weights/flux-schnell" }
+        $files = @(
+            "model_index.json",
+            "scheduler/scheduler_config.json",
+            "transformer/config.json",
+            "transformer/diffusion_pytorch_model.safetensors.index.json",
+            "vae/config.json",
+            "vae/diffusion_pytorch_model.safetensors",
+            "text_encoder/config.json",
+            "text_encoder/model.safetensors",
+            "text_encoder_2/config.json",
+            "text_encoder_2/model.safetensors.index.json",
+            "tokenizer/vocab.json",
+            "tokenizer/merges.txt",
+            "tokenizer_2/tokenizer.json"
+        )
+        $fallback = @{}
+    }
 }
 
 $resolved = (Resolve-Path -LiteralPath $OutDir -ErrorAction SilentlyContinue)
@@ -113,6 +146,30 @@ foreach ($f in $files) {
             }
         } else {
             throw "hf download failed for $f (exit $LASTEXITCODE)"
+        }
+    }
+}
+
+# --- sharded components -----------------------------------------------------
+# For models whose components ship sharded (flux-schnell), the loop above
+# fetched the `*.index.json` weight-maps. Extract the shard filenames from
+# each index and fetch every shard.
+$indexFiles = Get-ChildItem -LiteralPath $OutDir -Recurse -File `
+    -Filter "*.index.json" -ErrorAction SilentlyContinue
+foreach ($idx in $indexFiles) {
+    $compRel = $idx.Directory.Name
+    Write-Host ""
+    Write-Host "Expanding shards from $($idx.FullName.Substring($OutDir.Length + 1))"
+    $text = Get-Content -LiteralPath $idx.FullName -Raw
+    $shards = [regex]::Matches($text,
+        '[A-Za-z0-9_.-]+-[0-9]+-of-[0-9]+\.safetensors') |
+        ForEach-Object { $_.Value } | Sort-Object -Unique
+    foreach ($s in $shards) {
+        $rel = "$compRel/$s"
+        Write-Host "==> hf download $Repo $rel"
+        & hf download $Repo $rel --local-dir $OutDir
+        if ($LASTEXITCODE -ne 0) {
+            throw "hf download failed for shard $rel (exit $LASTEXITCODE)"
         }
     }
 }

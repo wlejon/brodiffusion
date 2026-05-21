@@ -201,6 +201,28 @@ static void test_flux(const fs::path& base) {
         "shift": 3.0,
         "use_dynamic_shifting": false
     })");
+    write_file(dir / "transformer" / "config.json", R"({
+        "in_channels": 64,
+        "num_layers": 19,
+        "num_single_layers": 38,
+        "attention_head_dim": 128,
+        "num_attention_heads": 24,
+        "joint_attention_dim": 4096,
+        "pooled_projection_dim": 768,
+        "guidance_embeds": false,
+        "axes_dims_rope": [16, 56, 56]
+    })");
+    write_file(dir / "text_encoder_2" / "config.json", R"({
+        "d_model": 4096,
+        "d_ff": 10240,
+        "d_kv": 64,
+        "num_heads": 64,
+        "num_layers": 24,
+        "relative_attention_num_buckets": 32,
+        "relative_attention_max_distance": 128,
+        "vocab_size": 32128,
+        "layer_norm_epsilon": 1e-06
+    })");
 
     bd::ModelConfig mc = bd::load_model_config(dir.string());
 
@@ -212,6 +234,19 @@ static void test_flux(const fs::path& base) {
         const auto& fc = std::get<bd::scheduler::FlowMatchConfig>(mc.scheduler);
         CHECK(approx(fc.shift, 3.0f));
     }
+
+    // Flux transformer config.
+    CHECK(mc.flux.in_channels == 64);
+    CHECK(mc.flux.num_layers == 19);
+    CHECK(mc.flux.num_single_layers == 38);
+    CHECK(mc.flux.guidance_embeds == false);
+    CHECK(mc.flux.axes_dims_rope == std::vector<int>({16, 56, 56}));
+
+    // T5 (text_encoder_2) config.
+    CHECK(mc.t5.d_model == 4096);
+    CHECK(mc.t5.num_layers == 24);
+    CHECK(mc.t5.num_heads == 64);
+    CHECK(approx(mc.t5.layer_norm_eps, 1e-6f, 1e-9f));
 }
 
 int main() {

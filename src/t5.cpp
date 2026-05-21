@@ -29,10 +29,22 @@ namespace {
     throw std::runtime_error("t5::TextEncoder: " + msg);
 }
 
-const st::TensorView& need(const st::File& f, const std::string& key) {
-    const auto* v = f.find(key);
-    if (!v) throw std::runtime_error("t5::TextEncoder: missing tensor '" + key + "'");
-    return *v;
+// Find a tensor by name across one or more shards; first match wins.
+const st::TensorView& need(const std::vector<const st::File*>& shards,
+                           const std::string& key) {
+    for (const st::File* f : shards) {
+        if (const auto* v = f->find(key)) return *v;
+    }
+    throw std::runtime_error("t5::TextEncoder: missing tensor '" + key + "'");
+}
+
+// Find a tensor by name across shards; nullptr if absent in every shard.
+const st::TensorView* find_in(const std::vector<const st::File*>& shards,
+                              const std::string& key) {
+    for (const st::File* f : shards) {
+        if (const auto* v = f->find(key)) return v;
+    }
+    return nullptr;
 }
 
 // Build a device-resident INT32 buffer holding `n` token ids. brotensor has
@@ -106,6 +118,13 @@ TextEncoder::~TextEncoder() = default;
 // ─── load_weights ──────────────────────────────────────────────────────────
 
 void TextEncoder::load_weights(const st::File& f, const std::string& prefix) {
+    const std::vector<const st::File*> shards = {&f};
+    load_weights(shards, prefix);
+}
+
+void TextEncoder::load_weights(const std::vector<const st::File*>& shards,
+                               const std::string& prefix) {
+    if (shards.empty()) fail("load_weights: no safetensors shards");
     const int V  = cfg_.vocab_size;
     const int D  = cfg_.d_model;
     const int FF = cfg_.d_ff;
@@ -117,8 +136,8 @@ void TextEncoder::load_weights(const st::File& f, const std::string& prefix) {
     {
         const std::string shared_key = prefix + "shared.weight";
         const std::string embed_key  = prefix + "encoder.embed_tokens.weight";
-        const auto* tv = f.find(shared_key);
-        if (!tv) tv = f.find(embed_key);
+        const auto* tv = find_in(shards, shared_key);
+        if (!tv) tv = find_in(shards, embed_key);
         if (!tv) {
             fail("missing token embedding ('" + shared_key + "' or '" +
                  embed_key + "')");
@@ -131,35 +150,35 @@ void TextEncoder::load_weights(const st::File& f, const std::string& prefix) {
             prefix + "encoder.block." + std::to_string(i) + ".";
         Block& B = blocks_[static_cast<std::size_t>(i)];
 
-        upload_compute_checked(need(f, p + "layer.0.layer_norm.weight"),
+        upload_compute_checked(need(shards, p + "layer.0.layer_norm.weight"),
                                D, 1, B.ln0, "block.layer.0.layer_norm");
 
         const std::string sa = p + "layer.0.SelfAttention.";
-        upload_compute_checked(need(f, sa + "q.weight"), D, D, B.Wq, "SelfAttention.q");
-        upload_compute_checked(need(f, sa + "k.weight"), D, D, B.Wk, "SelfAttention.k");
-        upload_compute_checked(need(f, sa + "v.weight"), D, D, B.Wv, "SelfAttention.v");
-        upload_compute_checked(need(f, sa + "o.weight"), D, D, B.Wo, "SelfAttention.o");
+        upload_compute_checked(need(shards, sa + "q.weight"), D, D, B.Wq, "SelfAttention.q");
+        upload_compute_checked(need(shards, sa + "k.weight"), D, D, B.Wk, "SelfAttention.k");
+        upload_compute_checked(need(shards, sa + "v.weight"), D, D, B.Wv, "SelfAttention.v");
+        upload_compute_checked(need(shards, sa + "o.weight"), D, D, B.Wo, "SelfAttention.o");
 
-        upload_compute_checked(need(f, p + "layer.1.layer_norm.weight"),
+        upload_compute_checked(need(shards, p + "layer.1.layer_norm.weight"),
                                D, 1, B.ln1, "block.layer.1.layer_norm");
 
         const std::string dr = p + "layer.1.DenseReluDense.";
-        upload_compute_checked(need(f, dr + "wi_0.weight"), FF, D, B.wi_0, "DenseReluDense.wi_0");
-        upload_compute_checked(need(f, dr + "wi_1.weight"), FF, D, B.wi_1, "DenseReluDense.wi_1");
-        upload_compute_checked(need(f, dr + "wo.weight"),   D, FF, B.wo,  "DenseReluDense.wo");
+        upload_compute_checked(need(shards, dr + "wi_0.weight"), FF, D, B.wi_0, "DenseReluDense.wi_0");
+        upload_compute_checked(need(shards, dr + "wi_1.weight"), FF, D, B.wi_1, "DenseReluDense.wi_1");
+        upload_compute_checked(need(shards, dr + "wo.weight"),   D, FF, B.wo,  "DenseReluDense.wo");
     }
 
     // Relative-position bias table — block 0 only, shared by every layer.
     {
         bt::Tensor rel;
         upload_compute_checked(
-            need(f, prefix + "encoder.block.0.layer.0.SelfAttention."
+            need(shards, prefix + "encoder.block.0.layer.0.SelfAttention."
                              "relative_attention_bias.weight"),
             NB, H, rel, "relative_attention_bias");
         rel_attn_bias_ = download_fp32(rel);
     }
 
-    upload_compute_checked(need(f, prefix + "encoder.final_layer_norm.weight"),
+    upload_compute_checked(need(shards, prefix + "encoder.final_layer_norm.weight"),
                            D, 1, final_ln_, "final_layer_norm");
 
     // Invalidate any cached position bias — weights just changed.

@@ -19,6 +19,8 @@
 #include "brodiffusion/scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
 #include "brodiffusion/flow_match_scheduler.h"
+#include "brodiffusion/dit/flux.h"
+#include "brodiffusion/t5.h"
 
 #include <string>
 #include <variant>
@@ -38,13 +40,13 @@ struct ModelConfig {
     vae::DecoderConfig      vae;           // always populated
     clip::TextEncoderConfig text_encoder;  // populated when a CLIP encoder exists
 
+    dit::FluxConfig flux;   // populated for ModelClass::Flux
+    t5::T5Config    t5;     // populated for ModelClass::Flux (the second text encoder)
+    int             t5_max_length = 512;  // T5 sequence length (flux-schnell 256, dev 512)
+
     std::variant<scheduler::DDIMConfig,
                  scheduler::LCMConfig,
                  scheduler::FlowMatchConfig> scheduler;
-
-    // NOTE: the Flux transformer config and the T5 text-encoder config are
-    // populated by later phases (they extend this struct + loader). Phase 3
-    // detects ModelClass::Flux and populates `vae` + `scheduler` for it.
 };
 
 // Read `model_index.json` + each component config from `model_dir`.

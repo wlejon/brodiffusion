@@ -2,26 +2,34 @@
 
 #include "brodiffusion/clip.h"
 #include "brodiffusion/denoiser.h"
+#include "brodiffusion/dit/flux.h"
 #include "brodiffusion/flow_match_scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
 #include "brodiffusion/lora.h"
+#include "brodiffusion/model_config.h"
 #include "brotensor/safetensors.h"
 #include "brodiffusion/scheduler.h"
+#include "brodiffusion/t5.h"
 #include "brodiffusion/tokenizer.h"
+#include "brodiffusion/tokenizer_t5.h"
 #include "brodiffusion/unet.h"
 #include "brodiffusion/vae.h"
 #include "brodiffusion/detail/compute.h"
+#include "brodiffusion/detail/safetensors_dir.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -85,20 +93,119 @@ void scheduler_step(SchedulerVariant& sched, const bt::Tensor& pred,
     }
 }
 
+// Construct the denoiser matching the model class.
+std::unique_ptr<Denoiser> make_denoiser(const PipelineConfig& cfg) {
+    if (cfg.model_class == ModelClass::Flux) {
+        return std::make_unique<dit::FluxDenoiser>(cfg.flux);
+    }
+    return std::make_unique<unet::UNet>(cfg.unet);
+}
+
 }  // namespace
 
 Pipeline::Pipeline(const PipelineConfig& cfg, clip::Tokenizer tokenizer)
     : cfg_(cfg),
+      model_class_(cfg.model_class),
       tokenizer_(std::move(tokenizer)),
       text_encoder_(cfg.text_encoder),
-      denoiser_(std::make_unique<unet::UNet>(cfg.unet)),
+      denoiser_(make_denoiser(cfg)),
       vae_(cfg.vae),
-      scheduler_(make_scheduler(cfg.scheduler)) {}
+      scheduler_(make_scheduler(cfg.scheduler)) {
+    if (cfg.model_class == ModelClass::Flux) {
+        fail("Pipeline: Flux model_class requires the (cfg, clip_tok, t5_tok) "
+             "constructor");
+    }
+}
+
+Pipeline::Pipeline(const PipelineConfig& cfg, clip::Tokenizer clip_tok,
+                   t5::Tokenizer t5_tok)
+    : cfg_(cfg),
+      model_class_(cfg.model_class),
+      tokenizer_(std::move(clip_tok)),
+      text_encoder_(cfg.text_encoder),
+      t5_tokenizer_(std::move(t5_tok)),
+      t5_encoder_(std::in_place, cfg.t5),
+      denoiser_(make_denoiser(cfg)),
+      vae_(cfg.vae),
+      scheduler_(make_scheduler(cfg.scheduler)) {
+    if (cfg.model_class != ModelClass::Flux) {
+        fail("Pipeline: the (cfg, clip_tok, t5_tok) constructor requires "
+             "model_class == Flux");
+    }
+}
 
 const unet::UNet& Pipeline::unet() const {
     const unet::UNet* u = denoiser_->as_unet();
     if (u == nullptr) fail("unet(): the active denoiser is not a UNet");
     return *u;
+}
+
+Pipeline Pipeline::from_model_dir(const std::string& model_dir) {
+    namespace fs = std::filesystem;
+    const ModelConfig mc = load_model_config(model_dir);
+
+    PipelineConfig cfg;
+    cfg.model_class   = mc.model_class;
+    cfg.unet          = mc.unet;
+    cfg.flux          = mc.flux;
+    cfg.vae           = mc.vae;
+    cfg.text_encoder  = mc.text_encoder;
+    cfg.t5            = mc.t5;
+    cfg.t5_max_length = mc.t5_max_length;
+    cfg.scheduler     = mc.scheduler;
+
+    const fs::path root(model_dir);
+
+    // CLIP tokenizer (both classes).
+    clip::Tokenizer clip_tok = clip::Tokenizer::load(
+        (root / "tokenizer" / "vocab.json").string(),
+        (root / "tokenizer" / "merges.txt").string());
+
+    if (mc.model_class == ModelClass::Flux) {
+        // T5 tokenizer for the second text encoder.
+        t5::Tokenizer t5_tok = t5::Tokenizer::load(
+            (root / "tokenizer_2" / "tokenizer.json").string());
+
+        Pipeline p(cfg, std::move(clip_tok), std::move(t5_tok));
+
+        // Load component weights. CLIP + VAE are single-file; the Flux
+        // transformer and the T5-XXL encoder may be sharded — search every
+        // shard by name (no .index.json parse needed).
+        auto te_files  = detail::open_component_files(
+            (root / "text_encoder").string());
+        auto vae_files = detail::open_component_files(
+            (root / "vae").string());
+        auto tf_files  = detail::open_component_files(
+            (root / "transformer").string());
+        auto t52_files = detail::open_component_files(
+            (root / "text_encoder_2").string());
+
+        p.text_encoder_.load_weights(te_files.front(), "text_model.");
+        p.vae_.load_weights(vae_files.front(), "decoder.");
+
+        std::vector<const brotensor::safetensors::File*> tf_ptrs;
+        for (const auto& f : tf_files) tf_ptrs.push_back(&f);
+        auto* flux = dynamic_cast<dit::FluxDenoiser*>(p.denoiser_.get());
+        if (!flux) fail("from_model_dir: Flux denoiser construction failed");
+        flux->load_weights(tf_ptrs, "");
+
+        std::vector<const brotensor::safetensors::File*> t52_ptrs;
+        for (const auto& f : t52_files) t52_ptrs.push_back(&f);
+        p.t5_encoder_->load_weights(t52_ptrs, "");
+
+        return p;
+    }
+
+    // StableDiffusion: single-file CLIP / UNet / VAE.
+    Pipeline p(cfg, std::move(clip_tok));
+    auto te_files   = detail::open_component_files(
+        (root / "text_encoder").string());
+    auto unet_files = detail::open_component_files(
+        (root / "unet").string());
+    auto vae_files  = detail::open_component_files(
+        (root / "vae").string());
+    p.load_weights(te_files.front(), unet_files.front(), vae_files.front());
+    return p;
 }
 
 void Pipeline::load_weights(const brotensor::safetensors::File& f) {
@@ -180,7 +287,8 @@ PipelineState Pipeline::prime(std::string_view prompt,
 
     const int H_lat = opts.height / 8;
     const int W_lat = opts.width  / 8;
-    const int C_lat = cfg_.unet.in_channels;
+    // Latent channel count is denoiser-defined (4 for SD1.5, 16 for Flux).
+    const int C_lat = denoiser_->latent_channels();
     const int n_lat = C_lat * H_lat * W_lat;
     const bool is_lcm = std::holds_alternative<scheduler::LCM>(scheduler_);
     const bool do_cfg = denoiser_->uses_cfg() && !is_lcm &&
@@ -190,18 +298,49 @@ PipelineState Pipeline::prime(std::string_view prompt,
     denoiser_->finalize_weights();
 
     // 1. Encode prompt(s) into the model-agnostic Conditioning struct.
-    encode_prompt_(prompt, conditioning_.text_embeddings);
-    if (do_cfg) {
-        encode_prompt_(opts.negative_prompt, conditioning_.uncond_embeddings);
-        conditioning_.has_uncond = true;
-    } else {
+    if (model_class_ == ModelClass::Flux) {
+        // Flux: T5 token sequence is the cross-attention context; the CLIP
+        // pooled vector feeds the AdaLN time-text embedding. No CFG branch.
+        if (!t5_tokenizer_ || !t5_encoder_) {
+            fail("prime: Flux pipeline missing T5 tokenizer / encoder");
+        }
+        std::vector<std::int32_t> t5_ids =
+            t5_tokenizer_->encode(prompt, cfg_.t5_max_length);
+        t5_encoder_->forward(t5_ids.data(),
+                             static_cast<int>(t5_ids.size()),
+                             conditioning_.text_embeddings);
+
+        // CLIP pooled vector — discard the CLIP sequence output for Flux.
+        std::vector<std::int32_t> clip_ids = tokenizer_.encode(prompt);
+        if (static_cast<int>(clip_ids.size()) !=
+            cfg_.text_encoder.max_position) {
+            fail("prime: CLIP tokenizer returned " +
+                 std::to_string(clip_ids.size()) + " ids, expected " +
+                 std::to_string(cfg_.text_encoder.max_position));
+        }
+        text_encoder_.forward(clip_ids.data(), scratch_,
+                              &conditioning_.pooled);
+
         conditioning_.has_uncond = false;
         conditioning_.uncond_embeddings = brotensor::Tensor{};
+        conditioning_.guidance =
+            cfg_.flux.guidance_embeds ? opts.guidance_scale : 0.0f;
+    } else {
+        encode_prompt_(prompt, conditioning_.text_embeddings);
+        if (do_cfg) {
+            encode_prompt_(opts.negative_prompt,
+                           conditioning_.uncond_embeddings);
+            conditioning_.has_uncond = true;
+        } else {
+            conditioning_.has_uncond = false;
+            conditioning_.uncond_embeddings = brotensor::Tensor{};
+        }
+        conditioning_.guidance = is_lcm ? opts.guidance_scale : 0.0f;
     }
-    conditioning_.guidance = is_lcm ? opts.guidance_scale : 0.0f;
 
     // 1b. Pre-process conditioning once per generation (cross-attention K/V
-    // projection for the UNet). Shared across all branched states.
+    // projection for the UNet; pre-projected T5 context for Flux). Shared
+    // across all branched states.
     prepared_ = denoiser_->prepare(conditioning_);
 
     // 2. Build the initial state.
@@ -219,9 +358,17 @@ PipelineState Pipeline::prime(std::string_view prompt,
     state.latent = detail::upload_host(noise.data(), 1, n_lat);
 
     // 3. Set the timestep schedule (lives on the scheduler — shared across
-    // all branches).
-    std::visit([&](auto& s) { s.set_timesteps(opts.num_inference_steps); },
-               scheduler_);
+    // all branches). FlowMatch with dynamic shifting (flux-dev) needs the
+    // image token count; DDIM / LCM ignore the second argument.
+    const int image_seq_len = (H_lat / 2) * (W_lat / 2);
+    std::visit([&](auto& s) {
+        using S = std::decay_t<decltype(s)>;
+        if constexpr (std::is_same_v<S, scheduler::FlowMatch>) {
+            s.set_timesteps(opts.num_inference_steps, image_seq_len);
+        } else {
+            s.set_timesteps(opts.num_inference_steps);
+        }
+    }, scheduler_);
     state.n_steps = std::visit(
         [](const auto& s) { return s.num_inference_steps(); }, scheduler_);
     state.step_index = 0;

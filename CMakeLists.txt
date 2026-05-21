@@ -121,6 +121,7 @@ target_sources(brodiffusion PRIVATE
     src/lcm_scheduler.cpp
     src/flow_match_scheduler.cpp
     src/model_config.cpp
+    src/detail/safetensors_dir.cpp
     src/lora.cpp
     src/pipeline.cpp
     src/clip_image.cpp

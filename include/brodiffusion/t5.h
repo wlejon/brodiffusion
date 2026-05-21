@@ -82,6 +82,14 @@ public:
     void load_weights(const brotensor::safetensors::File& f,
                       const std::string& prefix = "");
 
+    // Load from a *sharded* safetensors set: every tensor is searched across
+    // all `shards` (the first match wins; a name missing in every shard
+    // throws). The single-File overload above is a one-element wrapper over
+    // this path. The T5-XXL encoder ships sharded in diffusers format.
+    void load_weights(
+        const std::vector<const brotensor::safetensors::File*>& shards,
+        const std::string& prefix = "");
+
     // Forward over a length-L int32 token-id sequence (host pointer).
     //   ids: host pointer to L int32 token IDs in [0, vocab_size).
     //   out: (L, d_model) Tensor at the compute dtype, resized as needed.

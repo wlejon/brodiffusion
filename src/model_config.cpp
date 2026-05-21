@@ -124,6 +124,42 @@ scheduler::LCMConfig parse_lcm(const json::Value& cfg) {
     return c;
 }
 
+void populate_flux(const json::Value& cfg, dit::FluxConfig& out) {
+    out.in_channels         = cfg.get_int("in_channels", out.in_channels);
+    out.num_layers          = cfg.get_int("num_layers", out.num_layers);
+    out.num_single_layers   = cfg.get_int("num_single_layers",
+                                          out.num_single_layers);
+    out.attention_head_dim  = cfg.get_int("attention_head_dim",
+                                          out.attention_head_dim);
+    out.num_attention_heads = cfg.get_int("num_attention_heads",
+                                          out.num_attention_heads);
+    out.joint_attention_dim = cfg.get_int("joint_attention_dim",
+                                          out.joint_attention_dim);
+    out.pooled_projection_dim = cfg.get_int("pooled_projection_dim",
+                                            out.pooled_projection_dim);
+    out.guidance_embeds     = cfg.get_bool("guidance_embeds",
+                                           out.guidance_embeds);
+    out.axes_dims_rope      = cfg.get_int_array("axes_dims_rope",
+                                               out.axes_dims_rope);
+}
+
+void populate_t5(const json::Value& cfg, t5::T5Config& out) {
+    out.d_model    = cfg.get_int("d_model", out.d_model);
+    out.d_ff       = cfg.get_int("d_ff", out.d_ff);
+    out.d_kv       = cfg.get_int("d_kv", out.d_kv);
+    out.num_heads  = cfg.get_int("num_heads", out.num_heads);
+    out.num_layers = cfg.get_int("num_layers", out.num_layers);
+    out.relative_attention_num_buckets =
+        cfg.get_int("relative_attention_num_buckets",
+                    out.relative_attention_num_buckets);
+    out.relative_attention_max_distance =
+        cfg.get_int("relative_attention_max_distance",
+                    out.relative_attention_max_distance);
+    out.vocab_size = cfg.get_int("vocab_size", out.vocab_size);
+    out.layer_norm_eps =
+        cfg.get_float("layer_norm_epsilon", out.layer_norm_eps);
+}
+
 scheduler::FlowMatchConfig parse_flow_match(const json::Value& cfg) {
     scheduler::FlowMatchConfig c;
     c.num_train_timesteps =
@@ -171,6 +207,27 @@ ModelConfig load_model_config(const std::string& model_dir) {
         const fs::path unet_cfg = root / "unet" / "config.json";
         if (fs::exists(unet_cfg)) {
             populate_unet(parse_file(unet_cfg), out.unet);
+        }
+    }
+
+    // --- transformer/config.json + text_encoder_2/config.json (Flux only) ---
+    if (is_flux) {
+        const fs::path tf_cfg = root / "transformer" / "config.json";
+        if (fs::exists(tf_cfg)) {
+            populate_flux(parse_file(tf_cfg), out.flux);
+        }
+        const fs::path t5_cfg = root / "text_encoder_2" / "config.json";
+        if (fs::exists(t5_cfg)) {
+            populate_t5(parse_file(t5_cfg), out.t5);
+        }
+        // T5 sequence length: prefer tokenizer_2's model_max_length when present
+        // and sane (<= 512); leave the 512 default otherwise.
+        const fs::path tok2_cfg =
+            root / "tokenizer_2" / "tokenizer_config.json";
+        if (fs::exists(tok2_cfg)) {
+            const json::Value tc = parse_file(tok2_cfg);
+            const int mml = tc.get_int("model_max_length", out.t5_max_length);
+            if (mml > 0 && mml <= 512) out.t5_max_length = mml;
         }
     }
 
