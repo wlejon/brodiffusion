@@ -48,12 +48,15 @@ struct T5Config {
     int   relative_attention_max_distance = 128;
     float layer_norm_eps = 1e-6f;
 
-    // When true, load_weights() converts the per-block attention and FFN
-    // weight matrices (Wq/Wk/Wv/Wo, wi_0/wi_1/wo) to INT8 weight-only
-    // quantisation (W8A16) — halving their VRAM footprint. The token
-    // embedding, the RMSNorm gains, and the position-bias table stay at the
-    // compute dtype. INT8 is GPU-only; on the CPU backend the flag is
-    // ignored with a warning and every weight stays FP32.
+    // When true, load_weights() stores the per-block attention and FFN
+    // weight matrices (Wq/Wk/Wv/Wo, wi_0/wi_1/wo) as INT8 weight-only
+    // quantisation (W8A16) — halving their VRAM footprint. Each such weight
+    // is quantised on the host straight from the checkpoint and only its
+    // INT8 bytes reach VRAM: the FP16 weight is never materialised in VRAM,
+    // so peak VRAM stays at the quantised footprint. The token embedding,
+    // the RMSNorm gains, and the position-bias table stay at the compute
+    // dtype. INT8 is GPU-only; on the CPU backend the flag is ignored with a
+    // warning and every weight stays FP32.
     bool quantize_weights = false;
 };
 
@@ -134,11 +137,17 @@ private:
     // Cached: only rebuilt when L changes.
     void rebuild_position_bias_(int L);
 
-    // Quantise one FP16 weight to INT8 (W8A16): per-output-row symmetric
-    // scales (brotensor::quantize_int8_per_row_host), upload the INT8 weight
-    // + scales to W_fp16's device into `q`, then free the FP16 storage.
-    // No-op when W_fp16 is empty. Requires W_fp16 to be FP16 (GPU backend).
-    void quantize_weight_inplace_(brotensor::Tensor& W_fp16, QWeight& q);
+    // Quantise one weight to INT8 (W8A16) straight from its safetensors
+    // view, without ever materialising the FP16 weight in VRAM: convert the
+    // source (F16/F32/BF16) to a host FP16 buffer, run
+    // brotensor::quantize_int8_per_row_host for per-output-row symmetric
+    // scales, then upload only the INT8 weight + scales into `q`. `name`
+    // labels validation errors. Used by load_weights when
+    // T5Config::quantize_weights is set on a GPU backend; the matching FP16
+    // weight tensor is left empty.
+    void quantize_weight_from_view_(
+        const brotensor::safetensors::TensorView& view,
+        int out, int in, QWeight& q, const std::string& name);
 
     // One FFN linear: the INT8 W8A16 path when `q` is active, else the plain
     // compute-dtype batched linear on `W`. Bias-free (T5 has no linear bias).

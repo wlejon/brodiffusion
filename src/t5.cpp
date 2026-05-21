@@ -146,6 +146,33 @@ void TextEncoder::load_weights(const std::vector<const st::File*>& shards,
         upload_compute_checked(*tv, V, D, token_embed_, "shared.weight");
     }
 
+    // INT8 (W8A16) quantisation decision. GPU-only: the W8A16 ops have no
+    // CPU path, so on the CPU backend (FP32 compute dtype) the flag is
+    // ignored and every weight stays FP32. When active, each per-block
+    // attention / FFN matrix is quantised on the host straight from its
+    // safetensors view — the FP16 weight is never uploaded to VRAM.
+    const bool do_quantize =
+        cfg_.quantize_weights &&
+        (brodiffusion::compute_dtype() == bt::Dtype::FP16);
+    if (cfg_.quantize_weights && !do_quantize) {
+        std::fprintf(stderr,
+            "brodiffusion: INT8 weight quantization is GPU-only; ignoring "
+            "T5Config::quantize_weights on the CPU backend.\n");
+    }
+
+    // Load one attention/FFN weight: as INT8 straight from the checkpoint
+    // when quantising (FP16 tensor `W` left empty), else as a plain
+    // compute-dtype upload (`q` left inactive).
+    auto load_w = [&](const std::string& key, int out, int in,
+                      bt::Tensor& W, QWeight& q, const std::string& name) {
+        const st::TensorView& view = need(shards, key);
+        if (do_quantize) {
+            quantize_weight_from_view_(view, out, in, q, name);
+        } else {
+            upload_compute_checked(view, out, in, W, name);
+        }
+    };
+
     for (int i = 0; i < cfg_.num_layers; ++i) {
         const std::string p =
             prefix + "encoder.block." + std::to_string(i) + ".";
@@ -155,18 +182,18 @@ void TextEncoder::load_weights(const std::vector<const st::File*>& shards,
                                D, 1, B.ln0, "block.layer.0.layer_norm");
 
         const std::string sa = p + "layer.0.SelfAttention.";
-        upload_compute_checked(need(shards, sa + "q.weight"), D, D, B.Wq, "SelfAttention.q");
-        upload_compute_checked(need(shards, sa + "k.weight"), D, D, B.Wk, "SelfAttention.k");
-        upload_compute_checked(need(shards, sa + "v.weight"), D, D, B.Wv, "SelfAttention.v");
-        upload_compute_checked(need(shards, sa + "o.weight"), D, D, B.Wo, "SelfAttention.o");
+        load_w(sa + "q.weight", D, D, B.Wq, B.Wq_q, "SelfAttention.q");
+        load_w(sa + "k.weight", D, D, B.Wk, B.Wk_q, "SelfAttention.k");
+        load_w(sa + "v.weight", D, D, B.Wv, B.Wv_q, "SelfAttention.v");
+        load_w(sa + "o.weight", D, D, B.Wo, B.Wo_q, "SelfAttention.o");
 
         upload_compute_checked(need(shards, p + "layer.1.layer_norm.weight"),
                                D, 1, B.ln1, "block.layer.1.layer_norm");
 
         const std::string dr = p + "layer.1.DenseReluDense.";
-        upload_compute_checked(need(shards, dr + "wi_0.weight"), FF, D, B.wi_0, "DenseReluDense.wi_0");
-        upload_compute_checked(need(shards, dr + "wi_1.weight"), FF, D, B.wi_1, "DenseReluDense.wi_1");
-        upload_compute_checked(need(shards, dr + "wo.weight"),   D, FF, B.wo,  "DenseReluDense.wo");
+        load_w(dr + "wi_0.weight", FF, D, B.wi_0, B.wi_0_q, "DenseReluDense.wi_0");
+        load_w(dr + "wi_1.weight", FF, D, B.wi_1, B.wi_1_q, "DenseReluDense.wi_1");
+        load_w(dr + "wo.weight",   D, FF, B.wo,  B.wo_q,  "DenseReluDense.wo");
     }
 
     // Relative-position bias table — block 0 only, shared by every layer.
@@ -184,62 +211,65 @@ void TextEncoder::load_weights(const std::vector<const st::File*>& shards,
 
     // Invalidate any cached position bias — weights just changed.
     pos_bias_L_ = -1;
-
-    // INT8 (W8A16) quantisation. GPU-only: the W8A16 ops have no CPU path,
-    // so on the CPU backend the flag is ignored and every QWeight stays
-    // inactive (the FP32 forward path is used). On a GPU backend each
-    // per-block attention / FFN matrix is converted in place; the token
-    // embedding, RMSNorm gains, and position-bias table stay FP16.
-    if (cfg_.quantize_weights) {
-        if (token_embed_.device == bt::Device::CPU) {
-            std::fprintf(stderr,
-                "brodiffusion: INT8 weight quantization is GPU-only; "
-                "ignoring T5Config::quantize_weights on the CPU backend.\n");
-        } else {
-            for (Block& B : blocks_) {
-                quantize_weight_inplace_(B.Wq,   B.Wq_q);
-                quantize_weight_inplace_(B.Wk,   B.Wk_q);
-                quantize_weight_inplace_(B.Wv,   B.Wv_q);
-                quantize_weight_inplace_(B.Wo,   B.Wo_q);
-                quantize_weight_inplace_(B.wi_0, B.wi_0_q);
-                quantize_weight_inplace_(B.wi_1, B.wi_1_q);
-                quantize_weight_inplace_(B.wo,   B.wo_q);
-            }
-        }
-    }
 }
 
 // ─── INT8 (W8A16) quantisation ─────────────────────────────────────────────
 
-void TextEncoder::quantize_weight_inplace_(bt::Tensor& W_fp16, QWeight& q) {
-    if (W_fp16.size() == 0) return;             // nothing to quantise
-    if (W_fp16.dtype != bt::Dtype::FP16) {
-        fail("quantize_weight_inplace_: weight is not FP16");
+void TextEncoder::quantize_weight_from_view_(const st::TensorView& view,
+                                             int out, int in, QWeight& q,
+                                             const std::string& name) {
+    const std::size_t n =
+        static_cast<std::size_t>(out) * static_cast<std::size_t>(in);
+    if (view.numel() != static_cast<std::int64_t>(n)) {
+        fail("quantize '" + name + "': element count " +
+             std::to_string(view.numel()) + " != expected " +
+             std::to_string(n));
     }
-    const int out = W_fp16.rows;
-    const int in  = W_fp16.cols;
 
-    std::vector<std::uint16_t> host_fp16(
-        static_cast<std::size_t>(out) * static_cast<std::size_t>(in));
-    W_fp16.copy_to_host_fp16(host_fp16.data());
+    // Convert the source view to a host FP16 buffer — the input dtype
+    // brotensor::quantize_int8_per_row_host expects. On-disk weights are
+    // F16, F32, or BF16 (BF16 for Flux-family checkpoints); the source bytes
+    // live in the safetensors mmap, never in VRAM.
+    std::vector<std::uint16_t> host_fp16(n);
+    switch (view.dtype) {
+        case st::Dtype::F16:
+            std::memcpy(host_fp16.data(), view.data,
+                        n * sizeof(std::uint16_t));
+            break;
+        case st::Dtype::F32: {
+            const auto* src = reinterpret_cast<const float*>(view.data);
+            for (std::size_t i = 0; i < n; ++i) {
+                host_fp16[i] = bt::fp32_to_fp16_bits(src[i]);
+            }
+            break;
+        }
+        case st::Dtype::BF16: {
+            const auto* src =
+                reinterpret_cast<const std::uint16_t*>(view.data);
+            for (std::size_t i = 0; i < n; ++i) {
+                host_fp16[i] =
+                    bt::fp32_to_fp16_bits(bt::bf16_bits_to_fp32(src[i]));
+            }
+            break;
+        }
+        default:
+            fail("quantize '" + name + "': unsupported source dtype " +
+                 std::string(st::dtype_name(view.dtype)));
+    }
 
-    std::vector<std::int8_t> host_int8(host_fp16.size());
+    std::vector<std::int8_t> host_int8(n);
     std::vector<float>       host_scales(static_cast<std::size_t>(out));
     bt::quantize_int8_per_row_host(host_fp16.data(), out, in,
                                    host_int8.data(), host_scales.data());
 
     // brotensor has no from_host path for INT8 — stage the quantised bytes
-    // on the host, then migrate to W_fp16's device.
+    // on the host, then migrate to the default (GPU) device.
     bt::Tensor cpu_int8 =
         bt::Tensor::empty_on(bt::Device::CPU, out, in, bt::Dtype::INT8);
-    std::memcpy(cpu_int8.host_raw_mut(), host_int8.data(),
-                static_cast<std::size_t>(out) * static_cast<std::size_t>(in));
-    q.W_int8 = cpu_int8.to(W_fp16.device);
-    q.scales = bt::Tensor::from_host_on(W_fp16.device,
+    std::memcpy(cpu_int8.host_raw_mut(), host_int8.data(), n);
+    q.W_int8 = cpu_int8.to(bt::default_device());
+    q.scales = bt::Tensor::from_host_on(bt::default_device(),
                                         host_scales.data(), out, 1);
-
-    // Free the original FP16 storage.
-    W_fp16 = bt::Tensor();
 }
 
 void TextEncoder::ffn_linear_(const bt::Tensor& W, const QWeight& q,
