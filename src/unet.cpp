@@ -30,6 +30,16 @@ namespace {
     throw std::runtime_error("unet::UNet: " + msg);
 }
 
+// Concrete payload behind PreparedConditioning for the SD1.5 UNet: the
+// cloned text context (cond + optional uncond) plus the pre-projected
+// cross-attention K/V caches. Built by UNet::prepare, consumed by the
+// Denoiser-interface UNet::forward.
+struct UNetPrepared : public PreparedConditioning::Impl {
+    brotensor::Tensor      ctx_cond, ctx_uncond;
+    UNet::CrossAttnKVCache cache_cond, cache_uncond;
+    float                  lcm_guidance = 0.0f;
+};
+
 const st::TensorView& need(const st::File& f, const std::string& key) {
     const auto* v = f.find(key);
     if (!v) throw std::runtime_error("unet::UNet: missing tensor '" + key + "'");
@@ -599,6 +609,44 @@ void compute_sinusoidal_emb(float t, int dim,
 }
 
 }  // namespace
+
+// ── Denoiser interface ─────────────────────────────────────────────────────
+
+brotensor::Dtype UNet::compute_dtype() const {
+    return brodiffusion::compute_dtype();
+}
+
+PreparedConditioning UNet::prepare(const Conditioning& cond) {
+    auto p = std::make_unique<UNetPrepared>();
+    p->ctx_cond = cond.text_embeddings.clone();
+    prime_xattn_cache(p->ctx_cond, p->cache_cond);
+    if (cond.has_uncond) {
+        p->ctx_uncond = cond.uncond_embeddings.clone();
+        prime_xattn_cache(p->ctx_uncond, p->cache_uncond);
+    }
+    p->lcm_guidance = cond.guidance;
+    return PreparedConditioning(std::move(p));
+}
+
+void UNet::forward(const bt::Tensor& latent, int H, int W, float timestep,
+                   const PreparedConditioning& prepared, Branch branch,
+                   bt::Tensor& out) {
+    auto* p = static_cast<UNetPrepared*>(prepared.get());
+    if (p == nullptr) fail("forward: prepare() was not called");
+    const bool uncond = (branch == Branch::Uncond);
+    if (uncond && p->cache_uncond.empty()) {
+        fail("forward: Branch::Uncond requested but no uncond conditioning "
+             "was prepared");
+    }
+    const bt::Tensor& ctx = uncond ? p->ctx_uncond : p->ctx_cond;
+    const CrossAttnKVCache& cache = uncond ? p->cache_uncond : p->cache_cond;
+    if (cfg_.time_cond_proj_dim > 0) {
+        // LCM: route through the guidance-scale-embedding overload.
+        forward(latent, H, W, timestep, p->lcm_guidance, ctx, cache, out);
+    } else {
+        forward(latent, H, W, timestep, ctx, cache, out);
+    }
+}
 
 void UNet::forward(const bt::Tensor& sample,
                    int H, int W,

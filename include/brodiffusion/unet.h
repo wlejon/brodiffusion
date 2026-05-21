@@ -52,6 +52,8 @@
 // backend. The safetensors loader accepts F16 or F32 source weights and
 // converts as needed.
 
+#include "brodiffusion/denoiser.h"
+
 #include "brotensor/tensor.h"
 
 #include <array>
@@ -103,7 +105,7 @@ struct UNetConfig {
     bool quantize_weights = false;
 };
 
-class UNet {
+class UNet final : public Denoiser {
 public:
     explicit UNet(const UNetConfig& cfg);
     ~UNet();
@@ -121,7 +123,25 @@ public:
     // Throws std::runtime_error on missing names, shape mismatches, or a
     // source dtype that is neither F16 nor F32.
     void load_weights(const brotensor::safetensors::File& f,
-                      const std::string& prefix = "");
+                      const std::string& prefix = "") override;
+
+    // ── Denoiser interface ────────────────────────────────────────────────
+    //
+    // Model-agnostic entry points the Pipeline reaches through a
+    // unique_ptr<Denoiser>. The legacy UNet-shaped forward overloads below
+    // remain for direct callers (and trace mode).
+    PreparedConditioning prepare(const Conditioning& cond) override;
+    void forward(const brotensor::Tensor& latent, int H_lat, int W_lat,
+                 float timestep, const PreparedConditioning& prepared,
+                 Branch branch, brotensor::Tensor& out) override;
+    int latent_channels() const override { return cfg_.in_channels; }
+    PredictionType prediction_type() const override {
+        return PredictionType::Epsilon;
+    }
+    bool uses_cfg() const override { return true; }
+    brotensor::Dtype compute_dtype() const override;
+    unet::UNet* as_unet() override { return this; }
+    const unet::UNet* as_unet() const override { return this; }
 
     // Forward pass. Activation tensors carry the compute dtype (FP32 on CPU,
     // FP16 on a GPU backend).
@@ -264,7 +284,7 @@ public:
     // Idempotent: a second call is a no-op. apply_lora_delta() must be called
     // BEFORE finalize_weights() — once finalized, the weight storage backing
     // the LoRA-patchable layers may be gone.
-    void finalize_weights();
+    void finalize_weights() override;
     bool is_finalized() const { return finalized_; }
 
     const UNetConfig& config() const { return cfg_; }

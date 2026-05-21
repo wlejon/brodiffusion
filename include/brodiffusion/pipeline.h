@@ -14,6 +14,8 @@
 // rather than batching, since the rest of the inference stack is N=1.
 
 #include "brodiffusion/clip.h"
+#include "brodiffusion/denoiser.h"
+#include "brodiffusion/flow_match_scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
 #include "brodiffusion/scheduler.h"
 #include "brodiffusion/tokenizer.h"
@@ -23,6 +25,7 @@
 #include "brotensor/tensor.h"
 
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <string>
 #include <string_view>
@@ -41,7 +44,8 @@ struct PipelineConfig {
     // checkpoints with unet.time_cond_proj_dim > 0). The pipeline branches on
     // the active alternative; existing call sites that don't set this keep
     // working unchanged.
-    std::variant<scheduler::DDIMConfig, scheduler::LCMConfig> scheduler;
+    std::variant<scheduler::DDIMConfig, scheduler::LCMConfig,
+                 scheduler::FlowMatchConfig> scheduler;
 };
 
 // Snapshot of mid-generation state. Cheap to fork — only the latent
@@ -159,23 +163,29 @@ public:
     std::vector<float> decode(const PipelineState& state);
 
     // Accessors for research callers (e.g. tree search needs xattn block count
-    // to size the bias vector).
-    const unet::UNet& unet() const { return unet_; }
+    // to size the bias vector). Throws if the active denoiser is not a UNet.
+    const unet::UNet& unet() const;
 
     const PipelineConfig& config() const { return cfg_; }
 
 private:
     void encode_prompt_(std::string_view prompt, brotensor::Tensor& out);
 
-    PipelineConfig     cfg_;
-    clip::Tokenizer    tokenizer_;
-    clip::TextEncoder  text_encoder_;
-    unet::UNet         unet_;
-    vae::Decoder       vae_;
-    std::variant<scheduler::DDIM, scheduler::LCM> scheduler_;
+    PipelineConfig            cfg_;
+    clip::Tokenizer           tokenizer_;
+    clip::TextEncoder         text_encoder_;
+    std::unique_ptr<Denoiser> denoiser_;
+    vae::Decoder              vae_;
+    std::variant<scheduler::DDIM, scheduler::LCM, scheduler::FlowMatch>
+        scheduler_;
 
-    // Scratch tensors kept alive across generate() calls.
-    brotensor::Tensor ctx_cond_, ctx_uncond_;
+    // Model-agnostic conditioning, rebuilt each prime(). `conditioning_` keeps
+    // the raw text context around for trace-mode access; `prepared_` holds the
+    // per-denoiser prepared payload (K/V caches), shared across all branched
+    // states from the same prime().
+    Conditioning          conditioning_;
+    PreparedConditioning  prepared_;
+
     // Working buffers reused across step_once() calls. The current latent
     // lives on PipelineState, not here.
     brotensor::Tensor noise_pred_cond_, noise_pred_uncond_;
@@ -183,11 +193,6 @@ private:
     // Per-step Gaussian noise used by LCM (resampled at every non-final step
     // from the same RNG stream as the initial latent noise). Unused in DDIM.
     brotensor::Tensor noise_step_;
-
-    // Cross-attention K/V projected from the text context once per generate(),
-    // reused for all denoising steps. CFG (cond + uncond) keeps two caches.
-    unet::UNet::CrossAttnKVCache xattn_cache_cond_;
-    unet::UNet::CrossAttnKVCache xattn_cache_uncond_;
 };
 
 }  // namespace brodiffusion::pipeline

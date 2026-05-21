@@ -1,6 +1,8 @@
 #include "brodiffusion/pipeline.h"
 
 #include "brodiffusion/clip.h"
+#include "brodiffusion/denoiser.h"
+#include "brodiffusion/flow_match_scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
 #include "brodiffusion/lora.h"
 #include "brotensor/safetensors.h"
@@ -15,6 +17,7 @@
 #include "brotensor/tensor.h"
 
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -32,17 +35,54 @@ namespace {
     throw std::runtime_error("pipeline::Pipeline: " + msg);
 }
 
+using SchedulerVariant =
+    std::variant<scheduler::DDIM, scheduler::LCM, scheduler::FlowMatch>;
+
 // Construct the scheduler variant from the matching config variant.
-std::variant<scheduler::DDIM, scheduler::LCM>
-make_scheduler(const std::variant<scheduler::DDIMConfig, scheduler::LCMConfig>& v) {
+SchedulerVariant
+make_scheduler(const std::variant<scheduler::DDIMConfig, scheduler::LCMConfig,
+                                  scheduler::FlowMatchConfig>& v) {
     if (std::holds_alternative<scheduler::LCMConfig>(v)) {
-        return std::variant<scheduler::DDIM, scheduler::LCM>{
-            std::in_place_type<scheduler::LCM>,
-            std::get<scheduler::LCMConfig>(v)};
+        return SchedulerVariant{std::in_place_type<scheduler::LCM>,
+                                std::get<scheduler::LCMConfig>(v)};
     }
-    return std::variant<scheduler::DDIM, scheduler::LCM>{
-        std::in_place_type<scheduler::DDIM>,
-        std::get<scheduler::DDIMConfig>(v)};
+    if (std::holds_alternative<scheduler::FlowMatchConfig>(v)) {
+        return SchedulerVariant{std::in_place_type<scheduler::FlowMatch>,
+                                std::get<scheduler::FlowMatchConfig>(v)};
+    }
+    return SchedulerVariant{std::in_place_type<scheduler::DDIM>,
+                            std::get<scheduler::DDIMConfig>(v)};
+}
+
+// Fetch the timestep at step `i` as a float, uniformly across schedulers
+// (DDIM / LCM return int timesteps; FlowMatch returns continuous floats).
+float timestep_at(const SchedulerVariant& v, int i) {
+    return std::visit([i](const auto& s) -> float {
+        return static_cast<float>(s.timesteps()[i]);
+    }, v);
+}
+
+// Run one scheduler step on `state.latent`. LCM resamples per-step Gaussian
+// noise from the state's RNG stream; FlowMatch / DDIM are deterministic.
+void scheduler_step(SchedulerVariant& sched, const bt::Tensor& pred,
+                    int step_index, PipelineState& state, int n_lat,
+                    bt::Tensor& scratch, bt::Tensor& noise_step) {
+    if (std::holds_alternative<scheduler::LCM>(sched)) {
+        std::normal_distribution<float> nrm(0.0f, 1.0f);
+        std::vector<float> noise_vals(static_cast<std::size_t>(n_lat));
+        for (int k = 0; k < n_lat; ++k) {
+            noise_vals[static_cast<std::size_t>(k)] = nrm(state.rng);
+        }
+        noise_step = detail::upload_host(noise_vals.data(), 1, n_lat);
+        std::get<scheduler::LCM>(sched).step(
+            pred, step_index, state.latent, noise_step, scratch);
+    } else if (std::holds_alternative<scheduler::FlowMatch>(sched)) {
+        std::get<scheduler::FlowMatch>(sched).step(
+            pred, step_index, state.latent, scratch);
+    } else {
+        std::get<scheduler::DDIM>(sched).step(
+            pred, step_index, state.latent, scratch);
+    }
 }
 
 }  // namespace
@@ -51,9 +91,15 @@ Pipeline::Pipeline(const PipelineConfig& cfg, clip::Tokenizer tokenizer)
     : cfg_(cfg),
       tokenizer_(std::move(tokenizer)),
       text_encoder_(cfg.text_encoder),
-      unet_(cfg.unet),
+      denoiser_(std::make_unique<unet::UNet>(cfg.unet)),
       vae_(cfg.vae),
       scheduler_(make_scheduler(cfg.scheduler)) {}
+
+const unet::UNet& Pipeline::unet() const {
+    const unet::UNet* u = denoiser_->as_unet();
+    if (u == nullptr) fail("unet(): the active denoiser is not a UNet");
+    return *u;
+}
 
 void Pipeline::load_weights(const brotensor::safetensors::File& f) {
     load_weights(f,
@@ -67,7 +113,7 @@ void Pipeline::load_weights(const brotensor::safetensors::File& f,
                             const std::string& unet_prefix,
                             const std::string& vae_prefix) {
     text_encoder_.load_weights(f, text_prefix);
-    unet_.load_weights(f, unet_prefix);
+    denoiser_->load_weights(f, unet_prefix);
     vae_.load_weights(f, vae_prefix);
 }
 
@@ -75,7 +121,7 @@ void Pipeline::load_weights(const brotensor::safetensors::File& text_file,
                             const brotensor::safetensors::File& unet_file,
                             const brotensor::safetensors::File& vae_file) {
     text_encoder_.load_weights(text_file, "text_model.");
-    unet_.load_weights(unet_file, "");
+    denoiser_->load_weights(unet_file, "");
     vae_.load_weights(vae_file, "decoder.");
 }
 
@@ -90,7 +136,12 @@ void Pipeline::apply_lora(const brotensor::safetensors::File& f, float scale) {
         const brotensor::safetensors::TensorView& down = f.get(t.down_key);
         const brotensor::safetensors::TensorView& up   = f.get(t.up_key);
         if (t.domain == "unet") {
-            unet_.apply_lora_delta(t.target_path, down, up, scale_total);
+            unet::UNet* u = denoiser_->as_unet();
+            if (u == nullptr) {
+                fail("apply_lora: UNet LoRA target but the active denoiser "
+                     "is not a UNet");
+            }
+            u->apply_lora_delta(t.target_path, down, up, scale_total);
         } else if (t.domain == "text_encoder") {
             text_encoder_.apply_lora_delta(t.target_path, down, up, scale_total);
         } else {
@@ -132,19 +183,26 @@ PipelineState Pipeline::prime(std::string_view prompt,
     const int C_lat = cfg_.unet.in_channels;
     const int n_lat = C_lat * H_lat * W_lat;
     const bool is_lcm = std::holds_alternative<scheduler::LCM>(scheduler_);
-    const bool do_cfg = !is_lcm && (opts.guidance_scale != 1.0f);
+    const bool do_cfg = denoiser_->uses_cfg() && !is_lcm &&
+                        (opts.guidance_scale != 1.0f);
 
-    // 0. Finalize UNet weights (W8A16 quantisation happens here if enabled).
-    unet_.finalize_weights();
+    // 0. Finalize denoiser weights (W8A16 quantisation happens here if enabled).
+    denoiser_->finalize_weights();
 
-    // 1. Encode prompt(s).
-    encode_prompt_(prompt, ctx_cond_);
-    if (do_cfg) encode_prompt_(opts.negative_prompt, ctx_uncond_);
+    // 1. Encode prompt(s) into the model-agnostic Conditioning struct.
+    encode_prompt_(prompt, conditioning_.text_embeddings);
+    if (do_cfg) {
+        encode_prompt_(opts.negative_prompt, conditioning_.uncond_embeddings);
+        conditioning_.has_uncond = true;
+    } else {
+        conditioning_.has_uncond = false;
+        conditioning_.uncond_embeddings = brotensor::Tensor{};
+    }
+    conditioning_.guidance = is_lcm ? opts.guidance_scale : 0.0f;
 
-    // 1b. Pre-project cross-attention K/V once per generation (shared across
-    // all branched states).
-    unet_.prime_xattn_cache(ctx_cond_, xattn_cache_cond_);
-    if (do_cfg) unet_.prime_xattn_cache(ctx_uncond_, xattn_cache_uncond_);
+    // 1b. Pre-process conditioning once per generation (cross-attention K/V
+    // projection for the UNet). Shared across all branched states.
+    prepared_ = denoiser_->prepare(conditioning_);
 
     // 2. Build the initial state.
     PipelineState state;
@@ -179,48 +237,41 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
              ") >= n_steps (" + std::to_string(state.n_steps) + ")");
     }
     const bool is_lcm = std::holds_alternative<scheduler::LCM>(scheduler_);
-    const bool do_cfg = !is_lcm && (opts.guidance_scale != 1.0f);
+    const bool do_cfg = denoiser_->uses_cfg() && !is_lcm &&
+                        (opts.guidance_scale != 1.0f);
     const int i = state.step_index;
-    const int t_int = std::visit(
-        [i](const auto& s) { return s.timesteps()[i]; }, scheduler_);
-    const float t = static_cast<float>(t_int);
-    const int n_lat = cfg_.unet.in_channels * state.H_lat * state.W_lat;
+    const float t = timestep_at(scheduler_, i);
+    const int n_lat = denoiser_->latent_channels() *
+                      state.H_lat * state.W_lat;
 
     // Trace mode is forced if either the caller wants a trace OR is injecting
     // attention biases (forward_trace is the only path that accepts biases).
     const bool trace_mode = (trace_out != nullptr) || (attn_logit_biases != nullptr);
 
-    // ── UNet forward ──────────────────────────────────────────────────────
+    // ── Denoiser forward ──────────────────────────────────────────────────
     if (trace_mode) {
         // forward_trace bypasses K/V cache + INT8 + LCM cond_proj. We capture
         // the conditional pass only; CFG uncond (if any) still uses the fast
-        // cached path. Use a scratch trace when the caller asked for biases
-        // but not the trace itself.
+        // prepared path. Use a scratch trace when the caller asked for biases
+        // but not the trace itself. Trace mode is UNet-only.
+        unet::UNet* u = denoiser_->as_unet();
+        if (u == nullptr) fail("trace mode requires a UNet denoiser");
         unet::UNet::CrossAttnTrace scratch_trace;
         unet::UNet::CrossAttnTrace* trace_dst =
             trace_out ? trace_out : &scratch_trace;
-        unet_.forward_trace(state.latent, state.H_lat, state.W_lat, t,
-                            ctx_cond_, attn_logit_biases,
-                            trace_dst, noise_pred_cond_);
+        u->forward_trace(state.latent, state.H_lat, state.W_lat, t,
+                         conditioning_.text_embeddings, attn_logit_biases,
+                         trace_dst, noise_pred_cond_);
         if (do_cfg) {
-            unet_.forward(state.latent, state.H_lat, state.W_lat, t,
-                          ctx_uncond_, xattn_cache_uncond_, noise_pred_uncond_);
-        }
-    } else if (is_lcm) {
-        if (cfg_.unet.time_cond_proj_dim > 0) {
-            unet_.forward(state.latent, state.H_lat, state.W_lat, t,
-                          opts.guidance_scale,
-                          ctx_cond_, xattn_cache_cond_, noise_pred_cond_);
-        } else {
-            unet_.forward(state.latent, state.H_lat, state.W_lat, t,
-                          ctx_cond_, xattn_cache_cond_, noise_pred_cond_);
+            denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
+                               prepared_, Branch::Uncond, noise_pred_uncond_);
         }
     } else {
-        unet_.forward(state.latent, state.H_lat, state.W_lat, t,
-                      ctx_cond_, xattn_cache_cond_, noise_pred_cond_);
+        denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
+                           prepared_, Branch::Cond, noise_pred_cond_);
         if (do_cfg) {
-            unet_.forward(state.latent, state.H_lat, state.W_lat, t,
-                          ctx_uncond_, xattn_cache_uncond_, noise_pred_uncond_);
+            denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
+                               prepared_, Branch::Uncond, noise_pred_uncond_);
         }
     }
     // CFG combine (DDIM only; LCM has no uncond branch).
@@ -231,19 +282,8 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
     }
 
     // ── Scheduler step ────────────────────────────────────────────────────
-    if (is_lcm) {
-        std::normal_distribution<float> nrm(0.0f, 1.0f);
-        std::vector<float> noise_vals(static_cast<std::size_t>(n_lat));
-        for (int k = 0; k < n_lat; ++k) {
-            noise_vals[k] = nrm(state.rng);
-        }
-        noise_step_ = detail::upload_host(noise_vals.data(), 1, n_lat);
-        std::get<scheduler::LCM>(scheduler_).step(
-            noise_pred_cond_, i, state.latent, noise_step_, scratch_);
-    } else {
-        std::get<scheduler::DDIM>(scheduler_).step(
-            noise_pred_cond_, i, state.latent, scratch_);
-    }
+    scheduler_step(scheduler_, noise_pred_cond_, i, state, n_lat,
+                   scratch_, noise_step_);
     ++state.step_index;
 }
 
