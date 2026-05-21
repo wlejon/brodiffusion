@@ -265,10 +265,13 @@ void Decoder::decode(const bt::Tensor& latent,
     const int first_C = cfg_.block_out_channels.front();
     const int mid_C   = cfg_.block_out_channels.back();
 
-    // 1. Scale (latent /= scaling_factor).
+    // 1. Scale (latent /= scaling_factor), then optional shift.
     x_ = latent.clone();
     if (cfg_.scaling_factor != 1.0f) {
         bt::scale_inplace(x_, 1.0f / cfg_.scaling_factor);
+    }
+    if (cfg_.shift_factor != 0.0f) {
+        bt::add_scalar_inplace(x_, cfg_.shift_factor);
     }
 
     // 1b. post_quant_conv: 1x1 conv (in_channels -> in_channels). Applied by

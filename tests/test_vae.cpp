@@ -239,6 +239,23 @@ int main() {
         bt::sync_all();
         vals2 = bdtest::bd_download(out);
         CHECK(vals1 == vals2);
+
+        // shift_factor: default is 0 (no shift). With a non-zero shift the
+        // latent is offset before the decoder proper, so the decoded image
+        // must differ from the no-shift run.
+        CHECK(cfg.shift_factor == 0.0f);
+        vae::DecoderConfig cfg_shift = cfg;
+        cfg_shift.shift_factor = 0.5f;
+        vae::Decoder dec_shift(cfg_shift);
+        dec_shift.load_weights(file, "decoder.");
+        bt::Tensor out_shift;
+        dec_shift.decode(latent, H_lat, W_lat, out_shift);
+        bt::sync_all();
+        std::vector<float> vals_shift = bdtest::bd_download(out_shift);
+        int shift_nonfinite = 0;
+        for (float v : vals_shift) if (!bdtest::bd_finite(v)) ++shift_nonfinite;
+        CHECK(shift_nonfinite == 0);
+        CHECK(vals_shift != vals1);
     }
 
     std::error_code ec;

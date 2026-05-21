@@ -38,6 +38,10 @@ struct DecoderConfig {
     // SD applies `latent = latent / scaling_factor` before decode. Set to
     // 1.0f to disable (e.g. for unit tests with synthetic data).
     float scaling_factor = 0.18215f;
+    // Some VAEs (e.g. Flux) shift the latent after the scaling division:
+    //   latent = latent / scaling_factor + shift_factor
+    // SD1.5's VAE uses 0.0 (no shift).
+    float shift_factor = 0.0f;
     float eps            = 1e-6f;
     int num_attention_heads = 1;   // SD VAE mid-block is single-head.
 };

@@ -1,6 +1,7 @@
 #include "brodiffusion/clip.h"
 #include "brotensor/safetensors.h"
 #include "brodiffusion/detail/compute.h"
+#include "brodiffusion/detail/device.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -106,6 +107,16 @@ void TextEncoder::load_weights(const st::File& f, const std::string& prefix) {
     upload_compute_checked(need(f, prefix + "final_layer_norm.bias"),
                         D, 1, final_beta_,  "final_ln.bias");
 
+    // Optional projection. CLIPTextModelWithProjection ships a
+    // {prefix}text_projection.weight of shape (D, D) (diffusers (out, in)
+    // row-major). Plain CLIPTextModel — which is what Flux uses — omits it,
+    // in which case the pooled output is the raw EOS hidden state.
+    const auto* tp = f.find(prefix + "text_projection.weight");
+    has_text_projection_ = (tp != nullptr);
+    if (has_text_projection_) {
+        upload_compute_checked(*tp, D, D, text_projection_, "text_projection.weight");
+    }
+
     // Position-id buffer is fixed [0, 1, ..., P-1]. Upload once.
     std::vector<int32_t> positions(static_cast<std::size_t>(P));
     for (int i = 0; i < P; ++i) positions[static_cast<std::size_t>(i)] = i;
@@ -114,7 +125,8 @@ void TextEncoder::load_weights(const st::File& f, const std::string& prefix) {
 
 // ─── forward ───────────────────────────────────────────────────────────────
 
-void TextEncoder::forward(const int32_t* ids, bt::Tensor& out) {
+void TextEncoder::forward(const int32_t* ids, bt::Tensor& out,
+                          bt::Tensor* pooled) {
     if (!ids) fail("forward: ids pointer is null");
     if (token_embed_.size() == 0) fail("forward: weights not loaded");
     if (positions_dev_.empty()) fail("forward: position buffer not initialised");
@@ -167,6 +179,28 @@ void TextEncoder::forward(const int32_t* ids, bt::Tensor& out) {
 
     detail::layernorm_batched(
         x_, final_gamma_, final_beta_, out, cfg_.layer_norm_eps);
+
+    if (pooled != nullptr) {
+        // First occurrence of the EOS token marks end-of-text.
+        const int D = cfg_.hidden_dim;
+        int eos_pos = L - 1;
+        for (int i = 0; i < L; ++i) {
+            if (ids[i] == cfg_.eos_token_id) { eos_pos = i; break; }
+        }
+        if (has_text_projection_) {
+            // pooled = eos_row @ text_projection. Copy the EOS row out into a
+            // (1, D) scratch, then run the bias-free batched linear.
+            detail::resize_like(pooled_eos_, 1, D, compute_dtype(), out.device);
+            bt::copy_d2d(out, /*src_off=*/eos_pos * D,
+                         pooled_eos_, /*dst_off=*/0, /*count=*/D);
+            detail::linear_batched(text_projection_, /*bias=*/nullptr,
+                                   pooled_eos_, *pooled);
+        } else {
+            detail::resize_like(*pooled, 1, D, compute_dtype(), out.device);
+            bt::copy_d2d(out, /*src_off=*/eos_pos * D,
+                         *pooled, /*dst_off=*/0, /*count=*/D);
+        }
+    }
 }
 
 // ─── LoRA merge ────────────────────────────────────────────────────────────

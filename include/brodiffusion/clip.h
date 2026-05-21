@@ -38,6 +38,10 @@ struct TextEncoderConfig {
     int   num_layers       = 12;
     int   intermediate_dim = 3072;     // FFN inner width
     float layer_norm_eps   = 1e-5f;
+    // Token id whose first occurrence marks end-of-text. CLIP ViT-L/14: 49407.
+    // The pooled output (when requested) is the final hidden state at this
+    // token's first position in the sequence.
+    int eos_token_id = 49407;
 };
 
 class TextEncoder {
@@ -79,7 +83,15 @@ public:
     //   out: (L, hidden_dim) Tensor at the compute dtype, resized as needed.
     // brotensor::init() must have been called once before any forward.
     // The caller is responsible for sync_all() before reading `out` to host.
-    void forward(const int32_t* ids, brotensor::Tensor& out);
+    //
+    // If `pooled` is non-null it is filled with the (1, hidden_dim) pooled
+    // vector: the final hidden state at the first eos_token_id position in
+    // `ids`. When the checkpoint contains a `text_projection.weight`, the
+    // pooled vector is additionally projected through it (CLIPTextModelWith-
+    // Projection behavior); otherwise it is the raw EOS hidden state
+    // (CLIPTextModel behavior, which is what Flux uses).
+    void forward(const int32_t* ids, brotensor::Tensor& out,
+                 brotensor::Tensor* pooled = nullptr);
 
     const TextEncoderConfig& config() const { return cfg_; }
 
@@ -109,6 +121,8 @@ private:
     brotensor::Tensor position_embed_;  // (P, D)
     std::vector<Layer>   layers_;
     brotensor::Tensor final_gamma_, final_beta_;
+    brotensor::Tensor text_projection_;   // (D, D); empty when absent
+    bool                 has_text_projection_ = false;
 
     // Per-call scratch (kept alive across calls to avoid realloc).
     // Device-resident INT32 token-id / position-id buffers.
@@ -119,6 +133,7 @@ private:
     brotensor::Tensor ln_out_;
     brotensor::Tensor proj_out_;
     brotensor::Tensor ffn_mid_, ffn_act_, ffn_out_;
+    brotensor::Tensor pooled_eos_;   // (1, D) EOS-row scratch for projection
 };
 
 }  // namespace brodiffusion::clip

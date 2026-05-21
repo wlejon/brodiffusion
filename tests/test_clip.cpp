@@ -189,6 +189,31 @@ int main() {
         bt::sync_all();
         out_vals2 = bdtest::bd_download(out);
         CHECK(out_vals1 == out_vals2);
+
+        // Pooled output: no text_projection.weight in this fixture, so the
+        // pooled vector is the raw final hidden state at the EOS position.
+        // ids = {1,2,3,0}; with eos_token_id pointing at id 3 (index 2) we
+        // get a deterministic (1, D) finite vector matching out row 2.
+        clip::TextEncoderConfig cfg_pool = cfg;
+        cfg_pool.eos_token_id = 3;
+        clip::TextEncoder enc_pool(cfg_pool);
+        enc_pool.load_weights(file, "text_model.");
+        bt::Tensor out_pool, pooled;
+        enc_pool.forward(ids.data(), out_pool, &pooled);
+        bt::sync_all();
+        CHECK(pooled.rows == 1);
+        CHECK(pooled.cols == D);
+        CHECK(pooled.dtype == brodiffusion::compute_dtype());
+        std::vector<float> pooled_vals = bdtest::bd_download(pooled);
+        int pooled_nonfinite = 0;
+        for (float v : pooled_vals) if (!bdtest::bd_finite(v)) ++pooled_nonfinite;
+        CHECK(pooled_nonfinite == 0);
+        // Pooled vector must equal row 2 (EOS index) of the hidden states.
+        std::vector<float> hidden = bdtest::bd_download(out_pool);
+        for (int j = 0; j < D; ++j) {
+            CHECK(pooled_vals[static_cast<std::size_t>(j)] ==
+                  hidden[static_cast<std::size_t>(2 * D + j)]);
+        }
     }
 
     std::error_code ec;
