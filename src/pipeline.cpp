@@ -16,6 +16,7 @@
 #include "brodiffusion/vae.h"
 #include "brodiffusion/detail/compute.h"
 #include "brodiffusion/detail/safetensors_dir.h"
+#include "brodiffusion/detail/torch_rng.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -347,13 +348,36 @@ PipelineState Pipeline::prime(std::string_view prompt,
     PipelineState state;
     state.H_lat = H_lat;
     state.W_lat = W_lat;
+    // Seed the RNG even when init_noise is supplied: LCM resamples per-step
+    // noise from this same stream, so it must stay deterministic regardless.
     state.rng.seed(opts.seed);
-    std::normal_distribution<float> nrm(0.0f, 1.0f);
     const float sigma = std::visit(
         [](const auto& s) { return s.init_noise_sigma(); }, scheduler_);
     std::vector<float> noise(n_lat);
-    for (int i = 0; i < n_lat; ++i) {
-        noise[i] = sigma * nrm(state.rng);
+    if (!opts.init_noise.empty()) {
+        // Caller-supplied initial noise (raw N(0,1)); used for exact
+        // cross-implementation comparison. Still scaled by init_noise_sigma.
+        if (static_cast<int>(opts.init_noise.size()) != n_lat) {
+            fail("prime: init_noise has " +
+                 std::to_string(opts.init_noise.size()) +
+                 " values, expected " + std::to_string(n_lat));
+        }
+        for (int i = 0; i < n_lat; ++i) {
+            noise[i] = sigma * opts.init_noise[i];
+        }
+    } else if (opts.noise_source == NoiseSource::Torch) {
+        // torch.randn-compatible noise: makes `seed` reproduce a PyTorch
+        // reference run's starting latent (see detail/torch_rng.h).
+        const std::vector<float> r =
+            detail::torch_randn_f32(opts.seed, static_cast<std::size_t>(n_lat));
+        for (int i = 0; i < n_lat; ++i) {
+            noise[i] = sigma * r[i];
+        }
+    } else {
+        std::normal_distribution<float> nrm(0.0f, 1.0f);
+        for (int i = 0; i < n_lat; ++i) {
+            noise[i] = sigma * nrm(state.rng);
+        }
     }
     state.latent = detail::upload_host(noise.data(), 1, n_lat);
 

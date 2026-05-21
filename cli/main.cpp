@@ -39,6 +39,8 @@ static int usage() {
         "                       [--negative <text>] [--steps N] [--cfg F]\n"
         "                       [--width N] [--height N] [--seed N]\n"
         "                       [--scheduler ddim|lcm]\n"
+        "                       [--noise internal|torch]\n"
+        "                       [--latent-in <f32>] [--latent-out <f32>]\n"
         "                       [--lora <path>[:<scale>]]... [--lcm-lora <path>]\n"
         "                       [--quantize-unet]\n"
         "  brodiffusion bench   --text <st> --unet <st> --vae <st>\n"
@@ -66,6 +68,15 @@ static int usage() {
         "  --lcm-lora <path>  sugar for '--scheduler lcm --steps 4 --cfg 1.0\n"
         "                   --lora <path>' against a vanilla SD1.5 UNet (no\n"
         "                   cond_proj; LCM-LoRA on top of stock SD1.5).\n"
+        "\n"
+        "  --noise torch    generate the initial latent with a torch.randn-\n"
+        "                   compatible RNG, so --seed N reproduces a PyTorch\n"
+        "                   reference run seeded the same way (default: internal).\n"
+        "  --latent-in <f32>   load the initial latent noise from a raw\n"
+        "                   little-endian float32 file (NCHW flat, 4*H/8*W/8\n"
+        "                   values) instead of any RNG.\n"
+        "  --latent-out <f32>  dump the final denoised latent (pre-VAE) to a\n"
+        "                   raw float32 file, for cross-implementation diffing.\n"
         "\n"
         "  brodiffusion t5  --weights <st> --tokenizer <json> --prompt <text>\n"
         "                   [--max-length N] [--quantize]\n"
@@ -147,6 +158,53 @@ int write_ppm(const char* out_path, const std::vector<float>& img,
     return 0;
 }
 
+// Read a raw little-endian float32 file into a vector, checking the element
+// count. Used by --latent-in to feed an externally-generated initial latent.
+std::vector<float> load_latent_f32(const char* path, int expected_count) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        throw std::runtime_error(std::string("cannot open --latent-in: ") + path);
+    }
+    const std::streamsize bytes = f.tellg();
+    const std::streamsize want  =
+        static_cast<std::streamsize>(expected_count) * 4;
+    if (bytes != want) {
+        throw std::runtime_error(
+            "--latent-in size mismatch: " + std::to_string(bytes) +
+            " bytes, expected " + std::to_string(want) + " (" +
+            std::to_string(expected_count) + " float32)");
+    }
+    std::vector<float> v(static_cast<std::size_t>(expected_count));
+    f.seekg(0);
+    f.read(reinterpret_cast<char*>(v.data()), want);
+    return v;
+}
+
+// Write a tensor to a raw little-endian float32 file. Handles the FP16
+// compute dtype (GPU backend) by upconverting on the way out. Used by
+// --latent-out to dump the final denoised latent for cross-impl comparison.
+void dump_latent_f32(const char* path, const brotensor::Tensor& t) {
+    const std::size_t n = static_cast<std::size_t>(t.rows) * t.cols;
+    std::vector<float> vals;
+    if (t.dtype == brotensor::Dtype::FP16) {
+        std::vector<std::uint16_t> bits(n);
+        t.copy_to_host_fp16(bits.data());
+        brotensor::sync_all();
+        vals.resize(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            vals[i] = brotensor::fp16_bits_to_fp32(bits[i]);
+        }
+    } else {
+        vals = t.to_host_vector();
+    }
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        throw std::runtime_error(std::string("cannot open --latent-out: ") + path);
+    }
+    f.write(reinterpret_cast<const char*>(vals.data()),
+            static_cast<std::streamsize>(vals.size() * sizeof(float)));
+}
+
 // txt2img against a diffusers model directory (--model). Auto-detects SD1.5
 // vs Flux from the loaded config.
 int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
@@ -214,6 +272,9 @@ int run_txt2img(int argc, char** argv) {
     const char* seed_s      = arg_after(argc, argv, "--seed");
     const char* sched_s     = arg_after(argc, argv, "--scheduler");
     const char* lcm_lora    = arg_after(argc, argv, "--lcm-lora");
+    const char* noise_s     = arg_after(argc, argv, "--noise");
+    const char* latent_in   = arg_after(argc, argv, "--latent-in");
+    const char* latent_out  = arg_after(argc, argv, "--latent-out");
 
     bool quantize_unet = false;
     for (int i = 1; i < argc; ++i) {
@@ -261,6 +322,30 @@ int run_txt2img(int argc, char** argv) {
     if (height_s)opts.height = std::atoi(height_s);
     if (seed_s)  opts.seed = static_cast<std::uint64_t>(std::strtoull(seed_s, nullptr, 10));
 
+    // --noise selects the initial-latent RNG. 'torch' makes --seed reproduce a
+    // PyTorch reference run's starting latent (torch.randn under a CPU
+    // Generator), so the two pipelines can be compared with the RNG removed.
+    if (noise_s) {
+        if (std::strcmp(noise_s, "torch") == 0) {
+            opts.noise_source = pl::NoiseSource::Torch;
+        } else if (std::strcmp(noise_s, "internal") == 0) {
+            opts.noise_source = pl::NoiseSource::Internal;
+        } else {
+            std::fprintf(stderr,
+                "txt2img: --noise must be 'internal' or 'torch'\n");
+            return 2;
+        }
+    }
+
+    // --latent-in overrides the RNG entirely with raw N(0,1) noise from a
+    // file (NCHW flat float32) — the strongest form of cross-impl parity.
+    if (latent_in) {
+        const int n_lat = 4 * (opts.height / 8) * (opts.width / 8);
+        opts.init_noise = load_latent_f32(latent_in, n_lat);
+        std::printf("Initial latent noise loaded from %s (%d float32)\n",
+                    latent_in, n_lat);
+    }
+
     brotensor::init();
 
     auto tok = clip::Tokenizer::load(vocab_path, merges_path);
@@ -297,7 +382,19 @@ int run_txt2img(int argc, char** argv) {
                 static_cast<double>(opts.guidance_scale),
                 static_cast<unsigned long long>(opts.seed));
 
-    auto img = pipeline.generate(prompt, opts);  // (3*H*W) NCHW, FP32 in [-1, 1]
+    // (3*H*W) NCHW, FP32 in [-1, 1]. When --latent-out is set, run the
+    // step-wise API (bit-equivalent to generate()) so the final denoised
+    // latent can be dumped before the VAE decode.
+    std::vector<float> img;
+    if (latent_out) {
+        auto state = pipeline.prime(prompt, opts);
+        for (int s = 0; s < state.n_steps; ++s) pipeline.step_once(state, opts);
+        dump_latent_f32(latent_out, state.latent);
+        std::printf("Final latent written to %s\n", latent_out);
+        img = pipeline.decode(state);
+    } else {
+        img = pipeline.generate(prompt, opts);
+    }
     return write_ppm(out_path, img, opts.width, opts.height);
 }
 

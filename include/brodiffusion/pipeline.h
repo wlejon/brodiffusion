@@ -83,6 +83,15 @@ struct PipelineState {
     PipelineState clone() const;
 };
 
+// Source of the initial latent noise.
+//   Internal — brodiffusion's own std::mt19937_64 + std::normal_distribution
+//              stream (the historical default).
+//   Torch    — bit-compatible with torch.randn() filled by a CPU Generator
+//              seeded with `seed`. Lets `--seed N` reproduce a PyTorch
+//              reference run's starting latent exactly, so the two pipelines
+//              can be diffed with the RNG removed as a variable.
+enum class NoiseSource { Internal, Torch };
+
 struct GenerateOptions {
     // Image dimensions in pixels. Latent dims are H/8, W/8. Both must be
     // multiples of 8 and at least 8 (so latent dims are >= 1).
@@ -95,6 +104,20 @@ struct GenerateOptions {
 
     // RNG seed for the initial latent noise.
     std::uint64_t seed = 0;
+
+    // Which RNG produces the initial latent noise from `seed`. Ignored when
+    // init_noise is supplied. See NoiseSource above.
+    NoiseSource noise_source = NoiseSource::Internal;
+
+    // Optional explicit initial latent noise, in raw N(0,1) units (i.e. the
+    // output of randn(), before init_noise_sigma is applied), NCHW flat,
+    // length = C_lat * (height/8) * (width/8). When non-empty, prime() uses
+    // these values instead of seeding the RNG — this lets a caller feed a
+    // noise tensor generated elsewhere (e.g. a PyTorch reference run) so the
+    // two implementations start from a bit-identical latent and any output
+    // difference is attributable to the model, not the RNG. The scheduler's
+    // init_noise_sigma is still applied on top.
+    std::vector<float> init_noise;
 };
 
 class Pipeline {
