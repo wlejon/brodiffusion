@@ -127,6 +127,8 @@ target_sources(brodiffusion PRIVATE
     src/clip_score.cpp
     src/fused.cpp
     src/optim.cpp
+    src/dit/common.cpp
+    src/dit/flux.cpp
 )
 
 # SD1.5-tuned fused GPU kernels. fused.cpp dispatches a GPU-resident tensor to
