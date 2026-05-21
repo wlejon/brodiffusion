@@ -1,6 +1,8 @@
 #include "brodiffusion/pipeline.h"
 #include "brotensor/safetensors.h"
 #include "brodiffusion/tokenizer.h"
+#include "brodiffusion/t5.h"
+#include "brodiffusion/tokenizer_t5.h"
 #include "brodiffusion/version.h"
 
 #include "brotensor/runtime.h"
@@ -8,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -63,6 +66,12 @@ static int usage() {
         "  --lcm-lora <path>  sugar for '--scheduler lcm --steps 4 --cfg 1.0\n"
         "                   --lora <path>' against a vanilla SD1.5 UNet (no\n"
         "                   cond_proj; LCM-LoRA on top of stock SD1.5).\n"
+        "\n"
+        "  brodiffusion t5  --weights <st> --tokenizer <json> --prompt <text>\n"
+        "                   [--max-length N] [--quantize]\n"
+        "                   load the T5-XXL text encoder, encode <text>, run a\n"
+        "                   forward pass, and print output stats. --quantize\n"
+        "                   loads it as INT8 (W8A16); --max-length defaults 128.\n"
         "\n"
         "Writes an uncompressed PPM (P6) — a dev convenience for sanity-checking\n"
         "the generation pipeline. Proper PNG/JPEG encoding lives outside this\n"
@@ -292,6 +301,91 @@ int run_txt2img(int argc, char** argv) {
     return write_ppm(out_path, img, opts.width, opts.height);
 }
 
+// Load the T5-XXL encoder, encode a prompt, run one forward, print stats.
+// Doubles as the load/works check for the t5-xxl weight download and the
+// manual FP16-vs-INT8 comparison driver (run once with and once without
+// --quantize and diff the printed mean / L2 norm).
+int run_t5(int argc, char** argv) {
+    const char* weights_path = arg_after(argc, argv, "--weights");
+    const char* tok_path     = arg_after(argc, argv, "--tokenizer");
+    const char* prompt       = arg_after(argc, argv, "--prompt");
+    const char* maxlen_s     = arg_after(argc, argv, "--max-length");
+    bool quantize = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--quantize") == 0) quantize = true;
+    }
+    if (!weights_path || !tok_path || !prompt) {
+        std::fprintf(stderr,
+            "t5: --weights, --tokenizer, --prompt are required\n");
+        return 2;
+    }
+    const int max_length = maxlen_s ? std::atoi(maxlen_s) : 128;
+
+    brotensor::init();
+
+    auto tok = brodiffusion::t5::Tokenizer::load(tok_path);
+    std::vector<std::int32_t> ids = tok.encode(prompt, max_length);
+
+    brodiffusion::t5::T5Config cfg;
+    cfg.quantize_weights = quantize;
+    brodiffusion::t5::TextEncoder enc(cfg);
+
+    std::printf("Loading T5-XXL weights: %s%s\n", weights_path,
+                quantize ? "  (INT8 W8A16)" : "");
+    auto file = st::File::open(weights_path);
+
+    using clk = std::chrono::high_resolution_clock;
+    auto t0 = clk::now();
+    enc.load_weights(file, "");
+    brotensor::sync_all();
+    auto t1 = clk::now();
+    std::printf("Loaded (%s) in %.2f s\n",
+                quantize ? "quantized to INT8" : "FP16",
+                std::chrono::duration<double>(t1 - t0).count());
+
+    brotensor::Tensor out;
+    auto t2 = clk::now();
+    enc.forward(ids.data(), static_cast<int>(ids.size()), out);
+    brotensor::sync_all();
+    auto t3 = clk::now();
+
+    const int L = out.rows;
+    const int D = out.cols;
+    std::vector<float> vals;
+    if (out.dtype == brotensor::Dtype::FP16) {
+        std::vector<std::uint16_t> bits(static_cast<std::size_t>(L) * D);
+        out.copy_to_host_fp16(bits.data());
+        brotensor::sync_all();
+        vals.resize(bits.size());
+        for (std::size_t i = 0; i < bits.size(); ++i) {
+            vals[i] = brotensor::fp16_bits_to_fp32(bits[i]);
+        }
+    } else {
+        vals = out.to_host_vector();
+    }
+
+    int nonfinite = 0;
+    double sum = 0.0, sumsq = 0.0;
+    for (float v : vals) {
+        if (!std::isfinite(v)) { ++nonfinite; continue; }
+        sum += v;
+        sumsq += static_cast<double>(v) * static_cast<double>(v);
+    }
+    const double mean = vals.empty() ? 0.0 : sum / static_cast<double>(vals.size());
+    const double l2   = std::sqrt(sumsq);
+    std::printf("Output: (%d, %d)  tokens=%d  forward=%.1f ms\n",
+                L, D, static_cast<int>(ids.size()),
+                std::chrono::duration<double, std::milli>(t3 - t2).count());
+    std::printf("  non-finite : %d\n", nonfinite);
+    std::printf("  mean       : %.6f\n", mean);
+    std::printf("  L2 norm    : %.4f\n", l2);
+    if (vals.size() >= 5) {
+        std::printf("  first 5    : %.5f %.5f %.5f %.5f %.5f\n",
+                    vals[0], vals[1], vals[2], vals[3], vals[4]);
+    }
+    return nonfinite == 0 ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -305,6 +399,14 @@ int main(int argc, char** argv) {
             return run_txt2img(argc, argv);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "txt2img: %s\n", e.what());
+            return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "t5") == 0) {
+        try {
+            return run_t5(argc, argv);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "t5: %s\n", e.what());
             return 1;
         }
     }

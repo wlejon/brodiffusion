@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -183,6 +184,72 @@ void TextEncoder::load_weights(const std::vector<const st::File*>& shards,
 
     // Invalidate any cached position bias — weights just changed.
     pos_bias_L_ = -1;
+
+    // INT8 (W8A16) quantisation. GPU-only: the W8A16 ops have no CPU path,
+    // so on the CPU backend the flag is ignored and every QWeight stays
+    // inactive (the FP32 forward path is used). On a GPU backend each
+    // per-block attention / FFN matrix is converted in place; the token
+    // embedding, RMSNorm gains, and position-bias table stay FP16.
+    if (cfg_.quantize_weights) {
+        if (token_embed_.device == bt::Device::CPU) {
+            std::fprintf(stderr,
+                "brodiffusion: INT8 weight quantization is GPU-only; "
+                "ignoring T5Config::quantize_weights on the CPU backend.\n");
+        } else {
+            for (Block& B : blocks_) {
+                quantize_weight_inplace_(B.Wq,   B.Wq_q);
+                quantize_weight_inplace_(B.Wk,   B.Wk_q);
+                quantize_weight_inplace_(B.Wv,   B.Wv_q);
+                quantize_weight_inplace_(B.Wo,   B.Wo_q);
+                quantize_weight_inplace_(B.wi_0, B.wi_0_q);
+                quantize_weight_inplace_(B.wi_1, B.wi_1_q);
+                quantize_weight_inplace_(B.wo,   B.wo_q);
+            }
+        }
+    }
+}
+
+// ─── INT8 (W8A16) quantisation ─────────────────────────────────────────────
+
+void TextEncoder::quantize_weight_inplace_(bt::Tensor& W_fp16, QWeight& q) {
+    if (W_fp16.size() == 0) return;             // nothing to quantise
+    if (W_fp16.dtype != bt::Dtype::FP16) {
+        fail("quantize_weight_inplace_: weight is not FP16");
+    }
+    const int out = W_fp16.rows;
+    const int in  = W_fp16.cols;
+
+    std::vector<std::uint16_t> host_fp16(
+        static_cast<std::size_t>(out) * static_cast<std::size_t>(in));
+    W_fp16.copy_to_host_fp16(host_fp16.data());
+
+    std::vector<std::int8_t> host_int8(host_fp16.size());
+    std::vector<float>       host_scales(static_cast<std::size_t>(out));
+    bt::quantize_int8_per_row_host(host_fp16.data(), out, in,
+                                   host_int8.data(), host_scales.data());
+
+    // brotensor has no from_host path for INT8 — stage the quantised bytes
+    // on the host, then migrate to W_fp16's device.
+    bt::Tensor cpu_int8 =
+        bt::Tensor::empty_on(bt::Device::CPU, out, in, bt::Dtype::INT8);
+    std::memcpy(cpu_int8.host_raw_mut(), host_int8.data(),
+                static_cast<std::size_t>(out) * static_cast<std::size_t>(in));
+    q.W_int8 = cpu_int8.to(W_fp16.device);
+    q.scales = bt::Tensor::from_host_on(W_fp16.device,
+                                        host_scales.data(), out, 1);
+
+    // Free the original FP16 storage.
+    W_fp16 = bt::Tensor();
+}
+
+void TextEncoder::ffn_linear_(const bt::Tensor& W, const QWeight& q,
+                              const bt::Tensor& X, bt::Tensor& Y) {
+    if (q.active()) {
+        bt::linear_forward_batched_int8w_fp16(q.W_int8, q.scales,
+                                              /*bias=*/nullptr, X, Y);
+    } else {
+        detail::linear_batched(W, /*bias=*/nullptr, X, Y);
+    }
 }
 
 // ─── relative-position bias ────────────────────────────────────────────────
@@ -224,6 +291,17 @@ void TextEncoder::forward(const int32_t* ids, int L, bt::Tensor& out) {
 
     const int H = cfg_.num_heads;
 
+    // T5-XXL's residual stream grows monotonically across its 24 pre-norm
+    // blocks and overflows FP16 (±65504) after roughly a dozen layers — the
+    // well-known "T5 fp16" problem. Clamp the residual back into range after
+    // each sub-layer (HuggingFace does exactly this). It is sufficient
+    // because every sub-layer input is RMS-normed, hence scale-invariant: a
+    // clamped residual still feeds an O(1) normalised input to the next
+    // block. The CPU/FP32 path has no overflow and needs no clamp.
+    const bool clamp_residual =
+        (brodiffusion::compute_dtype() == bt::Dtype::FP16);
+    constexpr float kFp16Clamp = 64504.0f;   // finfo(fp16).max - 1000
+
     rebuild_position_bias_(L);
 
     // Embedding: x = embedding_lookup(shared, ids). No position embedding,
@@ -237,19 +315,30 @@ void TextEncoder::forward(const int32_t* ids, int L, bt::Tensor& out) {
     for (auto& B : blocks_) {
         // ── self-attention sub-layer ──────────────────────────────────────
         bt::rms_norm_forward(x_, B.ln0, cfg_.layer_norm_eps, n_);
-        bt::self_attention_bias_forward(
-            n_, B.Wq, B.Wk, B.Wv, B.Wo,
-            /*d_mask=*/nullptr, &pos_bias_, H, /*scale=*/1.0f, attn_);
+        if (B.Wq_q.active()) {
+            bt::self_attention_bias_int8w_fp16(
+                n_, B.Wq_q.W_int8, B.Wq_q.scales,
+                B.Wk_q.W_int8, B.Wk_q.scales,
+                B.Wv_q.W_int8, B.Wv_q.scales,
+                B.Wo_q.W_int8, B.Wo_q.scales,
+                /*d_mask=*/nullptr, &pos_bias_, H, /*scale=*/1.0f, attn_);
+        } else {
+            bt::self_attention_bias_forward(
+                n_, B.Wq, B.Wk, B.Wv, B.Wo,
+                /*d_mask=*/nullptr, &pos_bias_, H, /*scale=*/1.0f, attn_);
+        }
         bt::add_inplace(x_, attn_);
+        if (clamp_residual) bt::clamp(x_, -kFp16Clamp, kFp16Clamp);
 
         // ── FFN sub-layer (gated-gelu) ────────────────────────────────────
         bt::rms_norm_forward(x_, B.ln1, cfg_.layer_norm_eps, n_);
-        detail::linear_batched(B.wi_0, /*bias=*/nullptr, n_, g_);
+        ffn_linear_(B.wi_0, B.wi_0_q, n_, g_);
         bt::gelu_forward(g_, g_);                       // tanh-approx GELU
-        detail::linear_batched(B.wi_1, /*bias=*/nullptr, n_, l_);
+        ffn_linear_(B.wi_1, B.wi_1_q, n_, l_);
         bt::mul_inplace(g_, l_);                        // h = gelu(wi_0 n) * wi_1 n
-        detail::linear_batched(B.wo, /*bias=*/nullptr, g_, ffn_out_);
+        ffn_linear_(B.wo, B.wo_q, g_, ffn_out_);
         bt::add_inplace(x_, ffn_out_);
+        if (clamp_residual) bt::clamp(x_, -kFp16Clamp, kFp16Clamp);
     }
 
     bt::rms_norm_forward(x_, final_ln_, cfg_.layer_norm_eps, out);

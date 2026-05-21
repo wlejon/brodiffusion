@@ -20,6 +20,7 @@ brodiffusion_add_test(brodiffusion_test_flow_match_scheduler test_flow_match_sch
 brodiffusion_add_test(brodiffusion_test_lora           test_lora.cpp)
 brodiffusion_add_test(brodiffusion_test_pipeline       test_pipeline.cpp)
 brodiffusion_add_test(brodiffusion_test_quantize_unet  test_quantize_unet.cpp)
+brodiffusion_add_test(brodiffusion_test_quantize_t5    test_quantize_t5.cpp)
 brodiffusion_add_test(brodiffusion_test_pipeline_state test_pipeline_state.cpp)
 brodiffusion_add_test(brodiffusion_test_fused_parity   test_fused_parity.cpp)
 brodiffusion_add_test(brodiffusion_test_device_parity  test_device_parity.cpp)

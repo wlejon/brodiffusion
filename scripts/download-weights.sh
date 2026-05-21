@@ -32,6 +32,9 @@
 #                    `*.index.json` first, extracts the shard filenames from it,
 #                    and downloads each shard. NOTE: these weights are large
 #                    (~24 GB transformer + ~10 GB T5).
+#   t5-xxl           Just the T5-XXL text encoder (text_encoder_2) + tokenizer
+#                    from the same Flux.1-schnell repo. ~9.5 GB. The standalone
+#                    target for working on the T5 encoder.
 #
 # Auth: the SD1.5 mirror is public and needs no token. For rate-limited repos,
 # export HF_TOKEN=hf_... and it will be sent as a bearer token.
@@ -53,12 +56,12 @@ FORCE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        sd15|lcm-dreamshaper|clip-vit-l-14|flux-schnell) MODEL="$1"; shift ;;
+        sd15|lcm-dreamshaper|clip-vit-l-14|flux-schnell|t5-xxl) MODEL="$1"; shift ;;
         --repo)    REPO="${2:?--repo needs a value}"; shift 2 ;;
         --out-dir) OUT_DIR="${2:?--out-dir needs a value}"; shift 2 ;;
         --force)   FORCE=1; shift ;;
         -h|--help)
-            sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) echo "error: unknown argument '$1' (try --help)" >&2; exit 2 ;;
     esac
@@ -99,6 +102,28 @@ case "$MODEL" in
         [ -n "$OUT_DIR" ] || OUT_DIR="$REPO_ROOT/weights/clip-vit-l-14"
         FILES=( "model.safetensors" )
         ;;
+    t5-xxl)
+        # Just the T5-XXL text encoder + its tokenizer — the standalone target
+        # for working on the T5 encoder without the ~24 GB Flux transformer.
+        # ~9.5 GB (FP16).
+        #
+        # The Flux.1-schnell repo (which ships T5-XXL as `text_encoder_2`) is
+        # now gated, so the weights come from comfyanonymous/flux_text_encoders
+        # instead — the standard community T5-XXL for Flux: a single,
+        # un-sharded `t5xxl_fp16.safetensors` whose tensor names
+        # (`shared.weight`, `encoder.block.*`, ...) match what t5::TextEncoder
+        # expects. The tokenizer.json is the plain T5 SentencePiece Unigram
+        # model (identical across t5 / t5-v1.1), pulled from google-t5/t5-base;
+        # config.json is informational (T5Config defaults already match
+        # t5-v1_1-xxl). FILES entries may carry a `repo|path` override.
+        [ -n "$REPO" ]    || REPO="comfyanonymous/flux_text_encoders"
+        [ -n "$OUT_DIR" ] || OUT_DIR="$REPO_ROOT/weights/t5-xxl"
+        FILES=(
+            "t5xxl_fp16.safetensors"
+            "google-t5/t5-base|tokenizer.json"
+            "google/t5-v1_1-xxl|config.json"
+        )
+        ;;
     flux-schnell)
         # Flux.1-schnell, diffusers format. The transformer + the T5-XXL text
         # encoder ship sharded — only the `.index.json` weight-maps are listed
@@ -134,10 +159,11 @@ echo "Target:  $OUT_DIR"
 echo
 
 # --- download helper --------------------------------------------------------
-# fetch <relative-path> <dest-file> -> 0 on success, 1 on a 404, exits on error
+# fetch <relative-path> <dest-file> [repo] -> 0 on success, 1 on a 404,
+# exits on error. `repo` defaults to the model's $REPO.
 fetch() {
-    local rel="$1" dest="$2"
-    local url="https://huggingface.co/$REPO/resolve/main/$rel"
+    local rel="$1" dest="$2" repo="${3:-$REPO}"
+    local url="https://huggingface.co/$repo/resolve/main/$rel"
     local auth=()
     [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
 
@@ -160,21 +186,29 @@ fetch() {
     return 2
 }
 
-for f in "${FILES[@]}"; do
+# A FILES entry may be a bare path (fetched from $REPO) or `repo|path` to
+# pull that one file from a different repo — used by t5-xxl, whose weights,
+# tokenizer, and config live in three separate public repos.
+for entry in "${FILES[@]}"; do
+    f="$entry"
+    ent_repo="$REPO"
+    case "$entry" in
+        *"|"*) ent_repo="${entry%%|*}"; f="${entry#*|}" ;;
+    esac
     dest="$OUT_DIR/$f"
     if [ "$FORCE" -eq 0 ] && [ -s "$dest" ]; then
         echo "==> $f  (cached, skipping)"
         continue
     fi
-    echo "==> $f"
-    if fetch "$f" "$dest"; then
+    echo "==> $f${ent_repo:+  [$ent_repo]}"
+    if fetch "$f" "$dest" "$ent_repo"; then
         :
     else
         rc=$?
         if [ "$rc" -eq 1 ] && [[ "$f" == *.fp16.safetensors ]]; then
             alt="${f/.fp16.safetensors/.safetensors}"
             echo "    fp16 variant not found, trying fallback: $alt"
-            if ! fetch "$alt" "$OUT_DIR/$alt"; then
+            if ! fetch "$alt" "$OUT_DIR/$alt" "$ent_repo"; then
                 echo "error: download failed for both $f and $alt" >&2
                 exit 1
             fi

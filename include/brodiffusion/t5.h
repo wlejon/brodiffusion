@@ -47,6 +47,14 @@ struct T5Config {
     int   relative_attention_num_buckets  = 32;
     int   relative_attention_max_distance = 128;
     float layer_norm_eps = 1e-6f;
+
+    // When true, load_weights() converts the per-block attention and FFN
+    // weight matrices (Wq/Wk/Wv/Wo, wi_0/wi_1/wo) to INT8 weight-only
+    // quantisation (W8A16) — halving their VRAM footprint. The token
+    // embedding, the RMSNorm gains, and the position-bias table stay at the
+    // compute dtype. INT8 is GPU-only; on the CPU backend the flag is
+    // ignored with a warning and every weight stays FP32.
+    bool quantize_weights = false;
 };
 
 class TextEncoder {  // T5 encoder
@@ -100,17 +108,42 @@ public:
     const T5Config& config() const { return cfg_; }
 
 private:
+    // Paired INT8 weight + per-output-row FP32 scales. Populated by
+    // load_weights() when quantize_weights is true; .W_int8.size() == 0
+    // means this weight is still at the FP16 compute dtype.
+    struct QWeight {
+        brotensor::Tensor W_int8;   // INT8 (out, in)
+        brotensor::Tensor scales;   // FP32 (out, 1)
+        bool active() const { return W_int8.size() > 0; }
+    };
+
     struct Block {
         brotensor::Tensor ln0;            // (d_model, 1)
         brotensor::Tensor Wq, Wk, Wv, Wo; // each (d_model, d_model)
         brotensor::Tensor ln1;            // (d_model, 1)
         brotensor::Tensor wi_0, wi_1;     // each (d_ff, d_model)
         brotensor::Tensor wo;             // (d_model, d_ff)
+        // INT8 (W8A16) counterparts — populated by load_weights when
+        // T5Config::quantize_weights is set on a GPU backend. When active,
+        // the matching FP16 tensor above is freed.
+        QWeight Wq_q, Wk_q, Wv_q, Wo_q;
+        QWeight wi_0_q, wi_1_q, wo_q;
     };
 
     // Rebuild the (num_heads*L, L) FP32 relative-position bias for length L.
     // Cached: only rebuilt when L changes.
     void rebuild_position_bias_(int L);
+
+    // Quantise one FP16 weight to INT8 (W8A16): per-output-row symmetric
+    // scales (brotensor::quantize_int8_per_row_host), upload the INT8 weight
+    // + scales to W_fp16's device into `q`, then free the FP16 storage.
+    // No-op when W_fp16 is empty. Requires W_fp16 to be FP16 (GPU backend).
+    void quantize_weight_inplace_(brotensor::Tensor& W_fp16, QWeight& q);
+
+    // One FFN linear: the INT8 W8A16 path when `q` is active, else the plain
+    // compute-dtype batched linear on `W`. Bias-free (T5 has no linear bias).
+    void ffn_linear_(const brotensor::Tensor& W, const QWeight& q,
+                     const brotensor::Tensor& X, brotensor::Tensor& Y);
 
     T5Config cfg_;
 

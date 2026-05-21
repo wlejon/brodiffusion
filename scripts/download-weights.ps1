@@ -41,7 +41,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet("sd15", "lcm-dreamshaper", "clip-vit-l-14", "flux-schnell")]
+    [ValidateSet("sd15", "lcm-dreamshaper", "clip-vit-l-14", "flux-schnell", "t5-xxl")]
     [string]$Model  = "sd15",
     [string]$Repo   = "",
     [string]$OutDir = ""
@@ -95,6 +95,28 @@ switch ($Model) {
             "vae/diffusion_pytorch_model.fp16.safetensors"  = "vae/diffusion_pytorch_model.safetensors"
         }
     }
+    "t5-xxl" {
+        # Just the T5-XXL text encoder + its tokenizer — the standalone target
+        # for working on the T5 encoder without the ~24 GB Flux transformer.
+        # ~9.5 GB (FP16).
+        #
+        # The Flux.1-schnell repo (which ships T5-XXL as `text_encoder_2`) is
+        # now gated, so the weights come from comfyanonymous/flux_text_encoders
+        # instead — the standard community T5-XXL for Flux: a single,
+        # un-sharded `t5xxl_fp16.safetensors` whose tensor names match what
+        # t5::TextEncoder expects. The tokenizer.json is the plain T5
+        # SentencePiece Unigram model (identical across t5 / t5-v1.1), from
+        # google-t5/t5-base; config.json is informational. A `$files` entry
+        # may carry a `repo|path` override to pull from a different repo.
+        if (-not $Repo)   { $Repo   = "comfyanonymous/flux_text_encoders" }
+        if (-not $OutDir) { $OutDir = "$PSScriptRoot/../weights/t5-xxl" }
+        $files = @(
+            "t5xxl_fp16.safetensors",
+            "google-t5/t5-base|tokenizer.json",
+            "google/t5-v1_1-xxl|config.json"
+        )
+        $fallback = @{}
+    }
     "flux-schnell" {
         # Flux.1-schnell, diffusers format. The transformer + the T5-XXL text
         # encoder ship sharded — only the `.index.json` weight-maps are listed
@@ -133,14 +155,22 @@ Write-Host "Model:   $Model"
 Write-Host "Repo:    $Repo"
 Write-Host "Target:  $OutDir"
 
-foreach ($f in $files) {
-    Write-Host "==> hf download $Repo $f"
-    & hf download $Repo $f --local-dir $OutDir
+# A $files entry may be a bare path (fetched from $Repo) or `repo|path` to
+# pull that one file from a different repo — used by t5-xxl, whose weights,
+# tokenizer, and config live in three separate public repos.
+foreach ($entry in $files) {
+    $entRepo = $Repo
+    $f       = $entry
+    if ($entry -match '\|') {
+        $entRepo, $f = $entry -split '\|', 2
+    }
+    Write-Host "==> hf download $entRepo $f"
+    & hf download $entRepo $f --local-dir $OutDir
     if ($LASTEXITCODE -ne 0) {
         if ($fallback.ContainsKey($f)) {
             $alt = $fallback[$f]
             Write-Host "    primary failed, trying fallback: $alt"
-            & hf download $Repo $alt --local-dir $OutDir
+            & hf download $entRepo $alt --local-dir $OutDir
             if ($LASTEXITCODE -ne 0) {
                 throw "hf download failed for both $f and $alt (exit $LASTEXITCODE)"
             }
