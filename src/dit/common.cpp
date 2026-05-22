@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -211,6 +212,93 @@ void joint_attention(const bt::Tensor& Q, const bt::Tensor& K,
     bt::rope_apply(K, cos, sin, head_dim, num_heads, Kr);
     bt::flash_attention_forward(Qr, Kr, V, /*d_mask=*/nullptr, num_heads,
                                 /*causal=*/false, out);
+}
+
+void joint_attention_traced(const bt::Tensor& Q, const bt::Tensor& K,
+                            const bt::Tensor& V, const bt::Tensor& cos,
+                            const bt::Tensor& sin, int head_dim, int num_heads,
+                            bt::Tensor& out, bt::Tensor& attn_avg,
+                            bt::Tensor& Qr, bt::Tensor& Kr) {
+    // RoPE on Q and K — identical to the fused path.
+    bt::rope_apply(Q, cos, sin, head_dim, num_heads, Qr);
+    bt::rope_apply(K, cos, sin, head_dim, num_heads, Kr);
+
+    const int D = Q.cols;
+    if (head_dim <= 0 || num_heads <= 0 || D != head_dim * num_heads) {
+        fail("joint_attention_traced: D must equal head_dim * num_heads");
+    }
+    const int L = Q.rows;
+    if (K.rows != L || V.rows != L || K.cols != D || V.cols != D) {
+        fail("joint_attention_traced: Q/K/V must share shape (L, D)");
+    }
+
+    // Materialise the per-head softmax on host in FP32. This is the slow
+    // "experiment path": the fused flash kernel never exposes the softmax, so
+    // trace mode recomputes attention with plain primitives. FP32 accumulation
+    // throughout — matches the fused kernel's internal accumulation dtype.
+    bt::sync_all();
+    const std::vector<float> q = download_fp32(Qr);  // (L, D), RoPE-rotated
+    const std::vector<float> k = download_fp32(Kr);  // (L, D), RoPE-rotated
+    const std::vector<float> v = download_fp32(V);   // (L, D)
+
+    const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+    const std::size_t LD = static_cast<std::size_t>(L) * D;
+    const std::size_t LL = static_cast<std::size_t>(L) * L;
+
+    std::vector<float> o(LD, 0.0f);        // attention output (L, D)
+    std::vector<double> avg(LL, 0.0);      // head-summed softmax map (L, L)
+    std::vector<double> s(static_cast<std::size_t>(L));  // per-row score scratch
+
+    for (int h = 0; h < num_heads; ++h) {
+        const int hd0 = h * head_dim;
+        for (int qi = 0; qi < L; ++qi) {
+            const float* qrow = q.data() +
+                static_cast<std::size_t>(qi) * D + hd0;
+            // S[qi, kk] = scale * <Qr_head[qi], Kr_head[kk]>
+            double smax = -std::numeric_limits<double>::infinity();
+            for (int kk = 0; kk < L; ++kk) {
+                const float* krow = k.data() +
+                    static_cast<std::size_t>(kk) * D + hd0;
+                double dot = 0.0;
+                for (int d = 0; d < head_dim; ++d) {
+                    dot += static_cast<double>(qrow[d]) *
+                           static_cast<double>(krow[d]);
+                }
+                const double sc = dot * scale;
+                s[static_cast<std::size_t>(kk)] = sc;
+                if (sc > smax) smax = sc;
+            }
+            // Numerically stable softmax over keys.
+            double denom = 0.0;
+            for (int kk = 0; kk < L; ++kk) {
+                const double e =
+                    std::exp(s[static_cast<std::size_t>(kk)] - smax);
+                s[static_cast<std::size_t>(kk)] = e;
+                denom += e;
+            }
+            const double inv = (denom > 0.0) ? (1.0 / denom) : 0.0;
+            float* orow = o.data() + static_cast<std::size_t>(qi) * D + hd0;
+            for (int kk = 0; kk < L; ++kk) {
+                const double p = s[static_cast<std::size_t>(kk)] * inv;
+                avg[static_cast<std::size_t>(qi) * L + kk] += p;
+                const float* vrow = v.data() +
+                    static_cast<std::size_t>(kk) * D + hd0;
+                for (int d = 0; d < head_dim; ++d) {
+                    orow[d] += static_cast<float>(p) * vrow[d];
+                }
+            }
+        }
+    }
+
+    // Average the per-head softmax maps.
+    std::vector<float> avg_f(LL);
+    const float inv_h = 1.0f / static_cast<float>(num_heads);
+    for (std::size_t i = 0; i < LL; ++i) {
+        avg_f[i] = static_cast<float>(avg[i]) * inv_h;
+    }
+
+    out = detail::upload_host(o.data(), L, D);
+    attn_avg = detail::upload_host(avg_f.data(), L, L);
 }
 
 // ─── AdaLN modulation chunks ───────────────────────────────────────────────

@@ -54,6 +54,18 @@ void slice_rows(const bt::Tensor& src, int r0, int n, bt::Tensor& dst) {
     bt::copy_d2d(src, r0 * D, dst, 0, n * D);
 }
 
+// Slice the rectangular block rows [r0, r0+nr) × cols [c0, c0+nc) out of a
+// row-major (L_rows, L_cols) tensor into dst (nr, nc). One copy_d2d run per
+// row — the column slice is not contiguous in the source.
+void slice_block(const bt::Tensor& src, int r0, int nr, int c0, int nc,
+                 bt::Tensor& dst) {
+    const int L_cols = src.cols;
+    detail::resize_like(dst, nr, nc, src.dtype, src.device);
+    for (int r = 0; r < nr; ++r) {
+        bt::copy_d2d(src, (r0 + r) * L_cols + c0, dst, r * nc, nc);
+    }
+}
+
 }  // namespace
 
 // ─── ctor / dtor ───────────────────────────────────────────────────────────
@@ -232,7 +244,8 @@ void FluxDenoiser::run_double_block_(const DoubleBlock& blk,
                                      const bt::Tensor& temb,
                                      const bt::Tensor& cos,
                                      const bt::Tensor& sin,
-                                     int txt_len, int img_len) {
+                                     int txt_len, int img_len,
+                                     bt::Tensor* trace_out_entry) {
     const int D  = cfg_.inner_dim();
     const int HD = cfg_.attention_head_dim;
     const int NH = cfg_.num_attention_heads;
@@ -317,7 +330,18 @@ void FluxDenoiser::run_double_block_(const DoubleBlock& blk,
     concat_rows(txt_k_c, img_k_c, K_);
     concat_rows(txt_v_c, img_v_c, V_);
 
-    joint_attention(Q_, K_, V_, cos, sin, HD, NH, attn_, Qr_, Kr_);
+    if (trace_out_entry != nullptr) {
+        // Trace path: materialise the per-head softmax, average over heads,
+        // then keep the image-query × text-key block. Joint sequence is
+        // [text ; image], so image rows are [txt_len, txt_len+img_len) and
+        // text columns are [0, txt_len).
+        bt::Tensor attn_avg;
+        joint_attention_traced(Q_, K_, V_, cos, sin, HD, NH, attn_, attn_avg,
+                               Qr_, Kr_);
+        slice_block(attn_avg, txt_len, img_len, 0, txt_len, *trace_out_entry);
+    } else {
+        joint_attention(Q_, K_, V_, cos, sin, HD, NH, attn_, Qr_, Kr_);
+    }
 
     // split attn into text / image parts
     bt::Tensor txt_attn, img_attn;
@@ -363,10 +387,12 @@ void FluxDenoiser::run_single_block_(const SingleBlock& blk,
                                      const bt::Tensor& temb,
                                      const bt::Tensor& cos,
                                      const bt::Tensor& sin,
-                                     int L) {
+                                     int txt_len, int img_len,
+                                     bt::Tensor* trace_out_entry) {
     const int D  = cfg_.inner_dim();
     const int HD = cfg_.attention_head_dim;
     const int NH = cfg_.num_attention_heads;
+    const int L  = txt_len + img_len;
 
     bt::silu_forward(temb, silu_);
 
@@ -408,7 +434,17 @@ void FluxDenoiser::run_single_block_(const SingleBlock& blk,
     K_ = kh.clone();
     V_ = v_.clone();
 
-    joint_attention(Q_, K_, V_, cos, sin, HD, NH, attn_, Qr_, Kr_);
+    if (trace_out_entry != nullptr) {
+        // Trace path: same joint sequence layout as the double-stream block —
+        // [text ; image] — so the image-query × text-key block is rows
+        // [txt_len, txt_len+img_len) × cols [0, txt_len).
+        bt::Tensor attn_avg;
+        joint_attention_traced(Q_, K_, V_, cos, sin, HD, NH, attn_, attn_avg,
+                               Qr_, Kr_);
+        slice_block(attn_avg, txt_len, img_len, 0, txt_len, *trace_out_entry);
+    } else {
+        joint_attention(Q_, K_, V_, cos, sin, HD, NH, attn_, Qr_, Kr_);
+    }
 
     // out = proj_out(concat([attn, mlp]))  — (L, 5D) → (L, D)
     const int FF = 4 * D;
@@ -430,6 +466,32 @@ void FluxDenoiser::run_single_block_(const SingleBlock& blk,
 void FluxDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
                            float timestep, const PreparedConditioning& prepared,
                            Branch branch, bt::Tensor& out) {
+    forward_impl_(latent, H_lat, W_lat, timestep, prepared, branch,
+                  /*trace_out=*/nullptr, out);
+}
+
+void FluxDenoiser::forward_traced(
+        const bt::Tensor& latent, int H_lat, int W_lat, float timestep,
+        const PreparedConditioning& prepared, Branch branch,
+        const std::vector<const bt::Tensor*>* attn_logit_biases,
+        AttentionTrace* trace_out, bt::Tensor& out) {
+    if (attn_logit_biases != nullptr) {
+        throw std::runtime_error(
+            "FluxDenoiser::forward_traced: attention steering is not yet "
+            "implemented for Flux");
+    }
+    if (trace_out != nullptr) {
+        trace_out->resize(static_cast<std::size_t>(num_xattn_blocks()));
+    }
+    forward_impl_(latent, H_lat, W_lat, timestep, prepared, branch,
+                  trace_out, out);
+}
+
+void FluxDenoiser::forward_impl_(const bt::Tensor& latent,
+                                 int H_lat, int W_lat, float timestep,
+                                 const PreparedConditioning& prepared,
+                                 Branch branch,
+                                 AttentionTrace* trace_out, bt::Tensor& out) {
     if (branch != Branch::Cond) {
         fail("forward: Flux is single-branch; only Branch::Cond is valid");
     }
@@ -501,17 +563,31 @@ void FluxDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
     RopeTables rope = build_axial_rope_tables(txt_len, hp, wp, HD,
                                               cfg_.axes_dims_rope);
 
+    // Trace traversal: the num_layers double blocks fill entries
+    // [0, num_layers), then the num_single_layers single blocks fill the
+    // rest — matching num_xattn_blocks()'s declared order.
+    int trace_idx = 0;
+
     // ── double-stream blocks ──────────────────────────────────────────────
     for (const DoubleBlock& blk : double_blocks_) {
-        run_double_block_(blk, temb_, rope.cos, rope.sin, txt_len, img_len);
+        bt::Tensor* te = trace_out
+            ? &(*trace_out)[static_cast<std::size_t>(trace_idx)]
+            : nullptr;
+        run_double_block_(blk, temb_, rope.cos, rope.sin, txt_len, img_len,
+                          te);
+        ++trace_idx;
     }
 
     // ── concat [txt ; img] for single-stream stack ────────────────────────
     concat_rows(txt_, img_, x_);
-    const int L = txt_len + img_len;
 
     for (const SingleBlock& blk : single_blocks_) {
-        run_single_block_(blk, temb_, rope.cos, rope.sin, L);
+        bt::Tensor* te = trace_out
+            ? &(*trace_out)[static_cast<std::size_t>(trace_idx)]
+            : nullptr;
+        run_single_block_(blk, temb_, rope.cos, rope.sin, txt_len, img_len,
+                          te);
+        ++trace_idx;
     }
 
     // ── take image part ───────────────────────────────────────────────────

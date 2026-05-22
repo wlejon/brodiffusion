@@ -73,6 +73,33 @@ void joint_attention(const brotensor::Tensor& Q,
                      // scratch reused across calls (rotated Q / K)
                      brotensor::Tensor& Qr, brotensor::Tensor& Kr);
 
+// Traced variant of joint_attention — the slow "experiment path".
+//
+// Same math and bit-comparable output as joint_attention: applies the RoPE
+// cos/sin tables to Q and K, then attention over the full joint sequence.
+// But where joint_attention uses the fused flash kernel (which never
+// materialises the softmax), this materialises the per-head softmax with
+// plain matmul + softmax primitives so the attention weights can be observed.
+//
+// Q/K/V are (L, D); writes (L, D) into `out`, identical to joint_attention.
+// Additionally writes the head-AVERAGED softmax map — an (L, L) tensor at the
+// compute dtype — into `attn_avg`: attn_avg[q, k] = mean over heads of the
+// softmax weight query q places on key k.
+//
+// Slower than the fused path (it materialises an (L, L) score buffer per
+// head); intended only for trace-mode forwards, exactly as the SD1.5 UNet's
+// cross-attention trace documents.
+void joint_attention_traced(const brotensor::Tensor& Q,
+                            const brotensor::Tensor& K,
+                            const brotensor::Tensor& V,
+                            const brotensor::Tensor& cos,
+                            const brotensor::Tensor& sin,
+                            int head_dim, int num_heads,
+                            brotensor::Tensor& out,
+                            brotensor::Tensor& attn_avg,
+                            // scratch reused across calls (rotated Q / K)
+                            brotensor::Tensor& Qr, brotensor::Tensor& Kr);
+
 // ─── AdaLN modulation chunks ───────────────────────────────────────────────
 
 // Slice a (1, n_chunks*inner_dim) modulation row into `n_chunks` separate

@@ -84,6 +84,32 @@ public:
     bool uses_cfg() const override { return false; }
     brotensor::Dtype compute_dtype() const override;
 
+    // ── Attention trace seam ──────────────────────────────────────────────
+    //
+    // Flux exposes a head-averaged image→text attention map for every one of
+    // its joint-attention blocks: the num_layers double-stream blocks first,
+    // then the num_single_layers single-stream blocks.
+    int num_xattn_blocks() const override {
+        return cfg_.num_layers + cfg_.num_single_layers;
+    }
+
+    // Trace-mode forward. Runs the full Flux denoiser exactly as forward()
+    // does (producing the same velocity output), but routes every joint
+    // attention through the non-fused traced path (dit::joint_attention_traced)
+    // so the per-block head-averaged image-query → text-key softmax maps can
+    // be observed. `trace_out`, if non-null, is filled with num_xattn_blocks()
+    // (Lq=img_len, Lk=txt_len) maps in forward traversal order.
+    //
+    // `attn_logit_biases` (pre-softmax attention steering) is not yet
+    // implemented for Flux: a non-null value throws. The seam is left for a
+    // later steering chunk.
+    void forward_traced(
+            const brotensor::Tensor& latent, int H_lat, int W_lat,
+            float timestep, const PreparedConditioning& prepared,
+            Branch branch,
+            const std::vector<const brotensor::Tensor*>* attn_logit_biases,
+            AttentionTrace* trace_out, brotensor::Tensor& out) override;
+
     const FluxConfig& config() const { return cfg_; }
 
 private:
@@ -116,16 +142,33 @@ private:
         Linear proj_out;        // 5D → D
     };
 
+    // `trace_out_entry`, when non-null, switches the block's joint attention
+    // to the non-fused traced path and receives the (img_len, txt_len)
+    // head-averaged image→text attention map for this block. When null the
+    // block runs the fast fused attention (forward() behaviour, unchanged).
     void run_double_block_(const DoubleBlock& blk,
                            const brotensor::Tensor& temb,
                            const brotensor::Tensor& cos,
                            const brotensor::Tensor& sin,
-                           int txt_len, int img_len);
+                           int txt_len, int img_len,
+                           brotensor::Tensor* trace_out_entry = nullptr);
     void run_single_block_(const SingleBlock& blk,
                            const brotensor::Tensor& temb,
                            const brotensor::Tensor& cos,
                            const brotensor::Tensor& sin,
-                           int L);
+                           int txt_len, int img_len,
+                           brotensor::Tensor* trace_out_entry = nullptr);
+
+    // Shared forward worker. `trace_out`, when non-null, is filled with
+    // num_xattn_blocks() head-averaged image→text attention maps (double
+    // blocks first, then single blocks). When null this is the plain
+    // forward() path — every joint attention uses the fast fused kernel and
+    // the result is bit-identical to the pre-trace forward().
+    void forward_impl_(const brotensor::Tensor& latent, int H_lat, int W_lat,
+                       float timestep, const PreparedConditioning& prepared,
+                       Branch branch,
+                       AttentionTrace* trace_out,
+                       brotensor::Tensor& out);
 
     FluxConfig cfg_;
     bool finalized_ = false;

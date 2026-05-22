@@ -245,6 +245,68 @@ std::vector<float> run_flux(const dit::FluxConfig& cfg,
     std::vector<float> v2 = bdtest::bd_download(out2);
     CHECK(v1 == v2);
 
+    // ── attention trace ───────────────────────────────────────────────────
+    // num_xattn_blocks == num_layers + num_single_layers (one image→text map
+    // per joint-attention block).
+    const int n_blocks = cfg.num_layers + cfg.num_single_layers;
+    CHECK(flux.num_xattn_blocks() == n_blocks);
+
+    // forward_traced must fill exactly n_blocks maps, each (img_len, txt_len),
+    // and the velocity output must match a plain forward() to a tight
+    // tolerance (the traced path must not change the denoising result).
+    const int hp = H_lat / 2, wp = W_lat / 2;
+    const int img_len = hp * wp;
+    brodiffusion::AttentionTrace trace;
+    bt::Tensor out_traced;
+    flux.forward_traced(latent, H_lat, W_lat, 500.0f, prepared,
+                        brodiffusion::Branch::Cond,
+                        /*attn_logit_biases=*/nullptr, &trace, out_traced);
+    bt::sync_all();
+
+    CHECK(static_cast<int>(trace.size()) == n_blocks);
+    int bad_shape = 0, bad_weight = 0;
+    for (const bt::Tensor& m : trace) {
+        if (m.rows != img_len || m.cols != txt_len) { ++bad_shape; continue; }
+        std::vector<float> mv = bdtest::bd_download(m);
+        for (float w : mv) {
+            // Head-averaged softmax weights: non-negative and finite. The
+            // sliced image→text portion sums to <= 1 per row (text is only
+            // part of the joint keys), so we assert non-negativity, not
+            // row-sum == 1.
+            if (!bdtest::bd_finite(w) || w < -1e-4f) ++bad_weight;
+        }
+    }
+    CHECK(bad_shape == 0);
+    CHECK(bad_weight == 0);
+
+    // Traced velocity output matches the plain forward output tightly.
+    std::vector<float> vt = bdtest::bd_download(out_traced);
+    CHECK(vt.size() == v1.size());
+    float max_abs_diff = 0.0f;
+    if (vt.size() == v1.size()) {
+        for (std::size_t i = 0; i < vt.size(); ++i) {
+            float d = std::fabs(vt[i] - v1[i]);
+            if (d > max_abs_diff) max_abs_diff = d;
+        }
+    }
+    CHECK(max_abs_diff < 1e-3f);
+
+    // A non-null attn_logit_biases must be rejected (steering unimplemented).
+    {
+        bool steer_threw = false;
+        std::vector<const bt::Tensor*> biases(
+            static_cast<std::size_t>(n_blocks), nullptr);
+        try {
+            bt::Tensor dummy;
+            flux.forward_traced(latent, H_lat, W_lat, 500.0f, prepared,
+                                brodiffusion::Branch::Cond, &biases,
+                                /*trace_out=*/nullptr, dummy);
+        } catch (const std::exception&) {
+            steer_threw = true;
+        }
+        CHECK(steer_threw);
+    }
+
     // Uncond branch must be rejected.
     bool threw = false;
     try {
