@@ -78,17 +78,23 @@ struct UNetConfig {
     // time_embed_dim = block_out_channels[0] * time_embed_dim_mult.
     int time_embed_dim_mult = 4;
 
-    // Optional guidance-scale-embedding projection dimension. When > 0 the
-    // UNet expects the checkpoint to contain `time_embedding.cond_proj.weight`
-    // of shape (time_embed_dim, time_cond_proj_dim), no bias, and the caller
-    // must use the forward() overload that takes a `guidance_scale_embedding`
-    // float. When 0 (default — vanilla SD1.5) no cond_proj weight is loaded
-    // and the existing forward() overloads are used.
+    // Guidance-scale-embedding projection dimension for LCM-distilled
+    // checkpoints. This is a property of the checkpoint, not a caller choice:
+    // load_weights() auto-detects it. A distilled checkpoint ships
+    // `time_embedding.cond_proj.weight` of shape (freq_dim, cond_proj_dim),
+    // no bias — load_weights() loads it and sets time_cond_proj_dim from the
+    // weight's second dim. A vanilla SD1.5 checkpoint has no such tensor, so
+    // load_weights() sets time_cond_proj_dim = 0. Whatever value is set here
+    // before load_weights() is only a hint and is overwritten to match the
+    // file, so a pipeline built either way loads any checkpoint without a
+    // spurious "missing tensor" failure.
     //
-    // LCM-distilled checkpoints (e.g. SimianLuo/LCM_Dreamshaper_v7) ship with
-    // time_cond_proj_dim = 256; the projected guidance-scale embedding is
-    // added to the time embedding *after* linear_1 and *before* the SiLU,
-    // matching diffusers' TimestepEmbedding.forward.
+    // When time_cond_proj_dim > 0 after load, the caller must drive the UNet
+    // through the forward()/forward_trace() overload that takes a
+    // `guidance_scale_embedding`. The projected guidance-scale embedding is
+    // added to the sinusoidal time embedding *before* linear_1, matching
+    // diffusers' TimestepEmbedding.forward. LCM-distilled checkpoints
+    // (e.g. SimianLuo/LCM_Dreamshaper_v7) ship time_cond_proj_dim = 256.
     int time_cond_proj_dim = 0;
 
     // When true, finalize_weights() converts the big UNet weights (ResBlock

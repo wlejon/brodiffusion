@@ -219,12 +219,32 @@ void UNet::load_weights(const st::File& f, const std::string& prefix) {
     // LCM cond_proj: only present in distilled checkpoints. No bias term
     // (diffusers' TimestepEmbedding constructs it as `nn.Linear(cond_proj_dim,
     // in_channels=freq_dim, bias=False)`, and adds its output to `sample`
-    // *before* linear_1). Shape is (freq_dim_, cond_proj_dim), not
-    // (time_embed_dim_, cond_proj_dim) — caught by Dreamshaper-7 LCM at load.
-    if (cfg_.time_cond_proj_dim > 0) {
-        upload_compute_checked(need(f, prefix + "time_embedding.cond_proj.weight"),
-                            freq_dim_, cfg_.time_cond_proj_dim,
+    // *before* linear_1). Shape is (freq_dim_, cond_proj_dim).
+    //
+    // The checkpoint is authoritative for whether this is an LCM-distilled
+    // U-Net: a distilled checkpoint ships cond_proj.weight, a vanilla SD1.5 one
+    // does not. cfg_.time_cond_proj_dim coming in is only a hint — reconcile it
+    // with the file so a pipeline built either way loads any checkpoint instead
+    // of failing with a spurious "missing tensor 'cond_proj.weight'".
+    if (const st::TensorView* cp =
+            f.find(prefix + "time_embedding.cond_proj.weight")) {
+        if (cp->shape.size() != 2 ||
+            static_cast<int>(cp->shape[0]) != freq_dim_) {
+            fail("load_weights: time_embedding.cond_proj.weight must have shape "
+                 "(" + std::to_string(freq_dim_) + ", cond_proj_dim)");
+        }
+        const int cond_dim = static_cast<int>(cp->shape[1]);
+        if (cond_dim <= 0 || (cond_dim % 2) != 0) {
+            fail("load_weights: cond_proj_dim (" + std::to_string(cond_dim) +
+                 ") must be a positive even number");
+        }
+        cfg_.time_cond_proj_dim = cond_dim;
+        upload_compute_checked(*cp, freq_dim_, cond_dim,
                             te_cond_W_, "te.cond_proj.weight");
+    } else {
+        // Vanilla SD1.5 — no guidance-scale embedding.
+        cfg_.time_cond_proj_dim = 0;
+        te_cond_W_ = brotensor::Tensor{};
     }
 
     // ── down_blocks ────────────────────────────────────────────────────────

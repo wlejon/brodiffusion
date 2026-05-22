@@ -215,14 +215,6 @@ int main() {
           fp16_seq(static_cast<std::size_t>(temb_dim) * temb_dim, 0.05f, 101));
     b.add("time_embedding.linear_2.bias",   {temb_dim}, fp16_zeros(temb_dim));
 
-    // LCM guidance-scale cond_proj — shape (freq_dim, cond_proj_dim), no bias.
-    // Unused by the vanilla UNet (its load_weights only requests cond_proj
-    // when time_cond_proj_dim > 0); the LCM UNet built from this same fixture
-    // below does load it.
-    const int cond_proj_dim = 4;
-    b.add("time_embedding.cond_proj.weight", {freq_dim, cond_proj_dim},
-          fp16_seq(static_cast<std::size_t>(freq_dim) * cond_proj_dim, 0.05f, 102));
-
     // down_blocks
     int C_prev = first_C;
     for (int i = 0; i < nb; ++i) {
@@ -307,6 +299,19 @@ int main() {
 
     auto path = std::filesystem::temp_directory_path() / "brodiffusion_unet_test.safetensors";
     b.write(path);
+
+    // LCM fixture: the same weights plus the guidance-scale cond_proj. An
+    // LCM-distilled checkpoint ships time_embedding.cond_proj.weight (shape
+    // (freq_dim, cond_proj_dim), no bias); a vanilla SD1.5 one does not, and
+    // load_weights() keys the LCM cond_proj path off exactly that tensor.
+    const int cond_proj_dim = 4;
+    Builder b_lcm = b;
+    b_lcm.add("time_embedding.cond_proj.weight", {freq_dim, cond_proj_dim},
+              fp16_seq(static_cast<std::size_t>(freq_dim) * cond_proj_dim,
+                       0.05f, 102));
+    auto path_lcm = std::filesystem::temp_directory_path() /
+                    "brodiffusion_unet_lcm_test.safetensors";
+    b_lcm.write(path_lcm);
 
     const int H = 8, W = 8;
     const int L_text = 4;
@@ -415,17 +420,18 @@ int main() {
 
     // ── LCM (time_cond_proj_dim > 0) trace mode ──────────────────────────────
     // An LCM-distilled U-Net routes a guidance-scale embedding through
-    // cond_proj. forward_trace must support that path — the cond_proj plumbing
-    // and the attention trace are independent. Build an LCM U-Net from the same
-    // fixture (it carries the cond_proj weight), then check trace mode runs and
-    // matches the LCM fast path.
+    // cond_proj. load_weights() auto-detects that from the checkpoint, and
+    // forward_trace must support the path — the cond_proj plumbing and the
+    // attention trace are independent. Build a UNet with the *vanilla* config,
+    // load the LCM fixture, confirm load_weights upgraded it to LCM, then check
+    // trace mode runs and matches the LCM fast path.
     {
-        un::UNetConfig lcm_cfg = cfg;
-        lcm_cfg.time_cond_proj_dim = cond_proj_dim;
-
-        auto file = st::File::open(path.string());
-        un::UNet lcm(lcm_cfg);
+        auto file = st::File::open(path_lcm.string());
+        un::UNet lcm(cfg);                       // built vanilla on purpose
         lcm.load_weights(file, "");
+        // The checkpoint carries cond_proj — load_weights must have detected it
+        // and reconciled time_cond_proj_dim up from the config's 0.
+        CHECK(lcm.config().time_cond_proj_dim == cond_proj_dim);
 
         std::vector<float> latent_h(
             static_cast<std::size_t>(cfg.in_channels) * H * W);
@@ -500,8 +506,50 @@ int main() {
         CHECK(threw_missing);
     }
 
+    // ── LCM-configured UNet + vanilla checkpoint ─────────────────────────────
+    // The user-facing bug: a pipeline built expecting an LCM U-Net
+    // (time_cond_proj_dim > 0) must still load a vanilla SD1.5 checkpoint.
+    // load_weights() reconciles the config down to the file instead of failing
+    // with "missing tensor 'time_embedding.cond_proj.weight'".
+    {
+        un::UNetConfig lcm_cfg = cfg;
+        lcm_cfg.time_cond_proj_dim = cond_proj_dim;
+
+        auto file = st::File::open(path.string());      // vanilla fixture
+        un::UNet net2(lcm_cfg);
+        bool loaded = true;
+        try {
+            net2.load_weights(file, "");
+        } catch (const std::exception&) { loaded = false; }
+        CHECK(loaded);
+        // Reconciled down to vanilla — the checkpoint has no cond_proj.
+        CHECK(net2.config().time_cond_proj_dim == 0);
+
+        // And it runs through the vanilla forward path without throwing.
+        std::vector<float> latent_h(
+            static_cast<std::size_t>(cfg.in_channels) * H * W);
+        for (std::size_t i = 0; i < latent_h.size(); ++i) {
+            latent_h[i] = (static_cast<float>(i % 5) - 2.0f) * 0.1f;
+        }
+        bt::Tensor latent =
+            bdtest::bd_upload(latent_h, 1, cfg.in_channels * H * W);
+        std::vector<float> ctx_h(static_cast<std::size_t>(L_text) * ctx_dim);
+        for (std::size_t i = 0; i < ctx_h.size(); ++i) {
+            ctx_h[i] = (static_cast<float>(i % 7) - 3.0f) * 0.05f;
+        }
+        bt::Tensor ctx = bdtest::bd_upload(ctx_h, L_text, ctx_dim);
+        bt::Tensor out2;
+        net2.forward(latent, H, W, 500.0f, ctx, out2);
+        bt::sync_all();
+        std::vector<float> v2 = bdtest::bd_download(out2);
+        int nf = 0;
+        for (float v : v2) if (!bdtest::bd_finite(v)) ++nf;
+        CHECK(nf == 0);
+    }
+
     std::error_code ec;
     std::filesystem::remove(path, ec);
+    std::filesystem::remove(path_lcm, ec);
 
     if (g_failures == 0) std::printf("unet: OK\n");
     else std::fprintf(stderr, "unet: %d failure(s)\n", g_failures);
