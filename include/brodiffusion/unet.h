@@ -226,6 +226,14 @@ public:
     // entry `i` is either null (no bias) or a (Lq_i, Lk) FP32 Tensor added
     // to the scaled QKᵀ scores before softmax at layer i.
     //
+    // `guidance_scale_embedding` mirrors the LCM `forward` overload: pass a
+    // pointer to the raw guidance scale `w` for an LCM-distilled U-Net
+    // (time_cond_proj_dim > 0), or null for vanilla SD1.5. The cond_proj path
+    // and the trace plumbing are independent inside forward_impl_, so trace
+    // mode supports both families — but the pointer must be non-null iff the
+    // U-Net was built with time_cond_proj_dim > 0, exactly as the LCM and
+    // vanilla forward() overloads enforce.
+    //
     // Trace mode currently does NOT use the K/V cache (the with-attn brotensor
     // op has no cached variant yet) — K/V are reprojected from `ctx` at every
     // layer. Acceptable cost for experiment-mode tree search; if it bottlenecks
@@ -235,6 +243,7 @@ public:
     void forward_trace(const brotensor::Tensor& sample,
                        int H, int W,
                        float timestep,
+                       const float* guidance_scale_embedding,
                        const brotensor::Tensor& encoder_hidden_states,
                        const std::vector<const brotensor::Tensor*>* attn_logit_biases,
                        CrossAttnTrace* trace_out,

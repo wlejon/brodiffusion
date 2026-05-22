@@ -215,6 +215,14 @@ int main() {
           fp16_seq(static_cast<std::size_t>(temb_dim) * temb_dim, 0.05f, 101));
     b.add("time_embedding.linear_2.bias",   {temb_dim}, fp16_zeros(temb_dim));
 
+    // LCM guidance-scale cond_proj — shape (freq_dim, cond_proj_dim), no bias.
+    // Unused by the vanilla UNet (its load_weights only requests cond_proj
+    // when time_cond_proj_dim > 0); the LCM UNet built from this same fixture
+    // below does load it.
+    const int cond_proj_dim = 4;
+    b.add("time_embedding.cond_proj.weight", {freq_dim, cond_proj_dim},
+          fp16_seq(static_cast<std::size_t>(freq_dim) * cond_proj_dim, 0.05f, 102));
+
     // down_blocks
     int C_prev = first_C;
     for (int i = 0; i < nb; ++i) {
@@ -352,7 +360,7 @@ int main() {
         // path within FP16 numerical noise (different attn kernels = small
         // rounding drift even though the math is identical).
         un::UNet::CrossAttnTrace trace;
-        net.forward_trace(latent, H, W, 500.0f, ctx,
+        net.forward_trace(latent, H, W, 500.0f, /*guidance_scale=*/nullptr, ctx,
                           /*attn_logit_biases=*/nullptr, &trace, out);
         bt::sync_all();
 
@@ -390,6 +398,106 @@ int main() {
         // synthetic UNet has activation magnitudes O(1), so 0.05 is a
         // generous-but-meaningful bound.
         CHECK(max_abs_diff < 0.05f);
+
+        // A vanilla UNet (time_cond_proj_dim == 0) must reject a trace call
+        // that supplies a guidance scale — same contract the forward()
+        // overloads enforce.
+        bool threw_vanilla = false;
+        try {
+            un::UNet::CrossAttnTrace t2;
+            bt::Tensor o2;
+            const float g = 7.5f;
+            net.forward_trace(latent, H, W, 500.0f, &g, ctx,
+                              /*attn_logit_biases=*/nullptr, &t2, o2);
+        } catch (const std::exception&) { threw_vanilla = true; }
+        CHECK(threw_vanilla);
+    }
+
+    // ── LCM (time_cond_proj_dim > 0) trace mode ──────────────────────────────
+    // An LCM-distilled U-Net routes a guidance-scale embedding through
+    // cond_proj. forward_trace must support that path — the cond_proj plumbing
+    // and the attention trace are independent. Build an LCM U-Net from the same
+    // fixture (it carries the cond_proj weight), then check trace mode runs and
+    // matches the LCM fast path.
+    {
+        un::UNetConfig lcm_cfg = cfg;
+        lcm_cfg.time_cond_proj_dim = cond_proj_dim;
+
+        auto file = st::File::open(path.string());
+        un::UNet lcm(lcm_cfg);
+        lcm.load_weights(file, "");
+
+        std::vector<float> latent_h(
+            static_cast<std::size_t>(cfg.in_channels) * H * W);
+        for (std::size_t i = 0; i < latent_h.size(); ++i) {
+            latent_h[i] = (static_cast<float>(i % 5) - 2.0f) * 0.1f;
+        }
+        bt::Tensor latent =
+            bdtest::bd_upload(latent_h, 1, cfg.in_channels * H * W);
+
+        std::vector<float> ctx_h(static_cast<std::size_t>(L_text) * ctx_dim);
+        for (std::size_t i = 0; i < ctx_h.size(); ++i) {
+            ctx_h[i] = (static_cast<float>(i % 7) - 3.0f) * 0.05f;
+        }
+        bt::Tensor ctx = bdtest::bd_upload(ctx_h, L_text, ctx_dim);
+
+        const float guidance = 7.5f;
+
+        // LCM fast path: prime the K/V cache, run the guidance-scale forward.
+        un::UNet::CrossAttnKVCache cache;
+        lcm.prime_xattn_cache(ctx, cache);
+        bt::Tensor out_fast;
+        lcm.forward(latent, H, W, 500.0f, guidance, ctx, cache, out_fast);
+        bt::sync_all();
+        std::vector<float> vals_fast = bdtest::bd_download(out_fast);
+
+        // LCM trace path: forward_trace with the guidance scale supplied.
+        un::UNet::CrossAttnTrace trace;
+        bt::Tensor out_trace;
+        lcm.forward_trace(latent, H, W, 500.0f, &guidance, ctx,
+                          /*attn_logit_biases=*/nullptr, &trace, out_trace);
+        bt::sync_all();
+
+        const int n_xattn = lcm.num_xattn_blocks();
+        CHECK(static_cast<int>(trace.size()) == n_xattn);
+        for (int i = 0; i < n_xattn; ++i) {
+            const bt::Tensor& m = trace[static_cast<std::size_t>(i)];
+            CHECK(m.cols == L_text);
+            CHECK(m.rows > 0);
+            std::vector<float> hb = bdtest::bd_download(m);
+            for (int r = 0; r < m.rows; ++r) {
+                float s = 0.0f;
+                for (int c = 0; c < m.cols; ++c) {
+                    s += hb[static_cast<std::size_t>(r) * m.cols + c];
+                }
+                CHECK(s > 0.95f && s < 1.05f);
+            }
+        }
+
+        // The trace output must match the LCM fast path within FP16 kernel
+        // drift — proof the cond_proj guidance contribution is applied in
+        // trace mode, not silently dropped.
+        std::vector<float> vals_trace = bdtest::bd_download(out_trace);
+        CHECK(vals_trace.size() == vals_fast.size());
+        int nonfinite = 0;
+        float max_abs_diff = 0.0f;
+        for (std::size_t k = 0; k < vals_fast.size(); ++k) {
+            if (!bdtest::bd_finite(vals_trace[k])) ++nonfinite;
+            const float d = std::fabs(vals_fast[k] - vals_trace[k]);
+            if (d > max_abs_diff) max_abs_diff = d;
+        }
+        CHECK(nonfinite == 0);
+        CHECK(max_abs_diff < 0.05f);
+
+        // An LCM U-Net must reject a trace call with no guidance scale.
+        bool threw_missing = false;
+        try {
+            un::UNet::CrossAttnTrace t2;
+            bt::Tensor o2;
+            lcm.forward_trace(latent, H, W, 500.0f, /*guidance_scale=*/nullptr,
+                              ctx, /*attn_logit_biases=*/nullptr, &t2, o2);
+        } catch (const std::exception&) { threw_missing = true; }
+        CHECK(threw_missing);
     }
 
     std::error_code ec;

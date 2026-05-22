@@ -706,6 +706,7 @@ void UNet::forward(const bt::Tensor& sample,
 void UNet::forward_trace(const bt::Tensor& sample,
                          int H, int W,
                          float timestep,
+                         const float* guidance_scale_embedding,
                          const bt::Tensor& encoder_hidden_states,
                          const std::vector<const bt::Tensor*>* attn_logit_biases,
                          CrossAttnTrace* trace_out,
@@ -715,9 +716,17 @@ void UNet::forward_trace(const bt::Tensor& sample,
              "mode (brotensor::cross_attention_forward_with_attn is FP16 "
              "only)");
     }
-    if (cfg_.time_cond_proj_dim > 0) {
-        fail("forward_trace: LCM cond_proj path not yet supported in trace "
-             "mode; use the vanilla SD1.5 path");
+    // The LCM cond_proj path and the trace plumbing are independent inside
+    // forward_impl_, so trace mode supports LCM-distilled U-Nets — the caller
+    // just supplies the guidance scale, exactly as the LCM forward() overload
+    // requires. Enforce the same non-null-iff-LCM contract.
+    if (guidance_scale_embedding != nullptr && cfg_.time_cond_proj_dim <= 0) {
+        fail("forward_trace: guidance_scale_embedding supplied but UNet was "
+             "built with time_cond_proj_dim=0");
+    }
+    if (guidance_scale_embedding == nullptr && cfg_.time_cond_proj_dim > 0) {
+        fail("forward_trace: UNet built with time_cond_proj_dim>0 requires a "
+             "guidance_scale_embedding (LCM cond_proj path)");
     }
     const int n = num_xattn_blocks();
     if (attn_logit_biases &&
@@ -729,7 +738,7 @@ void UNet::forward_trace(const bt::Tensor& sample,
     if (trace_out) {
         trace_out->resize(static_cast<std::size_t>(n));
     }
-    forward_impl_(sample, H, W, timestep, /*gs_emb=*/nullptr,
+    forward_impl_(sample, H, W, timestep, guidance_scale_embedding,
                   encoder_hidden_states, /*xattn_cache=*/nullptr,
                   attn_logit_biases, trace_out, out);
 }
