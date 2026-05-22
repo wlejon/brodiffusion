@@ -89,7 +89,7 @@ void populate_vae(const json::Value& cfg, vae::DecoderConfig& out) {
     out.shift_factor       = cfg.get_float("shift_factor", out.shift_factor);
 }
 
-void populate_text_encoder(const json::Value& cfg, clip::TextEncoderConfig& out) {
+void populate_text_encoder(const json::Value& cfg, brolm::clip::TextEncoderConfig& out) {
     out.hidden_dim       = cfg.get_int("hidden_size", out.hidden_dim);
     out.intermediate_dim = cfg.get_int("intermediate_size", out.intermediate_dim);
     out.num_heads        = cfg.get_int("num_attention_heads", out.num_heads);
@@ -143,7 +143,7 @@ void populate_flux(const json::Value& cfg, dit::FluxConfig& out) {
                                                out.axes_dims_rope);
 }
 
-void populate_t5(const json::Value& cfg, t5::T5Config& out) {
+void populate_t5(const json::Value& cfg, brolm::t5::T5Config& out) {
     out.d_model    = cfg.get_int("d_model", out.d_model);
     out.d_ff       = cfg.get_int("d_ff", out.d_ff);
     out.d_kv       = cfg.get_int("d_kv", out.d_kv);

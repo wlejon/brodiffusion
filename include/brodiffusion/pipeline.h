@@ -13,16 +13,16 @@
 // guidance runs the U-Net twice per step (conditional + unconditional)
 // rather than batching, since the rest of the inference stack is N=1.
 
-#include "brodiffusion/clip.h"
+#include "brolm/clip.h"
 #include "brodiffusion/denoiser.h"
 #include "brodiffusion/dit/flux.h"
 #include "brodiffusion/flow_match_scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
 #include "brodiffusion/model_config.h"
 #include "brodiffusion/scheduler.h"
-#include "brodiffusion/t5.h"
-#include "brodiffusion/tokenizer.h"
-#include "brodiffusion/tokenizer_t5.h"
+#include "brolm/t5.h"
+#include "brolm/tokenizer.h"
+#include "brolm/tokenizer_t5.h"
 #include "brodiffusion/unet.h"
 #include "brodiffusion/vae.h"
 
@@ -48,8 +48,8 @@ struct PipelineConfig {
     unet::UNetConfig         unet;          // StableDiffusion
     dit::FluxConfig          flux;          // Flux
     vae::DecoderConfig       vae;
-    clip::TextEncoderConfig  text_encoder;  // CLIP — both classes
-    t5::T5Config             t5;            // Flux
+    brolm::clip::TextEncoderConfig  text_encoder;  // CLIP — both classes
+    brolm::t5::T5Config             t5;            // Flux
     int                      t5_max_length = 512;
     // DDIM (default, vanilla SD1.5) or LCM (latent-consistency, distilled
     // checkpoints with unet.time_cond_proj_dim > 0) or FlowMatch (Flux). The
@@ -124,12 +124,12 @@ class Pipeline {
 public:
     // StableDiffusion constructor: builds a UNet denoiser. Valid only when
     // cfg.model_class == ModelClass::StableDiffusion.
-    Pipeline(const PipelineConfig& cfg, clip::Tokenizer tokenizer);
+    Pipeline(const PipelineConfig& cfg, brolm::clip::Tokenizer tokenizer);
 
     // Flux constructor: builds a FluxDenoiser plus the second (T5) text
     // encoder + tokenizer. Valid only when cfg.model_class == ModelClass::Flux.
-    Pipeline(const PipelineConfig& cfg, clip::Tokenizer clip_tok,
-             t5::Tokenizer t5_tok);
+    Pipeline(const PipelineConfig& cfg, brolm::clip::Tokenizer clip_tok,
+             brolm::t5::Tokenizer t5_tok);
 
     // Build a fully-loaded Pipeline from a diffusers model directory: reads the
     // JSON configs, constructs the right sub-modules, loads all component
@@ -234,10 +234,10 @@ private:
 
     PipelineConfig            cfg_;
     ModelClass                model_class_;
-    clip::Tokenizer           tokenizer_;       // CLIP — both classes
-    clip::TextEncoder         text_encoder_;    // CLIP — both classes
-    std::optional<t5::Tokenizer>   t5_tokenizer_;   // Flux only
-    std::optional<t5::TextEncoder> t5_encoder_;     // Flux only
+    brolm::clip::Tokenizer    tokenizer_;       // CLIP — both classes
+    brolm::clip::TextEncoder  text_encoder_;    // CLIP — both classes
+    std::optional<brolm::t5::Tokenizer>   t5_tokenizer_;   // Flux only
+    std::optional<brolm::t5::TextEncoder> t5_encoder_;     // Flux only
     std::unique_ptr<Denoiser> denoiser_;
     vae::Decoder              vae_;
     std::variant<scheduler::DDIM, scheduler::LCM, scheduler::FlowMatch>

@@ -1,8 +1,10 @@
 # brodiffusion
 
 Diffusion-model inference for the bro stack. Pure C++20, built on
-[brotensor](https://github.com/wlejon/brotensor) (tensor + compute kernels) and [bromath](https://github.com/wlejon/bromath)
-(scalar / RNG / color helpers). Runs **CPU-by-default and on a GPU when one is
+[brotensor](https://github.com/wlejon/brotensor) (tensor + compute kernels),
+[bromath](https://github.com/wlejon/bromath) (scalar / RNG / color helpers),
+and [brolm](https://github.com/wlejon/brolm) (tokenizers + text encoders —
+brodiffusion's text frontend). Runs **CPU-by-default and on a GPU when one is
 available** — FP32 on the CPU backend, FP16 on a GPU — with the device chosen
 at runtime.
 
@@ -13,11 +15,6 @@ Metal (FP16) backends.
 
 | Header | Purpose |
 |---|---|
-| `brodiffusion/safetensors.h` | mmap'd safetensors reader + writer; FP16/FP32 tensor views |
-| `brodiffusion/tokenizer.h` | CLIP BPE tokenizer (`vocab.json` + `merges.txt`) |
-| `brodiffusion/clip.h` | CLIP ViT-L/14 text encoder (SD1.5 conditioning) |
-| `brodiffusion/clip_image.h` | CLIP ViT-L/14 vision encoder |
-| `brodiffusion/clip_score.h` | CLIP image/text similarity scoring |
 | `brodiffusion/unet.h` | SD1.5 U-Net — ResBlock + cross-attention + down/up; optional INT8 weights |
 | `brodiffusion/vae.h` | VAE decoder (latents → RGB) |
 | `brodiffusion/scheduler.h` | DDIM sampler (eta = 0, deterministic) |
@@ -74,12 +71,14 @@ Standalone sibling of [bro](https://github.com/wlejon/bro), [bromath](https://gi
 projects/
 ├── bromath/          # ../bromath    (header-only math)
 ├── brotensor/        # ../brotensor  (tensor + compute, CPU + GPU)
+├── brolm/            # ../brolm      (tokenizers + text encoders)
 └── brodiffusion/     # this repo
 ```
 
-CMake first looks for siblings at `../bromath` and `../brotensor`; if not
-found, it falls back to `third_party/bromath` and `third_party/brotensor`
-submodules. Override paths with `-DBROMATH_DIR=...` / `-DBROTENSOR_DIR=...`.
+CMake first looks for siblings at `../bromath`, `../brotensor`, and
+`../brolm`; if not found, it falls back to the matching `third_party/`
+submodules. Override paths with `-DBROMATH_DIR=...` / `-DBROTENSOR_DIR=...` /
+`-DBROLM_DIR=...`.
 
 ## Weights
 

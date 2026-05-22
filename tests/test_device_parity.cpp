@@ -19,7 +19,7 @@
 // Skips cleanly (exit 0) when no Metal backend is available, so the same
 // source builds and passes in the CPU-only configuration.
 
-#include "brodiffusion/clip.h"
+#include "brolm/clip.h"
 #include "brodiffusion/unet.h"
 #include "brodiffusion/vae.h"
 
@@ -41,7 +41,7 @@
 namespace bt   = brotensor;
 namespace un   = brodiffusion::unet;
 namespace vae  = brodiffusion::vae;
-namespace clip = brodiffusion::clip;
+namespace clip = brolm::clip;
 namespace st   = brotensor::safetensors;
 
 static int g_failures = 0;

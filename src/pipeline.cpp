@@ -1,6 +1,6 @@
 #include "brodiffusion/pipeline.h"
 
-#include "brodiffusion/clip.h"
+#include "brolm/clip.h"
 #include "brodiffusion/denoiser.h"
 #include "brodiffusion/dit/flux.h"
 #include "brodiffusion/flow_match_scheduler.h"
@@ -9,9 +9,9 @@
 #include "brodiffusion/model_config.h"
 #include "brotensor/safetensors.h"
 #include "brodiffusion/scheduler.h"
-#include "brodiffusion/t5.h"
-#include "brodiffusion/tokenizer.h"
-#include "brodiffusion/tokenizer_t5.h"
+#include "brolm/t5.h"
+#include "brolm/tokenizer.h"
+#include "brolm/tokenizer_t5.h"
 #include "brodiffusion/unet.h"
 #include "brodiffusion/vae.h"
 #include "brodiffusion/detail/compute.h"
@@ -104,7 +104,7 @@ std::unique_ptr<Denoiser> make_denoiser(const PipelineConfig& cfg) {
 
 }  // namespace
 
-Pipeline::Pipeline(const PipelineConfig& cfg, clip::Tokenizer tokenizer)
+Pipeline::Pipeline(const PipelineConfig& cfg, brolm::clip::Tokenizer tokenizer)
     : cfg_(cfg),
       model_class_(cfg.model_class),
       tokenizer_(std::move(tokenizer)),
@@ -118,8 +118,8 @@ Pipeline::Pipeline(const PipelineConfig& cfg, clip::Tokenizer tokenizer)
     }
 }
 
-Pipeline::Pipeline(const PipelineConfig& cfg, clip::Tokenizer clip_tok,
-                   t5::Tokenizer t5_tok)
+Pipeline::Pipeline(const PipelineConfig& cfg, brolm::clip::Tokenizer clip_tok,
+                   brolm::t5::Tokenizer t5_tok)
     : cfg_(cfg),
       model_class_(cfg.model_class),
       tokenizer_(std::move(clip_tok)),
@@ -158,13 +158,13 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir) {
     const fs::path root(model_dir);
 
     // CLIP tokenizer (both classes).
-    clip::Tokenizer clip_tok = clip::Tokenizer::load(
+    brolm::clip::Tokenizer clip_tok = brolm::clip::Tokenizer::load(
         (root / "tokenizer" / "vocab.json").string(),
         (root / "tokenizer" / "merges.txt").string());
 
     if (mc.model_class == ModelClass::Flux) {
         // T5 tokenizer for the second text encoder.
-        t5::Tokenizer t5_tok = t5::Tokenizer::load(
+        brolm::t5::Tokenizer t5_tok = brolm::t5::Tokenizer::load(
             (root / "tokenizer_2" / "tokenizer.json").string());
 
         Pipeline p(cfg, std::move(clip_tok), std::move(t5_tok));

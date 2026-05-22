@@ -12,7 +12,7 @@
 // compute dtype (FP32 on the CPU backend, FP16 on a GPU backend), so a single
 // fixture file drives a CPU↔GPU parity comparison.
 
-#include "brodiffusion/clip.h"
+#include "brolm/clip.h"
 #include "brodiffusion/unet.h"
 #include "brodiffusion/vae.h"
 
@@ -359,7 +359,7 @@ inline void build_vae(Builder& b, const brodiffusion::vae::DecoderConfig& cfg,
 
 // Emit a complete CLIP text-encoder weight set under `prefix`.
 inline void build_clip(Builder& b,
-                       const brodiffusion::clip::TextEncoderConfig& cfg,
+                       const brolm::clip::TextEncoderConfig& cfg,
                        const std::string& prefix) {
     const int V = cfg.vocab_size;
     const int P = cfg.max_position;

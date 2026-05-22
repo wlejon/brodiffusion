@@ -6,7 +6,7 @@
 // that lives in a separate real-weights integration test.
 
 #include "brodiffusion/pipeline.h"
-#include "brodiffusion/tokenizer.h"
+#include "brolm/tokenizer.h"
 
 #include <cstdio>
 #include <exception>
@@ -15,7 +15,7 @@
 #include <string>
 
 namespace pl   = brodiffusion::pipeline;
-namespace clip = brodiffusion::clip;
+namespace clip = brolm::clip;
 
 static int g_failures = 0;
 #define CHECK(cond) do { \

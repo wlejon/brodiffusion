@@ -86,6 +86,25 @@ if(NOT TARGET brotensor)
     endif()
 endif()
 
+# --- brolm (text encoders + tokenizers — brodiffusion's text frontend) ---
+#
+# Prefer the standalone repo at ../brolm; fall back to third_party/brolm.
+# brolm pulls in bromath + brotensor guarded by if(NOT TARGET ...), so it
+# reuses the targets added above.
+set(BROLM_DIR "${CMAKE_SOURCE_DIR}/../brolm" CACHE PATH
+    "Path to standalone brolm repo (set to a missing path to force submodule fallback)")
+if(NOT TARGET brolm)
+    if(EXISTS "${BROLM_DIR}/CMakeLists.txt")
+        add_subdirectory("${BROLM_DIR}" "${CMAKE_BINARY_DIR}/brolm" EXCLUDE_FROM_ALL)
+    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/brolm/CMakeLists.txt")
+        add_subdirectory(third_party/brolm EXCLUDE_FROM_ALL)
+    else()
+        message(FATAL_ERROR
+            "brolm not found at ${BROLM_DIR} or third_party/brolm. "
+            "Clone the brolm repo next to this repo, or override with -DBROLM_DIR=...")
+    endif()
+endif()
+
 # --- brodiffusion library ---
 
 add_library(brodiffusion STATIC)
@@ -99,6 +118,7 @@ target_compile_features(brodiffusion PUBLIC cxx_std_20)
 target_link_libraries(brodiffusion PUBLIC
     bromath::bromath
     brotensor::brotensor
+    brolm::brolm
 )
 
 if(MSVC)
@@ -111,10 +131,6 @@ endif()
 
 target_sources(brodiffusion PRIVATE
     src/version.cpp
-    src/tokenizer_clip.cpp
-    src/tokenizer_t5.cpp
-    src/clip.cpp
-    src/t5.cpp
     src/vae.cpp
     src/unet.cpp
     src/scheduler.cpp
@@ -124,8 +140,6 @@ target_sources(brodiffusion PRIVATE
     src/detail/safetensors_dir.cpp
     src/lora.cpp
     src/pipeline.cpp
-    src/clip_image.cpp
-    src/clip_score.cpp
     src/fused.cpp
     src/optim.cpp
     src/dit/common.cpp

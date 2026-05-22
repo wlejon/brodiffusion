@@ -1,8 +1,8 @@
 #include "brodiffusion/pipeline.h"
 #include "brotensor/safetensors.h"
-#include "brodiffusion/tokenizer.h"
-#include "brodiffusion/t5.h"
-#include "brodiffusion/tokenizer_t5.h"
+#include "brolm/tokenizer.h"
+#include "brolm/t5.h"
+#include "brolm/tokenizer_t5.h"
 #include "brodiffusion/version.h"
 
 #include "brotensor/runtime.h"
@@ -22,7 +22,7 @@
 
 namespace pl   = brodiffusion::pipeline;
 namespace st   = brotensor::safetensors;
-namespace clip = brodiffusion::clip;
+namespace clip = brolm::clip;
 
 static int usage() {
     std::printf(
@@ -420,12 +420,12 @@ int run_t5(int argc, char** argv) {
 
     brotensor::init();
 
-    auto tok = brodiffusion::t5::Tokenizer::load(tok_path);
+    auto tok = brolm::t5::Tokenizer::load(tok_path);
     std::vector<std::int32_t> ids = tok.encode(prompt, max_length);
 
-    brodiffusion::t5::T5Config cfg;
+    brolm::t5::T5Config cfg;
     cfg.quantize_weights = quantize;
-    brodiffusion::t5::TextEncoder enc(cfg);
+    brolm::t5::TextEncoder enc(cfg);
 
     std::printf("Loading T5-XXL weights: %s%s\n", weights_path,
                 quantize ? "  (INT8 W8A16)" : "");
