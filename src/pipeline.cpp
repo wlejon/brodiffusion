@@ -307,9 +307,12 @@ PipelineState Pipeline::prime(std::string_view prompt,
         }
         std::vector<std::int32_t> t5_ids =
             t5_tokenizer_->encode(prompt, cfg_.t5_max_length);
+        // encode() pads to t5_max_length with <pad>; pass pad_id so the T5
+        // encoder masks those positions out of self-attention (HF parity).
         t5_encoder_->forward(t5_ids.data(),
                              static_cast<int>(t5_ids.size()),
-                             conditioning_.text_embeddings);
+                             conditioning_.text_embeddings,
+                             t5_tokenizer_->pad_id());
 
         // CLIP pooled vector — discard the CLIP sequence output for Flux.
         std::vector<std::int32_t> clip_ids = tokenizer_.encode(prompt);
