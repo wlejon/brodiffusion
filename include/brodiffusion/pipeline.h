@@ -220,6 +220,13 @@ public:
     // to size the bias vector). Throws if the active denoiser is not a UNet.
     const unet::UNet& unet() const;
 
+    // Denoiser-generic count of traceable / steerable cross-attention blocks
+    // for the active denoiser (16 for the SD1.5 UNet, 57 for the Flux DiT,
+    // 0 for a denoiser with no trace support). Lets a caller size an
+    // attn_logit_biases vector or a trace array without knowing the denoiser
+    // type. Always valid — never throws.
+    int num_xattn_blocks() const { return denoiser_->num_xattn_blocks(); }
+
     const PipelineConfig& config() const { return cfg_; }
 
 private:
