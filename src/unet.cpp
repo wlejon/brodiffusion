@@ -668,6 +668,28 @@ void UNet::forward(const bt::Tensor& latent, int H, int W, float timestep,
     }
 }
 
+void UNet::forward_traced(
+        const bt::Tensor& latent, int H, int W, float timestep,
+        const PreparedConditioning& prepared, Branch branch,
+        const std::vector<const bt::Tensor*>* attn_logit_biases,
+        AttentionTrace* trace_out, bt::Tensor& out) {
+    auto* p = static_cast<UNetPrepared*>(prepared.get());
+    if (p == nullptr) fail("forward_traced: prepare() was not called");
+    const bool uncond = (branch == Branch::Uncond);
+    if (uncond && p->ctx_uncond.size() == 0) {
+        fail("forward_traced: Branch::Uncond requested but no uncond "
+             "conditioning was prepared");
+    }
+    // forward_trace reprojects K/V from the raw context (it bypasses the K/V
+    // cache), so the trace path needs ctx, not p->cache_*. An LCM-distilled
+    // U-Net routes the guidance scale through cond_proj — pass it through.
+    const bt::Tensor& ctx = uncond ? p->ctx_uncond : p->ctx_cond;
+    const float* gs = (cfg_.time_cond_proj_dim > 0) ? &p->lcm_guidance
+                                                    : nullptr;
+    forward_trace(latent, H, W, timestep, gs, ctx, attn_logit_biases,
+                  trace_out, out);
+}
+
 void UNet::forward(const bt::Tensor& sample,
                    int H, int W,
                    float timestep,

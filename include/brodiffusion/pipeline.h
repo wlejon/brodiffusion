@@ -205,12 +205,13 @@ public:
     // prime() and step_once() leaves the cache stale — re-prime() to refresh.
     PipelineState prime(std::string_view prompt, const GenerateOptions& opts);
     // If `attn_logit_biases` is non-null, trace mode is used and the bias
-    // vector is forwarded to UNet::forward_trace (length must equal
-    // unet().num_xattn_blocks(); per-entry nulls allowed for no-bias layers).
+    // vector is forwarded to the active denoiser's forward_traced (length must
+    // equal num_xattn_blocks(); per-entry nulls allowed for no-bias blocks).
     // When biases are supplied, trace_out may still be null — the trace is
-    // computed but discarded.
+    // computed but discarded. Trace mode requires a denoiser whose
+    // num_xattn_blocks() > 0.
     void step_once(PipelineState& state, const GenerateOptions& opts,
-                   unet::UNet::CrossAttnTrace* trace_out = nullptr,
+                   AttentionTrace* trace_out = nullptr,
                    const std::vector<const brotensor::Tensor*>*
                        attn_logit_biases = nullptr);
     std::vector<float> decode(const PipelineState& state);

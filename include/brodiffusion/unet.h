@@ -180,7 +180,8 @@ public:
     // resolution) and Lk is the text-context length (77 for SD1.5/CLIP). The
     // trace-mode forward overload below populates this vector for downstream
     // research consumers (cross-attention tree search, attention scoring).
-    using CrossAttnTrace = std::vector<brotensor::Tensor>;
+    // Alias of the model-agnostic brodiffusion::AttentionTrace.
+    using CrossAttnTrace = AttentionTrace;
 
     // Populate `cache` with one (K, V) pair per Transformer2D block (in the
     // same traversal order the forward pass visits them: down blocks,
@@ -255,9 +256,21 @@ public:
                        CrossAttnTrace* trace_out,
                        brotensor::Tensor& out);
 
+    // ── Denoiser trace seam ───────────────────────────────────────────────
+    // Model-agnostic trace entry point. Adapts the generic PreparedConditioning
+    // contract onto forward_trace: the raw text context and the LCM guidance
+    // scale are pulled from the UNet's prepared payload (forward_trace bypasses
+    // the K/V cache, so it needs the context, not the cache).
+    void forward_traced(
+            const brotensor::Tensor& latent, int H_lat, int W_lat,
+            float timestep, const PreparedConditioning& prepared,
+            Branch branch,
+            const std::vector<const brotensor::Tensor*>* attn_logit_biases,
+            AttentionTrace* trace_out, brotensor::Tensor& out) override;
+
     // Number of Transformer2D (cross-attn) blocks in the model — matches the
     // size of any cache returned by prime_xattn_cache.
-    int num_xattn_blocks() const;
+    int num_xattn_blocks() const override;
 
     // Per-Transformer2D-block spatial stride (relative to H_lat, W_lat), in
     // traversal order. SD1.5 schedule is hard-coded: down stages 0/1/2 each

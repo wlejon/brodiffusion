@@ -400,7 +400,7 @@ PipelineState Pipeline::prime(std::string_view prompt,
 }
 
 void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
-                         unet::UNet::CrossAttnTrace* trace_out,
+                         AttentionTrace* trace_out,
                          const std::vector<const bt::Tensor*>*
                              attn_logit_biases) {
     if (state.step_index >= state.n_steps) {
@@ -421,25 +421,20 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
 
     // ── Denoiser forward ──────────────────────────────────────────────────
     if (trace_mode) {
-        // forward_trace bypasses the K/V cache + INT8. We capture the
-        // conditional pass only; CFG uncond (if any) still uses the fast
-        // prepared path. Use a scratch trace when the caller asked for biases
-        // but not the trace itself. Trace mode is UNet-only.
-        unet::UNet* u = denoiser_->as_unet();
-        if (u == nullptr) fail("trace mode requires a UNet denoiser");
-        unet::UNet::CrossAttnTrace scratch_trace;
-        unet::UNet::CrossAttnTrace* trace_dst =
-            trace_out ? trace_out : &scratch_trace;
-        // An LCM-distilled U-Net routes the guidance scale through cond_proj;
-        // forward_trace needs it explicitly (the prepared path that normally
-        // carries it is skipped in trace mode). conditioning_.guidance holds
-        // the LCM guidance scale (0 for vanilla SD1.5 — see prime()).
-        const float lcm_guidance = conditioning_.guidance;
-        const float* gs = (u->config().time_cond_proj_dim > 0)
-                              ? &lcm_guidance : nullptr;
-        u->forward_trace(state.latent, state.H_lat, state.W_lat, t, gs,
-                         conditioning_.text_embeddings, attn_logit_biases,
-                         trace_dst, noise_pred_cond_);
+        // Trace mode bypasses the K/V cache + INT8 inside the denoiser and
+        // captures the conditional pass only; a CFG uncond branch (if any)
+        // still uses the fast prepared path. A scratch trace absorbs the maps
+        // when the caller wants biases but not the trace itself. The denoiser
+        // pulls the raw context (and any LCM guidance) from prepared_.
+        if (denoiser_->num_xattn_blocks() == 0) {
+            fail("step_once: trace mode requires a denoiser with traceable "
+                 "attention blocks");
+        }
+        AttentionTrace scratch_trace;
+        AttentionTrace* trace_dst = trace_out ? trace_out : &scratch_trace;
+        denoiser_->forward_traced(state.latent, state.H_lat, state.W_lat, t,
+                                  prepared_, Branch::Cond, attn_logit_biases,
+                                  trace_dst, noise_pred_cond_);
         if (do_cfg) {
             denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
                                prepared_, Branch::Uncond, noise_pred_uncond_);

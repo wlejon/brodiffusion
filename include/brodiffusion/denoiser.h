@@ -11,7 +11,9 @@
 #include "brotensor/tensor.h"
 
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace brotensor::safetensors { class File; }
 
@@ -72,6 +74,14 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// Per-attention-block head-averaged image-query → text-key attention map,
+// in the denoiser's forward traversal order. Each entry is an (Lq, Lk)
+// tensor at the compute dtype: Lq image/spatial query tokens, Lk text-context
+// tokens. A denoiser that exposes attention for inspection or steering fills
+// one of these per forward_traced() call — the SD1.5 UNet's Transformer2D
+// cross-attention blocks, a DiT's joint-attention blocks, etc.
+using AttentionTrace = std::vector<brotensor::Tensor>;
+
 // Abstract noise / velocity-prediction backbone.
 class Denoiser {
 public:
@@ -108,8 +118,43 @@ public:
     virtual bool uses_cfg() const = 0;
     virtual brotensor::Dtype compute_dtype() const = 0;
 
-    // Non-null only for the SD1.5 UNet. The trace / tree-search API is
-    // UNet-shaped and stays on Pipeline, gated through this hook.
+    // ── Attention trace / steering ────────────────────────────────────────
+    //
+    // Model-agnostic seam for cross-modal attention inspection and steering.
+    // The SD1.5 UNet implements it over its Transformer2D cross-attention
+    // blocks; a DiT implements it over its joint-attention blocks. A denoiser
+    // with no traceable text↔image attention leaves the defaults.
+
+    // Number of attention blocks that expose a head-averaged image→text map
+    // (and accept a per-block pre-softmax logit bias). 0 — the default —
+    // means this denoiser has no traceable cross-modal attention.
+    virtual int num_xattn_blocks() const { return 0; }
+
+    // Trace-mode forward: identical contract to forward(), but additionally
+    // captures a per-block AttentionTrace and/or injects per-block pre-softmax
+    // logit biases.
+    //   attn_logit_biases — null, or exactly num_xattn_blocks() entries;
+    //                       entry i is null (no bias) or an (Lq_i, Lk) FP32
+    //                       tensor added to block i's scores before softmax.
+    //   trace_out         — null, or filled with num_xattn_blocks() maps.
+    // The default throws — override when num_xattn_blocks() > 0.
+    virtual void forward_traced(
+            const brotensor::Tensor& latent, int H_lat, int W_lat,
+            float timestep, const PreparedConditioning& prepared,
+            Branch branch,
+            const std::vector<const brotensor::Tensor*>* attn_logit_biases,
+            AttentionTrace* trace_out, brotensor::Tensor& out) {
+        (void)latent; (void)H_lat; (void)W_lat; (void)timestep;
+        (void)prepared; (void)branch; (void)attn_logit_biases;
+        (void)trace_out; (void)out;
+        throw std::runtime_error(
+            "Denoiser::forward_traced: this denoiser has no traceable "
+            "attention");
+    }
+
+    // Non-null only for the SD1.5 UNet — the hook for genuinely UNet-specific
+    // operations (LoRA target resolution). The attention trace/steer API is
+    // NOT routed through this: it is the model-agnostic pair above.
     virtual unet::UNet* as_unet() { return nullptr; }
     virtual const unet::UNet* as_unet() const { return nullptr; }
 };
