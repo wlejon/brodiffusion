@@ -100,9 +100,12 @@ public:
     // be observed. `trace_out`, if non-null, is filled with num_xattn_blocks()
     // (Lq=img_len, Lk=txt_len) maps in forward traversal order.
     //
-    // `attn_logit_biases` (pre-softmax attention steering) is not yet
-    // implemented for Flux: a non-null value throws. The seam is left for a
-    // later steering chunk.
+    // `attn_logit_biases`, if non-null, must hold exactly num_xattn_blocks()
+    // entries in the same double-then-single block traversal order; entry i is
+    // null (no steering for block i) or an (img_len, txt_len) FP32 tensor added
+    // to that block's joint attention scores before softmax, on the
+    // image-query → text-key sub-block only. Biases work with `trace_out` null
+    // (steer and discard the trace) or non-null (steer and capture).
     void forward_traced(
             const brotensor::Tensor& latent, int H_lat, int W_lat,
             float timestep, const PreparedConditioning& prepared,
@@ -144,29 +147,39 @@ private:
 
     // `trace_out_entry`, when non-null, switches the block's joint attention
     // to the non-fused traced path and receives the (img_len, txt_len)
-    // head-averaged image→text attention map for this block. When null the
+    // head-averaged image→text attention map for this block. `attn_bias`, when
+    // non-null, is an (img_len, txt_len) FP32 pre-softmax steering bias added
+    // to this block's image→text attention scores; supplying it also forces
+    // the traced path (steering is only defined there). When both are null the
     // block runs the fast fused attention (forward() behaviour, unchanged).
     void run_double_block_(const DoubleBlock& blk,
                            const brotensor::Tensor& temb,
                            const brotensor::Tensor& cos,
                            const brotensor::Tensor& sin,
                            int txt_len, int img_len,
-                           brotensor::Tensor* trace_out_entry = nullptr);
+                           brotensor::Tensor* trace_out_entry = nullptr,
+                           const brotensor::Tensor* attn_bias = nullptr);
     void run_single_block_(const SingleBlock& blk,
                            const brotensor::Tensor& temb,
                            const brotensor::Tensor& cos,
                            const brotensor::Tensor& sin,
                            int txt_len, int img_len,
-                           brotensor::Tensor* trace_out_entry = nullptr);
+                           brotensor::Tensor* trace_out_entry = nullptr,
+                           const brotensor::Tensor* attn_bias = nullptr);
 
     // Shared forward worker. `trace_out`, when non-null, is filled with
     // num_xattn_blocks() head-averaged image→text attention maps (double
-    // blocks first, then single blocks). When null this is the plain
-    // forward() path — every joint attention uses the fast fused kernel and
-    // the result is bit-identical to the pre-trace forward().
+    // blocks first, then single blocks). `attn_logit_biases`, when non-null,
+    // holds exactly num_xattn_blocks() entries (each null or an
+    // (img_len, txt_len) FP32 pre-softmax bias) in the same traversal order.
+    // When both are null this is the plain forward() path — every joint
+    // attention uses the fast fused kernel and the result is bit-identical to
+    // the pre-trace forward().
     void forward_impl_(const brotensor::Tensor& latent, int H_lat, int W_lat,
                        float timestep, const PreparedConditioning& prepared,
                        Branch branch,
+                       const std::vector<const brotensor::Tensor*>*
+                           attn_logit_biases,
                        AttentionTrace* trace_out,
                        brotensor::Tensor& out);
 

@@ -218,7 +218,9 @@ void joint_attention_traced(const bt::Tensor& Q, const bt::Tensor& K,
                             const bt::Tensor& V, const bt::Tensor& cos,
                             const bt::Tensor& sin, int head_dim, int num_heads,
                             bt::Tensor& out, bt::Tensor& attn_avg,
-                            bt::Tensor& Qr, bt::Tensor& Kr) {
+                            bt::Tensor& Qr, bt::Tensor& Kr,
+                            int txt_len,
+                            const bt::Tensor* image_text_bias) {
     // RoPE on Q and K — identical to the fused path.
     bt::rope_apply(Q, cos, sin, head_dim, num_heads, Qr);
     bt::rope_apply(K, cos, sin, head_dim, num_heads, Kr);
@@ -230,6 +232,25 @@ void joint_attention_traced(const bt::Tensor& Q, const bt::Tensor& K,
     const int L = Q.rows;
     if (K.rows != L || V.rows != L || K.cols != D || V.cols != D) {
         fail("joint_attention_traced: Q/K/V must share shape (L, D)");
+    }
+
+    // Optional pre-softmax image→text steering bias. The joint sequence is
+    // [text ; image]: image rows are [txt_len, L), text cols [0, txt_len).
+    std::vector<float> bias_host;  // (img_len, txt_len) FP32, empty when unused
+    if (image_text_bias != nullptr) {
+        if (txt_len < 0 || txt_len > L) {
+            fail("joint_attention_traced: txt_len out of range for bias");
+        }
+        const int img_len = L - txt_len;
+        if (image_text_bias->dtype != bt::Dtype::FP32) {
+            fail("joint_attention_traced: image_text_bias must be FP32");
+        }
+        if (image_text_bias->rows != img_len ||
+            image_text_bias->cols != txt_len) {
+            fail("joint_attention_traced: image_text_bias must be "
+                 "(img_len, txt_len)");
+        }
+        bias_host = image_text_bias->to_host_vector();
     }
 
     // Materialise the per-head softmax on host in FP32. This is the slow
@@ -254,7 +275,16 @@ void joint_attention_traced(const bt::Tensor& Q, const bt::Tensor& K,
         for (int qi = 0; qi < L; ++qi) {
             const float* qrow = q.data() +
                 static_cast<std::size_t>(qi) * D + hd0;
-            // S[qi, kk] = scale * <Qr_head[qi], Kr_head[kk]>
+            // Image-query rows [txt_len, L) carry a per-text-key bias added to
+            // the scaled score before softmax; null bias / non-image rows add
+            // nothing.
+            const bool biased_row =
+                !bias_host.empty() && qi >= txt_len;
+            const float* brow = biased_row
+                ? bias_host.data() +
+                      static_cast<std::size_t>(qi - txt_len) * txt_len
+                : nullptr;
+            // S[qi, kk] = scale * <Qr_head[qi], Kr_head[kk]>  (+ bias)
             double smax = -std::numeric_limits<double>::infinity();
             for (int kk = 0; kk < L; ++kk) {
                 const float* krow = k.data() +
@@ -264,7 +294,10 @@ void joint_attention_traced(const bt::Tensor& Q, const bt::Tensor& K,
                     dot += static_cast<double>(qrow[d]) *
                            static_cast<double>(krow[d]);
                 }
-                const double sc = dot * scale;
+                double sc = dot * scale;
+                if (brow != nullptr && kk < txt_len) {
+                    sc += static_cast<double>(brow[kk]);
+                }
                 s[static_cast<std::size_t>(kk)] = sc;
                 if (sc > smax) smax = sc;
             }

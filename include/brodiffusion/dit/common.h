@@ -86,6 +86,17 @@ void joint_attention(const brotensor::Tensor& Q,
 // compute dtype — into `attn_avg`: attn_avg[q, k] = mean over heads of the
 // softmax weight query q places on key k.
 //
+// Optional pre-softmax steering. The joint sequence is [text ; image]: text
+// keys/queries occupy rows/cols [0, txt_len), image rows/cols
+// [txt_len, txt_len+img_len). When `image_text_bias` is non-null it must be an
+// (img_len, txt_len) FP32 tensor; before the softmax over keys, for every
+// image-query row q in [txt_len, L) and every text-key column k in [0, txt_len)
+// the value image_text_bias[q - txt_len, k] is added to the scaled score
+// S[q, k]. The softmax still runs over the full key axis (text + image keys) —
+// only the image→text sub-block is biased, exactly as the SD1.5 UNet biases
+// only the text-key columns of cross-attention. `txt_len` is ignored when
+// `image_text_bias` is null.
+//
 // Slower than the fused path (it materialises an (L, L) score buffer per
 // head); intended only for trace-mode forwards, exactly as the SD1.5 UNet's
 // cross-attention trace documents.
@@ -98,7 +109,10 @@ void joint_attention_traced(const brotensor::Tensor& Q,
                             brotensor::Tensor& out,
                             brotensor::Tensor& attn_avg,
                             // scratch reused across calls (rotated Q / K)
-                            brotensor::Tensor& Qr, brotensor::Tensor& Kr);
+                            brotensor::Tensor& Qr, brotensor::Tensor& Kr,
+                            // optional pre-softmax image→text steering bias
+                            int txt_len = 0,
+                            const brotensor::Tensor* image_text_bias = nullptr);
 
 // ─── AdaLN modulation chunks ───────────────────────────────────────────────
 

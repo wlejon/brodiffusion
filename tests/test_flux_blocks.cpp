@@ -291,20 +291,153 @@ std::vector<float> run_flux(const dit::FluxConfig& cfg,
     }
     CHECK(max_abs_diff < 1e-3f);
 
-    // A non-null attn_logit_biases must be rejected (steering unimplemented).
+    // ── joint-attention steering ──────────────────────────────────────────
+    // Helper: column sum of an (img_len, txt_len) trace map over all image
+    // rows for text token `col` — the total image→text attention mass that
+    // text token receives in this block.
+    auto col_sum = [&](const bt::Tensor& m, int col) -> double {
+        std::vector<float> mv = bdtest::bd_download(m);
+        double s = 0.0;
+        for (int r = 0; r < m.rows; ++r) {
+            s += static_cast<double>(mv[static_cast<std::size_t>(r) * m.cols +
+                                        col]);
+        }
+        return s;
+    };
+
+    // A biases vector of all-null entries must produce a trace identical to
+    // passing attn_logit_biases = nullptr (within tight tolerance).
     {
-        bool steer_threw = false;
-        std::vector<const bt::Tensor*> biases(
+        std::vector<const bt::Tensor*> null_biases(
             static_cast<std::size_t>(n_blocks), nullptr);
+        brodiffusion::AttentionTrace trace_nb;
+        bt::Tensor out_nb;
+        flux.forward_traced(latent, H_lat, W_lat, 500.0f, prepared,
+                            brodiffusion::Branch::Cond, &null_biases,
+                            &trace_nb, out_nb);
+        bt::sync_all();
+        CHECK(static_cast<int>(trace_nb.size()) == n_blocks);
+        float max_trace_diff = 0.0f;
+        for (int bi = 0; bi < n_blocks; ++bi) {
+            std::vector<float> a = bdtest::bd_download(trace[bi]);
+            std::vector<float> c = bdtest::bd_download(trace_nb[bi]);
+            CHECK(a.size() == c.size());
+            if (a.size() == c.size()) {
+                for (std::size_t i = 0; i < a.size(); ++i) {
+                    float d = std::fabs(a[i] - c[i]);
+                    if (d > max_trace_diff) max_trace_diff = d;
+                }
+            }
+        }
+        CHECK(max_trace_diff < 1e-5f);
+    }
+
+    // Positive bias on one text token's column must increase that token's
+    // image→text attention mass; a negative bias must decrease it. Steer the
+    // first double block, inspect block 0's trace map. Bias targets text
+    // token `tgt`.
+    {
+        const int tgt = 1;
+        std::vector<float> pos_b(
+            static_cast<std::size_t>(img_len) * txt_len, 0.0f);
+        std::vector<float> neg_b(
+            static_cast<std::size_t>(img_len) * txt_len, 0.0f);
+        for (int r = 0; r < img_len; ++r) {
+            pos_b[static_cast<std::size_t>(r) * txt_len + tgt] = 4.0f;
+            neg_b[static_cast<std::size_t>(r) * txt_len + tgt] = -4.0f;
+        }
+        bt::Tensor pos_t = bt::Tensor::from_host(pos_b.data(), img_len, txt_len)
+                               .to(bt::default_device());
+        bt::Tensor neg_t = bt::Tensor::from_host(neg_b.data(), img_len, txt_len)
+                               .to(bt::default_device());
+
+        std::vector<const bt::Tensor*> pos_biases(
+            static_cast<std::size_t>(n_blocks), nullptr);
+        pos_biases[0] = &pos_t;
+        std::vector<const bt::Tensor*> neg_biases(
+            static_cast<std::size_t>(n_blocks), nullptr);
+        neg_biases[0] = &neg_t;
+
+        brodiffusion::AttentionTrace trace_pos, trace_neg;
+        bt::Tensor out_pos, out_neg;
+        flux.forward_traced(latent, H_lat, W_lat, 500.0f, prepared,
+                            brodiffusion::Branch::Cond, &pos_biases,
+                            &trace_pos, out_pos);
+        flux.forward_traced(latent, H_lat, W_lat, 500.0f, prepared,
+                            brodiffusion::Branch::Cond, &neg_biases,
+                            &trace_neg, out_neg);
+        bt::sync_all();
+
+        const double base = col_sum(trace[0], tgt);
+        const double pos  = col_sum(trace_pos[0], tgt);
+        const double neg  = col_sum(trace_neg[0], tgt);
+        std::printf("flux steer: block0 text-token %d image->text mass  "
+                    "base=%.5f  +4bias=%.5f  -4bias=%.5f\n",
+                    tgt, base, pos, neg);
+        CHECK(pos > base);
+        CHECK(neg < base);
+
+        // Biases must work with trace_out null (steer + discard the trace):
+        // the steered velocity output is the same whether or not the trace is
+        // captured. (Compute-dtype tolerance — on an FP16 backend the extra
+        // trace-slice ops perturb GPU reduction order by ~1 ULP, the same band
+        // the traced-vs-plain check above uses.)
+        bt::Tensor out_pos2;
+        flux.forward_traced(latent, H_lat, W_lat, 500.0f, prepared,
+                            brodiffusion::Branch::Cond, &pos_biases,
+                            /*trace_out=*/nullptr, out_pos2);
+        bt::sync_all();
+        std::vector<float> op1 = bdtest::bd_download(out_pos);
+        std::vector<float> op2 = bdtest::bd_download(out_pos2);
+        CHECK(op1.size() == op2.size());
+        float op_diff = 0.0f;
+        if (op1.size() == op2.size()) {
+            for (std::size_t i = 0; i < op1.size(); ++i) {
+                float d = std::fabs(op1[i] - op2[i]);
+                if (d > op_diff) op_diff = d;
+            }
+        }
+        std::printf("flux steer: trace vs no-trace out max-abs-diff %.3e\n",
+                    op_diff);
+        CHECK(op_diff < 1e-3f);
+    }
+
+    // attn_logit_biases with the wrong length must throw.
+    {
+        bool len_threw = false;
+        std::vector<const bt::Tensor*> bad_len(
+            static_cast<std::size_t>(n_blocks + 1), nullptr);
         try {
             bt::Tensor dummy;
             flux.forward_traced(latent, H_lat, W_lat, 500.0f, prepared,
-                                brodiffusion::Branch::Cond, &biases,
+                                brodiffusion::Branch::Cond, &bad_len,
                                 /*trace_out=*/nullptr, dummy);
         } catch (const std::exception&) {
-            steer_threw = true;
+            len_threw = true;
         }
-        CHECK(steer_threw);
+        CHECK(len_threw);
+    }
+
+    // A bias entry with the wrong shape must throw.
+    {
+        bool shape_threw = false;
+        std::vector<float> wrong(
+            static_cast<std::size_t>(img_len) * (txt_len + 1), 0.0f);
+        bt::Tensor wrong_t =
+            bt::Tensor::from_host(wrong.data(), img_len, txt_len + 1)
+                .to(bt::default_device());
+        std::vector<const bt::Tensor*> bad_shape_biases(
+            static_cast<std::size_t>(n_blocks), nullptr);
+        bad_shape_biases[0] = &wrong_t;
+        try {
+            bt::Tensor dummy;
+            flux.forward_traced(latent, H_lat, W_lat, 500.0f, prepared,
+                                brodiffusion::Branch::Cond, &bad_shape_biases,
+                                /*trace_out=*/nullptr, dummy);
+        } catch (const std::exception&) {
+            shape_threw = true;
+        }
+        CHECK(shape_threw);
     }
 
     // Uncond branch must be rejected.

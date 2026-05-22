@@ -245,7 +245,8 @@ void FluxDenoiser::run_double_block_(const DoubleBlock& blk,
                                      const bt::Tensor& cos,
                                      const bt::Tensor& sin,
                                      int txt_len, int img_len,
-                                     bt::Tensor* trace_out_entry) {
+                                     bt::Tensor* trace_out_entry,
+                                     const bt::Tensor* attn_bias) {
     const int D  = cfg_.inner_dim();
     const int HD = cfg_.attention_head_dim;
     const int NH = cfg_.num_attention_heads;
@@ -330,15 +331,19 @@ void FluxDenoiser::run_double_block_(const DoubleBlock& blk,
     concat_rows(txt_k_c, img_k_c, K_);
     concat_rows(txt_v_c, img_v_c, V_);
 
-    if (trace_out_entry != nullptr) {
-        // Trace path: materialise the per-head softmax, average over heads,
-        // then keep the image-query × text-key block. Joint sequence is
+    if (trace_out_entry != nullptr || attn_bias != nullptr) {
+        // Trace / steering path: materialise the per-head softmax, average over
+        // heads, then keep the image-query × text-key block. Joint sequence is
         // [text ; image], so image rows are [txt_len, txt_len+img_len) and
-        // text columns are [0, txt_len).
+        // text columns are [0, txt_len). `attn_bias`, if non-null, is added to
+        // the image→text scores before softmax.
         bt::Tensor attn_avg;
         joint_attention_traced(Q_, K_, V_, cos, sin, HD, NH, attn_, attn_avg,
-                               Qr_, Kr_);
-        slice_block(attn_avg, txt_len, img_len, 0, txt_len, *trace_out_entry);
+                               Qr_, Kr_, txt_len, attn_bias);
+        if (trace_out_entry != nullptr) {
+            slice_block(attn_avg, txt_len, img_len, 0, txt_len,
+                        *trace_out_entry);
+        }
     } else {
         joint_attention(Q_, K_, V_, cos, sin, HD, NH, attn_, Qr_, Kr_);
     }
@@ -388,7 +393,8 @@ void FluxDenoiser::run_single_block_(const SingleBlock& blk,
                                      const bt::Tensor& cos,
                                      const bt::Tensor& sin,
                                      int txt_len, int img_len,
-                                     bt::Tensor* trace_out_entry) {
+                                     bt::Tensor* trace_out_entry,
+                                     const bt::Tensor* attn_bias) {
     const int D  = cfg_.inner_dim();
     const int HD = cfg_.attention_head_dim;
     const int NH = cfg_.num_attention_heads;
@@ -434,14 +440,19 @@ void FluxDenoiser::run_single_block_(const SingleBlock& blk,
     K_ = kh.clone();
     V_ = v_.clone();
 
-    if (trace_out_entry != nullptr) {
-        // Trace path: same joint sequence layout as the double-stream block —
-        // [text ; image] — so the image-query × text-key block is rows
-        // [txt_len, txt_len+img_len) × cols [0, txt_len).
+    if (trace_out_entry != nullptr || attn_bias != nullptr) {
+        // Trace / steering path: same joint sequence layout as the
+        // double-stream block — [text ; image] — so the image-query × text-key
+        // block is rows [txt_len, txt_len+img_len) × cols [0, txt_len).
+        // `attn_bias`, if non-null, is added to the image→text scores before
+        // softmax.
         bt::Tensor attn_avg;
         joint_attention_traced(Q_, K_, V_, cos, sin, HD, NH, attn_, attn_avg,
-                               Qr_, Kr_);
-        slice_block(attn_avg, txt_len, img_len, 0, txt_len, *trace_out_entry);
+                               Qr_, Kr_, txt_len, attn_bias);
+        if (trace_out_entry != nullptr) {
+            slice_block(attn_avg, txt_len, img_len, 0, txt_len,
+                        *trace_out_entry);
+        }
     } else {
         joint_attention(Q_, K_, V_, cos, sin, HD, NH, attn_, Qr_, Kr_);
     }
@@ -467,7 +478,7 @@ void FluxDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
                            float timestep, const PreparedConditioning& prepared,
                            Branch branch, bt::Tensor& out) {
     forward_impl_(latent, H_lat, W_lat, timestep, prepared, branch,
-                  /*trace_out=*/nullptr, out);
+                  /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr, out);
 }
 
 void FluxDenoiser::forward_traced(
@@ -475,22 +486,25 @@ void FluxDenoiser::forward_traced(
         const PreparedConditioning& prepared, Branch branch,
         const std::vector<const bt::Tensor*>* attn_logit_biases,
         AttentionTrace* trace_out, bt::Tensor& out) {
-    if (attn_logit_biases != nullptr) {
-        throw std::runtime_error(
-            "FluxDenoiser::forward_traced: attention steering is not yet "
-            "implemented for Flux");
+    if (attn_logit_biases != nullptr &&
+        static_cast<int>(attn_logit_biases->size()) != num_xattn_blocks()) {
+        fail("forward_traced: attn_logit_biases has " +
+             std::to_string(attn_logit_biases->size()) + " entries, expected " +
+             std::to_string(num_xattn_blocks()));
     }
     if (trace_out != nullptr) {
         trace_out->resize(static_cast<std::size_t>(num_xattn_blocks()));
     }
     forward_impl_(latent, H_lat, W_lat, timestep, prepared, branch,
-                  trace_out, out);
+                  attn_logit_biases, trace_out, out);
 }
 
 void FluxDenoiser::forward_impl_(const bt::Tensor& latent,
                                  int H_lat, int W_lat, float timestep,
                                  const PreparedConditioning& prepared,
                                  Branch branch,
+                                 const std::vector<const bt::Tensor*>*
+                                     attn_logit_biases,
                                  AttentionTrace* trace_out, bt::Tensor& out) {
     if (branch != Branch::Cond) {
         fail("forward: Flux is single-branch; only Branch::Cond is valid");
@@ -565,8 +579,27 @@ void FluxDenoiser::forward_impl_(const bt::Tensor& latent,
 
     // Trace traversal: the num_layers double blocks fill entries
     // [0, num_layers), then the num_single_layers single blocks fill the
-    // rest — matching num_xattn_blocks()'s declared order.
+    // rest — matching num_xattn_blocks()'s declared order. Per-block steering
+    // biases (when supplied) follow the same order.
     int trace_idx = 0;
+
+    // Resolve (and shape-check) the steering bias for block `idx`. A non-null
+    // bias entry must be an (img_len, txt_len) FP32 tensor.
+    auto bias_at = [&](int idx) -> const bt::Tensor* {
+        if (attn_logit_biases == nullptr) return nullptr;
+        const bt::Tensor* b =
+            (*attn_logit_biases)[static_cast<std::size_t>(idx)];
+        if (b == nullptr) return nullptr;
+        if (b->dtype != bt::Dtype::FP32) {
+            fail("forward: attn_logit_biases[" + std::to_string(idx) +
+                 "] must be FP32");
+        }
+        if (b->rows != img_len || b->cols != txt_len) {
+            fail("forward: attn_logit_biases[" + std::to_string(idx) +
+                 "] must be (img_len, txt_len)");
+        }
+        return b;
+    };
 
     // ── double-stream blocks ──────────────────────────────────────────────
     for (const DoubleBlock& blk : double_blocks_) {
@@ -574,7 +607,7 @@ void FluxDenoiser::forward_impl_(const bt::Tensor& latent,
             ? &(*trace_out)[static_cast<std::size_t>(trace_idx)]
             : nullptr;
         run_double_block_(blk, temb_, rope.cos, rope.sin, txt_len, img_len,
-                          te);
+                          te, bias_at(trace_idx));
         ++trace_idx;
     }
 
@@ -586,7 +619,7 @@ void FluxDenoiser::forward_impl_(const bt::Tensor& latent,
             ? &(*trace_out)[static_cast<std::size_t>(trace_idx)]
             : nullptr;
         run_single_block_(blk, temb_, rope.cos, rope.sin, txt_len, img_len,
-                          te);
+                          te, bias_at(trace_idx));
         ++trace_idx;
     }
 
