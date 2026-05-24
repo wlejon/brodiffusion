@@ -78,6 +78,15 @@ public:
               brotensor::Tensor& sample,
               brotensor::Tensor& scratch) const;
 
+    // Rectified-flow forward noising for img2img priming:
+    //   x_t = (1 - sigma_t) * x_0 + sigma_t * noise,
+    // where sigma_t = sigmas_[step_index]. Must be called after set_timesteps().
+    void add_noise(const brotensor::Tensor& x0,
+                   const brotensor::Tensor& noise,
+                   int step_index,
+                   brotensor::Tensor& sample,
+                   brotensor::Tensor& scratch) const;
+
     const FlowMatchConfig& config() const { return cfg_; }
 
 private:

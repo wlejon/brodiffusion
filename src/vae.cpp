@@ -1,9 +1,12 @@
 #include "brodiffusion/vae.h"
+#include "brodiffusion/detail/compute.h"
+#include "brodiffusion/detail/device.h"
 #include "brotensor/safetensors.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
 
+#include <cmath>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -19,10 +22,18 @@ namespace {
 [[noreturn]] void fail(const std::string& msg) {
     throw std::runtime_error("vae::Decoder: " + msg);
 }
+[[noreturn]] void fail_enc(const std::string& msg) {
+    throw std::runtime_error("vae::Encoder: " + msg);
+}
 
 const st::TensorView& need(const st::File& f, const std::string& key) {
     const auto* v = f.find(key);
     if (!v) throw std::runtime_error("vae::Decoder: missing tensor '" + key + "'");
+    return *v;
+}
+const st::TensorView& need_enc(const st::File& f, const std::string& key) {
+    const auto* v = f.find(key);
+    if (!v) throw std::runtime_error("vae::Encoder: missing tensor '" + key + "'");
     return *v;
 }
 
@@ -38,6 +49,19 @@ void upload_compute_checked(const st::TensorView& v, int rows, int cols,
         fail(std::string(name) + ": shape mismatch (expected " +
              std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
              std::to_string(v.numel()) + ")");
+    }
+    st::upload_compute(v, rows, cols, dst);
+}
+void upload_compute_checked_enc(const st::TensorView& v, int rows, int cols,
+                                bt::Tensor& dst, const char* name) {
+    if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
+        fail_enc(std::string(name) + ": expected F16 or F32, got " + st::dtype_name(v.dtype));
+    }
+    int64_t expected = static_cast<int64_t>(rows) * static_cast<int64_t>(cols);
+    if (v.numel() != expected) {
+        fail_enc(std::string(name) + ": shape mismatch (expected " +
+                 std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
+                 std::to_string(v.numel()) + ")");
     }
     st::upload_compute(v, rows, cols, dst);
 }
@@ -322,6 +346,311 @@ void Decoder::decode(const bt::Tensor& latent,
     apply_conv3x3_(conv_out_W_, conv_out_b_,
                    first_C, cfg_.out_channels, H, W,
                    y_, out);
+}
+
+// ─── Encoder ───────────────────────────────────────────────────────────────
+
+Encoder::Encoder(const EncoderConfig& cfg) : cfg_(cfg) {
+    if (cfg_.block_out_channels.empty()) fail_enc("block_out_channels must be non-empty");
+    if (cfg_.layers_per_block <= 0) fail_enc("layers_per_block must be positive");
+    for (int c : cfg_.block_out_channels) {
+        if (c <= 0 || c % cfg_.norm_num_groups != 0) {
+            fail_enc("each block_out_channels entry must be a positive multiple of norm_num_groups");
+        }
+    }
+    down_blocks_.resize(cfg_.block_out_channels.size());
+}
+
+Encoder::~Encoder() = default;
+
+void Encoder::load_resnet_(const st::File& f, const std::string& p,
+                           int C_in, int C_out, Resnet& r) {
+    upload_compute_checked_enc(need_enc(f, p + "norm1.weight"), C_in, 1, r.norm1_g, "norm1.weight");
+    upload_compute_checked_enc(need_enc(f, p + "norm1.bias"),   C_in, 1, r.norm1_b, "norm1.bias");
+    upload_compute_checked_enc(need_enc(f, p + "conv1.weight"), C_out, C_in * 3 * 3, r.conv1_W, "conv1.weight");
+    upload_compute_checked_enc(need_enc(f, p + "conv1.bias"),   C_out, 1, r.conv1_b, "conv1.bias");
+    upload_compute_checked_enc(need_enc(f, p + "norm2.weight"), C_out, 1, r.norm2_g, "norm2.weight");
+    upload_compute_checked_enc(need_enc(f, p + "norm2.bias"),   C_out, 1, r.norm2_b, "norm2.bias");
+    upload_compute_checked_enc(need_enc(f, p + "conv2.weight"), C_out, C_out * 3 * 3, r.conv2_W, "conv2.weight");
+    upload_compute_checked_enc(need_enc(f, p + "conv2.bias"),   C_out, 1, r.conv2_b, "conv2.bias");
+
+    r.C_in = C_in;
+    r.C_out = C_out;
+    r.has_shortcut = (C_in != C_out);
+    if (r.has_shortcut) {
+        upload_compute_checked_enc(need_enc(f, p + "conv_shortcut.weight"),
+                                   C_out, C_in, r.short_W, "conv_shortcut.weight");
+        upload_compute_checked_enc(need_enc(f, p + "conv_shortcut.bias"),
+                                   C_out, 1, r.short_b, "conv_shortcut.bias");
+    }
+}
+
+void Encoder::load_weights(const st::File& f, const std::string& prefix) {
+    const int first_C = cfg_.block_out_channels.front();
+    const int mid_C   = cfg_.block_out_channels.back();
+    const int twoC_lat = 2 * cfg_.in_channels;
+
+    // quant_conv sits above the "encoder." subtree (sibling of post_quant_conv).
+    std::string parent = prefix;
+    {
+        const std::string tail = "encoder.";
+        if (parent.size() >= tail.size() &&
+            parent.compare(parent.size() - tail.size(), tail.size(), tail) == 0) {
+            parent.erase(parent.size() - tail.size());
+        }
+    }
+    const auto* qw = f.find(parent + "quant_conv.weight");
+    const auto* qb = f.find(parent + "quant_conv.bias");
+    has_quant_conv_ = (qw != nullptr && qb != nullptr);
+    if (has_quant_conv_) {
+        upload_compute_checked_enc(*qw, twoC_lat, twoC_lat, quant_W_, "quant_conv.weight");
+        upload_compute_checked_enc(*qb, twoC_lat, 1, quant_b_, "quant_conv.bias");
+    }
+
+    // conv_in: (first_C, out_channels, 3, 3) -> 2D (first_C, out_channels * 9)
+    upload_compute_checked_enc(need_enc(f, prefix + "conv_in.weight"),
+                               first_C, cfg_.out_channels * 3 * 3,
+                               conv_in_W_, "conv_in.weight");
+    upload_compute_checked_enc(need_enc(f, prefix + "conv_in.bias"),
+                               first_C, 1, conv_in_b_, "conv_in.bias");
+
+    // down_blocks
+    int C_prev = first_C;
+    const int nb = static_cast<int>(cfg_.block_out_channels.size());
+    for (int i = 0; i < nb; ++i) {
+        const int C_block = cfg_.block_out_channels[static_cast<std::size_t>(i)];
+        DownBlock& db = down_blocks_[static_cast<std::size_t>(i)];
+        db.resnets.clear();
+        db.resnets.resize(static_cast<std::size_t>(cfg_.layers_per_block));
+        db.C_out = C_block;
+        for (int j = 0; j < cfg_.layers_per_block; ++j) {
+            const int Ci = (j == 0) ? C_prev : C_block;
+            const std::string rp = prefix + "down_blocks." + std::to_string(i) +
+                                   ".resnets." + std::to_string(j) + ".";
+            load_resnet_(f, rp, Ci, C_block,
+                         db.resnets[static_cast<std::size_t>(j)]);
+        }
+        db.has_downsampler = (i + 1 < nb);
+        if (db.has_downsampler) {
+            const std::string dp = prefix + "down_blocks." + std::to_string(i) +
+                                   ".downsamplers.0.conv.";
+            upload_compute_checked_enc(need_enc(f, dp + "weight"),
+                                       C_block, C_block * 3 * 3, db.downsampler.W,
+                                       "downsampler.conv.weight");
+            upload_compute_checked_enc(need_enc(f, dp + "bias"),
+                                       C_block, 1, db.downsampler.b,
+                                       "downsampler.conv.bias");
+        }
+        C_prev = C_block;
+    }
+
+    // mid_block
+    load_resnet_(f, prefix + "mid_block.resnets.0.", mid_C, mid_C, mid_res0_);
+    load_resnet_(f, prefix + "mid_block.resnets.1.", mid_C, mid_C, mid_res1_);
+
+    const std::string ap = prefix + "mid_block.attentions.0.";
+    upload_compute_checked_enc(need_enc(f, ap + "group_norm.weight"), mid_C, 1, mid_attn_.gn_g, "attn.gn.w");
+    upload_compute_checked_enc(need_enc(f, ap + "group_norm.bias"),   mid_C, 1, mid_attn_.gn_b, "attn.gn.b");
+    auto need_alt = [&](const char* primary, const char* legacy) -> const st::TensorView& {
+        const auto* v = f.find(ap + primary);
+        if (v) return *v;
+        v = f.find(ap + legacy);
+        if (v) return *v;
+        fail_enc("missing attention tensor '" + ap + primary + "' (also tried '" + ap + legacy + "')");
+    };
+    upload_compute_checked_enc(need_alt("to_q.weight",     "query.weight"),     mid_C, mid_C, mid_attn_.Wq, "attn.q.w");
+    upload_compute_checked_enc(need_alt("to_q.bias",       "query.bias"),       mid_C, 1, mid_attn_.bq, "attn.q.b");
+    upload_compute_checked_enc(need_alt("to_k.weight",     "key.weight"),       mid_C, mid_C, mid_attn_.Wk, "attn.k.w");
+    upload_compute_checked_enc(need_alt("to_k.bias",       "key.bias"),         mid_C, 1, mid_attn_.bk, "attn.k.b");
+    upload_compute_checked_enc(need_alt("to_v.weight",     "value.weight"),     mid_C, mid_C, mid_attn_.Wv, "attn.v.w");
+    upload_compute_checked_enc(need_alt("to_v.bias",       "value.bias"),       mid_C, 1, mid_attn_.bv, "attn.v.b");
+    upload_compute_checked_enc(need_alt("to_out.0.weight", "proj_attn.weight"), mid_C, mid_C, mid_attn_.Wo, "attn.o.w");
+    upload_compute_checked_enc(need_alt("to_out.0.bias",   "proj_attn.bias"),   mid_C, 1, mid_attn_.bo, "attn.o.b");
+    mid_attn_.C = mid_C;
+
+    upload_compute_checked_enc(need_enc(f, prefix + "conv_norm_out.weight"),
+                               mid_C, 1, norm_out_g_, "conv_norm_out.weight");
+    upload_compute_checked_enc(need_enc(f, prefix + "conv_norm_out.bias"),
+                               mid_C, 1, norm_out_b_, "conv_norm_out.bias");
+
+    // conv_out: (2*in_channels, mid_C, 3, 3) -> 2D
+    upload_compute_checked_enc(need_enc(f, prefix + "conv_out.weight"),
+                               twoC_lat, mid_C * 3 * 3, conv_out_W_, "conv_out.weight");
+    upload_compute_checked_enc(need_enc(f, prefix + "conv_out.bias"),
+                               twoC_lat, 1, conv_out_b_, "conv_out.bias");
+}
+
+void Encoder::apply_resnet_(const Resnet& r, int H, int W,
+                            bt::Tensor& x, bt::Tensor& tmp) {
+    const bt::Tensor* skip_W = r.has_shortcut ? &r.short_W : nullptr;
+    const bt::Tensor* skip_b = r.has_shortcut ? &r.short_b : nullptr;
+    bt::resblock_forward(x,
+                         r.norm1_g, r.norm1_b,
+                         r.conv1_W, &r.conv1_b,
+                         /*t_emb_shift=*/nullptr,
+                         r.norm2_g, r.norm2_b,
+                         r.conv2_W, &r.conv2_b,
+                         skip_W, skip_b,
+                         /*N=*/1, r.C_in, r.C_out, H, W,
+                         cfg_.norm_num_groups, cfg_.eps,
+                         tmp);
+    std::swap(x, tmp);
+}
+
+void Encoder::apply_attention_(const Attention& a, int H, int W,
+                               bt::Tensor& x) {
+    bt::group_norm_forward(x, a.gn_g, a.gn_b,
+                           1, a.C, H, W, cfg_.norm_num_groups, cfg_.eps,
+                           ln_nchw_);
+    bt::nchw_to_sequence(ln_nchw_, 1, a.C, H, W, seq_);
+    bt::flash_attention_qkvo_forward(
+        seq_, /*Ctx=*/nullptr,
+        a.Wq, &a.bq, a.Wk, &a.bk, a.Wv, &a.bv, a.Wo, &a.bo,
+        /*d_mask=*/nullptr, cfg_.num_attention_heads, /*causal=*/false,
+        proj_seq_);
+    bt::sequence_to_nchw(proj_seq_, 1, a.C, H, W, attn_nchw_);
+    bt::add_inplace(x, attn_nchw_);
+}
+
+void Encoder::apply_downsample_(const DownsampleConv& d, int C, int H, int W,
+                                bt::Tensor& x, bt::Tensor& tmp) {
+    // Diffusers Downsample2D: F.pad(x, (0, 1, 0, 1)) then conv stride=2 pad=0.
+    // pad2d_forward(... pad_top, pad_bottom, pad_left, pad_right, mode=0/zero)
+    bt::pad2d_forward(x, /*N=*/1, C, H, W,
+                      /*pad_top=*/0, /*pad_bottom=*/1,
+                      /*pad_left=*/0, /*pad_right=*/1,
+                      /*mode=*/0, pad_);
+    bt::conv2d_forward(pad_, d.W, &d.b,
+                       /*N=*/1, /*C_in=*/C, /*H=*/H + 1, /*W=*/W + 1,
+                       /*C_out=*/C, /*kH=*/3, /*kW=*/3,
+                       /*stride=*/2, 2, /*pad=*/0, 0, /*dil=*/1, 1,
+                       tmp);
+    std::swap(x, tmp);
+}
+
+void Encoder::apply_conv3x3_(const bt::Tensor& W, const bt::Tensor& b,
+                             int C_in, int C_out, int H, int W_,
+                             bt::Tensor& x_in, bt::Tensor& x_out) {
+    bt::conv2d_forward(x_in, W, &b,
+                       /*N=*/1, C_in, H, W_,
+                       C_out, /*kH=*/3, /*kW=*/3,
+                       1, 1, /*pad=*/1, 1, 1, 1,
+                       x_out);
+}
+
+void Encoder::encode(const bt::Tensor& image, int H, int W,
+                     const bt::Tensor* eps, bt::Tensor& out) {
+    if (conv_in_W_.size() == 0) fail_enc("encode: weights not loaded");
+    if (H <= 0 || W <= 0) fail_enc("encode: H and W must be positive");
+    if (H % 8 != 0 || W % 8 != 0) fail_enc("encode: H and W must be multiples of 8");
+    if (image.rows != 1 || image.cols != cfg_.out_channels * H * W) {
+        fail_enc("encode: image must be (1, out_channels*H*W)");
+    }
+
+    const int first_C = cfg_.block_out_channels.front();
+    const int mid_C   = cfg_.block_out_channels.back();
+    const int H_lat   = H / 8;
+    const int W_lat   = W / 8;
+    const int spatial_lat = H_lat * W_lat;
+    const int C_lat   = cfg_.in_channels;
+
+    // 1. conv_in: out_channels (3) -> first_C.
+    x_ = image.clone();
+    apply_conv3x3_(conv_in_W_, conv_in_b_,
+                   cfg_.out_channels, first_C, H, W,
+                   x_, y_);
+    std::swap(x_, y_);
+
+    // 2. down_blocks.
+    int Hc = H, Wc = W;
+    for (auto& db : down_blocks_) {
+        for (auto& r : db.resnets) {
+            apply_resnet_(r, Hc, Wc, x_, y_);
+        }
+        if (db.has_downsampler) {
+            apply_downsample_(db.downsampler, db.C_out, Hc, Wc, x_, y_);
+            Hc /= 2;
+            Wc /= 2;
+        }
+    }
+
+    // 3. mid_block: resnet -> attention -> resnet.
+    apply_resnet_(mid_res0_, Hc, Wc, x_, y_);
+    apply_attention_(mid_attn_, Hc, Wc, x_);
+    apply_resnet_(mid_res1_, Hc, Wc, x_, y_);
+
+    // 4. conv_norm_out + SiLU.
+    bt::group_norm_forward(x_, norm_out_g_, norm_out_b_,
+                           1, mid_C, Hc, Wc, cfg_.norm_num_groups, cfg_.eps,
+                           y_);
+    bt::silu_forward(y_, y_);
+
+    // 5. conv_out: mid_C -> 2 * in_channels. Lands in moments_ if quant_conv
+    //    follows, else directly into a temp for split.
+    apply_conv3x3_(conv_out_W_, conv_out_b_,
+                   mid_C, 2 * C_lat, Hc, Wc,
+                   y_, x_);
+
+    // 6. quant_conv (1x1 conv).
+    if (has_quant_conv_) {
+        bt::conv2d_forward(x_, quant_W_, &quant_b_,
+                           /*N=*/1, /*C_in=*/2 * C_lat, H_lat, W_lat,
+                           /*C_out=*/2 * C_lat, /*kH=*/1, /*kW=*/1,
+                           1, 1, /*pad=*/0, 0, 1, 1,
+                           moments_);
+    } else {
+        // Just alias via swap so the rest of the path reads from moments_.
+        std::swap(x_, moments_);
+    }
+
+    // 7. Split (mean, logvar) along channel dim and reparameterize. The flat
+    //    layout is NCHW with N=1, so channels are the slowest-varying axis:
+    //    mean   = moments[0 .. C_lat*spatial_lat)
+    //    logvar = moments[C_lat*spatial_lat .. 2*C_lat*spatial_lat)
+    const int half = C_lat * spatial_lat;
+    detail::resize_like(out, 1, half, compute_dtype(), moments_.device);
+    // Copy mean -> out.
+    bt::copy_d2d(moments_, /*src_off=*/0, out, /*dst_off=*/0, half);
+
+    if (eps != nullptr) {
+        if (eps->rows != 1 || eps->cols != half) {
+            fail_enc("encode: eps must be (1, in_channels*H/8*W/8)");
+        }
+        if (eps->dtype != out.dtype) fail_enc("encode: eps dtype must match output");
+
+        // Stage logvar in logvar_, compute exp(0.5 * logvar) host-side
+        // (one-off per encode, not perf-critical), upload back, multiply
+        // elementwise by eps, then add to out.
+        detail::resize_like(logvar_, 1, half, compute_dtype(), moments_.device);
+        bt::copy_d2d(moments_, /*src_off=*/half, logvar_, /*dst_off=*/0, half);
+
+        // Host-side exp(0.5*lv). Use bd-style download then upload at compute
+        // dtype.
+        std::vector<float> lv_host;
+        bt::sync_all();
+        if (logvar_.dtype == bt::Dtype::FP16) {
+            std::vector<uint16_t> bits = logvar_.to_host_vector_fp16();
+            lv_host.resize(bits.size());
+            for (std::size_t i = 0; i < bits.size(); ++i) {
+                lv_host[i] = std::exp(0.5f * bt::fp16_bits_to_fp32(bits[i]));
+            }
+        } else {
+            lv_host = logvar_.to_host_vector();
+            for (float& v : lv_host) v = std::exp(0.5f * v);
+        }
+        bt::Tensor std_dev = detail::upload_host(lv_host.data(), 1, half);
+        // std_dev *= eps  (mul elementwise)
+        bt::mul_inplace(std_dev, *eps);
+        bt::add_inplace(out, std_dev);
+    }
+
+    // 8. out = (sample - shift_factor) * scaling_factor.
+    if (cfg_.shift_factor != 0.0f) {
+        bt::add_scalar_inplace(out, -cfg_.shift_factor);
+    }
+    if (cfg_.scaling_factor != 1.0f) {
+        bt::scale_inplace(out, cfg_.scaling_factor);
+    }
 }
 
 }  // namespace brodiffusion::vae

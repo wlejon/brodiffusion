@@ -158,4 +158,136 @@ private:
     brotensor::Tensor ln_nchw_;
 };
 
+// Encoder mirrors Decoder. Phase A: deterministic-or-sampled forward only.
+//
+// Architecture (diffusers AutoencoderKL encoder):
+//   conv_in: out_channels (3) -> block_out_channels.front() (128)
+//   down_blocks[i] for i in [0, num_blocks):
+//     layers_per_block resnets at block_out_channels[i] (first resnet handles
+//     the C_prev -> C_i channel transition via a 1x1 conv shortcut)
+//     if i < num_blocks - 1: stride-2 3x3 conv (same channels)
+//   mid_block: resnet -> attention -> resnet at block_out_channels.back()
+//   conv_norm_out -> SiLU
+//   conv_out: block_out_channels.back() -> 2 * in_channels (mean, logvar)
+//   quant_conv (above the "encoder." subtree): 1x1 conv 2*latent -> 2*latent
+//
+// Field names match DecoderConfig for code-share clarity:
+//   in_channels       = latent channel count   (= 4 for SD1.5)
+//   out_channels      = RGB channel count       (= 3)
+struct EncoderConfig {
+    int in_channels   = 4;
+    int out_channels  = 3;
+    std::vector<int> block_out_channels = {128, 256, 512, 512};
+    int layers_per_block = 2;
+    int norm_num_groups  = 32;
+    // Pipeline applies   latent_out = (sample - shift_factor) * scaling_factor
+    // — the inverse of Decoder's pre-scaling. Set to 1.0f / 0.0f for tests on
+    // synthetic data.
+    float scaling_factor = 0.18215f;
+    float shift_factor   = 0.0f;
+    float eps            = 1e-6f;
+    int num_attention_heads = 1;
+};
+
+class Encoder {
+public:
+    explicit Encoder(const EncoderConfig& cfg);
+    ~Encoder();
+
+    Encoder(const Encoder&) = delete;
+    Encoder& operator=(const Encoder&) = delete;
+    Encoder(Encoder&&) noexcept = default;
+    Encoder& operator=(Encoder&&) noexcept = default;
+
+    // Load encoder weights. Default prefix matches a standalone diffusers VAE
+    // export ("encoder."); SD1.5 full checkpoints use
+    // "first_stage_model.encoder." — pass that explicitly. `quant_conv` lives
+    // above the "encoder." subtree (e.g. plain "quant_conv.{weight,bias}"
+    // for a diffusers VAE, or "first_stage_model.quant_conv.{weight,bias}").
+    // Optional: legacy/decoder-only checkpoints may omit it.
+    void load_weights(const brotensor::safetensors::File& f,
+                      const std::string& prefix = "encoder.");
+
+    // Encode image -> latent.
+    //   image: (1, out_channels * H * W) in NCHW at the pipeline compute dtype,
+    //          values in [-1, 1]. H and W must be positive multiples of 8.
+    //   eps:   if non-null, sample = mean + exp(0.5*logvar) * eps  (eps in
+    //          standard-Gaussian units, shape (1, in_channels * H/8 * W/8),
+    //          same dtype as image). If null, deterministic mode: sample =
+    //          mean.
+    //   out:   (1, in_channels * H/8 * W/8) — the final latent
+    //          = (sample - shift_factor) * scaling_factor.
+    void encode(const brotensor::Tensor& image,
+                int H, int W,
+                const brotensor::Tensor* eps,
+                brotensor::Tensor& out);
+
+    const EncoderConfig& config() const { return cfg_; }
+
+private:
+    // Internal block structs mirror Decoder. Kept private to Encoder for
+    // Phase A — a future refactor can lift them into a shared header once a
+    // third user appears.
+    struct Resnet {
+        brotensor::Tensor norm1_g, norm1_b;
+        brotensor::Tensor conv1_W, conv1_b;
+        brotensor::Tensor norm2_g, norm2_b;
+        brotensor::Tensor conv2_W, conv2_b;
+        brotensor::Tensor short_W, short_b;
+        bool has_shortcut = false;
+        int  C_in = 0, C_out = 0;
+    };
+    struct Attention {
+        brotensor::Tensor gn_g, gn_b;
+        brotensor::Tensor Wq, bq, Wk, bk, Wv, bv, Wo, bo;
+        int C = 0;
+    };
+    struct DownsampleConv {
+        brotensor::Tensor W, b;  // 3x3 stride-2 same-channel
+    };
+    struct DownBlock {
+        std::vector<Resnet> resnets;
+        DownsampleConv      downsampler;
+        bool has_downsampler = false;
+        int  C_out = 0;
+    };
+
+    void load_resnet_(const brotensor::safetensors::File& f,
+                      const std::string& prefix,
+                      int C_in, int C_out, Resnet& r);
+    void apply_resnet_(const Resnet& r, int H, int W,
+                       brotensor::Tensor& x, brotensor::Tensor& tmp);
+    void apply_attention_(const Attention& a, int H, int W,
+                          brotensor::Tensor& x);
+    // Diffusers Downsample2D: F.pad(x, (0, 1, 0, 1)) followed by stride-2 3x3
+    // conv with pad=0. We mirror that asymmetric pad via pad2d_forward.
+    void apply_downsample_(const DownsampleConv& d, int C, int H, int W,
+                           brotensor::Tensor& x, brotensor::Tensor& tmp);
+    void apply_conv3x3_(const brotensor::Tensor& W,
+                        const brotensor::Tensor& b,
+                        int C_in, int C_out, int H, int W_,
+                        brotensor::Tensor& x_in, brotensor::Tensor& x_out);
+
+    EncoderConfig cfg_;
+
+    // Weights.
+    brotensor::Tensor conv_in_W_, conv_in_b_;
+    std::vector<DownBlock> down_blocks_;
+    Resnet               mid_res0_, mid_res1_;
+    Attention            mid_attn_;
+    brotensor::Tensor norm_out_g_, norm_out_b_;
+    brotensor::Tensor conv_out_W_, conv_out_b_;
+    // quant_conv lives ABOVE "encoder." (sibling of post_quant_conv); 1x1 conv
+    // (2*in_channels -> 2*in_channels) applied after the encoder body.
+    brotensor::Tensor quant_W_, quant_b_;
+    bool                 has_quant_conv_ = false;
+
+    // Scratch.
+    brotensor::Tensor x_, y_, pad_;
+    brotensor::Tensor seq_, proj_seq_, attn_nchw_;
+    brotensor::Tensor ln_nchw_;
+    brotensor::Tensor moments_;     // (1, 2*C_lat*H_lat*W_lat) post-quant_conv
+    brotensor::Tensor logvar_;      // (1, C_lat*H_lat*W_lat) — for exp(0.5*lv)
+};
+
 }  // namespace brodiffusion::vae

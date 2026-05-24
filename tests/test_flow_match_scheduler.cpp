@@ -137,5 +137,46 @@ int main() {
         CHECK(std::fabs(ts_dyn.front() - ref_t0) < 1.0f);
     }
 
+    // ── add_noise checks ──────────────────────────────────────────────────
+    //
+    // FlowMatch forward noising: x_t = (1 - sigma_t) * x_0 + sigma_t * noise,
+    // where sigma_t is the static-shift sigma we constructed in the ref above.
+    {
+        sc::FlowMatch fmn;
+        fmn.set_timesteps(4);
+        // From the reference comment: shifted sigmas = {1.0, 0.9, 0.75, 0.5}.
+        const float sigma0 = 1.0f;
+
+        std::vector<float> x0_vals(n), z_vals(n, 0.0f);
+        for (int i = 0; i < n; ++i) x0_vals[i] = static_cast<float>((i % 9) - 4) * 0.1f;
+        bt::Tensor x0 = bdtest::bd_upload(x0_vals, 1, n);
+        bt::Tensor zn = bdtest::bd_upload(z_vals,  1, n);
+        bt::Tensor sample, scratch;
+        fmn.add_noise(x0, zn, /*step_index=*/0, sample, scratch);
+        std::vector<float> got = bdtest::bd_download(sample);
+        const float tol = 1e-3f;
+        int bad = 0;
+        for (int i = 0; i < n; ++i) {
+            float expect = (1.0f - sigma0) * x0_vals[i];
+            if (std::fabs(got[static_cast<std::size_t>(i)] - expect) > tol) ++bad;
+        }
+        CHECK(bad == 0);
+
+        // Random x0 + random noise at a mid step → finite output, correct shape.
+        std::mt19937 rng2(0xF00D);
+        std::normal_distribution<float> nrm2(0.0f, 1.0f);
+        std::vector<float> r_x0(n), r_n(n);
+        for (int i = 0; i < n; ++i) { r_x0[i] = nrm2(rng2); r_n[i] = nrm2(rng2); }
+        bt::Tensor rx = bdtest::bd_upload(r_x0, 1, n);
+        bt::Tensor rn = bdtest::bd_upload(r_n,  1, n);
+        bt::Tensor s2, sc2;
+        fmn.add_noise(rx, rn, /*step_index=*/2, s2, sc2);
+        std::vector<float> got2 = bdtest::bd_download(s2);
+        CHECK(s2.rows == 1 && s2.cols == n);
+        int bad2 = 0;
+        for (float val : got2) if (!bdtest::bd_finite(val)) ++bad2;
+        CHECK(bad2 == 0);
+    }
+
     return g_failures == 0 ? 0 : 1;
 }

@@ -87,5 +87,70 @@ int main() {
     }
     CHECK(n_bad == 0);
 
+    // ── add_noise checks ──────────────────────────────────────────────────
+    //
+    // DDIM forward noising: x_t = sqrt(alpha_t) * x_0 + sqrt(1 - alpha_t) * noise
+    // at t = timesteps()[step_index].
+    //
+    // 1) Zero-noise identity: out = sqrt(alpha_t) * x_0  (exactly, up to fp).
+    // 2) Shape + finite with random x0 / noise.
+    {
+        sc::DDIM dn;
+        dn.set_timesteps(10);
+        const int step_index = 0;
+        const int t = dn.timesteps()[step_index];
+        // Replicate the scheduler's alphas_cumprod construction host-side.
+        sc::DDIMConfig cfg;
+        std::vector<float> alphas(static_cast<std::size_t>(cfg.num_train_timesteps));
+        {
+            double cumprod = 1.0;
+            const float s0 = std::sqrt(cfg.beta_start);
+            const float s1 = std::sqrt(cfg.beta_end);
+            const int N = cfg.num_train_timesteps;
+            for (int i = 0; i < N; ++i) {
+                const float u = static_cast<float>(i) / static_cast<float>(N - 1);
+                const float s = s0 + (s1 - s0) * u;
+                const float beta = s * s;
+                cumprod *= static_cast<double>(1.0f - beta);
+                alphas[static_cast<std::size_t>(i)] = static_cast<float>(cumprod);
+            }
+        }
+        const int t_clamp = (t >= cfg.num_train_timesteps) ? cfg.num_train_timesteps - 1 : t;
+        const float sqrt_a = std::sqrt(alphas[static_cast<std::size_t>(t_clamp)]);
+
+        // Build x0 and zero noise.
+        std::vector<float> x0_vals(n), z_vals(n, 0.0f);
+        for (int i = 0; i < n; ++i) x0_vals[i] = static_cast<float>((i % 11) - 5) * 0.1f;
+        bt::Tensor x0 = bdtest::bd_upload(x0_vals, 1, n);
+        bt::Tensor zn = bdtest::bd_upload(z_vals,  1, n);
+        bt::Tensor sample, scratch;
+        dn.add_noise(x0, zn, step_index, sample, scratch);
+        std::vector<float> got = bdtest::bd_download(sample);
+        CHECK(static_cast<int>(got.size()) == n);
+        // Tolerance accommodates FP16 round-trips (compute_dtype may be FP16 on GPU).
+        const float tol = 1e-3f;
+        int bad = 0;
+        for (int i = 0; i < n; ++i) {
+            float expect = sqrt_a * x0_vals[i];
+            if (std::fabs(got[static_cast<std::size_t>(i)] - expect) > tol) ++bad;
+        }
+        CHECK(bad == 0);
+
+        // Random x0 + random noise → finite output, correct shape.
+        std::mt19937 rng2(0xABCD);
+        std::normal_distribution<float> nrm2(0.0f, 1.0f);
+        std::vector<float> r_x0(n), r_n(n);
+        for (int i = 0; i < n; ++i) { r_x0[i] = nrm2(rng2); r_n[i] = nrm2(rng2); }
+        bt::Tensor rx = bdtest::bd_upload(r_x0, 1, n);
+        bt::Tensor rn = bdtest::bd_upload(r_n,  1, n);
+        bt::Tensor s2, sc2;
+        dn.add_noise(rx, rn, 5, s2, sc2);
+        std::vector<float> got2 = bdtest::bd_download(s2);
+        CHECK(s2.rows == 1 && s2.cols == n);
+        int bad2 = 0;
+        for (float v : got2) if (!bdtest::bd_finite(v)) ++bad2;
+        CHECK(bad2 == 0);
+    }
+
     return g_failures == 0 ? 0 : 1;
 }

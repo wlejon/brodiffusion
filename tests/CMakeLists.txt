@@ -11,6 +11,8 @@ endfunction()
 
 brodiffusion_add_test(brodiffusion_test_smoke          test_smoke.cpp)
 brodiffusion_add_test(brodiffusion_test_vae            test_vae.cpp)
+brodiffusion_add_test(brodiffusion_test_vae_encoder    test_vae_encoder.cpp)
+brodiffusion_add_test(brodiffusion_test_image_io       test_image_io.cpp)
 brodiffusion_add_test(brodiffusion_test_unet           test_unet.cpp)
 brodiffusion_add_test(brodiffusion_test_scheduler      test_scheduler.cpp)
 brodiffusion_add_test(brodiffusion_test_torch_rng      test_torch_rng.cpp)

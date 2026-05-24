@@ -90,6 +90,16 @@ public:
               const brotensor::Tensor& noise,
               brotensor::Tensor& scratch) const;
 
+    // Forward noising for img2img / inpaint priming. Identical math to DDIM
+    // (LCM uses the same alpha_cumprod schedule for forward noising):
+    //   x_t = sqrt(alpha_cumprod_t) * x_0 + sqrt(1 - alpha_cumprod_t) * noise
+    // where t = timesteps()[step_index]. Must be called after set_timesteps().
+    void add_noise(const brotensor::Tensor& x0,
+                   const brotensor::Tensor& noise,
+                   int step_index,
+                   brotensor::Tensor& sample,
+                   brotensor::Tensor& scratch) const;
+
     const LCMConfig& config() const { return cfg_; }
 
 private:

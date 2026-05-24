@@ -64,6 +64,19 @@ public:
               brotensor::Tensor& sample,
               brotensor::Tensor& scratch) const;
 
+    // Forward noising for img2img / inpaint priming:
+    //   x_t = sqrt(alpha_cumprod_t) * x_0 + sqrt(1 - alpha_cumprod_t) * noise
+    // where t = timesteps()[step_index]. Must be called after set_timesteps().
+    //   x0:     (1, C*H*W) — clean latent.
+    //   noise:  (1, C*H*W) — standard-Gaussian noise.
+    //   sample: output, resized as needed.
+    //   scratch: reused; resized as needed.
+    void add_noise(const brotensor::Tensor& x0,
+                   const brotensor::Tensor& noise,
+                   int step_index,
+                   brotensor::Tensor& sample,
+                   brotensor::Tensor& scratch) const;
+
     const DDIMConfig& config() const { return cfg_; }
 
 private:

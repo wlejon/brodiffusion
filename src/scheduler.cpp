@@ -103,4 +103,35 @@ void DDIM::step(const bt::Tensor& noise_pred,
     bt::add_inplace(sample, scratch);
 }
 
+void DDIM::add_noise(const bt::Tensor& x0,
+                     const bt::Tensor& noise,
+                     int step_index,
+                     bt::Tensor& sample,
+                     bt::Tensor& scratch) const {
+    if (timesteps_.empty()) fail("add_noise: set_timesteps() not called");
+    if (step_index < 0 || step_index >= static_cast<int>(timesteps_.size())) {
+        fail("add_noise: step_index out of range");
+    }
+    if (x0.dtype != noise.dtype) fail("add_noise: x0 and noise must share a dtype");
+    if (x0.rows != noise.rows || x0.cols != noise.cols) {
+        fail("add_noise: x0 and noise shape mismatch");
+    }
+
+    const int N = cfg_.num_train_timesteps;
+    const int t = timesteps_[step_index];
+    const int t_clamped = (t >= N) ? N - 1 : (t < 0 ? 0 : t);
+    const float alpha = alphas_cumprod_[t_clamped];
+    const float sqrt_a   = std::sqrt(alpha);
+    const float sqrt_1ma = std::sqrt(1.0f - alpha);
+
+    detail::resize_like(sample,  x0.rows, x0.cols, compute_dtype(), x0.device);
+    detail::resize_like(scratch, x0.rows, x0.cols, compute_dtype(), x0.device);
+
+    bt::copy_d2d(x0,    0, sample,  0, x0.size());
+    bt::scale_inplace(sample, sqrt_a);
+    bt::copy_d2d(noise, 0, scratch, 0, noise.size());
+    bt::scale_inplace(scratch, sqrt_1ma);
+    bt::add_inplace(sample, scratch);
+}
+
 }  // namespace brodiffusion::scheduler

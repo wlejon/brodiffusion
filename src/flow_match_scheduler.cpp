@@ -114,4 +114,31 @@ void FlowMatch::step(const bt::Tensor& v,
     bt::add_inplace(sample, scratch);
 }
 
+void FlowMatch::add_noise(const bt::Tensor& x0,
+                          const bt::Tensor& noise,
+                          int step_index,
+                          bt::Tensor& sample,
+                          bt::Tensor& scratch) const {
+    if (timesteps_.empty()) fail("add_noise: set_timesteps() not called");
+    if (step_index < 0 || step_index >= static_cast<int>(timesteps_.size())) {
+        fail("add_noise: step_index out of range");
+    }
+    if (x0.dtype != noise.dtype) fail("add_noise: x0 and noise must share a dtype");
+    if (x0.rows != noise.rows || x0.cols != noise.cols) {
+        fail("add_noise: x0 and noise shape mismatch");
+    }
+
+    const float sigma_t = sigmas_[static_cast<std::size_t>(step_index)];
+    const float one_minus = 1.0f - sigma_t;
+
+    detail::resize_like(sample,  x0.rows, x0.cols, compute_dtype(), x0.device);
+    detail::resize_like(scratch, x0.rows, x0.cols, compute_dtype(), x0.device);
+
+    bt::copy_d2d(x0,    0, sample,  0, x0.size());
+    bt::scale_inplace(sample, one_minus);
+    bt::copy_d2d(noise, 0, scratch, 0, noise.size());
+    bt::scale_inplace(scratch, sigma_t);
+    bt::add_inplace(sample, scratch);
+}
+
 }  // namespace brodiffusion::scheduler
