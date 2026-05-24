@@ -31,7 +31,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <random>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -72,7 +71,10 @@ struct PipelineConfig {
 // different attn_logit_bias, etc.), score, and pick a winner.
 struct PipelineState {
     brotensor::Tensor latent;  // (1, C_lat * H_lat * W_lat) at compute dtype
-    std::mt19937_64 rng;          // initial-noise + per-step LCM noise stream
+    // Philox key for initial-noise + per-step LCM noise. Initialised from
+    // opts.seed in prime(); branched states should mutate this on the clone
+    // (e.g. XOR a branch id) to diverge their noise streams.
+    std::uint64_t rng_key = 0;
     int step_index = 0;           // 0-based: how many step_once() calls have run
     int n_steps    = 0;           // total scheduled steps for this generation
     int H_lat      = 0;
@@ -84,8 +86,8 @@ struct PipelineState {
 };
 
 // Source of the initial latent noise.
-//   Internal — brodiffusion's own std::mt19937_64 + std::normal_distribution
-//              stream (the historical default).
+//   Internal — brotensor's device-side Philox stream keyed by `seed`. Same
+//              stream is reused for per-step LCM noise.
 //   Torch    — bit-compatible with torch.randn() filled by a CPU Generator
 //              seeded with `seed`. Lets `--seed N` reproduce a PyTorch
 //              reference run's starting latent exactly, so the two pipelines

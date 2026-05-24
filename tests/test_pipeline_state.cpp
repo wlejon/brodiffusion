@@ -3,9 +3,8 @@
 // Verifies the contract of PipelineState::clone() in isolation:
 //   1. The cloned latent is bit-identical on the GPU after clone.
 //   2. Mutating the clone's latent does NOT affect the original.
-//   3. The cloned mt19937_64 produces the same sequence as the original
-//      from the clone point forward.
-//   4. Advancing the original's RNG after clone does NOT affect the clone.
+//   3. The cloned rng_key is copied verbatim (same key -> same Philox draws).
+//   4. Mutating one clone's rng_key does NOT affect another clone.
 //   5. step_index / n_steps / H_lat / W_lat are copied.
 //
 // Full end-to-end Pipeline::prime + step_once + decode determinism is
@@ -20,7 +19,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <random>
 #include <vector>
 
 namespace pl = brodiffusion::pipeline;
@@ -51,10 +49,7 @@ int main() {
 
     pl::PipelineState s0;
     s0.latent = brotensor::Tensor::from_host_fp16(bits.data(), 1, N);
-    s0.rng.seed(424242ULL);
-    // Burn a few RNG draws to make the state non-trivial.
-    std::normal_distribution<float> nrm(0.0f, 1.0f);
-    for (int i = 0; i < 5; ++i) (void)nrm(s0.rng);
+    s0.rng_key = 424242ULL;
     s0.step_index = 3;
     s0.n_steps    = 8;
     s0.H_lat      = 32;
@@ -80,25 +75,18 @@ int main() {
     CHECK(std::memcmp(b0_after.data(), b0.data(), N * 2) == 0);
     CHECK(std::memcmp(b1_after.data(), bumped.data(), N * 2) == 0);
 
-    // 3. Cloned RNG produces same raw-engine sequence as the original from
-    //    the clone point. (Raw uint64 draws avoid the cached-second-value
-    //    state inside std::normal_distribution, which would entangle two
-    //    streams sharing a single distribution instance.)
+    // 3. Cloned rng_key is copied verbatim.
+    CHECK(s1.rng_key == 424242ULL);
     pl::PipelineState s_a = s0.clone();
     pl::PipelineState s_b = s0.clone();
-    constexpr int K = 16;
-    for (int i = 0; i < K; ++i) {
-        const std::uint64_t va = s_a.rng();
-        const std::uint64_t vb = s_b.rng();
-        CHECK(va == vb);
-    }
+    CHECK(s_a.rng_key == s_b.rng_key);
 
-    // 4. Advancing one clone's RNG does NOT affect another clone.
+    // 4. Mutating one clone's rng_key does NOT touch another clone.
     pl::PipelineState s_d = s0.clone();
     pl::PipelineState s_e = s0.clone();
-    pl::PipelineState s_burn = s0.clone();
-    for (int i = 0; i < 7; ++i) (void)s_burn.rng();  // burn on s_burn only
-    CHECK(s_d.rng() == s_e.rng());
+    s_d.rng_key ^= 0xBEEFull;
+    CHECK(s_d.rng_key != s_e.rng_key);
+    CHECK(s_e.rng_key == 424242ULL);
 
     // 5. Scalars copy.
     CHECK(s1.step_index == 3);

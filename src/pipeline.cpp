@@ -26,7 +26,6 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -71,18 +70,37 @@ float timestep_at(const SchedulerVariant& v, int i) {
     }, v);
 }
 
+// Fill `out` (allocated to (1, n) at compute_dtype() on the default device)
+// with n N(0,1) draws from the Philox stream keyed by (key, counter). When
+// compute_dtype() is FP16 the draws are made into an FP32 scratch tensor and
+// cast — brotensor::randn is FP32-only by design. `out` is always
+// reassigned via Tensor::empty so a default-constructed (= CPU) input lands
+// on the active default device.
+void randn_compute(std::uint64_t key, std::uint64_t counter, int n,
+                   bt::Tensor& out) {
+    const bt::Dtype dt = compute_dtype();
+    out = bt::Tensor::empty(1, n, dt);
+    if (dt == bt::Dtype::FP16) {
+        bt::Tensor fp32 = bt::Tensor::empty(1, n, bt::Dtype::FP32);
+        bt::randn(key, counter, fp32);
+        bt::cast(fp32, out, bt::Dtype::FP16);
+    } else {
+        bt::randn(key, counter, out);
+    }
+}
+
 // Run one scheduler step on `state.latent`. LCM resamples per-step Gaussian
-// noise from the state's RNG stream; FlowMatch / DDIM are deterministic.
+// noise from the state's Philox stream (key = state.rng_key, counter offset
+// past the initial latent + all earlier steps); FlowMatch / DDIM are
+// deterministic.
 void scheduler_step(SchedulerVariant& sched, const bt::Tensor& pred,
                     int step_index, PipelineState& state, int n_lat,
                     bt::Tensor& scratch, bt::Tensor& noise_step) {
     if (std::holds_alternative<scheduler::LCM>(sched)) {
-        std::normal_distribution<float> nrm(0.0f, 1.0f);
-        std::vector<float> noise_vals(static_cast<std::size_t>(n_lat));
-        for (int k = 0; k < n_lat; ++k) {
-            noise_vals[static_cast<std::size_t>(k)] = nrm(state.rng);
-        }
-        noise_step = detail::upload_host(noise_vals.data(), 1, n_lat);
+        const std::uint64_t counter =
+            static_cast<std::uint64_t>(1 + step_index) *
+            static_cast<std::uint64_t>(n_lat);
+        randn_compute(state.rng_key, counter, n_lat, noise_step);
         std::get<scheduler::LCM>(sched).step(
             pred, step_index, state.latent, noise_step, scratch);
     } else if (std::holds_alternative<scheduler::FlowMatch>(sched)) {
@@ -270,7 +288,7 @@ void Pipeline::encode_prompt_(std::string_view prompt, bt::Tensor& out) {
 PipelineState PipelineState::clone() const {
     PipelineState out;
     out.latent     = latent.clone();
-    out.rng        = rng;          // mt19937_64 is trivially copyable
+    out.rng_key    = rng_key;
     out.step_index = step_index;
     out.n_steps    = n_steps;
     out.H_lat      = H_lat;
@@ -351,12 +369,11 @@ PipelineState Pipeline::prime(std::string_view prompt,
     PipelineState state;
     state.H_lat = H_lat;
     state.W_lat = W_lat;
-    // Seed the RNG even when init_noise is supplied: LCM resamples per-step
-    // noise from this same stream, so it must stay deterministic regardless.
-    state.rng.seed(opts.seed);
+    // Stash the seed: LCM resamples per-step noise from this same Philox key,
+    // and branched states diverge by mutating rng_key on the clone.
+    state.rng_key = opts.seed;
     const float sigma = std::visit(
         [](const auto& s) { return s.init_noise_sigma(); }, scheduler_);
-    std::vector<float> noise(n_lat);
     if (!opts.init_noise.empty()) {
         // Caller-supplied initial noise (raw N(0,1)); used for exact
         // cross-implementation comparison. Still scaled by init_noise_sigma.
@@ -365,24 +382,28 @@ PipelineState Pipeline::prime(std::string_view prompt,
                  std::to_string(opts.init_noise.size()) +
                  " values, expected " + std::to_string(n_lat));
         }
+        std::vector<float> noise(n_lat);
         for (int i = 0; i < n_lat; ++i) {
             noise[i] = sigma * opts.init_noise[i];
         }
+        state.latent = detail::upload_host(noise.data(), 1, n_lat);
     } else if (opts.noise_source == NoiseSource::Torch) {
         // torch.randn-compatible noise: makes `seed` reproduce a PyTorch
-        // reference run's starting latent (see detail/torch_rng.h).
-        const std::vector<float> r =
+        // reference run's starting latent (see detail/torch_rng.h). This
+        // path stays host-side by construction — the bit-exact Box-Muller
+        // is the whole point.
+        std::vector<float> noise =
             detail::torch_randn_f32(opts.seed, static_cast<std::size_t>(n_lat));
-        for (int i = 0; i < n_lat; ++i) {
-            noise[i] = sigma * r[i];
+        if (sigma != 1.0f) {
+            for (int i = 0; i < n_lat; ++i) noise[i] *= sigma;
         }
+        state.latent = detail::upload_host(noise.data(), 1, n_lat);
     } else {
-        std::normal_distribution<float> nrm(0.0f, 1.0f);
-        for (int i = 0; i < n_lat; ++i) {
-            noise[i] = sigma * nrm(state.rng);
-        }
+        // Internal: device-side Philox stream. Counter 0..n_lat is the
+        // initial latent; per-step LCM noise uses (1+step)*n_lat onwards.
+        randn_compute(opts.seed, 0, n_lat, state.latent);
+        if (sigma != 1.0f) bt::scale_inplace(state.latent, sigma);
     }
-    state.latent = detail::upload_host(noise.data(), 1, n_lat);
 
     // 3. Set the timestep schedule (lives on the scheduler — shared across
     // all branches). FlowMatch with dynamic shifting (flux-dev) needs the
