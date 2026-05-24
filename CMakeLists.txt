@@ -105,6 +105,21 @@ if(NOT TARGET brolm)
     endif()
 endif()
 
+# --- broimage (image decode/encode + host preproc) ---
+set(BROIMAGE_DIR "${CMAKE_SOURCE_DIR}/../broimage" CACHE PATH
+    "Path to standalone broimage repo (set to a missing path to force submodule fallback)")
+if(NOT TARGET broimage)
+    if(EXISTS "${BROIMAGE_DIR}/CMakeLists.txt")
+        add_subdirectory("${BROIMAGE_DIR}" "${CMAKE_BINARY_DIR}/broimage" EXCLUDE_FROM_ALL)
+    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/broimage/CMakeLists.txt")
+        add_subdirectory(third_party/broimage EXCLUDE_FROM_ALL)
+    else()
+        message(FATAL_ERROR
+            "broimage not found at ${BROIMAGE_DIR} or third_party/broimage. "
+            "Clone the broimage repo next to this repo, or override with -DBROIMAGE_DIR=...")
+    endif()
+endif()
+
 # --- brodiffusion library ---
 
 add_library(brodiffusion STATIC)
@@ -119,6 +134,7 @@ target_link_libraries(brodiffusion PUBLIC
     bromath::bromath
     brotensor::brotensor
     brolm::brolm
+    broimage::broimage
 )
 
 if(MSVC)
@@ -140,6 +156,7 @@ target_sources(brodiffusion PRIVATE
     src/detail/safetensors_dir.cpp
     src/lora.cpp
     src/pipeline.cpp
+    src/image_io.cpp
     src/fused.cpp
     src/optim.cpp
     src/dit/common.cpp

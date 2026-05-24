@@ -8,7 +8,9 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
-#include <algorithm>
+#include "broimage/encode.h"
+#include "broimage/preproc.h"
+
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -30,12 +32,12 @@ static int usage() {
         "\n"
         "Usage:\n"
         "  brodiffusion --version\n"
-        "  brodiffusion txt2img --model <dir> --prompt <text> --out <ppm>\n"
+        "  brodiffusion txt2img --model <dir> --prompt <text> --out <png>\n"
         "                       [--negative <text>] [--steps N] [--cfg F]\n"
         "                       [--width N] [--height N] [--seed N]\n"
         "  brodiffusion txt2img --text <st> --unet <st> --vae <st>\n"
         "                       --vocab <vocab.json> --merges <merges.txt>\n"
-        "                       --prompt <text> --out <ppm>\n"
+        "                       --prompt <text> --out <png>\n"
         "                       [--negative <text>] [--steps N] [--cfg F]\n"
         "                       [--width N] [--height N] [--seed N]\n"
         "                       [--scheduler ddim|lcm]\n"
@@ -84,9 +86,7 @@ static int usage() {
         "                   forward pass, and print output stats. --quantize\n"
         "                   loads it as INT8 (W8A16); --max-length defaults 128.\n"
         "\n"
-        "Writes an uncompressed PPM (P6) — a dev convenience for sanity-checking\n"
-        "the generation pipeline. Proper PNG/JPEG encoding lives outside this\n"
-        "library (bro's image-api on integration).\n",
+        "Writes an RGB PNG via broimage.\n",
         brodiffusion::version_string());
     return 0;
 }
@@ -134,26 +134,18 @@ std::vector<LoraSpec> collect_loras(int argc, char** argv) {
     return out;
 }
 
-// Convert a planar [-1,1] FP32 image (3*H*W NCHW) to an uncompressed PPM.
-int write_ppm(const char* out_path, const std::vector<float>& img,
+// Convert a planar [-1,1] FP32 image (3*H*W NCHW) to PNG via broimage.
+// f32_nchw_to_u8_nhwc with scale=127.5, bias=127.5 maps [-1,1] -> [0,255]
+// with the same round+clamp the old hand-rolled PPM writer used.
+int write_png(const char* out_path, const std::vector<float>& img,
               int W, int H) {
-    const int plane = H * W;
-    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(3) * plane);
-    for (int i = 0; i < plane; ++i) {
-        for (int c = 0; c < 3; ++c) {
-            float v = (img[c * plane + i] + 1.0f) * 127.5f;
-            v = std::clamp(v, 0.0f, 255.0f);
-            rgb[3 * i + c] = static_cast<std::uint8_t>(v + 0.5f);
-        }
-    }
-    std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
-    if (!f) {
-        std::fprintf(stderr, "txt2img: cannot open output %s\n", out_path);
+    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(3) * H * W);
+    broimage::f32_nchw_to_u8_nhwc(img.data(), 1, 3, H, W,
+                                  127.5f, 127.5f, rgb.data());
+    if (!broimage::encode_png_file(out_path, rgb.data(), W, H, 3)) {
+        std::fprintf(stderr, "txt2img: cannot write PNG %s\n", out_path);
         return 1;
     }
-    f << "P6\n" << W << " " << H << "\n255\n";
-    f.write(reinterpret_cast<const char*>(rgb.data()),
-            static_cast<std::streamsize>(rgb.size()));
     std::printf("Wrote %s\n", out_path);
     return 0;
 }
@@ -247,7 +239,7 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
                 static_cast<unsigned long long>(opts.seed));
 
     auto img = pipeline.generate(prompt, opts);
-    return write_ppm(out_path, img, opts.width, opts.height);
+    return write_png(out_path, img, opts.width, opts.height);
 }
 
 int run_txt2img(int argc, char** argv) {
@@ -285,7 +277,7 @@ int run_txt2img(int argc, char** argv) {
         !vocab_path || !merges_path || !prompt || !out_path) {
         std::fprintf(stderr,
             "txt2img: --text, --unet, --vae, --vocab, --merges, --prompt, --out are required\n"
-            "         (or use --model <dir> --prompt <text> --out <ppm>)\n");
+            "         (or use --model <dir> --prompt <text> --out <png>)\n");
         return 2;
     }
 
@@ -395,7 +387,7 @@ int run_txt2img(int argc, char** argv) {
     } else {
         img = pipeline.generate(prompt, opts);
     }
-    return write_ppm(out_path, img, opts.width, opts.height);
+    return write_png(out_path, img, opts.width, opts.height);
 }
 
 // Load the T5-XXL encoder, encode a prompt, run one forward, print stats.
