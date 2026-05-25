@@ -51,6 +51,14 @@ static int usage() {
         "                       [--strength F] [--vae-sample]\n"
         "                       (all txt2img flags also accepted; SD1.5 only;\n"
         "                        white mask pixels = inpaint, black = keep)\n"
+        "\n"
+        "  --control <weights> --control-image <png> [--control-scale F]\n"
+        "                       enable single ControlNet (SD1.5 only). Loads\n"
+        "                       the safetensors after the main weights. Both\n"
+        "                       --control and --control-image are required\n"
+        "                       together. Multi-ControlNet stacking is not\n"
+        "                       supported; trace mode / LCM scheduler combos\n"
+        "                       with ControlNet are not supported.\n"
         "  brodiffusion bench   --text <st> --unet <st> --vae <st>\n"
         "                       --vocab <vocab.json> --merges <merges.txt>\n"
         "                       [--steps N] [--iters N] [--warmup N]\n"
@@ -217,6 +225,9 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     const char* init_path = arg_after(argc, argv, "--init");
     const char* mask_path = arg_after(argc, argv, "--mask");
     const char* strength_s = arg_after(argc, argv, "--strength");
+    const char* control_path       = arg_after(argc, argv, "--control");
+    const char* control_image_path = arg_after(argc, argv, "--control-image");
+    const char* control_scale_s    = arg_after(argc, argv, "--control-scale");
     bool vae_sample = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--vae-sample") == 0) vae_sample = true;
@@ -274,6 +285,31 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
         opts.mask_image_path = mask_path;
     }
 
+    // ControlNet: --control + --control-image must both be set, and Flux is
+    // rejected (SD1.5 only).
+    if (control_path || control_image_path) {
+        if (!control_path || !control_image_path) {
+            std::fprintf(stderr,
+                "controlnet: --control and --control-image must be set "
+                "together\n");
+            return 2;
+        }
+        if (is_flux) {
+            std::fprintf(stderr,
+                "controlnet: not supported for Flux model dirs "
+                "(SD1.5 only)\n");
+            return 2;
+        }
+        std::printf("Loading ControlNet: %s\n", control_path);
+        auto cn_file = st::File::open(control_path);
+        pipeline.apply_controlnet(cn_file);
+        opts.control_image_path = control_image_path;
+        if (control_scale_s) {
+            opts.control_scale =
+                static_cast<float>(std::atof(control_scale_s));
+        }
+    }
+
     std::printf("Generating %dx%d, %d steps, CFG=%.1f, seed=%llu\n",
                 opts.width, opts.height, opts.num_inference_steps,
                 static_cast<double>(opts.guidance_scale),
@@ -316,6 +352,9 @@ int run_txt2img(int argc, char** argv) {
     const char* init_path   = arg_after(argc, argv, "--init");
     const char* mask_path   = arg_after(argc, argv, "--mask");
     const char* strength_s  = arg_after(argc, argv, "--strength");
+    const char* control_path       = arg_after(argc, argv, "--control");
+    const char* control_image_path = arg_after(argc, argv, "--control-image");
+    const char* control_scale_s    = arg_after(argc, argv, "--control-scale");
 
     bool quantize_unet = false;
     bool vae_sample    = false;
@@ -434,6 +473,25 @@ int run_txt2img(int argc, char** argv) {
     auto unet_file = st::File::open(unet_path);
     auto vae_file  = st::File::open(vae_path);
     pipeline.load_weights(text_file, unet_file, vae_file);
+
+    // ControlNet: --control + --control-image must both be set if either
+    // is. Loaded AFTER the base weights, BEFORE generate. Single-net only.
+    if (control_path || control_image_path) {
+        if (!control_path || !control_image_path) {
+            std::fprintf(stderr,
+                "controlnet: --control and --control-image must be set "
+                "together\n");
+            return 2;
+        }
+        std::printf("Loading ControlNet: %s\n", control_path);
+        auto cn_file = st::File::open(control_path);
+        pipeline.apply_controlnet(cn_file);
+        opts.control_image_path = control_image_path;
+        if (control_scale_s) {
+            opts.control_scale =
+                static_cast<float>(std::atof(control_scale_s));
+        }
+    }
 
     // Merge LoRAs in command-line order. Each apply_lora call mutates the
     // underlying UNet/CLIP weights in place; later calls stack on earlier

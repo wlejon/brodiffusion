@@ -187,6 +187,16 @@ public:
     void prime_xattn_cache(const brotensor::Tensor& ctx,
                            CrossAttnKVCache& cache);
 
+    // Access the pre-projected cross-attention K/V cache for a given branch
+    // inside a PreparedConditioning produced by this UNet's prepare(). Used by
+    // the ControlNet-augmented step_once path in Pipeline, which calls UNet's
+    // residual-aware forward directly (bypassing Denoiser::forward) and so
+    // needs the cache rather than the opaque PreparedConditioning. Throws if
+    // `prepared` is empty or if Branch::Uncond is requested without an uncond
+    // having been prepared.
+    const CrossAttnKVCache& kv_cache_for(const PreparedConditioning& prepared,
+                                         Branch branch) const;
+
     // Variant of forward that uses a pre-primed K/V cache built from the
     // same `encoder_hidden_states` (or, more precisely, from a ctx with the
     // exact tokens the cache was primed against). Cross-attention layers

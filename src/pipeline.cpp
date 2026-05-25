@@ -1,6 +1,7 @@
 #include "brodiffusion/pipeline.h"
 
 #include "brolm/clip.h"
+#include "brodiffusion/controlnet.h"
 #include "brodiffusion/denoiser.h"
 #include "brodiffusion/dit/flux.h"
 #include "brodiffusion/flow_match_scheduler.h"
@@ -345,6 +346,19 @@ void Pipeline::apply_lora(const brotensor::safetensors::File& f, float scale) {
     }
 }
 
+void Pipeline::apply_controlnet(const brotensor::safetensors::File& f) {
+    apply_controlnet(f, controlnet::ControlNetConfig{});
+}
+
+void Pipeline::apply_controlnet(const brotensor::safetensors::File& f,
+                                const controlnet::ControlNetConfig& cfg) {
+    if (model_class_ != ModelClass::StableDiffusion) {
+        fail("apply_controlnet: Flux not supported (SD1.5 only)");
+    }
+    controlnet_ = std::make_unique<controlnet::ControlNet>(cfg);
+    controlnet_->load_weights(f, "");
+}
+
 void Pipeline::encode_prompt_(std::string_view prompt, bt::Tensor& out) {
     std::vector<std::int32_t> ids = tokenizer_.encode(prompt);
     if (static_cast<int>(ids.size()) != cfg_.text_encoder.max_position) {
@@ -394,6 +408,24 @@ PipelineState Pipeline::prime(std::string_view prompt,
     // the next call. Re-armed below in the img2img branch when mask_image_path
     // is set.
     inpaint_active_ = false;
+
+    // Reset ControlNet activation; armed below when control_image_path is set.
+    controlnet_active_ = false;
+    if (!opts.control_image_path.empty()) {
+        if (model_class_ != ModelClass::StableDiffusion) {
+            fail("prime: ControlNet is currently SD1.5 only; "
+                 "Flux ControlNet is not supported");
+        }
+        if (controlnet_ == nullptr) {
+            fail("prime: control_image_path is set but no ControlNet has "
+                 "been loaded — call apply_controlnet() first");
+        }
+        // Control image lives at FULL image resolution; ControlNet's
+        // conditioning_embedding does the 8x downsample to latent space.
+        control_image_ = brodiffusion::load_image_as_latent_input(
+            opts.control_image_path, opts.width, opts.height);
+        controlnet_active_ = true;
+    }
 
     const int H_lat = opts.height / 8;
     const int W_lat = opts.width  / 8;
@@ -631,8 +663,47 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
     // attention biases (forward_trace is the only path that accepts biases).
     const bool trace_mode = (trace_out != nullptr) || (attn_logit_biases != nullptr);
 
-    // ── Denoiser forward ──────────────────────────────────────────────────
-    if (trace_mode) {
+    // ── ControlNet-augmented forward ──────────────────────────────────────
+    // When a ControlNet is active, run it once per step against the cond
+    // branch's RAW text context (HF default guess_mode=false reuses the same
+    // residuals for both CFG branches). The residual-aware UNet overload is
+    // reached through Denoiser::as_unet() — bypassing the Denoiser virtual
+    // dispatch, which (intentionally) has no residual-carrying forward.
+    if (controlnet_active_) {
+        if (trace_mode) {
+            fail("step_once: trace mode is not supported together with "
+                 "ControlNet (Phase D3 leaves the combination out of scope)");
+        }
+        if (is_lcm) {
+            fail("step_once: LCM scheduler is not supported together with "
+                 "ControlNet (Phase D3 leaves the combination out of scope)");
+        }
+        unet::UNet* u = denoiser_->as_unet();
+        if (u == nullptr) {
+            fail("step_once: ControlNet requires a UNet denoiser");
+        }
+        const bt::Tensor& ctx_cond = conditioning_.text_embeddings;
+        controlnet_->forward(state.latent, state.H_lat, state.W_lat, t,
+                             ctx_cond, control_image_, opts.control_scale,
+                             cn_down_residuals_, cn_mid_residual_);
+        std::vector<const bt::Tensor*> down_ptrs;
+        down_ptrs.reserve(cn_down_residuals_.size());
+        for (const auto& rt : cn_down_residuals_) down_ptrs.push_back(&rt);
+
+        const auto& cache_cond =
+            u->kv_cache_for(prepared_, Branch::Cond);
+        u->forward(state.latent, state.H_lat, state.W_lat, t,
+                   ctx_cond, cache_cond, down_ptrs, &cn_mid_residual_,
+                   noise_pred_cond_);
+        if (do_cfg) {
+            const auto& cache_uncond =
+                u->kv_cache_for(prepared_, Branch::Uncond);
+            const bt::Tensor& ctx_uncond = conditioning_.uncond_embeddings;
+            u->forward(state.latent, state.H_lat, state.W_lat, t,
+                       ctx_uncond, cache_uncond, down_ptrs, &cn_mid_residual_,
+                       noise_pred_uncond_);
+        }
+    } else if (trace_mode) {
         // Trace mode bypasses the K/V cache + INT8 inside the denoiser and
         // captures the conditional pass only; a CFG uncond branch (if any)
         // still uses the fast prepared path. A scratch trace absorbs the maps

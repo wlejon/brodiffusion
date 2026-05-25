@@ -373,6 +373,18 @@ PreparedConditioning UNet::prepare(const Conditioning& cond) {
     return PreparedConditioning(std::move(p));
 }
 
+const UNet::CrossAttnKVCache&
+UNet::kv_cache_for(const PreparedConditioning& prepared, Branch branch) const {
+    auto* p = static_cast<UNetPrepared*>(prepared.get());
+    if (p == nullptr) fail("kv_cache_for: prepare() was not called");
+    const bool uncond = (branch == Branch::Uncond);
+    if (uncond && p->cache_uncond.empty()) {
+        fail("kv_cache_for: Branch::Uncond requested but no uncond "
+             "conditioning was prepared");
+    }
+    return uncond ? p->cache_uncond : p->cache_cond;
+}
+
 void UNet::forward(const bt::Tensor& latent, int H, int W, float timestep,
                    const PreparedConditioning& prepared, Branch branch,
                    bt::Tensor& out) {

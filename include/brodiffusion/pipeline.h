@@ -14,6 +14,7 @@
 // rather than batching, since the rest of the inference stack is N=1.
 
 #include "brolm/clip.h"
+#include "brodiffusion/controlnet.h"
 #include "brodiffusion/denoiser.h"
 #include "brodiffusion/dit/flux.h"
 #include "brodiffusion/flow_match_scheduler.h"
@@ -145,6 +146,21 @@ struct GenerateOptions {
     // Ignored when init_image_path is empty.
     bool vae_encode_sample = false;
 
+    // ── ControlNet (SD1.5 only) ───────────────────────────────────────────
+    // When non-empty, prime() loads this image and runs ControlNet forward
+    // at each scheduler step, feeding its 12 down + 1 mid residuals into
+    // UNet's skip connections. Requires apply_controlnet() to have been
+    // called first; throws if no ControlNet weights are loaded. Throws on
+    // Flux. Trace mode and LCM scheduler are not supported with ControlNet
+    // active; either combination throws from step_once.
+    std::string control_image_path;
+
+    // Scalar multiplier on every ControlNet residual. 0.0 disables the
+    // ControlNet's contribution entirely (useful for ablation); 1.0 is the
+    // HF default; values >1 amplify control. Ignored when
+    // control_image_path is empty.
+    float control_scale = 1.0f;
+
     // Inpaint mask path. When non-empty, the pipeline runs in inpaint mode:
     // init_image_path must ALSO be set, and at each scheduler step (except
     // the final one) the unmasked region of the latent is replaced by a
@@ -214,6 +230,19 @@ public:
     // format is auto-detected from the key prefixes. Throws if the file
     // contains LoRA tensors that don't map to a known SD1.5 target.
     void apply_lora(const brotensor::safetensors::File& f, float scale = 1.0f);
+
+    // Load a ControlNet safetensors file. The network stays resident on
+    // Pipeline until destruction (or until apply_controlnet is called again
+    // with a different file — the previous net is replaced). SD1.5 only;
+    // throws on Flux. The default config matches HF's lllyasviel/sd-
+    // controlnet-* zoo; pass an explicit ControlNetConfig if a non-default
+    // checkpoint shape is needed.
+    void apply_controlnet(const brotensor::safetensors::File& f);
+    void apply_controlnet(const brotensor::safetensors::File& f,
+                          const controlnet::ControlNetConfig& cfg);
+
+    // True iff a ControlNet has been loaded.
+    bool has_controlnet() const { return controlnet_ != nullptr; }
 
     // Generate an image. Returns a freshly-allocated host buffer of
     // 3 * height * width FP32 values in NCHW (C=3, [-1, 1]).
@@ -315,6 +344,18 @@ private:
     brotensor::Tensor inpaint_renoise_buf_; // (1, C_lat*H_lat*W_lat) scratch
     brotensor::Tensor inpaint_noise_step_;  // (1, C_lat*H_lat*W_lat) Philox draw
     bool              inpaint_active_ = false;
+
+    // ControlNet plumbing. `controlnet_` is owned for the lifetime of
+    // Pipeline (or until apply_controlnet replaces it). `control_image_` is
+    // built in prime() at the active device + compute dtype and reused for
+    // every step in the current generation. `controlnet_active_` mirrors
+    // "control_image_path is non-empty AND controlnet_ is loaded" — checked
+    // by step_once to branch into the residual-aware UNet path.
+    std::unique_ptr<controlnet::ControlNet> controlnet_;
+    brotensor::Tensor                       control_image_;
+    bool                                    controlnet_active_ = false;
+    std::vector<brotensor::Tensor>          cn_down_residuals_;
+    brotensor::Tensor                       cn_mid_residual_;
 };
 
 }  // namespace brodiffusion::pipeline
