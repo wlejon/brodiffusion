@@ -59,6 +59,9 @@ static int usage() {
         "                       together. Multi-ControlNet stacking is not\n"
         "                       supported; trace mode / LCM scheduler combos\n"
         "                       with ControlNet are not supported.\n"
+        "  brodiffusion make-mask --out <png> [--width N] [--height N]\n"
+        "                       writes a center-square binary inpaint mask\n"
+        "                       (white quarter-area box on black, default 512x512).\n"
         "  brodiffusion bench   --text <st> --unet <st> --vae <st>\n"
         "                       --vocab <vocab.json> --merges <merges.txt>\n"
         "                       [--steps N] [--iters N] [--warmup N]\n"
@@ -663,6 +666,41 @@ int main(int argc, char** argv) {
             return run_t5(argc, argv);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "t5: %s\n", e.what());
+            return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "make-mask") == 0) {
+        try {
+            const char* out_path = arg_after(argc, argv, "--out");
+            const char* w_s = arg_after(argc, argv, "--width");
+            const char* h_s = arg_after(argc, argv, "--height");
+            if (!out_path) {
+                std::fprintf(stderr, "make-mask: --out <png> required\n");
+                return 2;
+            }
+            const int W = w_s ? std::atoi(w_s) : 512;
+            const int H = h_s ? std::atoi(h_s) : 512;
+            if (W <= 0 || H <= 0) {
+                std::fprintf(stderr, "make-mask: width/height must be positive\n");
+                return 2;
+            }
+            // Center-square binary mask: white quarter-area box on black.
+            std::vector<std::uint8_t> rgb(static_cast<std::size_t>(3) * H * W, 0);
+            const int cx = W / 4, cy = H / 4, cw = W / 2, ch = H / 2;
+            for (int y = cy; y < cy + ch; ++y) {
+                for (int x = cx; x < cx + cw; ++x) {
+                    auto i = static_cast<std::size_t>(y * W + x) * 3;
+                    rgb[i + 0] = rgb[i + 1] = rgb[i + 2] = 255;
+                }
+            }
+            if (!broimage::encode_png_file(out_path, rgb.data(), W, H, 3)) {
+                std::fprintf(stderr, "make-mask: cannot write PNG %s\n", out_path);
+                return 1;
+            }
+            std::printf("Wrote %s (%dx%d center-square mask)\n", out_path, W, H);
+            return 0;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "make-mask: %s\n", e.what());
             return 1;
         }
     }

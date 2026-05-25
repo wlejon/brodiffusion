@@ -41,7 +41,8 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet("sd15", "lcm-dreamshaper", "clip-vit-l-14", "flux-schnell", "t5-xxl")]
+    [ValidateSet("sd15", "lcm-dreamshaper", "clip-vit-l-14", "flux-schnell", "t5-xxl",
+                 "controlnet-canny", "controlnet-depth", "controlnet-openpose")]
     [string]$Model  = "sd15",
     [string]$Repo   = "",
     [string]$OutDir = ""
@@ -54,8 +55,13 @@ switch ($Model) {
         if (-not $Repo)   { $Repo   = "stable-diffusion-v1-5/stable-diffusion-v1-5" }
         if (-not $OutDir) { $OutDir = "$PSScriptRoot/../weights/sd15" }
         $files = @(
+            "model_index.json",
+            "scheduler/scheduler_config.json",
+            "text_encoder/config.json",
             "text_encoder/model.fp16.safetensors",
+            "unet/config.json",
             "unet/diffusion_pytorch_model.fp16.safetensors",
+            "vae/config.json",
             "vae/diffusion_pytorch_model.fp16.safetensors",
             "tokenizer/vocab.json",
             "tokenizer/merges.txt"
@@ -83,8 +89,13 @@ switch ($Model) {
         # the repo. SimianLuo/LCM_Dreamshaper_v7 is known to ship fp32 at
         # least for the unet; the loaders accept either.
         $files = @(
+            "model_index.json",
+            "scheduler/scheduler_config.json",
+            "text_encoder/config.json",
             "text_encoder/model.fp16.safetensors",
+            "unet/config.json",
             "unet/diffusion_pytorch_model.fp16.safetensors",
+            "vae/config.json",
             "vae/diffusion_pytorch_model.fp16.safetensors",
             "tokenizer/vocab.json",
             "tokenizer/merges.txt"
@@ -114,6 +125,38 @@ switch ($Model) {
             "t5xxl_fp16.safetensors",
             "google-t5/t5-base|tokenizer.json",
             "google/t5-v1_1-xxl|config.json"
+        )
+        $fallback = @{}
+    }
+    "controlnet-canny" {
+        # SD1.5 ControlNet (Canny edges). Diffusion model + the model card's
+        # example canny image so --control-image has something to point at.
+        if (-not $Repo)   { $Repo   = "lllyasviel/sd-controlnet-canny" }
+        if (-not $OutDir) { $OutDir = "$PSScriptRoot/../weights/controlnet-canny" }
+        $files = @(
+            "config.json",
+            "diffusion_pytorch_model.fp16.safetensors",
+            "images/bird_canny.png"
+        )
+        $fallback = @{}
+    }
+    "controlnet-depth" {
+        if (-not $Repo)   { $Repo   = "lllyasviel/sd-controlnet-depth" }
+        if (-not $OutDir) { $OutDir = "$PSScriptRoot/../weights/controlnet-depth" }
+        $files = @(
+            "config.json",
+            "diffusion_pytorch_model.fp16.safetensors",
+            "images/stormtrooper_depth.png"
+        )
+        $fallback = @{}
+    }
+    "controlnet-openpose" {
+        if (-not $Repo)   { $Repo   = "lllyasviel/sd-controlnet-openpose" }
+        if (-not $OutDir) { $OutDir = "$PSScriptRoot/../weights/controlnet-openpose" }
+        $files = @(
+            "config.json",
+            "diffusion_pytorch_model.fp16.safetensors",
+            "images/pose.png"
         )
         $fallback = @{}
     }

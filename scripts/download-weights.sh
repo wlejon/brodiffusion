@@ -35,6 +35,11 @@
 #   t5-xxl           Just the T5-XXL text encoder (text_encoder_2) + tokenizer
 #                    from the same Flux.1-schnell repo. ~9.5 GB. The standalone
 #                    target for working on the T5 encoder.
+#   controlnet-canny / controlnet-depth / controlnet-openpose
+#                    lllyasviel/sd-controlnet-{canny,depth,openpose}. The FP16
+#                    diffusion_pytorch_model + the model card's example
+#                    control image (so a clean checkout has something concrete
+#                    to feed --control-image). ~1.4 GB each.
 #
 # Auth: the SD1.5 mirror is public and needs no token. For rate-limited repos,
 # export HF_TOKEN=hf_... and it will be sent as a bearer token.
@@ -56,7 +61,7 @@ FORCE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        sd15|lcm-dreamshaper|clip-vit-l-14|flux-schnell|t5-xxl) MODEL="$1"; shift ;;
+        sd15|lcm-dreamshaper|clip-vit-l-14|flux-schnell|t5-xxl|controlnet-canny|controlnet-depth|controlnet-openpose) MODEL="$1"; shift ;;
         --repo)    REPO="${2:?--repo needs a value}"; shift 2 ;;
         --out-dir) OUT_DIR="${2:?--out-dir needs a value}"; shift 2 ;;
         --force)   FORCE=1; shift ;;
@@ -79,8 +84,13 @@ case "$MODEL" in
         [ -n "$REPO" ]    || REPO="stable-diffusion-v1-5/stable-diffusion-v1-5"
         [ -n "$OUT_DIR" ] || OUT_DIR="$REPO_ROOT/weights/sd15"
         FILES=(
+            "model_index.json"
+            "scheduler/scheduler_config.json"
+            "text_encoder/config.json"
             "text_encoder/model.fp16.safetensors"
+            "unet/config.json"
             "unet/diffusion_pytorch_model.fp16.safetensors"
+            "vae/config.json"
             "vae/diffusion_pytorch_model.fp16.safetensors"
             "tokenizer/vocab.json"
             "tokenizer/merges.txt"
@@ -90,8 +100,13 @@ case "$MODEL" in
         [ -n "$REPO" ]    || REPO="SimianLuo/LCM_Dreamshaper_v7"
         [ -n "$OUT_DIR" ] || OUT_DIR="$REPO_ROOT/weights/lcm-dreamshaper"
         FILES=(
+            "model_index.json"
+            "scheduler/scheduler_config.json"
+            "text_encoder/config.json"
             "text_encoder/model.fp16.safetensors"
+            "unet/config.json"
             "unet/diffusion_pytorch_model.fp16.safetensors"
+            "vae/config.json"
             "vae/diffusion_pytorch_model.fp16.safetensors"
             "tokenizer/vocab.json"
             "tokenizer/merges.txt"
@@ -122,6 +137,29 @@ case "$MODEL" in
             "t5xxl_fp16.safetensors"
             "google-t5/t5-base|tokenizer.json"
             "google/t5-v1_1-xxl|config.json"
+        )
+        ;;
+    controlnet-canny|controlnet-depth|controlnet-openpose)
+        # ControlNet weights for SD1.5 from lllyasviel. The diffusion_pytorch_model
+        # is the residual-producing network; --control-image must be a prepared
+        # control map (an edge image for canny, a depth map for depth, a stick-
+        # figure pose render for openpose) — brodiffusion does NOT extract these
+        # from a natural image. The model card's example image is bundled so
+        # --control-image has something to point at out of the box.
+        case "$MODEL" in
+            controlnet-canny)    cn_repo="lllyasviel/sd-controlnet-canny"
+                                 cn_example="images/bird_canny.png" ;;
+            controlnet-depth)    cn_repo="lllyasviel/sd-controlnet-depth"
+                                 cn_example="images/stormtrooper_depth.png" ;;
+            controlnet-openpose) cn_repo="lllyasviel/sd-controlnet-openpose"
+                                 cn_example="images/pose.png" ;;
+        esac
+        [ -n "$REPO" ]    || REPO="$cn_repo"
+        [ -n "$OUT_DIR" ] || OUT_DIR="$REPO_ROOT/weights/$MODEL"
+        FILES=(
+            "config.json"
+            "diffusion_pytorch_model.fp16.safetensors"
+            "$cn_example"
         )
         ;;
     flux-schnell)
