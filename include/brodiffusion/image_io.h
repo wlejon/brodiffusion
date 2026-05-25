@@ -25,4 +25,22 @@ namespace brodiffusion {
 brotensor::Tensor load_image_as_latent_input(const std::string& path,
                                              int dst_w, int dst_h);
 
+// Decode a 1-channel mask image and produce a (1, H_lat * W_lat) tensor of
+// {0.0, 1.0} values on the active brotensor device at compute dtype.
+//
+// Convention: input pixel >= `threshold` (default 128) -> 1.0 ("inpaint this
+// region"); pixel < threshold -> 0.0 ("keep original"). Matches the diffusers
+// inpaint mask convention (white = inpaint, black = keep).
+//
+// The mask is decoded via broimage (RGBA8), converted to a single channel via
+// luminance (rgba_to_rgb then rgb_to_gray), resized to (W_lat, H_lat) with
+// nearest-neighbor (preserves the hard mask boundary — bilinear would blur a
+// binary mask into a gradient), then thresholded and uploaded.
+//
+// H_lat and W_lat must be positive. Throws std::runtime_error on decode
+// failure or invalid dims.
+brotensor::Tensor load_mask_as_latent(const std::string& path,
+                                      int H_lat, int W_lat,
+                                      uint8_t threshold = 128);
+
 }  // namespace brodiffusion

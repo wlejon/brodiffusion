@@ -381,6 +381,19 @@ PipelineState Pipeline::prime(std::string_view prompt,
         fail("prime: img2img (init_image_path) is currently SD1.5 only; "
              "Flux img2img is not yet supported");
     }
+    if (!opts.mask_image_path.empty() && opts.init_image_path.empty()) {
+        fail("inpaint: --mask requires --init (mask_image_path is set but "
+             "init_image_path is empty)");
+    }
+    if (!opts.mask_image_path.empty() &&
+        model_class_ != ModelClass::StableDiffusion) {
+        fail("inpaint: Flux is not yet supported (SD1.5 only)");
+    }
+
+    // Reset inpaint state so a previous inpaint generation doesn't leak into
+    // the next call. Re-armed below in the img2img branch when mask_image_path
+    // is set.
+    inpaint_active_ = false;
 
     const int H_lat = opts.height / 8;
     const int W_lat = opts.width  / 8;
@@ -506,6 +519,55 @@ PipelineState Pipeline::prime(std::string_view prompt,
         randn_compute(opts.seed, 0, n_lat, noise);
 
         const int t_start = img2img_t_start(state.n_steps, opts.strength);
+
+        // Inpaint: stash a clone of x0 BEFORE add_noise consumes it via
+        // state.latent. Cheap (one extra latent-sized tensor per generation).
+        if (!opts.mask_image_path.empty()) {
+            inpaint_x0_   = x0_latent.clone();
+            inpaint_mask_ = brodiffusion::load_mask_as_latent(
+                                opts.mask_image_path, H_lat, W_lat);
+
+            // Broadcast the (1, H_lat*W_lat) mask across C_lat channels on the
+            // host once per generation — the device-side per-step blend then
+            // reduces to plain elementwise mul + add against the cached
+            // broadcast tensors. Faster than rebuilding the broadcast each
+            // step, and avoids needing a broadcasting op in brotensor.
+            const int mask_n = H_lat * W_lat;
+            std::vector<float> mask_host(static_cast<std::size_t>(mask_n));
+            if (inpaint_mask_.dtype == bt::Dtype::FP16) {
+                std::vector<std::uint16_t> bits(
+                    static_cast<std::size_t>(mask_n));
+                inpaint_mask_.copy_to_host_fp16(bits.data());
+                bt::sync_all();
+                for (int i = 0; i < mask_n; ++i) {
+                    mask_host[static_cast<std::size_t>(i)] =
+                        bt::fp16_bits_to_fp32(bits[static_cast<std::size_t>(i)]);
+                }
+            } else {
+                mask_host = inpaint_mask_.to_host_vector();
+            }
+            std::vector<float> mask_b_host(static_cast<std::size_t>(n_lat));
+            std::vector<float> one_minus_b_host(
+                static_cast<std::size_t>(n_lat));
+            for (int c = 0; c < C_lat; ++c) {
+                for (int i = 0; i < mask_n; ++i) {
+                    const std::size_t k =
+                        static_cast<std::size_t>(c) *
+                        static_cast<std::size_t>(mask_n) +
+                        static_cast<std::size_t>(i);
+                    const float m =
+                        mask_host[static_cast<std::size_t>(i)];
+                    mask_b_host[k]      = m;
+                    one_minus_b_host[k] = 1.0f - m;
+                }
+            }
+            inpaint_mask_b_      = detail::upload_host(mask_b_host.data(),
+                                                       1, n_lat);
+            inpaint_one_minus_b_ = detail::upload_host(one_minus_b_host.data(),
+                                                       1, n_lat);
+            inpaint_active_ = true;
+        }
+
         std::visit([&](auto& s) {
             s.add_noise(x0_latent, noise, t_start, state.latent, scratch_);
         }, scheduler_);
@@ -608,6 +670,46 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
     scheduler_step(scheduler_, noise_pred_cond_, i, state, n_lat,
                    scratch_, noise_step_);
     ++state.step_index;
+
+    // ── Inpaint latent blend ──────────────────────────────────────────────
+    // After the scheduler step, the latent represents the state at the next
+    // timestep (i+1). Re-noise x0 to that same timestep and replace the
+    // unmasked region (mask=0) with it — keeping the inpaint region (mask=1)
+    // on the model's own trajectory. Skip on the final step: the latent is at
+    // t=0 (clean) and re-noising would just re-add noise to a clean image.
+    if (inpaint_active_ && state.step_index < state.n_steps) {
+        // Per-step renoise noise: separate Philox slot from the LCM per-step
+        // stream. We XOR the state's rng_key with the golden-ratio constant
+        // to decorrelate from both the initial-noise (counter 0..n_lat) and
+        // LCM per-step (counter (1+step)*n_lat..) draws on the same key.
+        const std::uint64_t inpaint_key =
+            state.rng_key ^ 0x9E3779B97F4A7C15ULL;
+        const std::uint64_t counter =
+            static_cast<std::uint64_t>(state.step_index) *
+            static_cast<std::uint64_t>(n_lat);
+        randn_compute(inpaint_key, counter, n_lat, inpaint_noise_step_);
+
+        // x0_renoised = add_noise(x0, noise_step, state.step_index).
+        // Only DDIM / LCM have add_noise on the SD1.5 path; FlowMatch is
+        // unreachable here (the Flux guard in prime() rejected it).
+        std::visit([&](auto& s) {
+            using S = std::decay_t<decltype(s)>;
+            if constexpr (std::is_same_v<S, scheduler::DDIM> ||
+                          std::is_same_v<S, scheduler::LCM>) {
+                s.add_noise(inpaint_x0_, inpaint_noise_step_,
+                            state.step_index, inpaint_renoise_buf_, scratch_);
+            } else {
+                fail("step_once: inpaint blend reached non-SD1.5 scheduler "
+                     "(this should be impossible — Flux guard in prime() "
+                     "should have rejected it)");
+            }
+        }, scheduler_);
+
+        // Blend: latent = mask_b * latent + (1 - mask_b) * x0_renoised.
+        bt::mul_inplace(state.latent, inpaint_mask_b_);
+        bt::mul_inplace(inpaint_renoise_buf_, inpaint_one_minus_b_);
+        bt::add_inplace(state.latent, inpaint_renoise_buf_);
+    }
 }
 
 std::vector<float> Pipeline::decode(const PipelineState& state) {

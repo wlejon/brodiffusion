@@ -144,6 +144,15 @@ struct GenerateOptions {
     // stream as the schedule noise at a non-overlapping counter offset).
     // Ignored when init_image_path is empty.
     bool vae_encode_sample = false;
+
+    // Inpaint mask path. When non-empty, the pipeline runs in inpaint mode:
+    // init_image_path must ALSO be set, and at each scheduler step (except
+    // the final one) the unmasked region of the latent is replaced by a
+    // re-noised version of the encoded init latent at the next timestep.
+    // The mask is decoded as 1-channel and resized to latent dims with
+    // nearest-neighbor (see load_mask_as_latent). White (>= 128) = inpaint,
+    // black = keep. SD1.5 only; throws on Flux.
+    std::string mask_image_path;
 };
 
 class Pipeline {
@@ -289,6 +298,23 @@ private:
     // Per-step Gaussian noise used by LCM (resampled at every non-final step
     // from the same RNG stream as the initial latent noise). Unused in DDIM.
     brotensor::Tensor noise_step_;
+
+    // Inpaint blending state. Built in prime() when opts.mask_image_path is
+    // non-empty; consumed by step_once() to blend the unmasked region of the
+    // generated latent with a re-noised version of x0 at each step. `mask_b`
+    // is the per-channel-broadcast mask (shape matches the latent); raw
+    // `mask` of shape (1, H_lat*W_lat) is kept around for tests / debug.
+    // Empty tensors + inpaint_active_=false mean inpaint mode is off for the
+    // current generation. Lives on Pipeline (not PipelineState) — shared
+    // across branched states from the same prime() call, same as the K/V
+    // cache.
+    brotensor::Tensor inpaint_x0_;          // (1, C_lat*H_lat*W_lat)
+    brotensor::Tensor inpaint_mask_;        // (1, H_lat*W_lat), {0,1}
+    brotensor::Tensor inpaint_mask_b_;      // (1, C_lat*H_lat*W_lat) broadcast
+    brotensor::Tensor inpaint_one_minus_b_; // (1, C_lat*H_lat*W_lat) = 1 - mask_b
+    brotensor::Tensor inpaint_renoise_buf_; // (1, C_lat*H_lat*W_lat) scratch
+    brotensor::Tensor inpaint_noise_step_;  // (1, C_lat*H_lat*W_lat) Philox draw
+    bool              inpaint_active_ = false;
 };
 
 }  // namespace brodiffusion::pipeline

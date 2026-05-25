@@ -111,9 +111,50 @@ int main() {
         CHECK(bad == 0);
     }
 
+    // ── Mask loader: 16x16 binary pattern -> 2x2 latent ───────────────────
+    // Left half = 0 (keep), right half = 255 (inpaint). After nearest-resize
+    // to 2x2 latent and threshold, expect [[0, 1], [0, 1]] flat = {0, 1, 0, 1}.
+    auto mask_path = tmp / "brodiffusion_imgio_mask.png";
+    {
+        const int w = 16, h = 16;
+        std::vector<uint8_t> rgba(static_cast<std::size_t>(w * h * 4));
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                std::size_t i = static_cast<std::size_t>((y * w + x) * 4);
+                uint8_t c = (x >= w / 2) ? 255 : 0;
+                rgba[i+0] = c; rgba[i+1] = c; rgba[i+2] = c; rgba[i+3] = 255;
+            }
+        }
+        bool ok = broimage::encode_png_file(mask_path.string(), rgba.data(),
+                                            w, h, /*channels=*/4);
+        CHECK(ok);
+
+        bt::Tensor m = brodiffusion::load_mask_as_latent(
+            mask_path.string(), /*H_lat=*/2, /*W_lat=*/2);
+        bt::sync_all();
+        CHECK(m.rows == 1);
+        CHECK(m.cols == 4);
+        CHECK(m.dtype == brodiffusion::compute_dtype());
+        std::vector<float> vals = bdtest::bd_download(m);
+        CHECK(vals.size() == 4);
+        // Every value must be exactly 0.0 or 1.0 (the threshold is strict —
+        // no in-between values from bilinear smoothing).
+        int impure = 0;
+        for (float v : vals) {
+            if (v != 0.0f && v != 1.0f) ++impure;
+        }
+        CHECK(impure == 0);
+        // Left half (cols 0, 2 in flat (H_lat=2, W_lat=2)) = 0; right (1, 3) = 1.
+        CHECK(vals[0] == 0.0f);
+        CHECK(vals[1] == 1.0f);
+        CHECK(vals[2] == 0.0f);
+        CHECK(vals[3] == 1.0f);
+    }
+
     std::error_code ec;
-    std::filesystem::remove(cb_path,  ec);
-    std::filesystem::remove(mid_path, ec);
+    std::filesystem::remove(cb_path,   ec);
+    std::filesystem::remove(mid_path,  ec);
+    std::filesystem::remove(mask_path, ec);
 
     if (g_failures == 0) std::printf("image_io: OK\n");
     else std::fprintf(stderr, "image_io: %d failure(s)\n", g_failures);

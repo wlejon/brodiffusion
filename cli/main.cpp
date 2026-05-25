@@ -47,6 +47,10 @@ static int usage() {
         "                       [--quantize-unet]\n"
         "  brodiffusion img2img --init <png> [--strength F] [--vae-sample]\n"
         "                       (all txt2img flags also accepted; SD1.5 only)\n"
+        "  brodiffusion inpaint --init <png> --mask <png>\n"
+        "                       [--strength F] [--vae-sample]\n"
+        "                       (all txt2img flags also accepted; SD1.5 only;\n"
+        "                        white mask pixels = inpaint, black = keep)\n"
         "  brodiffusion bench   --text <st> --unet <st> --vae <st>\n"
         "                       --vocab <vocab.json> --merges <merges.txt>\n"
         "                       [--steps N] [--iters N] [--warmup N]\n"
@@ -211,6 +215,7 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     const char* height_s = arg_after(argc, argv, "--height");
     const char* seed_s   = arg_after(argc, argv, "--seed");
     const char* init_path = arg_after(argc, argv, "--init");
+    const char* mask_path = arg_after(argc, argv, "--mask");
     const char* strength_s = arg_after(argc, argv, "--strength");
     bool vae_sample = false;
     for (int i = 1; i < argc; ++i) {
@@ -254,6 +259,20 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
             opts.strength = static_cast<float>(std::atof(strength_s));
         }
     }
+    if (mask_path) {
+        if (!init_path) {
+            std::fprintf(stderr,
+                "inpaint: --mask requires --init (SD1.5 only)\n");
+            return 2;
+        }
+        if (is_flux) {
+            std::fprintf(stderr,
+                "inpaint: --mask is not supported for Flux model dirs "
+                "(SD1.5 only)\n");
+            return 2;
+        }
+        opts.mask_image_path = mask_path;
+    }
 
     std::printf("Generating %dx%d, %d steps, CFG=%.1f, seed=%llu\n",
                 opts.width, opts.height, opts.num_inference_steps,
@@ -295,6 +314,7 @@ int run_txt2img(int argc, char** argv) {
     // them merged avoids duplicating the full --text/--unet/--vae setup; a
     // future PR can split if either branch grows.
     const char* init_path   = arg_after(argc, argv, "--init");
+    const char* mask_path   = arg_after(argc, argv, "--mask");
     const char* strength_s  = arg_after(argc, argv, "--strength");
 
     bool quantize_unet = false;
@@ -373,6 +393,16 @@ int run_txt2img(int argc, char** argv) {
                 "(use one or the other)\n");
             return 2;
         }
+    }
+    // Inpaint: --mask requires --init (validated below); empty path =
+    // img2img / txt2img per init_image_path.
+    if (mask_path) {
+        if (!init_path) {
+            std::fprintf(stderr,
+                "inpaint: --mask requires --init (SD1.5 only)\n");
+            return 2;
+        }
+        opts.mask_image_path = mask_path;
     }
 
     // --latent-in overrides the RNG entirely with raw N(0,1) noise from a
@@ -551,6 +581,22 @@ int main(int argc, char** argv) {
             return run_txt2img(argc, argv);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "img2img: %s\n", e.what());
+            return 1;
+        }
+    }
+    // inpaint is sugar for txt2img + --init + --mask. Same run_txt2img code
+    // path; the active branch is selected by whether mask_image_path is set.
+    if (std::strcmp(argv[1], "inpaint") == 0) {
+        try {
+            if (!arg_after(argc, argv, "--init") ||
+                !arg_after(argc, argv, "--mask")) {
+                std::fprintf(stderr,
+                    "inpaint: --init <png> and --mask <png> are required\n");
+                return 2;
+            }
+            return run_txt2img(argc, argv);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "inpaint: %s\n", e.what());
             return 1;
         }
     }
