@@ -375,216 +375,12 @@ void UNet::load_weights(const st::File& f, const std::string& prefix) {
 }
 
 // ─── per-block forward helpers ─────────────────────────────────────────────
+//
+// Phase D1 lifted the per-block helpers (apply_resnet, apply_transformer,
+// apply_conv3x3, apply_conv3x3_q) into brodiffusion::unet::detail (see
+// src/unet_blocks.cpp). UNet now forwards to those free functions with its
+// `block_scratch_` member supplying the scratch tensors.
 
-void UNet::apply_conv3x3_(const bt::Tensor& W, const bt::Tensor& b,
-                          int C_in, int C_out, int H, int W_,
-                          int stride, int pad,
-                          const bt::Tensor& in, bt::Tensor& out) {
-    bt::conv2d_forward(in, W, &b,
-                           /*N=*/1, C_in, H, W_,
-                           C_out, /*kH=*/3, /*kW=*/3,
-                           stride, stride, pad, pad, /*dil=*/1, 1,
-                           out);
-}
-
-void UNet::apply_conv3x3_q_(const QWeight& Wq, const bt::Tensor& b,
-                            int C_in, int C_out, int H, int W_,
-                            int stride, int pad,
-                            const bt::Tensor& in, bt::Tensor& out) {
-    bt::conv2d_int8w_fp16_forward(in, Wq.W_int8, Wq.scales, &b,
-                                      /*N=*/1, C_in, H, W_,
-                                      C_out, /*kH=*/3, /*kW=*/3,
-                                      stride, stride, pad, pad, /*dil=*/1, 1,
-                                      /*groups=*/1, out);
-}
-
-void UNet::apply_resnet_(const Resnet& r, int H, int W,
-                         bt::Tensor& x, bt::Tensor& tmp) {
-    // Per-resblock time-emb projection: silu(temb) -> Linear -> (1, C_out).
-    detail::linear_batched(r.temb_W, &r.temb_b, temb_silu_, temb_proj_);
-
-    if (r.W1_q.active()) {
-        const QWeight* skip_q = r.has_shortcut ? &r.Ws_q : nullptr;
-        const bt::Tensor* skip_b = r.has_shortcut ? &r.bs : nullptr;
-        const bt::Tensor* skip_W_int8   = skip_q ? &skip_q->W_int8 : nullptr;
-        const bt::Tensor* skip_W_scales = skip_q ? &skip_q->scales : nullptr;
-        brodiffusion::fused_resblock_forward(x,
-                                             r.n1g, r.n1b,
-                                             r.W1_q.W_int8, r.W1_q.scales, r.b1,
-                                             temb_proj_,
-                                             r.n2g, r.n2b,
-                                             r.W2_q.W_int8, r.W2_q.scales, r.b2,
-                                             skip_W_int8, skip_W_scales, skip_b,
-                                             r.C_in, r.C_out, H, W,
-                                             cfg_.norm_num_groups, cfg_.eps,
-                                             tmp);
-    } else {
-        const bt::Tensor* skip_W = r.has_shortcut ? &r.Ws : nullptr;
-        const bt::Tensor* skip_b = r.has_shortcut ? &r.bs : nullptr;
-        brodiffusion::fused_resblock_forward(x,
-                                             r.n1g, r.n1b,
-                                             r.W1, r.b1,
-                                             temb_proj_,
-                                             r.n2g, r.n2b,
-                                             r.W2, r.b2,
-                                             skip_W, skip_b,
-                                             r.C_in, r.C_out, H, W,
-                                             cfg_.norm_num_groups, cfg_.eps,
-                                             tmp);
-    }
-    std::swap(x, tmp);
-}
-
-void UNet::apply_transformer_(const Transformer2D& t,
-                              const bt::Tensor& ctx,
-                              const CrossAttnKVCacheEntry* cache_entry,
-                              int H, int W, bt::Tensor& x,
-                              bt::Tensor* trace_out_entry,
-                              const bt::Tensor* attn_logit_bias) {
-    // Trace mode is incompatible with the cached K/V fast path because
-    // brotensor's cross_attention_forward_with_attn reprojects K/V from
-    // ctx every call. forward_trace() already ensures no cache is passed.
-    if (trace_out_entry != nullptr && cache_entry != nullptr) {
-        fail("apply_transformer_: trace_out_entry and cache_entry are "
-             "mutually exclusive");
-    }
-    const int C  = t.C;
-    const int H_heads = t.num_heads;
-
-    // 1. residual is `x` itself; we add the post-transformer result back in.
-    // 2. GroupNorm in NCHW. Diffusers' Transformer2DModel uses eps=1e-6 on
-    //    this outer GroupNorm (distinct from the 1e-5 used on the ResNet
-    //    GroupNorms); hard-code it here rather than relying on cfg_.eps.
-    bt::group_norm_forward(x, t.gn_g, t.gn_b,
-                               1, C, H, W, cfg_.norm_num_groups, 1e-6f, gn_);
-
-    // 3. NCHW -> (L, C) sequence.
-    bt::nchw_to_sequence(gn_, 1, C, H, W, seq_);
-
-    // 4. proj_in: 1x1 conv ≡ Linear over C.
-    if (t.pi_q.active()) {
-        bt::linear_forward_batched_int8w_fp16(
-            t.pi_q.W_int8, t.pi_q.scales, &t.pi_b, seq_, proj_in_seq_);
-    } else {
-        detail::linear_batched(t.pi_W, &t.pi_b, seq_, proj_in_seq_);
-    }
-
-    // 5. transformer blocks (always 1 for SD1.5).
-    tseq_ = proj_in_seq_.clone();
-    for (const AttnFFN& blk : t.blocks) {
-        // ── self-attention (Q/K/V bias-less, Wo biased) ───────────────────
-        detail::layernorm_batched(tseq_, blk.n1g, blk.n1b, ln_, cfg_.eps);
-        if (blk.Wq1_q.active()) {
-            bt::flash_attention_qkvo_int8w_fp16(
-                ln_, /*Ctx=*/nullptr,
-                blk.Wq1_q.W_int8, blk.Wq1_q.scales, /*bq=*/nullptr,
-                blk.Wk1_q.W_int8, blk.Wk1_q.scales, /*bk=*/nullptr,
-                blk.Wv1_q.W_int8, blk.Wv1_q.scales, /*bv=*/nullptr,
-                blk.Wo1_q.W_int8, blk.Wo1_q.scales, &blk.bo1,
-                /*d_mask=*/nullptr, H_heads, /*causal=*/false,
-                attn_proj_);
-        } else {
-            bt::flash_attention_qkvo_forward(
-                ln_, /*Ctx=*/nullptr,
-                blk.Wq1, /*bq=*/nullptr,
-                blk.Wk1, /*bk=*/nullptr,
-                blk.Wv1, /*bv=*/nullptr,
-                blk.Wo1, &blk.bo1,
-                /*d_mask=*/nullptr, H_heads, /*causal=*/false,
-                attn_proj_);
-        }
-        brodiffusion::add_inplace_vec(tseq_, attn_proj_);
-
-        // ── cross-attention (K, V from `ctx` — possibly cached) ───────────
-        detail::layernorm_batched(tseq_, blk.n2g, blk.n2b, ln_, cfg_.eps);
-        if (trace_out_entry) {
-            // Trace path: brotensor's cross_attention_forward_with_attn
-            // writes the head-averaged softmax map to AttnAvg. No Wo
-            // bias is supported by that op, so we manually add bo2 after.
-            // (forward_trace already guards against INT8.)
-            bt::cross_attention_forward_with_attn(
-                ln_, ctx,
-                blk.Wq2, blk.Wk2, blk.Wv2, blk.Wo2,
-                /*d_mask=*/nullptr,
-                attn_logit_bias,
-                H_heads,
-                attn_proj_, *trace_out_entry);
-            // Add output bias bo2 (per-column broadcast across rows of attn_proj_).
-            brodiffusion::add_inplace_row_bias(attn_proj_, blk.bo2);
-        } else if (cache_entry) {
-            // K/V already projected from `ctx` upstream — skip the two
-            // per-step matmuls and feed the cached buffers straight in.
-            if (blk.Wq2_q.active()) {
-                bt::flash_attention_q_with_kv_cached_int8w_fp16(
-                    ln_, cache_entry->K, cache_entry->V,
-                    blk.Wq2_q.W_int8, blk.Wq2_q.scales, /*bq=*/nullptr,
-                    blk.Wo2_q.W_int8, blk.Wo2_q.scales, &blk.bo2,
-                    /*d_mask=*/nullptr, H_heads, /*causal=*/false,
-                    attn_proj_);
-            } else {
-                bt::flash_attention_q_with_kv_cached_forward(
-                    ln_, cache_entry->K, cache_entry->V,
-                    blk.Wq2, /*bq=*/nullptr,
-                    blk.Wo2, &blk.bo2,
-                    /*d_mask=*/nullptr, H_heads, /*causal=*/false,
-                    attn_proj_);
-            }
-        } else {
-            if (blk.Wq2_q.active()) {
-                bt::flash_attention_qkvo_int8w_fp16(
-                    ln_, &ctx,
-                    blk.Wq2_q.W_int8, blk.Wq2_q.scales, /*bq=*/nullptr,
-                    blk.Wk2_q.W_int8, blk.Wk2_q.scales, /*bk=*/nullptr,
-                    blk.Wv2_q.W_int8, blk.Wv2_q.scales, /*bv=*/nullptr,
-                    blk.Wo2_q.W_int8, blk.Wo2_q.scales, &blk.bo2,
-                    /*d_mask=*/nullptr, H_heads, /*causal=*/false,
-                    attn_proj_);
-            } else {
-                bt::flash_attention_qkvo_forward(
-                    ln_, &ctx,
-                    blk.Wq2, /*bq=*/nullptr,
-                    blk.Wk2, /*bk=*/nullptr,
-                    blk.Wv2, /*bv=*/nullptr,
-                    blk.Wo2, &blk.bo2,
-                    /*d_mask=*/nullptr, H_heads, /*causal=*/false,
-                    attn_proj_);
-            }
-        }
-        brodiffusion::add_inplace_vec(tseq_, attn_proj_);
-
-        // ── feed-forward (GEGLU) ──────────────────────────────────────────
-        detail::layernorm_batched(tseq_, blk.n3g, blk.n3b, ln_, cfg_.eps);
-        // Fused FF1 + exact-GEGLU: skips the (B, 2*D) intermediate of FF1.
-        // SD1.5's BasicTransformerBlock uses F.gelu(approximate=False).
-        if (blk.ff1_q.active()) {
-            brodiffusion::fused_linear_geglu(
-                ln_, blk.ff1_q.W_int8, blk.ff1_q.scales, blk.ff1_b, ff_act_);
-        } else {
-            brodiffusion::fused_linear_geglu(ln_, blk.ff1_W, blk.ff1_b, ff_act_);
-        }
-        if (blk.ff2_q.active()) {
-            bt::linear_forward_batched_int8w_fp16(
-                blk.ff2_q.W_int8, blk.ff2_q.scales, &blk.ff2_b, ff_act_, ff_out_);
-        } else {
-            detail::linear_batched(blk.ff2_W, &blk.ff2_b, ff_act_, ff_out_);
-        }
-        brodiffusion::add_inplace_vec(tseq_, ff_out_);
-    }
-
-    // 6. proj_out: 1x1 conv ≡ Linear.
-    if (t.po_q.active()) {
-        bt::linear_forward_batched_int8w_fp16(
-            t.po_q.W_int8, t.po_q.scales, &t.po_b, tseq_, proj_out_seq_);
-    } else {
-        detail::linear_batched(t.po_W, &t.po_b, tseq_, proj_out_seq_);
-    }
-
-    // 7. seq -> NCHW.
-    bt::sequence_to_nchw(proj_out_seq_, 1, C, H, W, proj_out_nchw_);
-
-    // 8. residual add.
-    bt::add_inplace(x, proj_out_nchw_);
-}
 
 // ─── forward ───────────────────────────────────────────────────────────────
 
@@ -701,7 +497,8 @@ void UNet::forward(const bt::Tensor& sample,
     }
     forward_impl_(sample, H, W, timestep, /*gs_emb=*/nullptr,
                   encoder_hidden_states, /*xattn_cache=*/nullptr,
-                  /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr, out);
+                  /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr,
+                  /*down_residuals=*/nullptr, /*mid_residual=*/nullptr, out);
 }
 
 void UNet::forward(const bt::Tensor& sample,
@@ -721,7 +518,36 @@ void UNet::forward(const bt::Tensor& sample,
     }
     forward_impl_(sample, H, W, timestep, /*gs_emb=*/nullptr,
                   encoder_hidden_states, &xattn_cache,
-                  /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr, out);
+                  /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr,
+                  /*down_residuals=*/nullptr, /*mid_residual=*/nullptr, out);
+}
+
+void UNet::forward(const bt::Tensor& sample,
+                   int H, int W,
+                   float timestep,
+                   const bt::Tensor& encoder_hidden_states,
+                   const CrossAttnKVCache& xattn_cache,
+                   const std::vector<const bt::Tensor*>& down_residuals,
+                   const bt::Tensor* mid_residual,
+                   bt::Tensor& out) {
+    // ControlNet-augmented forward. Vanilla SD1.5 only (no LCM cond_proj —
+    // ControlNet has no LCM-distilled variant). Same shape contract as the
+    // cached forward; residual lengths are validated inside forward_impl_.
+    if (cfg_.time_cond_proj_dim > 0) {
+        fail("forward(controlnet): residual-aware forward is not wired for "
+             "LCM-distilled U-Nets (time_cond_proj_dim>0)");
+    }
+    if (static_cast<int>(xattn_cache.size()) != num_xattn_blocks()) {
+        fail("forward(controlnet): cross-attn KV cache has " +
+             std::to_string(xattn_cache.size()) + " entries, expected " +
+             std::to_string(num_xattn_blocks()));
+    }
+    const std::vector<const bt::Tensor*>* dr =
+        down_residuals.empty() ? nullptr : &down_residuals;
+    forward_impl_(sample, H, W, timestep, /*gs_emb=*/nullptr,
+                  encoder_hidden_states, &xattn_cache,
+                  /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr,
+                  dr, mid_residual, out);
 }
 
 void UNet::forward(const bt::Tensor& sample,
@@ -742,7 +568,8 @@ void UNet::forward(const bt::Tensor& sample,
     }
     forward_impl_(sample, H, W, timestep, &guidance_scale_embedding,
                   encoder_hidden_states, &xattn_cache,
-                  /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr, out);
+                  /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr,
+                  /*down_residuals=*/nullptr, /*mid_residual=*/nullptr, out);
 }
 
 void UNet::forward_trace(const bt::Tensor& sample,
@@ -782,7 +609,8 @@ void UNet::forward_trace(const bt::Tensor& sample,
     }
     forward_impl_(sample, H, W, timestep, guidance_scale_embedding,
                   encoder_hidden_states, /*xattn_cache=*/nullptr,
-                  attn_logit_biases, trace_out, out);
+                  attn_logit_biases, trace_out,
+                  /*down_residuals=*/nullptr, /*mid_residual=*/nullptr, out);
 }
 
 // ─── LoRA merge ────────────────────────────────────────────────────────────
@@ -1237,6 +1065,8 @@ void UNet::forward_impl_(const bt::Tensor& sample,
                          const CrossAttnKVCache* xattn_cache,
                          const std::vector<const bt::Tensor*>* attn_logit_biases,
                          CrossAttnTrace* trace_out,
+                         const std::vector<const bt::Tensor*>* down_residuals,
+                         const bt::Tensor* mid_residual,
                          bt::Tensor& out) {
     if (conv_in_W_.size() == 0) fail("forward: weights not loaded");
 
@@ -1259,10 +1089,27 @@ void UNet::forward_impl_(const bt::Tensor& sample,
              "cross_attention_dim");
     }
 
+    // Total number of skip pushes the down pass will make: 1 from conv_in,
+    // plus layers_per_block per stage, plus 1 per downsampler. For the stock
+    // SD1.5 config (nb=4, layers_per_block=2) this is 1 + 4*2 + 3 = 12.
+    int expected_skips = 1;
+    for (int i = 0; i < nb; ++i) {
+        expected_skips += cfg_.layers_per_block;
+        if (down_blocks_[static_cast<std::size_t>(i)].has_downsampler) {
+            ++expected_skips;
+        }
+    }
+    if (down_residuals != nullptr &&
+        static_cast<int>(down_residuals->size()) != expected_skips) {
+        fail("forward: down_residuals has " +
+             std::to_string(down_residuals->size()) +
+             " entries, expected " + std::to_string(expected_skips));
+    }
+
     // ── 1. Build the time embedding ────────────────────────────────────────
     std::vector<float> sin_vals;
     compute_sinusoidal_emb(timestep, freq_dim_, sin_vals);
-    freq_emb_ = detail::upload_host(sin_vals.data(), 1, freq_dim_);
+    freq_emb_ = brodiffusion::detail::upload_host(sin_vals.data(), 1, freq_dim_);
 
     // LCM cond_proj: add projected guidance-scale embedding to the freq_emb
     // *before* linear_1. Matches diffusers' TimestepEmbedding.forward:
@@ -1275,17 +1122,17 @@ void UNet::forward_impl_(const bt::Tensor& sample,
         // sinusoidal embedding.
         std::vector<float> w_vals;
         compute_guidance_scale_emb((*gs_emb) * 1000.0f, cfg_.time_cond_proj_dim, w_vals);
-        w_emb_ = detail::upload_host(w_vals.data(), 1, cfg_.time_cond_proj_dim);
+        w_emb_ = brodiffusion::detail::upload_host(w_vals.data(), 1, cfg_.time_cond_proj_dim);
         // cond_proj is bias-free: pass nullptr.
-        detail::linear_batched(te_cond_W_, /*bias=*/nullptr, w_emb_, temb_cond_);
+        brodiffusion::detail::linear_batched(te_cond_W_, /*bias=*/nullptr, w_emb_, temb_cond_);
         bt::add_inplace(freq_emb_, temb_cond_);
     }
 
-    detail::linear_batched(te_l1_W_, &te_l1_b_, freq_emb_, temb_a_);
+    brodiffusion::detail::linear_batched(te_l1_W_, &te_l1_b_, freq_emb_, temb_a_);
     bt::silu_forward(temb_a_, temb_a_);
-    detail::linear_batched(te_l2_W_, &te_l2_b_, temb_a_, temb_b_);
+    brodiffusion::detail::linear_batched(te_l2_W_, &te_l2_b_, temb_a_, temb_b_);
     // Master temb in temb_b_. Pre-compute SiLU once for reuse across resblocks.
-    bt::silu_forward(temb_b_, temb_silu_);
+    bt::silu_forward(temb_b_, block_scratch_.temb_silu);
 
     // Skip stack: each entry is a deep copy of the residual stream at push time.
     // Down-path xattn caches advance xattn_idx (kept in scope for mid + up).
@@ -1294,6 +1141,7 @@ void UNet::forward_impl_(const bt::Tensor& sample,
                   static_cast<std::size_t>(cfg_.layers_per_block + 1));
     int Hc = H, Wc = W;
     int xattn_idx = 0;
+    int skip_idx  = 0;
     auto cache_at = [&](int i) -> const CrossAttnKVCacheEntry* {
         return xattn_cache ? &(*xattn_cache)[static_cast<std::size_t>(i)] : nullptr;
     };
@@ -1304,58 +1152,85 @@ void UNet::forward_impl_(const bt::Tensor& sample,
         return attn_logit_biases ? (*attn_logit_biases)[static_cast<std::size_t>(i)]
                                  : nullptr;
     };
+    // Push the current `x_` onto the skip stack, first applying the
+    // ControlNet residual for this skip index (if any).
+    auto push_skip = [&]() {
+        bt::Tensor skip = x_.clone();
+        if (down_residuals != nullptr) {
+            const bt::Tensor* res =
+                (*down_residuals)[static_cast<std::size_t>(skip_idx)];
+            if (res != nullptr) {
+                bt::add_inplace(skip, *res);
+            }
+        }
+        ++skip_idx;
+        skips.push_back(std::move(skip));
+    };
 
     // ── 2. conv_in: in_channels -> first_C ─────────────────────────────────
     x_ = sample.clone();
-    apply_conv3x3_(conv_in_W_, conv_in_b_, cfg_.in_channels, first_C, H, W,
-                   /*stride=*/1, /*pad=*/1, x_, y_);
+    detail::apply_conv3x3(conv_in_W_, conv_in_b_, cfg_.in_channels, first_C, H, W,
+                          /*stride=*/1, /*pad=*/1, x_, y_);
     std::swap(x_, y_);
 
-    skips.push_back(x_.clone());
+    push_skip();
 
     // ── 3. down_blocks ─────────────────────────────────────────────────────
     for (int i = 0; i < nb; ++i) {
         DownBlock& d = down_blocks_[static_cast<std::size_t>(i)];
         for (int j = 0; j < cfg_.layers_per_block; ++j) {
-            apply_resnet_(d.resnets[static_cast<std::size_t>(j)], Hc, Wc, x_, y_);
+            detail::apply_resnet(d.resnets[static_cast<std::size_t>(j)], Hc, Wc, x_, y_,
+                                 block_scratch_, cfg_.norm_num_groups, cfg_.eps);
             if (d.has_attention) {
                 const int idx = xattn_idx++;
-                apply_transformer_(d.transformers[static_cast<std::size_t>(j)],
-                                   encoder_hidden_states,
-                                   cache_at(idx),
-                                   Hc, Wc, x_,
-                                   trace_at(idx), bias_at(idx));
+                detail::apply_transformer(d.transformers[static_cast<std::size_t>(j)],
+                                          encoder_hidden_states,
+                                          cache_at(idx),
+                                          Hc, Wc, x_,
+                                          block_scratch_,
+                                          cfg_.norm_num_groups, cfg_.eps,
+                                          trace_at(idx), bias_at(idx));
             }
-            skips.push_back(x_.clone());
+            push_skip();
         }
         if (d.has_downsampler) {
             // 3x3 stride-2 conv same-channels.
             if (d.downsampler.W_q.active()) {
-                apply_conv3x3_q_(d.downsampler.W_q, d.downsampler.b,
-                                 d.C_out, d.C_out, Hc, Wc,
-                                 /*stride=*/2, /*pad=*/1, x_, y_);
+                detail::apply_conv3x3_q(d.downsampler.W_q, d.downsampler.b,
+                                        d.C_out, d.C_out, Hc, Wc,
+                                        /*stride=*/2, /*pad=*/1, x_, y_);
             } else {
-                apply_conv3x3_(d.downsampler.W, d.downsampler.b,
-                               d.C_out, d.C_out, Hc, Wc,
-                               /*stride=*/2, /*pad=*/1, x_, y_);
+                detail::apply_conv3x3(d.downsampler.W, d.downsampler.b,
+                                      d.C_out, d.C_out, Hc, Wc,
+                                      /*stride=*/2, /*pad=*/1, x_, y_);
             }
             std::swap(x_, y_);
             Hc /= 2;
             Wc /= 2;
-            skips.push_back(x_.clone());
+            push_skip();
         }
     }
 
     // ── 4. mid_block: resnet -> transformer -> resnet ──────────────────────
-    apply_resnet_(mid_.r0, Hc, Wc, x_, y_);
+    detail::apply_resnet(mid_.r0, Hc, Wc, x_, y_,
+                         block_scratch_, cfg_.norm_num_groups, cfg_.eps);
     {
         const int idx = xattn_idx++;
-        apply_transformer_(mid_.t, encoder_hidden_states,
-                           cache_at(idx),
-                           Hc, Wc, x_,
-                           trace_at(idx), bias_at(idx));
+        detail::apply_transformer(mid_.t, encoder_hidden_states,
+                                  cache_at(idx),
+                                  Hc, Wc, x_,
+                                  block_scratch_,
+                                  cfg_.norm_num_groups, cfg_.eps,
+                                  trace_at(idx), bias_at(idx));
     }
-    apply_resnet_(mid_.r1, Hc, Wc, x_, y_);
+    detail::apply_resnet(mid_.r1, Hc, Wc, x_, y_,
+                         block_scratch_, cfg_.norm_num_groups, cfg_.eps);
+
+    // ControlNet mid residual: added once after the mid block, before the
+    // up pass reads x_.
+    if (mid_residual != nullptr) {
+        bt::add_inplace(x_, *mid_residual);
+    }
 
     // ── 5. up_blocks ───────────────────────────────────────────────────────
     for (int i = 0; i < nb; ++i) {
@@ -1372,26 +1247,29 @@ void UNet::forward_impl_(const bt::Tensor& sample,
             bt::concat_nchw_channels(parts, /*N=*/1, Hc, Wc, C_parts, cat_buf_);
             std::swap(x_, cat_buf_);
 
-            apply_resnet_(u.resnets[static_cast<std::size_t>(j)], Hc, Wc, x_, y_);
+            detail::apply_resnet(u.resnets[static_cast<std::size_t>(j)], Hc, Wc, x_, y_,
+                                 block_scratch_, cfg_.norm_num_groups, cfg_.eps);
             if (u.has_attention) {
                 const int idx = xattn_idx++;
-                apply_transformer_(u.transformers[static_cast<std::size_t>(j)],
-                                   encoder_hidden_states,
-                                   cache_at(idx),
-                                   Hc, Wc, x_,
-                                   trace_at(idx), bias_at(idx));
+                detail::apply_transformer(u.transformers[static_cast<std::size_t>(j)],
+                                          encoder_hidden_states,
+                                          cache_at(idx),
+                                          Hc, Wc, x_,
+                                          block_scratch_,
+                                          cfg_.norm_num_groups, cfg_.eps,
+                                          trace_at(idx), bias_at(idx));
             }
         }
         if (u.has_upsampler) {
             bt::upsample_nearest_2x(x_, 1, u.C_out, Hc, Wc, y_);
             if (u.upsampler.W_q.active()) {
-                apply_conv3x3_q_(u.upsampler.W_q, u.upsampler.b,
-                                 u.C_out, u.C_out, 2 * Hc, 2 * Wc,
-                                 /*stride=*/1, /*pad=*/1, y_, x_);
+                detail::apply_conv3x3_q(u.upsampler.W_q, u.upsampler.b,
+                                        u.C_out, u.C_out, 2 * Hc, 2 * Wc,
+                                        /*stride=*/1, /*pad=*/1, y_, x_);
             } else {
-                apply_conv3x3_(u.upsampler.W, u.upsampler.b,
-                               u.C_out, u.C_out, 2 * Hc, 2 * Wc,
-                               /*stride=*/1, /*pad=*/1, y_, x_);
+                detail::apply_conv3x3(u.upsampler.W, u.upsampler.b,
+                                      u.C_out, u.C_out, 2 * Hc, 2 * Wc,
+                                      /*stride=*/1, /*pad=*/1, y_, x_);
             }
             Hc *= 2;
             Wc *= 2;
@@ -1403,9 +1281,9 @@ void UNet::forward_impl_(const bt::Tensor& sample,
                                1, first_C, Hc, Wc, cfg_.norm_num_groups, cfg_.eps,
                                y_);
     bt::silu_forward(y_, y_);
-    apply_conv3x3_(conv_out_W_, conv_out_b_,
-                   first_C, cfg_.out_channels, Hc, Wc,
-                   /*stride=*/1, /*pad=*/1, y_, out);
+    detail::apply_conv3x3(conv_out_W_, conv_out_b_,
+                          first_C, cfg_.out_channels, Hc, Wc,
+                          /*stride=*/1, /*pad=*/1, y_, out);
 }
 
 }  // namespace brodiffusion::unet

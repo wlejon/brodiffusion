@@ -53,6 +53,7 @@
 // converts as needed.
 
 #include "brodiffusion/denoiser.h"
+#include "brodiffusion/detail/unet_blocks.h"
 
 #include "brotensor/tensor.h"
 
@@ -168,10 +169,7 @@ public:
     // brotensor::flash_attention_forward's K/V args (Lk, C). The text
     // context is fixed across all denoising steps so projecting K/V once per
     // generate() per CFG branch eliminates 16 × steps × 2 redundant matmuls.
-    struct CrossAttnKVCacheEntry {
-        brotensor::Tensor K;  // (Lk, C)
-        brotensor::Tensor V;  // (Lk, C)
-    };
+    using CrossAttnKVCacheEntry = detail::CrossAttnKVCacheEntry;
     using CrossAttnKVCache = std::vector<CrossAttnKVCacheEntry>;
 
     // Head-averaged cross-attention softmax map per Transformer2D block, in the
@@ -217,6 +215,28 @@ public:
                  float guidance_scale_embedding,
                  const brotensor::Tensor& encoder_hidden_states,
                  const CrossAttnKVCache& xattn_cache,
+                 brotensor::Tensor& out);
+
+    // ControlNet-augmented forward. Same shape contract as the cached
+    // forward() above; `xattn_cache` is required (same performance contract).
+    // `down_residuals` must either be empty (no contribution) OR have one
+    // entry per skip-stack push made during the down pass. For the stock
+    // SD1.5 block configuration that is 12 entries (1 from conv_in plus
+    // layers_per_block per down stage plus 1 per downsampler =
+    // 1 + 3*2 + 3*1 + 2 + 0 = 12). Each entry may itself be null, meaning
+    // "no residual for that skip"; otherwise it must match the shape of the
+    // corresponding skip tensor and is added (bt::add_inplace) onto the
+    // skip BEFORE it is pushed onto the up-pass stack. `mid_residual`, if
+    // non-null, is added to the mid_block output before the up pass reads
+    // it. Vanilla SD1.5 only — LCM cond_proj path is intentionally not
+    // wired (ControlNet has no LCM-distilled variant in the wild).
+    void forward(const brotensor::Tensor& sample,
+                 int H, int W,
+                 float timestep,
+                 const brotensor::Tensor& encoder_hidden_states,
+                 const CrossAttnKVCache& xattn_cache,
+                 const std::vector<const brotensor::Tensor*>& down_residuals,
+                 const brotensor::Tensor* mid_residual,
                  brotensor::Tensor& out);
 
     // Trace-mode forward. Routes each cross-attention (`attn2`) call through
@@ -318,70 +338,17 @@ public:
     const UNetConfig& config() const { return cfg_; }
 
 private:
-    // Paired INT8 weight + per-output-row FP32 scales. Populated by
-    // finalize_weights() when quantize_weights is true; .W_int8.size() == 0
-    // means this layer is still using its FP16 weight.
-    struct QWeight {
-        brotensor::Tensor W_int8;   // INT8 (out, in)
-        brotensor::Tensor scales;   // FP32 (out, 1)
-        bool active() const { return W_int8.size() > 0; }
-    };
-    struct Resnet {
-        brotensor::Tensor n1g, n1b, W1, b1;
-        brotensor::Tensor temb_W, temb_b;
-        brotensor::Tensor n2g, n2b, W2, b2;
-        brotensor::Tensor Ws, bs;
-        // INT8 counterparts (populated by finalize_weights when enabled).
-        QWeight W1_q, W2_q, Ws_q;
-        bool has_shortcut = false;
-        int  C_in = 0, C_out = 0;
-    };
-    struct AttnFFN {
-        brotensor::Tensor n1g, n1b;
-        brotensor::Tensor Wq1, Wk1, Wv1, Wo1, bo1;
-        brotensor::Tensor n2g, n2b;
-        brotensor::Tensor Wq2, Wk2, Wv2, Wo2, bo2;
-        brotensor::Tensor n3g, n3b;
-        brotensor::Tensor ff1_W, ff1_b;
-        brotensor::Tensor ff2_W, ff2_b;
-        // INT8 counterparts.
-        QWeight Wq1_q, Wk1_q, Wv1_q, Wo1_q;
-        QWeight Wq2_q, Wk2_q, Wv2_q, Wo2_q;
-        QWeight ff1_q, ff2_q;
-    };
-    struct Transformer2D {
-        brotensor::Tensor gn_g, gn_b;
-        brotensor::Tensor pi_W, pi_b;
-        brotensor::Tensor po_W, po_b;
-        QWeight pi_q, po_q;
-        std::vector<AttnFFN> blocks;
-        int  C = 0;
-        int  num_heads = 0;
-    };
-    struct SampleConv {
-        brotensor::Tensor W, b;
-        QWeight W_q;
-    };
-    struct DownBlock {
-        std::vector<Resnet>        resnets;
-        std::vector<Transformer2D> transformers;
-        SampleConv                 downsampler;
-        bool has_attention   = false;
-        bool has_downsampler = false;
-        int  C_out = 0;
-    };
-    struct MidBlock {
-        Resnet         r0, r1;
-        Transformer2D  t;
-    };
-    struct UpBlock {
-        std::vector<Resnet>        resnets;
-        std::vector<Transformer2D> transformers;
-        SampleConv                 upsampler;
-        bool has_attention = false;
-        bool has_upsampler = false;
-        int  C_out = 0;
-    };
+    // Phase D1 lifted these into include/brodiffusion/detail/unet_blocks.h so
+    // ControlNet can reuse the same block forward code. The aliases keep
+    // every existing UNet::<Struct> reference compiling unchanged.
+    using QWeight        = detail::QWeight;
+    using Resnet         = detail::Resnet;
+    using AttnFFN        = detail::AttnFFN;
+    using Transformer2D  = detail::Transformer2D;
+    using SampleConv     = detail::SampleConv;
+    using DownBlock      = detail::DownBlock;
+    using MidBlock       = detail::MidBlock;
+    using UpBlock        = detail::UpBlock;
 
     void load_resnet_(const brotensor::safetensors::File& f,
                       const std::string& prefix,
@@ -390,31 +357,17 @@ private:
                            const std::string& prefix,
                            int C, int num_heads, Transformer2D& t);
 
-    void apply_resnet_(const Resnet& r, int H, int W,
-                       brotensor::Tensor& x, brotensor::Tensor& tmp);
-    // If `cache_entry` is non-null, its (K, V) replace the cross-attn K/V
-    // projections (must have been primed against the same `ctx`).
-    void apply_transformer_(const Transformer2D& t,
-                            const brotensor::Tensor& ctx,
-                            const CrossAttnKVCacheEntry* cache_entry,
-                            int H, int W,
-                            brotensor::Tensor& x,
-                            // Trace plumbing. Both null = fast path (existing
-                            // behaviour). When trace_out_entry is non-null,
-                            // attn2 is routed through
-                            // cross_attention_forward_with_attn and AttnAvg
-                            // is written to
-                            // *trace_out_entry. attn_logit_bias is an optional
-                            // FP32 (Lq, Lk) pre-softmax bias passed straight
-                            // through to the brotensor op.
-                            brotensor::Tensor* trace_out_entry = nullptr,
-                            const brotensor::Tensor* attn_logit_bias = nullptr);
     // Shared forward worker; xattn_cache may be null (legacy path) or point
     // at a cache with exactly num_xattn_blocks() entries. If `gs_emb` is
     // non-null the LCM cond_proj path is used (requires time_cond_proj_dim>0);
     // otherwise the vanilla SD1.5 time-embedding path is used. `trace_out`
     // and `attn_logit_biases` (both optional) wire the trace-mode plumbing
     // for cross-attention research; see UNet::forward_trace.
+    //
+    // `down_residuals` / `mid_residual` are the optional ControlNet
+    // contributions (see the public residual-aware forward() above). Pass
+    // nullptr (or an empty `down_residuals` vector pointer) for a vanilla
+    // forward.
     void forward_impl_(const brotensor::Tensor& sample,
                        int H, int W,
                        float timestep,
@@ -423,6 +376,8 @@ private:
                        const CrossAttnKVCache* xattn_cache,
                        const std::vector<const brotensor::Tensor*>* attn_logit_biases,
                        CrossAttnTrace* trace_out,
+                       const std::vector<const brotensor::Tensor*>* down_residuals,
+                       const brotensor::Tensor* mid_residual,
                        brotensor::Tensor& out);
     // Returns a pointer to the base weight identified by `target_path`
     // (a diffusers tail within the UNet, e.g. "down_blocks.0.attentions.0.
@@ -436,19 +391,6 @@ private:
     static brotensor::Tensor* resolve_resnet_target_(Resnet& r,
                                                         const std::string& tail);
 
-    void apply_conv3x3_(const brotensor::Tensor& W,
-                        const brotensor::Tensor& b,
-                        int C_in, int C_out, int H, int W_,
-                        int stride, int pad,
-                        const brotensor::Tensor& in,
-                        brotensor::Tensor& out);
-    // INT8 variant; called when the supplied QWeight is active.
-    void apply_conv3x3_q_(const QWeight& Wq,
-                          const brotensor::Tensor& b,
-                          int C_in, int C_out, int H, int W_,
-                          int stride, int pad,
-                          const brotensor::Tensor& in,
-                          brotensor::Tensor& out);
     // Helper used by finalize_weights() to quantise a single FP16 weight in
     // place: downloads the FP16 weight, runs quantize_int8_per_row_host,
     // uploads INT8 + scales, then frees the FP16 Tensor.
@@ -470,15 +412,15 @@ private:
     brotensor::Tensor conv_out_W_, conv_out_b_;
 
     brotensor::Tensor x_, y_;
-    brotensor::Tensor freq_emb_, temb_a_, temb_b_, temb_silu_, temb_proj_;
+    brotensor::Tensor freq_emb_, temb_a_, temb_b_;
     // LCM scratch: w_emb_ holds the sinusoidal guidance-scale embedding,
     // temb_cond_ holds cond_proj(w_emb_); both unused when time_cond_proj_dim==0.
     brotensor::Tensor w_emb_, temb_cond_;
     brotensor::Tensor cat_buf_;
-    brotensor::Tensor gn_, seq_, proj_in_seq_, tseq_, ln_;
-    brotensor::Tensor attn_proj_;
-    brotensor::Tensor ff_mid_, ff_act_, ff_out_;
-    brotensor::Tensor proj_out_seq_, proj_out_nchw_;
+    // Block-level scratch (temb_silu, transformer intermediates, etc.) —
+    // bundled so the free-function apply_* helpers can be invoked from
+    // here AND from a future ControlNet without duplicating scratch storage.
+    detail::BlockScratch block_scratch_;
 };
 
 }  // namespace brodiffusion::unet
