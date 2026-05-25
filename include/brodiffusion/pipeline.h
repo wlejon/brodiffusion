@@ -95,6 +95,21 @@ struct PipelineState {
 //              can be diffed with the RNG removed as a variable.
 enum class NoiseSource { Internal, Torch };
 
+// One conditioning image for a single registered ControlNet (SD1.5 only).
+// `scale` is the per-net `conditioning_scale` (diffusers parity); 0.0
+// disables that net's contribution for the run, 1.0 is the HF default.
+// `start_step` / `end_step` are the schedule fractions (in [0, 1]) over
+// which this net contributes — outside the window, the net is skipped and
+// its residual stays zero. Defaults cover the full schedule. The window is
+// half-open on the right: a step at fractional position `f` runs the net
+// iff `start_step <= f < end_step`.
+struct ControlNetInput {
+    std::string image_path;
+    float       scale      = 1.0f;
+    float       start_step = 0.0f;
+    float       end_step   = 1.0f;
+};
+
 struct GenerateOptions {
     // Image dimensions in pixels. Latent dims are H/8, W/8. Both must be
     // multiples of 8 and at least 8 (so latent dims are >= 1).
@@ -147,19 +162,23 @@ struct GenerateOptions {
     bool vae_encode_sample = false;
 
     // ── ControlNet (SD1.5 only) ───────────────────────────────────────────
-    // When non-empty, prime() loads this image and runs ControlNet forward
-    // at each scheduler step, feeding its 12 down + 1 mid residuals into
-    // UNet's skip connections. Requires apply_controlnet() to have been
-    // called first; throws if no ControlNet weights are loaded. Throws on
-    // Flux. Trace mode and LCM scheduler are not supported with ControlNet
-    // active; either combination throws from step_once.
-    std::string control_image_path;
+    // Multi-ControlNet inputs, one per registered ControlNet (in the order
+    // they were added). When non-empty, prime() loads each control image and
+    // step_once() runs every registered ControlNet, summing their residuals
+    // position-wise (each weighted by its own ControlNetInput::scale) before
+    // feeding them into UNet's skip connections. Size must equal the number
+    // of registered ControlNets. SD1.5 only; throws on Flux.
+    //
+    // For single-CN use, the `control_image_path` / `control_scale` legacy
+    // shortcut below is still accepted (auto-translated to a one-entry
+    // `controls` list); the two surfaces are mutually exclusive.
+    std::vector<ControlNetInput> controls;
 
-    // Scalar multiplier on every ControlNet residual. 0.0 disables the
-    // ControlNet's contribution entirely (useful for ablation); 1.0 is the
-    // HF default; values >1 amplify control. Ignored when
-    // control_image_path is empty.
-    float control_scale = 1.0f;
+    // Legacy single-CN shortcut. When `controls` is empty AND this path is
+    // non-empty, prime() synthesizes a single ControlNetInput from these
+    // fields. Use `controls` directly for any multi-CN setup.
+    std::string control_image_path;
+    float       control_scale = 1.0f;
 
     // Inpaint mask path. When non-empty, the pipeline runs in inpaint mode:
     // init_image_path must ALSO be set, and at each scheduler step (except
@@ -231,18 +250,33 @@ public:
     // contains LoRA tensors that don't map to a known SD1.5 target.
     void apply_lora(const brotensor::safetensors::File& f, float scale = 1.0f);
 
-    // Load a ControlNet safetensors file. The network stays resident on
-    // Pipeline until destruction (or until apply_controlnet is called again
-    // with a different file — the previous net is replaced). SD1.5 only;
-    // throws on Flux. The default config matches HF's lllyasviel/sd-
-    // controlnet-* zoo; pass an explicit ControlNetConfig if a non-default
-    // checkpoint shape is needed.
+    // Load a ControlNet safetensors file and replace any previously loaded
+    // ControlNet(s) with it. Equivalent to clear_controlnets() followed by
+    // add_controlnet(f[, cfg]). SD1.5 only; throws on Flux. The default
+    // config matches HF's lllyasviel/sd-controlnet-* zoo; pass an explicit
+    // ControlNetConfig if a non-default checkpoint shape is needed.
     void apply_controlnet(const brotensor::safetensors::File& f);
     void apply_controlnet(const brotensor::safetensors::File& f,
                           const controlnet::ControlNetConfig& cfg);
 
-    // True iff a ControlNet has been loaded.
-    bool has_controlnet() const { return controlnet_ != nullptr; }
+    // Stack an additional ControlNet onto the registered list. The returned
+    // index is the addressing key used elsewhere (e.g. remove_controlnet,
+    // and the position into GenerateOptions::controls). SD1.5 only.
+    int add_controlnet(const brotensor::safetensors::File& f);
+    int add_controlnet(const brotensor::safetensors::File& f,
+                       const controlnet::ControlNetConfig& cfg);
+
+    // Drop one registered ControlNet by index. Subsequent indices shift down.
+    void remove_controlnet(int index);
+
+    // Drop all registered ControlNets.
+    void clear_controlnets();
+
+    // Number of currently registered ControlNets.
+    int num_controlnets() const { return static_cast<int>(controlnets_.size()); }
+
+    // True iff at least one ControlNet has been loaded.
+    bool has_controlnet() const { return !controlnets_.empty(); }
 
     // Generate an image. Returns a freshly-allocated host buffer of
     // 3 * height * width FP32 values in NCHW (C=3, [-1, 1]).
@@ -345,17 +379,31 @@ private:
     brotensor::Tensor inpaint_noise_step_;  // (1, C_lat*H_lat*W_lat) Philox draw
     bool              inpaint_active_ = false;
 
-    // ControlNet plumbing. `controlnet_` is owned for the lifetime of
-    // Pipeline (or until apply_controlnet replaces it). `control_image_` is
-    // built in prime() at the active device + compute dtype and reused for
-    // every step in the current generation. `controlnet_active_` mirrors
-    // "control_image_path is non-empty AND controlnet_ is loaded" — checked
-    // by step_once to branch into the residual-aware UNet path.
-    std::unique_ptr<controlnet::ControlNet> controlnet_;
-    brotensor::Tensor                       control_image_;
-    bool                                    controlnet_active_ = false;
-    std::vector<brotensor::Tensor>          cn_down_residuals_;
-    brotensor::Tensor                       cn_mid_residual_;
+    // ControlNet plumbing. `controlnets_` is the registered stack (lifetime
+    // tied to Pipeline; replaced wholesale by apply_controlnet, appended by
+    // add_controlnet). `control_inputs_` is the resolved per-run input list
+    // (size == controlnets_.size() when active), copied from
+    // GenerateOptions::controls (or synthesised from the legacy
+    // control_image_path / control_scale shortcut). `control_images_` holds
+    // one image tensor per registered ControlNet, built in prime() at the
+    // active device + compute dtype and reused for every step in the
+    // current generation. `controlnet_active_` mirrors "at least one
+    // ControlNet image path was non-empty AND the registered count matches"
+    // — checked by step_once to branch into the residual-aware UNet path.
+    //
+    // Step buffers: `cn_down_residuals_` / `cn_mid_residual_` are the
+    // summed-across-nets residuals fed into the UNet skips; the first net
+    // writes directly into them and subsequent nets accumulate via
+    // bt::add_inplace through the *_scratch_ buffers. With one registered
+    // ControlNet the scratch buffers are unused.
+    std::vector<std::unique_ptr<controlnet::ControlNet>> controlnets_;
+    std::vector<ControlNetInput>                         control_inputs_;
+    std::vector<brotensor::Tensor>                       control_images_;
+    bool                                                 controlnet_active_ = false;
+    std::vector<brotensor::Tensor>                       cn_down_residuals_;
+    brotensor::Tensor                                    cn_mid_residual_;
+    std::vector<brotensor::Tensor>                       cn_down_residuals_scratch_;
+    brotensor::Tensor                                    cn_mid_residual_scratch_;
 };
 
 }  // namespace brodiffusion::pipeline

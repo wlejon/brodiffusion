@@ -352,11 +352,46 @@ void Pipeline::apply_controlnet(const brotensor::safetensors::File& f) {
 
 void Pipeline::apply_controlnet(const brotensor::safetensors::File& f,
                                 const controlnet::ControlNetConfig& cfg) {
+    clear_controlnets();
+    add_controlnet(f, cfg);
+}
+
+int Pipeline::add_controlnet(const brotensor::safetensors::File& f) {
+    return add_controlnet(f, controlnet::ControlNetConfig{});
+}
+
+int Pipeline::add_controlnet(const brotensor::safetensors::File& f,
+                             const controlnet::ControlNetConfig& cfg) {
     if (model_class_ != ModelClass::StableDiffusion) {
-        fail("apply_controlnet: Flux not supported (SD1.5 only)");
+        fail("add_controlnet: Flux not supported (SD1.5 only)");
     }
-    controlnet_ = std::make_unique<controlnet::ControlNet>(cfg);
-    controlnet_->load_weights(f, "");
+    auto net = std::make_unique<controlnet::ControlNet>(cfg);
+    net->load_weights(f, "");
+    controlnets_.push_back(std::move(net));
+    return static_cast<int>(controlnets_.size()) - 1;
+}
+
+void Pipeline::remove_controlnet(int index) {
+    if (index < 0 || index >= static_cast<int>(controlnets_.size())) {
+        fail("remove_controlnet: index " + std::to_string(index) +
+             " out of range (have " + std::to_string(controlnets_.size()) +
+             ")");
+    }
+    controlnets_.erase(controlnets_.begin() + index);
+    if (index < static_cast<int>(control_images_.size())) {
+        control_images_.erase(control_images_.begin() + index);
+    }
+    if (index < static_cast<int>(control_inputs_.size())) {
+        control_inputs_.erase(control_inputs_.begin() + index);
+    }
+    if (controlnets_.empty()) controlnet_active_ = false;
+}
+
+void Pipeline::clear_controlnets() {
+    controlnets_.clear();
+    control_images_.clear();
+    control_inputs_.clear();
+    controlnet_active_ = false;
 }
 
 void Pipeline::encode_prompt_(std::string_view prompt, bt::Tensor& out) {
@@ -409,24 +444,64 @@ PipelineState Pipeline::prime(std::string_view prompt,
     // is set.
     inpaint_active_ = false;
 
-    // Reset ControlNet activation; armed below when control_image_path is set.
+    // Reset ControlNet activation; armed below when control input(s) supplied.
     controlnet_active_ = false;
-    if (!opts.control_image_path.empty()) {
+    control_inputs_.clear();
+    control_images_.clear();
+
+    // Resolve the per-run input list: prefer opts.controls when set; else
+    // synthesise a single entry from the legacy control_image_path / scale
+    // shortcut. The two surfaces are mutually exclusive.
+    if (!opts.controls.empty() && !opts.control_image_path.empty()) {
+        fail("prime: GenerateOptions.controls and the legacy "
+             "control_image_path shortcut are mutually exclusive");
+    }
+    std::vector<ControlNetInput> resolved;
+    if (!opts.controls.empty()) {
+        resolved = opts.controls;
+    } else if (!opts.control_image_path.empty()) {
+        ControlNetInput single;
+        single.image_path = opts.control_image_path;
+        single.scale      = opts.control_scale;
+        resolved.push_back(std::move(single));
+    }
+
+    if (!resolved.empty()) {
         if (model_class_ != ModelClass::StableDiffusion) {
             fail("prime: ControlNet is currently SD1.5 only; "
                  "Flux ControlNet is not supported");
         }
-        if (controlnet_ == nullptr) {
-            fail("prime: control_image_path is set but no ControlNet has "
-                 "been loaded — call apply_controlnet() first");
+        if (controlnets_.empty()) {
+            fail("prime: ControlNet input(s) supplied but no ControlNet has "
+                 "been loaded — call add_controlnet() / apply_controlnet() "
+                 "first");
         }
-        // Control image lives at FULL image resolution; ControlNet's
+        if (resolved.size() != controlnets_.size()) {
+            fail("prime: GenerateOptions has " +
+                 std::to_string(resolved.size()) +
+                 " ControlNet input(s) but " +
+                 std::to_string(controlnets_.size()) +
+                 " ControlNet(s) are registered — counts must match");
+        }
+        // Control images live at FULL image resolution; each ControlNet's
         // conditioning_embedding does the 8x downsample to latent space.
         // Pixel range is [0, 1] (UnsignedUnit) to match diffusers — the HF
         // ControlNetPipeline's preprocessor does pixel/255 with no recentering.
-        control_image_ = brodiffusion::load_image_as_latent_input(
-            opts.control_image_path, opts.width, opts.height,
-            brodiffusion::PixelRange::UnsignedUnit);
+        control_images_.reserve(resolved.size());
+        for (const auto& ci : resolved) {
+            if (ci.image_path.empty()) {
+                fail("prime: ControlNetInput.image_path must be non-empty");
+            }
+            if (!(ci.start_step >= 0.0f && ci.end_step <= 1.0f &&
+                  ci.start_step <= ci.end_step)) {
+                fail("prime: ControlNetInput.start_step/end_step must "
+                     "satisfy 0 <= start <= end <= 1");
+            }
+            control_images_.push_back(brodiffusion::load_image_as_latent_input(
+                ci.image_path, opts.width, opts.height,
+                brodiffusion::PixelRange::UnsignedUnit));
+        }
+        control_inputs_   = std::move(resolved);
         controlnet_active_ = true;
     }
 
@@ -686,24 +761,66 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
             fail("step_once: ControlNet requires a UNet denoiser");
         }
         const bt::Tensor& ctx_cond = conditioning_.text_embeddings;
-        controlnet_->forward(state.latent, state.H_lat, state.W_lat, t,
-                             ctx_cond, control_image_, opts.control_scale,
-                             cn_down_residuals_, cn_mid_residual_);
+
+        // Active-window membership: a net contributes at step i iff
+        // start_step <= i/n_steps < end_step. Avoids running the forward
+        // for inactive nets; the residual contribution is simply skipped.
+        const float frac = (state.n_steps > 0)
+            ? (static_cast<float>(i) / static_cast<float>(state.n_steps))
+            : 0.0f;
+        auto in_window = [&](const ControlNetInput& ci) {
+            return frac >= ci.start_step && frac < ci.end_step;
+        };
+
+        // Sum residuals across all registered ControlNets. First active net
+        // writes directly into the summed buffers; subsequent active nets
+        // run into per-net scratch and accumulate via bt::add_inplace.
+        // When no nets are in-window this step the summed buffers retain
+        // the previous step's contents — we zero them by writing the first
+        // net's contribution. If literally no net is active we feed
+        // nullptrs to the UNet (== plain non-CN forward).
+        bool any_active = false;
+        for (std::size_t k = 0; k < controlnets_.size(); ++k) {
+            const auto& ci = control_inputs_[k];
+            if (!in_window(ci)) continue;
+            if (!any_active) {
+                controlnets_[k]->forward(
+                    state.latent, state.H_lat, state.W_lat, t,
+                    ctx_cond, control_images_[k], ci.scale,
+                    cn_down_residuals_, cn_mid_residual_);
+                any_active = true;
+            } else {
+                controlnets_[k]->forward(
+                    state.latent, state.H_lat, state.W_lat, t,
+                    ctx_cond, control_images_[k], ci.scale,
+                    cn_down_residuals_scratch_, cn_mid_residual_scratch_);
+                for (std::size_t r = 0; r < cn_down_residuals_.size(); ++r) {
+                    bt::add_inplace(cn_down_residuals_[r],
+                                    cn_down_residuals_scratch_[r]);
+                }
+                bt::add_inplace(cn_mid_residual_, cn_mid_residual_scratch_);
+            }
+        }
+
         std::vector<const bt::Tensor*> down_ptrs;
-        down_ptrs.reserve(cn_down_residuals_.size());
-        for (const auto& rt : cn_down_residuals_) down_ptrs.push_back(&rt);
+        const bt::Tensor* mid_ptr = nullptr;
+        if (any_active) {
+            down_ptrs.reserve(cn_down_residuals_.size());
+            for (const auto& rt : cn_down_residuals_) down_ptrs.push_back(&rt);
+            mid_ptr = &cn_mid_residual_;
+        }
 
         const auto& cache_cond =
             u->kv_cache_for(prepared_, Branch::Cond);
         u->forward(state.latent, state.H_lat, state.W_lat, t,
-                   ctx_cond, cache_cond, down_ptrs, &cn_mid_residual_,
+                   ctx_cond, cache_cond, down_ptrs, mid_ptr,
                    noise_pred_cond_);
         if (do_cfg) {
             const auto& cache_uncond =
                 u->kv_cache_for(prepared_, Branch::Uncond);
             const bt::Tensor& ctx_uncond = conditioning_.uncond_embeddings;
             u->forward(state.latent, state.H_lat, state.W_lat, t,
-                       ctx_uncond, cache_uncond, down_ptrs, &cn_mid_residual_,
+                       ctx_uncond, cache_uncond, down_ptrs, mid_ptr,
                        noise_pred_uncond_);
         }
     } else if (trace_mode) {

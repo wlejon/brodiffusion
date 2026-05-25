@@ -548,6 +548,120 @@ int main() {
         CHECK(nonfinite == 0);
     }
 
+    // ── 4b. multi-CN: two-CN sum equals single-CN-2x-scale ──────────────
+    // Same registered ControlNet weights, same control image, both nets at
+    // scale=1.0 → the residuals sum to exactly 2x the single-net scale=1.0
+    // contribution. Comparing two-CN (scale 1+1) against single-CN scale=2.0
+    // verifies the per-position sum reaches the UNet correctly.
+    {
+        auto tok = clip::Tokenizer::load(vp.string(), mp.string());
+        pl::Pipeline p_single(make_cfg(), std::move(tok));
+        p_single.load_weights(sd_file, "text_model.", "", "decoder.");
+        p_single.apply_controlnet(cn_file, cn_cfg);
+        auto opts_single = base_opts();
+        opts_single.control_image_path = ctrl_path.string();
+        opts_single.control_scale      = 2.0f;
+        std::vector<float> img_single = p_single.generate("hi", opts_single);
+
+        auto tok2 = clip::Tokenizer::load(vp.string(), mp.string());
+        pl::Pipeline p_multi(make_cfg(), std::move(tok2));
+        p_multi.load_weights(sd_file, "text_model.", "", "decoder.");
+        const int idx0 = p_multi.add_controlnet(cn_file, cn_cfg);
+        const int idx1 = p_multi.add_controlnet(cn_file, cn_cfg);
+        CHECK(idx0 == 0);
+        CHECK(idx1 == 1);
+        CHECK(p_multi.num_controlnets() == 2);
+        auto opts_multi = base_opts();
+        opts_multi.controls = {
+            pl::ControlNetInput{ctrl_path.string(), 1.0f, 0.0f, 1.0f},
+            pl::ControlNetInput{ctrl_path.string(), 1.0f, 0.0f, 1.0f},
+        };
+        std::vector<float> img_multi = p_multi.generate("hi", opts_multi);
+
+        CHECK(img_single.size() == img_multi.size());
+        float max_d = 0.0f;
+        for (std::size_t i = 0; i < img_single.size(); ++i) {
+            float d = std::fabs(img_single[i] - img_multi[i]);
+            if (d > max_d) max_d = d;
+        }
+        // FP16 backend tolerance — accumulation order through add_inplace
+        // can perturb the last bit but the sum is mathematically identical.
+        if (max_d > 1e-2f) {
+            std::fprintf(stderr,
+                "multi-CN additive: max abs delta = %g (expected ~0)\n",
+                static_cast<double>(max_d));
+        }
+        CHECK(max_d < 1e-2f);
+    }
+
+    // ── 4c. multi-CN: end_step=0 disables a net's contribution ──────────
+    // A net whose [start, end) window is empty for every step contributes
+    // nothing — the run must match the single-CN baseline.
+    {
+        auto tok = clip::Tokenizer::load(vp.string(), mp.string());
+        pl::Pipeline p_single(make_cfg(), std::move(tok));
+        p_single.load_weights(sd_file, "text_model.", "", "decoder.");
+        p_single.apply_controlnet(cn_file, cn_cfg);
+        auto opts_single = base_opts();
+        opts_single.control_image_path = ctrl_path.string();
+        opts_single.control_scale      = 1.0f;
+        std::vector<float> img_single = p_single.generate("hi", opts_single);
+
+        auto tok2 = clip::Tokenizer::load(vp.string(), mp.string());
+        pl::Pipeline p_two(make_cfg(), std::move(tok2));
+        p_two.load_weights(sd_file, "text_model.", "", "decoder.");
+        p_two.add_controlnet(cn_file, cn_cfg);
+        p_two.add_controlnet(cn_file, cn_cfg);
+        auto opts_two = base_opts();
+        opts_two.controls = {
+            pl::ControlNetInput{ctrl_path.string(), 1.0f, 0.0f, 1.0f},
+            // start==end → never in window, so this net contributes 0.
+            pl::ControlNetInput{ctrl_path.string(), 1.0f, 0.0f, 0.0f},
+        };
+        std::vector<float> img_two = p_two.generate("hi", opts_two);
+
+        CHECK(img_single.size() == img_two.size());
+        float max_d = 0.0f;
+        for (std::size_t i = 0; i < img_single.size(); ++i) {
+            float d = std::fabs(img_single[i] - img_two[i]);
+            if (d > max_d) max_d = d;
+        }
+        CHECK(max_d < 1e-2f);
+    }
+
+    // ── 4d. multi-CN: count mismatch throws ─────────────────────────────
+    {
+        auto tok = clip::Tokenizer::load(vp.string(), mp.string());
+        pl::Pipeline p(make_cfg(), std::move(tok));
+        p.load_weights(sd_file, "text_model.", "", "decoder.");
+        p.add_controlnet(cn_file, cn_cfg);
+        p.add_controlnet(cn_file, cn_cfg);
+        auto opts = base_opts();
+        opts.controls = {
+            pl::ControlNetInput{ctrl_path.string(), 1.0f, 0.0f, 1.0f},
+        };
+        bool threw = false;
+        try { (void)p.generate("hi", opts); }
+        catch (const std::exception&) { threw = true; }
+        CHECK(threw);
+    }
+
+    // ── 4e. multi-CN: remove_controlnet shifts indices ──────────────────
+    {
+        auto tok = clip::Tokenizer::load(vp.string(), mp.string());
+        pl::Pipeline p(make_cfg(), std::move(tok));
+        p.load_weights(sd_file, "text_model.", "", "decoder.");
+        p.add_controlnet(cn_file, cn_cfg);
+        p.add_controlnet(cn_file, cn_cfg);
+        p.add_controlnet(cn_file, cn_cfg);
+        CHECK(p.num_controlnets() == 3);
+        p.remove_controlnet(1);
+        CHECK(p.num_controlnets() == 2);
+        p.clear_controlnets();
+        CHECK(p.num_controlnets() == 0);
+        CHECK(!p.has_controlnet());
+    }
+
     // ── 4. missing_controlnet_throws ─────────────────────────────────────
     {
         auto p_no = make_pipeline(/*with_controlnet=*/false);
