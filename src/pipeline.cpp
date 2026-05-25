@@ -346,16 +346,6 @@ void Pipeline::apply_lora(const brotensor::safetensors::File& f, float scale) {
     }
 }
 
-void Pipeline::apply_controlnet(const brotensor::safetensors::File& f) {
-    apply_controlnet(f, controlnet::ControlNetConfig{});
-}
-
-void Pipeline::apply_controlnet(const brotensor::safetensors::File& f,
-                                const controlnet::ControlNetConfig& cfg) {
-    clear_controlnets();
-    add_controlnet(f, cfg);
-}
-
 int Pipeline::add_controlnet(const brotensor::safetensors::File& f) {
     return add_controlnet(f, controlnet::ControlNetConfig{});
 }
@@ -444,41 +434,24 @@ PipelineState Pipeline::prime(std::string_view prompt,
     // is set.
     inpaint_active_ = false;
 
-    // Reset ControlNet activation; armed below when control input(s) supplied.
+    // Reset ControlNet activation; armed below when controls are supplied.
     controlnet_active_ = false;
     control_inputs_.clear();
     control_images_.clear();
 
-    // Resolve the per-run input list: prefer opts.controls when set; else
-    // synthesise a single entry from the legacy control_image_path / scale
-    // shortcut. The two surfaces are mutually exclusive.
-    if (!opts.controls.empty() && !opts.control_image_path.empty()) {
-        fail("prime: GenerateOptions.controls and the legacy "
-             "control_image_path shortcut are mutually exclusive");
-    }
-    std::vector<ControlNetInput> resolved;
     if (!opts.controls.empty()) {
-        resolved = opts.controls;
-    } else if (!opts.control_image_path.empty()) {
-        ControlNetInput single;
-        single.image_path = opts.control_image_path;
-        single.scale      = opts.control_scale;
-        resolved.push_back(std::move(single));
-    }
-
-    if (!resolved.empty()) {
         if (model_class_ != ModelClass::StableDiffusion) {
             fail("prime: ControlNet is currently SD1.5 only; "
                  "Flux ControlNet is not supported");
         }
         if (controlnets_.empty()) {
-            fail("prime: ControlNet input(s) supplied but no ControlNet has "
-                 "been loaded — call add_controlnet() / apply_controlnet() "
+            fail("prime: GenerateOptions.controls is non-empty but no "
+                 "ControlNet has been registered — call add_controlnet() "
                  "first");
         }
-        if (resolved.size() != controlnets_.size()) {
+        if (opts.controls.size() != controlnets_.size()) {
             fail("prime: GenerateOptions has " +
-                 std::to_string(resolved.size()) +
+                 std::to_string(opts.controls.size()) +
                  " ControlNet input(s) but " +
                  std::to_string(controlnets_.size()) +
                  " ControlNet(s) are registered — counts must match");
@@ -487,8 +460,8 @@ PipelineState Pipeline::prime(std::string_view prompt,
         // conditioning_embedding does the 8x downsample to latent space.
         // Pixel range is [0, 1] (UnsignedUnit) to match diffusers — the HF
         // ControlNetPipeline's preprocessor does pixel/255 with no recentering.
-        control_images_.reserve(resolved.size());
-        for (const auto& ci : resolved) {
+        control_images_.reserve(opts.controls.size());
+        for (const auto& ci : opts.controls) {
             if (ci.image_path.empty()) {
                 fail("prime: ControlNetInput.image_path must be non-empty");
             }
@@ -501,7 +474,7 @@ PipelineState Pipeline::prime(std::string_view prompt,
                 ci.image_path, opts.width, opts.height,
                 brodiffusion::PixelRange::UnsignedUnit));
         }
-        control_inputs_   = std::move(resolved);
+        control_inputs_   = opts.controls;
         controlnet_active_ = true;
     }
 

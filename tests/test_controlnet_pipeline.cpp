@@ -11,10 +11,10 @@
 //      control image moves the generated image away from the baseline.
 //   3. finite_output                    — 2-step generate() with ControlNet
 //      yields finite, in-shape pixels.
-//   4. missing_controlnet_throws        — generate() with control_image_path
-//      set but no apply_controlnet() call throws.
+//   4. missing_controlnet_throws        — generate() with opts.controls set
+//      but no add_controlnet() call throws.
 //
-// The Flux-throws guard in apply_controlnet is exercised by inspection of the
+// The Flux-throws guard in add_controlnet is exercised by inspection of the
 // SD1.5-only check in src/pipeline.cpp; standing up a Flux pipeline just to
 // hit that branch would dwarf the rest of this test, so it's skipped here
 // (see the Phase D3 report).
@@ -499,8 +499,12 @@ int main() {
         auto tok = clip::Tokenizer::load(vp.string(), mp.string());
         pl::Pipeline p(make_cfg(), std::move(tok));
         p.load_weights(sd_file, "text_model.", "", "decoder.");
-        if (with_controlnet) p.apply_controlnet(cn_file, cn_cfg);
+        if (with_controlnet) p.add_controlnet(cn_file, cn_cfg);
         return p;
+    };
+
+    auto single_input = [&](float scale) {
+        return pl::ControlNetInput{ctrl_path.string(), scale, 0.0f, 1.0f};
     };
 
     constexpr int W = 16;
@@ -523,8 +527,7 @@ int main() {
 
         auto p_cn = make_pipeline(/*with_controlnet=*/true);
         auto opts = base_opts();
-        opts.control_image_path = ctrl_path.string();
-        opts.control_scale      = 0.0f;
+        opts.controls = { single_input(0.0f) };
         std::vector<float> img_cn0 = p_cn.generate("hi", opts);
 
         CHECK(img_no.size() == img_cn0.size());
@@ -554,8 +557,7 @@ int main() {
 
         auto p_cn = make_pipeline(/*with_controlnet=*/true);
         auto opts = base_opts();
-        opts.control_image_path = ctrl_path.string();
-        opts.control_scale      = 1.0f;
+        opts.controls = { single_input(1.0f) };
         std::vector<float> img_cn = p_cn.generate("hi", opts);
 
         CHECK(img_no.size() == img_cn.size());
@@ -578,8 +580,7 @@ int main() {
     {
         auto p_cn = make_pipeline(/*with_controlnet=*/true);
         auto opts = base_opts();
-        opts.control_image_path = ctrl_path.string();
-        opts.control_scale      = 1.0f;
+        opts.controls = { single_input(1.0f) };
         std::vector<float> img = p_cn.generate("hi", opts);
         const std::size_t n_img =
             3u * static_cast<std::size_t>(H) * static_cast<std::size_t>(W);
@@ -598,10 +599,9 @@ int main() {
         auto tok = clip::Tokenizer::load(vp.string(), mp.string());
         pl::Pipeline p_single(make_cfg(), std::move(tok));
         p_single.load_weights(sd_file, "text_model.", "", "decoder.");
-        p_single.apply_controlnet(cn_file, cn_cfg);
+        p_single.add_controlnet(cn_file, cn_cfg);
         auto opts_single = base_opts();
-        opts_single.control_image_path = ctrl_path.string();
-        opts_single.control_scale      = 2.0f;
+        opts_single.controls = { single_input(2.0f) };
         std::vector<float> img_single = p_single.generate("hi", opts_single);
 
         auto tok2 = clip::Tokenizer::load(vp.string(), mp.string());
@@ -642,10 +642,9 @@ int main() {
         auto tok = clip::Tokenizer::load(vp.string(), mp.string());
         pl::Pipeline p_single(make_cfg(), std::move(tok));
         p_single.load_weights(sd_file, "text_model.", "", "decoder.");
-        p_single.apply_controlnet(cn_file, cn_cfg);
+        p_single.add_controlnet(cn_file, cn_cfg);
         auto opts_single = base_opts();
-        opts_single.control_image_path = ctrl_path.string();
-        opts_single.control_scale      = 1.0f;
+        opts_single.controls = { single_input(1.0f) };
         std::vector<float> img_single = p_single.generate("hi", opts_single);
 
         auto tok2 = clip::Tokenizer::load(vp.string(), mp.string());
@@ -707,7 +706,7 @@ int main() {
     {
         auto p_no = make_pipeline(/*with_controlnet=*/false);
         auto opts = base_opts();
-        opts.control_image_path = ctrl_path.string();
+        opts.controls = { single_input(1.0f) };
         bool threw = false;
         try {
             (void)p_no.generate("hi", opts);
@@ -728,11 +727,10 @@ int main() {
         auto tok = clip::Tokenizer::load(vp.string(), mp.string());
         pl::Pipeline p(make_cfg_lcm(), std::move(tok));
         p.load_weights(sd_lcm_file, "text_model.", "", "decoder.");
-        p.apply_controlnet(cn_file, cn_cfg);
+        p.add_controlnet(cn_file, cn_cfg);
         auto opts = base_opts();
         opts.guidance_scale     = 1.5f;  // LCM cond_proj input `w`
-        opts.control_image_path = ctrl_path.string();
-        opts.control_scale      = 1.0f;
+        opts.controls = { single_input(1.0f) };
         std::vector<float> img = p.generate("hi", opts);
         const std::size_t n_img =
             3u * static_cast<std::size_t>(H) * static_cast<std::size_t>(W);
@@ -771,10 +769,9 @@ int main() {
         auto tok = clip::Tokenizer::load(vp.string(), mp.string());
         pl::Pipeline p(make_cfg(), std::move(tok));
         p.load_weights(sd_file, "text_model.", "", "decoder.");
-        p.apply_controlnet(cn_file, cn_cfg);
+        p.add_controlnet(cn_file, cn_cfg);
         auto opts = base_opts();
-        opts.control_image_path = ctrl_path.string();
-        opts.control_scale      = 1.0f;
+        opts.controls = { single_input(1.0f) };
         auto state = p.prime("hi", opts);
         brodiffusion::AttentionTrace trace;
         p.step_once(state, opts, &trace);

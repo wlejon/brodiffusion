@@ -162,23 +162,14 @@ struct GenerateOptions {
     bool vae_encode_sample = false;
 
     // ── ControlNet (SD1.5 only) ───────────────────────────────────────────
-    // Multi-ControlNet inputs, one per registered ControlNet (in the order
-    // they were added). When non-empty, prime() loads each control image and
-    // step_once() runs every registered ControlNet, summing their residuals
-    // position-wise (each weighted by its own ControlNetInput::scale) before
-    // feeding them into UNet's skip connections. Size must equal the number
-    // of registered ControlNets. SD1.5 only; throws on Flux.
-    //
-    // For single-CN use, the `control_image_path` / `control_scale` legacy
-    // shortcut below is still accepted (auto-translated to a one-entry
-    // `controls` list); the two surfaces are mutually exclusive.
+    // One ControlNetInput per registered ControlNet (in the order they were
+    // added via add_controlnet). When non-empty, prime() loads each control
+    // image and step_once() runs every registered ControlNet, summing their
+    // residuals position-wise (each weighted by its own ControlNetInput::
+    // scale) before feeding them into UNet's skip connections. Size must
+    // equal the number of registered ControlNets. SD1.5 only; throws on
+    // Flux. Empty = no ControlNet for this run.
     std::vector<ControlNetInput> controls;
-
-    // Legacy single-CN shortcut. When `controls` is empty AND this path is
-    // non-empty, prime() synthesizes a single ControlNetInput from these
-    // fields. Use `controls` directly for any multi-CN setup.
-    std::string control_image_path;
-    float       control_scale = 1.0f;
 
     // Inpaint mask path. When non-empty, the pipeline runs in inpaint mode:
     // init_image_path must ALSO be set, and at each scheduler step (except
@@ -250,18 +241,11 @@ public:
     // contains LoRA tensors that don't map to a known SD1.5 target.
     void apply_lora(const brotensor::safetensors::File& f, float scale = 1.0f);
 
-    // Load a ControlNet safetensors file and replace any previously loaded
-    // ControlNet(s) with it. Equivalent to clear_controlnets() followed by
-    // add_controlnet(f[, cfg]). SD1.5 only; throws on Flux. The default
-    // config matches HF's lllyasviel/sd-controlnet-* zoo; pass an explicit
-    // ControlNetConfig if a non-default checkpoint shape is needed.
-    void apply_controlnet(const brotensor::safetensors::File& f);
-    void apply_controlnet(const brotensor::safetensors::File& f,
-                          const controlnet::ControlNetConfig& cfg);
-
-    // Stack an additional ControlNet onto the registered list. The returned
-    // index is the addressing key used elsewhere (e.g. remove_controlnet,
-    // and the position into GenerateOptions::controls). SD1.5 only.
+    // Register a ControlNet safetensors file. The returned index is the
+    // addressing key used elsewhere (remove_controlnet, plus the position
+    // into GenerateOptions::controls). SD1.5 only; throws on Flux. The
+    // default config matches HF's lllyasviel/sd-controlnet-* zoo; pass an
+    // explicit ControlNetConfig if a non-default checkpoint shape is needed.
     int add_controlnet(const brotensor::safetensors::File& f);
     int add_controlnet(const brotensor::safetensors::File& f,
                        const controlnet::ControlNetConfig& cfg);
@@ -380,16 +364,15 @@ private:
     bool              inpaint_active_ = false;
 
     // ControlNet plumbing. `controlnets_` is the registered stack (lifetime
-    // tied to Pipeline; replaced wholesale by apply_controlnet, appended by
-    // add_controlnet). `control_inputs_` is the resolved per-run input list
-    // (size == controlnets_.size() when active), copied from
-    // GenerateOptions::controls (or synthesised from the legacy
-    // control_image_path / control_scale shortcut). `control_images_` holds
-    // one image tensor per registered ControlNet, built in prime() at the
+    // tied to Pipeline; appended via add_controlnet, dropped via
+    // remove_controlnet / clear_controlnets). `control_inputs_` is the
+    // per-run input list copied from GenerateOptions::controls in prime();
+    // size == controlnets_.size() when active. `control_images_` holds one
+    // image tensor per registered ControlNet, built in prime() at the
     // active device + compute dtype and reused for every step in the
-    // current generation. `controlnet_active_` mirrors "at least one
-    // ControlNet image path was non-empty AND the registered count matches"
-    // — checked by step_once to branch into the residual-aware UNet path.
+    // current generation. `controlnet_active_` mirrors "GenerateOptions
+    // .controls is non-empty AND the registered count matches" — checked
+    // by step_once to branch into the residual-aware UNet path.
     //
     // Step buffers: `cn_down_residuals_` / `cn_mid_residual_` are the
     // summed-across-nets residuals fed into the UNet skips; the first net

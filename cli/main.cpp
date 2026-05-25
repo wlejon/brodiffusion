@@ -52,13 +52,19 @@ static int usage() {
         "                       (all txt2img flags also accepted; SD1.5 only;\n"
         "                        white mask pixels = inpaint, black = keep)\n"
         "\n"
-        "  --control <weights> --control-image <png> [--control-scale F]\n"
-        "                       enable single ControlNet (SD1.5 only). Loads\n"
-        "                       the safetensors after the main weights. Both\n"
-        "                       --control and --control-image are required\n"
-        "                       together. Multi-ControlNet stacking is not\n"
-        "                       supported; trace mode / LCM scheduler combos\n"
-        "                       with ControlNet are not supported.\n"
+        "  --control <weights> --control-image <png>\n"
+        "                       [--control-scale F] [--control-window S:E]\n"
+        "                       register a ControlNet (SD1.5 only). Repeat\n"
+        "                       the group for multi-ControlNet stacking — the\n"
+        "                       residuals are summed position-wise (each\n"
+        "                       weighted by its --control-scale, default 1.0)\n"
+        "                       and fed into the UNet skips. --control-window\n"
+        "                       S:E (each in [0,1]) restricts the net to a\n"
+        "                       half-open fraction of the schedule (default\n"
+        "                       0:1 = full). --control-image / --control-scale\n"
+        "                       / --control-window attach to the most recent\n"
+        "                       --control entry. LCM scheduler is supported;\n"
+        "                       trace mode is supported (cond pass only).\n"
         "  brodiffusion make-mask --out <png> [--width N] [--height N]\n"
         "                       writes a center-square binary inpaint mask\n"
         "                       (white quarter-area box on black, default 512x512).\n"
@@ -151,6 +157,81 @@ std::vector<LoraSpec> collect_loras(int argc, char** argv) {
     return out;
 }
 
+struct ControlSpec {
+    std::string weights_path;
+    std::string image_path;
+    float       scale      = 1.0f;
+    float       start_step = 0.0f;
+    float       end_step   = 1.0f;
+};
+
+// Collect repeated --control / --control-image / --control-scale /
+// --control-window arguments in positional order. Each --control adds a
+// new entry; --control-image / --control-scale / --control-window fill
+// in subsequent fields of the *most recent* entry. The CLI form mirrors
+// the API: one ControlNet, one input. Throws by returning empty on a
+// usage error after printing a message.
+std::vector<ControlSpec> collect_controls(int argc, char** argv,
+                                          bool& usage_error) {
+    std::vector<ControlSpec> out;
+    usage_error = false;
+    for (int i = 1; i < argc - 1; ++i) {
+        const char* a = argv[i];
+        const char* v = argv[i + 1];
+        if (std::strcmp(a, "--control") == 0) {
+            ControlSpec s;
+            s.weights_path = v;
+            out.push_back(std::move(s));
+        } else if (std::strcmp(a, "--control-image") == 0) {
+            if (out.empty()) {
+                std::fprintf(stderr,
+                    "controlnet: --control-image must follow --control\n");
+                usage_error = true;
+                return {};
+            }
+            out.back().image_path = v;
+        } else if (std::strcmp(a, "--control-scale") == 0) {
+            if (out.empty()) {
+                std::fprintf(stderr,
+                    "controlnet: --control-scale must follow --control\n");
+                usage_error = true;
+                return {};
+            }
+            out.back().scale = static_cast<float>(std::atof(v));
+        } else if (std::strcmp(a, "--control-window") == 0) {
+            if (out.empty()) {
+                std::fprintf(stderr,
+                    "controlnet: --control-window must follow --control\n");
+                usage_error = true;
+                return {};
+            }
+            // Format: "<start>:<end>" (both fractions in [0,1]).
+            std::string raw = v;
+            auto pos = raw.find(':');
+            if (pos == std::string::npos) {
+                std::fprintf(stderr,
+                    "controlnet: --control-window expects <start>:<end>\n");
+                usage_error = true;
+                return {};
+            }
+            out.back().start_step =
+                static_cast<float>(std::atof(raw.substr(0, pos).c_str()));
+            out.back().end_step =
+                static_cast<float>(std::atof(raw.substr(pos + 1).c_str()));
+        }
+    }
+    for (const auto& s : out) {
+        if (s.image_path.empty()) {
+            std::fprintf(stderr,
+                "controlnet: every --control needs a matching "
+                "--control-image\n");
+            usage_error = true;
+            return {};
+        }
+    }
+    return out;
+}
+
 // Convert a planar [-1,1] FP32 image (3*H*W NCHW) to PNG via broimage.
 // f32_nchw_to_u8_nhwc with scale=127.5, bias=127.5 maps [-1,1] -> [0,255]
 // with the same round+clamp the old hand-rolled PPM writer used.
@@ -228,9 +309,6 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     const char* init_path = arg_after(argc, argv, "--init");
     const char* mask_path = arg_after(argc, argv, "--mask");
     const char* strength_s = arg_after(argc, argv, "--strength");
-    const char* control_path       = arg_after(argc, argv, "--control");
-    const char* control_image_path = arg_after(argc, argv, "--control-image");
-    const char* control_scale_s    = arg_after(argc, argv, "--control-scale");
     bool vae_sample = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--vae-sample") == 0) vae_sample = true;
@@ -288,28 +366,25 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
         opts.mask_image_path = mask_path;
     }
 
-    // ControlNet: --control + --control-image must both be set, and Flux is
-    // rejected (SD1.5 only).
-    if (control_path || control_image_path) {
-        if (!control_path || !control_image_path) {
-            std::fprintf(stderr,
-                "controlnet: --control and --control-image must be set "
-                "together\n");
-            return 2;
-        }
-        if (is_flux) {
+    // ControlNet: each --control adds a registered net; --control-image /
+    // --control-scale / --control-window fill the most recent entry.
+    // Repeatable for multi-ControlNet stacking. SD1.5 only.
+    {
+        bool cn_usage_err = false;
+        auto controls = collect_controls(argc, argv, cn_usage_err);
+        if (cn_usage_err) return 2;
+        if (!controls.empty() && is_flux) {
             std::fprintf(stderr,
                 "controlnet: not supported for Flux model dirs "
                 "(SD1.5 only)\n");
             return 2;
         }
-        std::printf("Loading ControlNet: %s\n", control_path);
-        auto cn_file = st::File::open(control_path);
-        pipeline.apply_controlnet(cn_file);
-        opts.control_image_path = control_image_path;
-        if (control_scale_s) {
-            opts.control_scale =
-                static_cast<float>(std::atof(control_scale_s));
+        for (const auto& cs : controls) {
+            std::printf("Loading ControlNet: %s\n", cs.weights_path.c_str());
+            auto cn_file = st::File::open(cs.weights_path);
+            pipeline.add_controlnet(cn_file);
+            opts.controls.push_back(pl::ControlNetInput{
+                cs.image_path, cs.scale, cs.start_step, cs.end_step});
         }
     }
 
@@ -355,10 +430,6 @@ int run_txt2img(int argc, char** argv) {
     const char* init_path   = arg_after(argc, argv, "--init");
     const char* mask_path   = arg_after(argc, argv, "--mask");
     const char* strength_s  = arg_after(argc, argv, "--strength");
-    const char* control_path       = arg_after(argc, argv, "--control");
-    const char* control_image_path = arg_after(argc, argv, "--control-image");
-    const char* control_scale_s    = arg_after(argc, argv, "--control-scale");
-
     bool quantize_unet = false;
     bool vae_sample    = false;
     for (int i = 1; i < argc; ++i) {
@@ -477,22 +548,20 @@ int run_txt2img(int argc, char** argv) {
     auto vae_file  = st::File::open(vae_path);
     pipeline.load_weights(text_file, unet_file, vae_file);
 
-    // ControlNet: --control + --control-image must both be set if either
-    // is. Loaded AFTER the base weights, BEFORE generate. Single-net only.
-    if (control_path || control_image_path) {
-        if (!control_path || !control_image_path) {
-            std::fprintf(stderr,
-                "controlnet: --control and --control-image must be set "
-                "together\n");
-            return 2;
-        }
-        std::printf("Loading ControlNet: %s\n", control_path);
-        auto cn_file = st::File::open(control_path);
-        pipeline.apply_controlnet(cn_file);
-        opts.control_image_path = control_image_path;
-        if (control_scale_s) {
-            opts.control_scale =
-                static_cast<float>(std::atof(control_scale_s));
+    // ControlNet: each --control adds a registered net; --control-image /
+    // --control-scale / --control-window fill the most recent entry.
+    // Repeatable for multi-ControlNet stacking. Loaded AFTER the base
+    // weights, BEFORE generate.
+    {
+        bool cn_usage_err = false;
+        auto controls = collect_controls(argc, argv, cn_usage_err);
+        if (cn_usage_err) return 2;
+        for (const auto& cs : controls) {
+            std::printf("Loading ControlNet: %s\n", cs.weights_path.c_str());
+            auto cn_file = st::File::open(cs.weights_path);
+            pipeline.add_controlnet(cn_file);
+            opts.controls.push_back(pl::ControlNetInput{
+                cs.image_path, cs.scale, cs.start_step, cs.end_step});
         }
     }
 
