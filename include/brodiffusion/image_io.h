@@ -20,10 +20,16 @@
 
 namespace brodiffusion {
 
+// Output pixel-value range. SignedUnit ([-1, 1]) matches VAE encoder input;
+// UnsignedUnit ([0, 1]) matches diffusers' ControlNet conditioning input
+// (where the preprocessor does only `pixel / 255.0`, no recentering).
+enum class PixelRange { SignedUnit, UnsignedUnit };
+
 // dst_h and dst_w must be positive multiples of 8 (matches the VAE 8x stride).
 // Throws std::runtime_error on decode failure or invalid dims.
 brotensor::Tensor load_image_as_latent_input(const std::string& path,
-                                             int dst_w, int dst_h);
+                                             int dst_w, int dst_h,
+                                             PixelRange range = PixelRange::SignedUnit);
 
 // Decode a 1-channel mask image and produce a (1, H_lat * W_lat) tensor of
 // {0.0, 1.0} values on the active brotensor device at compute dtype.

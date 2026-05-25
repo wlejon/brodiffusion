@@ -16,7 +16,8 @@
 namespace brodiffusion {
 
 brotensor::Tensor load_image_as_latent_input(const std::string& path,
-                                             int dst_w, int dst_h) {
+                                             int dst_w, int dst_h,
+                                             PixelRange range) {
     if (dst_w <= 0 || dst_h <= 0) {
         throw std::runtime_error("load_image_as_latent_input: dst_w/dst_h must be positive");
     }
@@ -49,13 +50,16 @@ brotensor::Tensor load_image_as_latent_input(const std::string& path,
                             broimage::Filter::Bilinear,
                             /*src_stride_bytes=*/0, /*dst_stride_bytes=*/0);
 
-    // 3. u8 NHWC -> f32 NCHW, scale 2/255, bias -1  (maps [0,255] -> [-1,1]).
+    // 3. u8 NHWC -> f32 NCHW, scaled to either [-1, 1] (VAE input) or [0, 1]
+    //    (ControlNet conditioning input — diffusers does just /255, no bias).
+    const float scale = (range == PixelRange::UnsignedUnit) ? 1.0f / 255.0f
+                                                            : 2.0f / 255.0f;
+    const float bias  = (range == PixelRange::UnsignedUnit) ? 0.0f : -1.0f;
     std::vector<float> f32(
         static_cast<std::size_t>(dst_w) * static_cast<std::size_t>(dst_h) * 3);
     broimage::u8_nhwc_to_f32_nchw(rgb_resized.data(),
                                   /*N=*/1, /*H=*/dst_h, /*W=*/dst_w, /*C=*/3,
-                                  /*scale=*/2.0f / 255.0f, /*bias=*/-1.0f,
-                                  f32.data());
+                                  scale, bias, f32.data());
 
     // 4. Upload at the pipeline compute dtype.
     return detail::upload_host(f32.data(),

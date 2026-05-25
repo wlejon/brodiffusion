@@ -422,8 +422,11 @@ PipelineState Pipeline::prime(std::string_view prompt,
         }
         // Control image lives at FULL image resolution; ControlNet's
         // conditioning_embedding does the 8x downsample to latent space.
+        // Pixel range is [0, 1] (UnsignedUnit) to match diffusers — the HF
+        // ControlNetPipeline's preprocessor does pixel/255 with no recentering.
         control_image_ = brodiffusion::load_image_as_latent_input(
-            opts.control_image_path, opts.width, opts.height);
+            opts.control_image_path, opts.width, opts.height,
+            brodiffusion::PixelRange::UnsignedUnit);
         controlnet_active_ = true;
     }
 
