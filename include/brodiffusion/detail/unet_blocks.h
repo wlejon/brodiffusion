@@ -18,7 +18,10 @@
 
 #include "brotensor/tensor.h"
 
+#include <string>
 #include <vector>
+
+namespace brotensor::safetensors { class File; }
 
 namespace brodiffusion::unet::detail {
 
@@ -167,5 +170,30 @@ void apply_transformer(const Transformer2D& t,
                        int norm_num_groups, float layernorm_eps,
                        brotensor::Tensor* trace_out_entry = nullptr,
                        const brotensor::Tensor* attn_logit_bias = nullptr);
+
+// ── Weight loaders ─────────────────────────────────────────────────────────
+//
+// Lifted from UNet's private section so ControlNet can reuse them verbatim.
+// Behavior is bit-identical to UNet's pre-Phase-D2 private helpers: each
+// reads tensors from `f` under the given `prefix` (which must end in '.'),
+// uploads them at the brodiffusion compute dtype, and fills in the matching
+// struct fields. Throws std::runtime_error on missing tensors or shape
+// mismatches (tagged "unet::detail::load_resnet" / "...load_transformer").
+//
+// `time_embed_dim` is the master temb dim (= cfg.block_out_channels[0] *
+// time_embed_dim_mult on the standard UNet); the resnet's time_emb_proj
+// weight is shaped (C_out, time_embed_dim).
+//
+// `cross_attention_dim` is the K/V context width for cross-attention
+// (CLIP-L = 768 for SD1.5).
+void load_resnet(const brotensor::safetensors::File& f,
+                 const std::string& prefix,
+                 int C_in, int C_out, int time_embed_dim,
+                 Resnet& r);
+
+void load_transformer(const brotensor::safetensors::File& f,
+                      const std::string& prefix,
+                      int C, int num_heads, int cross_attention_dim,
+                      Transformer2D& t);
 
 }  // namespace brodiffusion::unet::detail

@@ -114,85 +114,14 @@ UNet::~UNet() = default;
 
 void UNet::load_resnet_(const st::File& f, const std::string& p,
                         int C_in, int C_out, Resnet& r) {
-    upload_compute_checked(need(f, p + "norm1.weight"), C_in,  1, r.n1g, "resnet.norm1.weight");
-    upload_compute_checked(need(f, p + "norm1.bias"),   C_in,  1, r.n1b, "resnet.norm1.bias");
-    upload_compute_checked(need(f, p + "conv1.weight"), C_out, C_in * 3 * 3, r.W1, "resnet.conv1.weight");
-    upload_compute_checked(need(f, p + "conv1.bias"),   C_out, 1, r.b1, "resnet.conv1.bias");
-
-    upload_compute_checked(need(f, p + "time_emb_proj.weight"),
-                        C_out, time_embed_dim_, r.temb_W, "resnet.time_emb_proj.weight");
-    upload_compute_checked(need(f, p + "time_emb_proj.bias"),
-                        C_out, 1, r.temb_b, "resnet.time_emb_proj.bias");
-
-    upload_compute_checked(need(f, p + "norm2.weight"), C_out, 1, r.n2g, "resnet.norm2.weight");
-    upload_compute_checked(need(f, p + "norm2.bias"),   C_out, 1, r.n2b, "resnet.norm2.bias");
-    upload_compute_checked(need(f, p + "conv2.weight"), C_out, C_out * 3 * 3, r.W2, "resnet.conv2.weight");
-    upload_compute_checked(need(f, p + "conv2.bias"),   C_out, 1, r.b2, "resnet.conv2.bias");
-
-    r.C_in = C_in;
-    r.C_out = C_out;
-    r.has_shortcut = (C_in != C_out);
-    if (r.has_shortcut) {
-        upload_compute_checked(need(f, p + "conv_shortcut.weight"),
-                            C_out, C_in, r.Ws, "resnet.conv_shortcut.weight");
-        upload_compute_checked(need(f, p + "conv_shortcut.bias"),
-                            C_out, 1, r.bs, "resnet.conv_shortcut.bias");
-    }
+    // Phase D2: delegate to the lifted free function in
+    // brodiffusion::unet::detail so ControlNet can reuse the same loader.
+    detail::load_resnet(f, p, C_in, C_out, time_embed_dim_, r);
 }
 
 void UNet::load_transformer_(const st::File& f, const std::string& p,
                              int C, int num_heads, Transformer2D& t) {
-    t.C = C;
-    t.num_heads = num_heads;
-
-    upload_compute_checked(need(f, p + "norm.weight"), C, 1, t.gn_g, "tr.norm.weight");
-    upload_compute_checked(need(f, p + "norm.bias"),   C, 1, t.gn_b, "tr.norm.bias");
-
-    // 1x1 convs flatten to (C, C). Stored as (C_out, C_in, 1, 1) in safetensors.
-    upload_compute_checked(need(f, p + "proj_in.weight"),  C, C, t.pi_W, "tr.proj_in.weight");
-    upload_compute_checked(need(f, p + "proj_in.bias"),    C, 1, t.pi_b, "tr.proj_in.bias");
-    upload_compute_checked(need(f, p + "proj_out.weight"), C, C, t.po_W, "tr.proj_out.weight");
-    upload_compute_checked(need(f, p + "proj_out.bias"),   C, 1, t.po_b, "tr.proj_out.bias");
-
-    // SD1.5 always uses a single BasicTransformerBlock per Transformer2DModel.
-    t.blocks.clear();
-    t.blocks.resize(1);
-    AttnFFN& blk = t.blocks[0];
-
-    const std::string b = p + "transformer_blocks.0.";
-
-    // norm1 + self-attention (no Q/K/V bias).
-    upload_compute_checked(need(f, b + "norm1.weight"), C, 1, blk.n1g, "tr.b.norm1.weight");
-    upload_compute_checked(need(f, b + "norm1.bias"),   C, 1, blk.n1b, "tr.b.norm1.bias");
-    upload_compute_checked(need(f, b + "attn1.to_q.weight"), C, C, blk.Wq1, "tr.b.attn1.to_q.weight");
-    upload_compute_checked(need(f, b + "attn1.to_k.weight"), C, C, blk.Wk1, "tr.b.attn1.to_k.weight");
-    upload_compute_checked(need(f, b + "attn1.to_v.weight"), C, C, blk.Wv1, "tr.b.attn1.to_v.weight");
-    upload_compute_checked(need(f, b + "attn1.to_out.0.weight"), C, C, blk.Wo1, "tr.b.attn1.to_out.weight");
-    upload_compute_checked(need(f, b + "attn1.to_out.0.bias"),   C, 1, blk.bo1, "tr.b.attn1.to_out.bias");
-
-    // norm2 + cross-attention (no Q/K/V bias; K/V project from cross_attention_dim).
-    upload_compute_checked(need(f, b + "norm2.weight"), C, 1, blk.n2g, "tr.b.norm2.weight");
-    upload_compute_checked(need(f, b + "norm2.bias"),   C, 1, blk.n2b, "tr.b.norm2.bias");
-    upload_compute_checked(need(f, b + "attn2.to_q.weight"), C, C, blk.Wq2, "tr.b.attn2.to_q.weight");
-    upload_compute_checked(need(f, b + "attn2.to_k.weight"),
-                        C, cfg_.cross_attention_dim, blk.Wk2, "tr.b.attn2.to_k.weight");
-    upload_compute_checked(need(f, b + "attn2.to_v.weight"),
-                        C, cfg_.cross_attention_dim, blk.Wv2, "tr.b.attn2.to_v.weight");
-    upload_compute_checked(need(f, b + "attn2.to_out.0.weight"), C, C, blk.Wo2, "tr.b.attn2.to_out.weight");
-    upload_compute_checked(need(f, b + "attn2.to_out.0.bias"),   C, 1, blk.bo2, "tr.b.attn2.to_out.bias");
-
-    // norm3 + FF (GEGLU): Linear(C, 8C) -> split-and-multiply -> Linear(4C, C).
-    upload_compute_checked(need(f, b + "norm3.weight"), C, 1, blk.n3g, "tr.b.norm3.weight");
-    upload_compute_checked(need(f, b + "norm3.bias"),   C, 1, blk.n3b, "tr.b.norm3.bias");
-    const int ff_inner = 4 * C;
-    upload_compute_checked(need(f, b + "ff.net.0.proj.weight"),
-                        2 * ff_inner, C, blk.ff1_W, "tr.b.ff.net.0.proj.weight");
-    upload_compute_checked(need(f, b + "ff.net.0.proj.bias"),
-                        2 * ff_inner, 1, blk.ff1_b, "tr.b.ff.net.0.proj.bias");
-    upload_compute_checked(need(f, b + "ff.net.2.weight"),
-                        C, ff_inner, blk.ff2_W, "tr.b.ff.net.2.weight");
-    upload_compute_checked(need(f, b + "ff.net.2.bias"),
-                        C, 1, blk.ff2_b, "tr.b.ff.net.2.bias");
+    detail::load_transformer(f, p, C, num_heads, cfg_.cross_attention_dim, t);
 }
 
 void UNet::load_weights(const st::File& f, const std::string& prefix) {
