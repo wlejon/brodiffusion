@@ -243,6 +243,41 @@ void write_png(const std::filesystem::path& path, int pattern) {
 
 // ── fixture builders ──────────────────────────────────────────────────────
 
+// LCM fixture: same as build_sd_fixture but appends time_embedding.cond_proj
+// .weight (no bias), which load_weights() auto-detects to flip the UNet into
+// the LCM cond_proj path. Matches test_unet.cpp's LCM checkpoint pattern.
+std::filesystem::path build_sd_fixture_lcm(int cond_proj_dim) {
+    bdfix::Builder b;
+    bdfix::build_clip(b, clip_cfg(), "text_model.");
+    bdfix::build_unet(b, unet_cfg(), "");
+    const int freq_dim = unet_cfg().block_out_channels.front();
+    b.add("time_embedding.cond_proj.weight",
+          {freq_dim, cond_proj_dim},
+          bdfix::fp16_rand(
+              static_cast<std::size_t>(freq_dim) * cond_proj_dim,
+              0.02f, 555));
+    bdfix::build_vae(b, vae_dec_cfg(), "decoder.");
+    build_post_quant_conv(b, vae_dec_cfg().in_channels, /*parent=*/"");
+    {
+        vae::EncoderConfig enc;
+        const auto d = vae_dec_cfg();
+        enc.in_channels         = d.in_channels;
+        enc.out_channels        = d.out_channels;
+        enc.block_out_channels  = d.block_out_channels;
+        enc.layers_per_block    = d.layers_per_block;
+        enc.norm_num_groups     = d.norm_num_groups;
+        enc.scaling_factor      = d.scaling_factor;
+        enc.shift_factor        = d.shift_factor;
+        enc.eps                 = d.eps;
+        enc.num_attention_heads = d.num_attention_heads;
+        build_vae_encoder(b, enc, "encoder.");
+    }
+    auto path = std::filesystem::temp_directory_path() /
+                "brodiffusion_controlnet_pipeline_sd_lcm.safetensors";
+    b.write(path);
+    return path;
+}
+
 std::filesystem::path build_sd_fixture() {
     bdfix::Builder b;
     bdfix::build_clip(b, clip_cfg(), "text_model.");
@@ -412,6 +447,12 @@ pl::PipelineConfig make_cfg() {
     cfg.unet         = unet_cfg();
     cfg.vae          = vae_dec_cfg();
     cfg.text_encoder = clip_cfg();
+    return cfg;
+}
+
+pl::PipelineConfig make_cfg_lcm() {
+    auto cfg = make_cfg();
+    cfg.scheduler = brodiffusion::scheduler::LCMConfig{};
     return cfg;
 }
 
@@ -676,9 +717,56 @@ int main() {
         CHECK(threw);
     }
 
+    // ── 5. LCM + ControlNet end-to-end ───────────────────────────────────
+    // The LCM cond_proj path and the ControlNet residual path are
+    // independent inside the UNet — verify they compose. Build an LCM
+    // checkpoint (cond_proj weight present in the safetensors), wire CN,
+    // run a 2-step generate and confirm finite output (no LCM-guard throw).
+    auto sd_lcm_path = build_sd_fixture_lcm(/*cond_proj_dim=*/4);
+    auto sd_lcm_file = st::File::open(sd_lcm_path.string());
+    {
+        auto tok = clip::Tokenizer::load(vp.string(), mp.string());
+        pl::Pipeline p(make_cfg_lcm(), std::move(tok));
+        p.load_weights(sd_lcm_file, "text_model.", "", "decoder.");
+        p.apply_controlnet(cn_file, cn_cfg);
+        auto opts = base_opts();
+        opts.guidance_scale     = 1.5f;  // LCM cond_proj input `w`
+        opts.control_image_path = ctrl_path.string();
+        opts.control_scale      = 1.0f;
+        std::vector<float> img = p.generate("hi", opts);
+        const std::size_t n_img =
+            3u * static_cast<std::size_t>(H) * static_cast<std::size_t>(W);
+        CHECK(img.size() == n_img);
+        int nonfinite = 0;
+        for (float v : img) if (!std::isfinite(v)) ++nonfinite;
+        CHECK(nonfinite == 0);
+    }
+
+    // ── 5b. LCM + multi-CN ───────────────────────────────────────────────
+    // Two stacked CNs with LCM scheduler — the residual-sum path and the
+    // cond_proj path coexist for both the single-net and multi-net case.
+    {
+        auto tok = clip::Tokenizer::load(vp.string(), mp.string());
+        pl::Pipeline p(make_cfg_lcm(), std::move(tok));
+        p.load_weights(sd_lcm_file, "text_model.", "", "decoder.");
+        p.add_controlnet(cn_file, cn_cfg);
+        p.add_controlnet(cn_file, cn_cfg);
+        auto opts = base_opts();
+        opts.guidance_scale = 1.5f;
+        opts.controls = {
+            pl::ControlNetInput{ctrl_path.string(), 0.5f, 0.0f, 1.0f},
+            pl::ControlNetInput{ctrl_path.string(), 0.5f, 0.0f, 1.0f},
+        };
+        std::vector<float> img = p.generate("hi", opts);
+        int nonfinite = 0;
+        for (float v : img) if (!std::isfinite(v)) ++nonfinite;
+        CHECK(nonfinite == 0);
+    }
+
     // ── cleanup ──────────────────────────────────────────────────────────
     std::error_code ec;
-    std::filesystem::remove(sd_path,   ec);
+    std::filesystem::remove(sd_path,     ec);
+    std::filesystem::remove(sd_lcm_path, ec);
     std::filesystem::remove(cn_path,   ec);
     std::filesystem::remove(ctrl_path, ec);
     std::filesystem::remove(vp,        ec);

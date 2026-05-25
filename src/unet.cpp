@@ -513,6 +513,32 @@ void UNet::forward(const bt::Tensor& sample,
                   /*down_residuals=*/nullptr, /*mid_residual=*/nullptr, out);
 }
 
+void UNet::forward(const bt::Tensor& sample,
+                   int H, int W,
+                   float timestep,
+                   float guidance_scale_embedding,
+                   const bt::Tensor& encoder_hidden_states,
+                   const CrossAttnKVCache& xattn_cache,
+                   const std::vector<const bt::Tensor*>& down_residuals,
+                   const bt::Tensor* mid_residual,
+                   bt::Tensor& out) {
+    if (cfg_.time_cond_proj_dim <= 0) {
+        fail("forward(controlnet+lcm): UNet built with time_cond_proj_dim=0; "
+             "use the non-guidance overload for vanilla SD1.5");
+    }
+    if (static_cast<int>(xattn_cache.size()) != num_xattn_blocks()) {
+        fail("forward(controlnet+lcm): cross-attn KV cache has " +
+             std::to_string(xattn_cache.size()) + " entries, expected " +
+             std::to_string(num_xattn_blocks()));
+    }
+    const std::vector<const bt::Tensor*>* dr =
+        down_residuals.empty() ? nullptr : &down_residuals;
+    forward_impl_(sample, H, W, timestep, &guidance_scale_embedding,
+                  encoder_hidden_states, &xattn_cache,
+                  /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr,
+                  dr, mid_residual, out);
+}
+
 void UNet::forward_trace(const bt::Tensor& sample,
                          int H, int W,
                          float timestep,

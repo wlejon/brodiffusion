@@ -752,10 +752,6 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
             fail("step_once: trace mode is not supported together with "
                  "ControlNet (Phase D3 leaves the combination out of scope)");
         }
-        if (is_lcm) {
-            fail("step_once: LCM scheduler is not supported together with "
-                 "ControlNet (Phase D3 leaves the combination out of scope)");
-        }
         unet::UNet* u = denoiser_->as_unet();
         if (u == nullptr) {
             fail("step_once: ControlNet requires a UNet denoiser");
@@ -812,16 +808,25 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
 
         const auto& cache_cond =
             u->kv_cache_for(prepared_, Branch::Cond);
-        u->forward(state.latent, state.H_lat, state.W_lat, t,
-                   ctx_cond, cache_cond, down_ptrs, mid_ptr,
-                   noise_pred_cond_);
-        if (do_cfg) {
-            const auto& cache_uncond =
-                u->kv_cache_for(prepared_, Branch::Uncond);
-            const bt::Tensor& ctx_uncond = conditioning_.uncond_embeddings;
+        if (is_lcm) {
+            // LCM-distilled UNet: cond_proj path adds the guidance embedding
+            // to the time embedding. No CFG branch under LCM.
             u->forward(state.latent, state.H_lat, state.W_lat, t,
-                       ctx_uncond, cache_uncond, down_ptrs, mid_ptr,
-                       noise_pred_uncond_);
+                       conditioning_.guidance, ctx_cond, cache_cond,
+                       down_ptrs, mid_ptr, noise_pred_cond_);
+        } else {
+            u->forward(state.latent, state.H_lat, state.W_lat, t,
+                       ctx_cond, cache_cond, down_ptrs, mid_ptr,
+                       noise_pred_cond_);
+            if (do_cfg) {
+                const auto& cache_uncond =
+                    u->kv_cache_for(prepared_, Branch::Uncond);
+                const bt::Tensor& ctx_uncond =
+                    conditioning_.uncond_embeddings;
+                u->forward(state.latent, state.H_lat, state.W_lat, t,
+                           ctx_uncond, cache_uncond, down_ptrs, mid_ptr,
+                           noise_pred_uncond_);
+            }
         }
     } else if (trace_mode) {
         // Trace mode bypasses the K/V cache + INT8 inside the denoiser and

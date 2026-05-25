@@ -238,11 +238,24 @@ public:
     // corresponding skip tensor and is added (bt::add_inplace) onto the
     // skip BEFORE it is pushed onto the up-pass stack. `mid_residual`, if
     // non-null, is added to the mid_block output before the up pass reads
-    // it. Vanilla SD1.5 only — LCM cond_proj path is intentionally not
-    // wired (ControlNet has no LCM-distilled variant in the wild).
+    // it. Vanilla SD1.5 (time_cond_proj_dim == 0) only.
     void forward(const brotensor::Tensor& sample,
                  int H, int W,
                  float timestep,
+                 const brotensor::Tensor& encoder_hidden_states,
+                 const CrossAttnKVCache& xattn_cache,
+                 const std::vector<const brotensor::Tensor*>& down_residuals,
+                 const brotensor::Tensor* mid_residual,
+                 brotensor::Tensor& out);
+
+    // LCM (time_cond_proj_dim > 0) + ControlNet variant of the above.
+    // Identical contract except the guidance-scale embedding `w` is added
+    // via the loaded cond_proj path (matching the non-CN LCM forward
+    // overload). Throws if time_cond_proj_dim == 0.
+    void forward(const brotensor::Tensor& sample,
+                 int H, int W,
+                 float timestep,
+                 float guidance_scale_embedding,
                  const brotensor::Tensor& encoder_hidden_states,
                  const CrossAttnKVCache& xattn_cache,
                  const std::vector<const brotensor::Tensor*>& down_residuals,
