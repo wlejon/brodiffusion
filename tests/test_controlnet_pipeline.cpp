@@ -763,6 +763,62 @@ int main() {
         CHECK(nonfinite == 0);
     }
 
+    // ── 6. Trace + ControlNet (DDIM, 1 CN) ───────────────────────────────
+    // step_once with a non-null trace_out and ControlNet active must run
+    // the residual-aware traced UNet forward, populating one map per
+    // Transformer2D block (num_xattn_blocks() entries) at finite values.
+    {
+        auto tok = clip::Tokenizer::load(vp.string(), mp.string());
+        pl::Pipeline p(make_cfg(), std::move(tok));
+        p.load_weights(sd_file, "text_model.", "", "decoder.");
+        p.apply_controlnet(cn_file, cn_cfg);
+        auto opts = base_opts();
+        opts.control_image_path = ctrl_path.string();
+        opts.control_scale      = 1.0f;
+        auto state = p.prime("hi", opts);
+        brodiffusion::AttentionTrace trace;
+        p.step_once(state, opts, &trace);
+        const int n_blocks = p.num_xattn_blocks();
+        CHECK(static_cast<int>(trace.size()) == n_blocks);
+        CHECK(n_blocks > 0);
+        int nonfinite_maps = 0;
+        for (const auto& m : trace) {
+            const auto v = dl(m);
+            for (float f : v) if (!std::isfinite(f)) ++nonfinite_maps;
+        }
+        CHECK(nonfinite_maps == 0);
+    }
+
+    // ── 6b. Trace + ControlNet (LCM, 2 CNs) ──────────────────────────────
+    // Multi-CN residuals are pre-summed by Pipeline before the traced UNet
+    // forward sees them, so the trace overload only ever observes one
+    // summed down_ptrs / mid_residual. Combined with the LCM cond_proj
+    // path, this exercises every new seam at once.
+    {
+        auto tok = clip::Tokenizer::load(vp.string(), mp.string());
+        pl::Pipeline p(make_cfg_lcm(), std::move(tok));
+        p.load_weights(sd_lcm_file, "text_model.", "", "decoder.");
+        p.add_controlnet(cn_file, cn_cfg);
+        p.add_controlnet(cn_file, cn_cfg);
+        auto opts = base_opts();
+        opts.guidance_scale = 1.5f;
+        opts.controls = {
+            pl::ControlNetInput{ctrl_path.string(), 0.5f, 0.0f, 1.0f},
+            pl::ControlNetInput{ctrl_path.string(), 0.5f, 0.0f, 1.0f},
+        };
+        auto state = p.prime("hi", opts);
+        brodiffusion::AttentionTrace trace;
+        p.step_once(state, opts, &trace);
+        const int n_blocks = p.num_xattn_blocks();
+        CHECK(static_cast<int>(trace.size()) == n_blocks);
+        int nonfinite_maps = 0;
+        for (const auto& m : trace) {
+            const auto v = dl(m);
+            for (float f : v) if (!std::isfinite(f)) ++nonfinite_maps;
+        }
+        CHECK(nonfinite_maps == 0);
+    }
+
     // ── cleanup ──────────────────────────────────────────────────────────
     std::error_code ec;
     std::filesystem::remove(sd_path,     ec);

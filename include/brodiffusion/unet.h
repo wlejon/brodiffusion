@@ -299,6 +299,26 @@ public:
                        CrossAttnTrace* trace_out,
                        brotensor::Tensor& out);
 
+    // ControlNet-augmented trace forward. Same contract as forward_trace
+    // above plus the residual-add semantics of the residual-aware forward
+    // overload(s) — `down_residuals` and `mid_residual` follow the same
+    // shape / nullability rules. The residuals must already be summed
+    // across all registered ControlNets by the caller; the UNet does not
+    // know about the stacked-net layout. Supports both vanilla SD1.5 and
+    // LCM-distilled checkpoints via the `guidance_scale_embedding` pointer
+    // (same non-null-iff-LCM contract as the other trace overload). INT8
+    // (quantize_weights) is unsupported in trace mode and still throws.
+    void forward_trace(const brotensor::Tensor& sample,
+                       int H, int W,
+                       float timestep,
+                       const float* guidance_scale_embedding,
+                       const brotensor::Tensor& encoder_hidden_states,
+                       const std::vector<const brotensor::Tensor*>& down_residuals,
+                       const brotensor::Tensor* mid_residual,
+                       const std::vector<const brotensor::Tensor*>* attn_logit_biases,
+                       CrossAttnTrace* trace_out,
+                       brotensor::Tensor& out);
+
     // ── Denoiser trace seam ───────────────────────────────────────────────
     // Model-agnostic trace entry point. Adapts the generic PreparedConditioning
     // contract onto forward_trace: the raw text context and the LCM guidance

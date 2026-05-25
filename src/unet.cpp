@@ -580,6 +580,47 @@ void UNet::forward_trace(const bt::Tensor& sample,
                   /*down_residuals=*/nullptr, /*mid_residual=*/nullptr, out);
 }
 
+void UNet::forward_trace(const bt::Tensor& sample,
+                         int H, int W,
+                         float timestep,
+                         const float* guidance_scale_embedding,
+                         const bt::Tensor& encoder_hidden_states,
+                         const std::vector<const bt::Tensor*>& down_residuals,
+                         const bt::Tensor* mid_residual,
+                         const std::vector<const bt::Tensor*>* attn_logit_biases,
+                         CrossAttnTrace* trace_out,
+                         bt::Tensor& out) {
+    if (cfg_.quantize_weights) {
+        fail("forward_trace(controlnet): INT8 quantize_weights not yet "
+             "supported in trace mode");
+    }
+    if (guidance_scale_embedding != nullptr && cfg_.time_cond_proj_dim <= 0) {
+        fail("forward_trace(controlnet): guidance_scale_embedding supplied "
+             "but UNet was built with time_cond_proj_dim=0");
+    }
+    if (guidance_scale_embedding == nullptr && cfg_.time_cond_proj_dim > 0) {
+        fail("forward_trace(controlnet): UNet built with "
+             "time_cond_proj_dim>0 requires a guidance_scale_embedding "
+             "(LCM cond_proj path)");
+    }
+    const int n = num_xattn_blocks();
+    if (attn_logit_biases &&
+        static_cast<int>(attn_logit_biases->size()) != n) {
+        fail("forward_trace(controlnet): attn_logit_biases has " +
+             std::to_string(attn_logit_biases->size()) +
+             " entries, expected " + std::to_string(n));
+    }
+    if (trace_out) {
+        trace_out->resize(static_cast<std::size_t>(n));
+    }
+    const std::vector<const bt::Tensor*>* dr =
+        down_residuals.empty() ? nullptr : &down_residuals;
+    forward_impl_(sample, H, W, timestep, guidance_scale_embedding,
+                  encoder_hidden_states, /*xattn_cache=*/nullptr,
+                  attn_logit_biases, trace_out,
+                  dr, mid_residual, out);
+}
+
 // ─── LoRA merge ────────────────────────────────────────────────────────────
 //
 // Resolve a diffusers tensor path to the corresponding base weight
