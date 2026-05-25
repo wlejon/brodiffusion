@@ -17,6 +17,7 @@
 #include "brodiffusion/detail/compute.h"
 #include "brodiffusion/detail/safetensors_dir.h"
 #include "brodiffusion/detail/torch_rng.h"
+#include "brodiffusion/image_io.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -112,6 +113,60 @@ void scheduler_step(SchedulerVariant& sched, const bt::Tensor& pred,
     }
 }
 
+// Build an EncoderConfig from a DecoderConfig. The two structs share fields
+// by design — both describe the same SD1.5 AutoencoderKL with mirrored
+// topology. Used by Pipeline's encoder member so callers don't have to
+// duplicate channel counts in PipelineConfig.
+vae::EncoderConfig encoder_config_from_decoder(const vae::DecoderConfig& d) {
+    vae::EncoderConfig e;
+    e.in_channels         = d.in_channels;
+    e.out_channels        = d.out_channels;
+    e.block_out_channels  = d.block_out_channels;
+    e.layers_per_block    = d.layers_per_block;
+    e.norm_num_groups     = d.norm_num_groups;
+    e.scaling_factor      = d.scaling_factor;
+    e.shift_factor        = d.shift_factor;
+    e.eps                 = d.eps;
+    e.num_attention_heads = d.num_attention_heads;
+    return e;
+}
+
+// Derive the encoder-weight prefix from a decoder-weight prefix by stripping
+// a trailing "decoder." and appending "encoder.". This keeps the existing
+// (text, unet, vae) 3-prefix load_weights signature working for img2img:
+// callers don't pass an explicit encoder prefix because in every diffusers /
+// CompVis layout we've seen, the encoder is a sibling subtree of the decoder
+// under the same VAE parent.
+std::string encoder_prefix_from_decoder(const std::string& vae_prefix) {
+    const std::string tail = "decoder.";
+    if (vae_prefix.size() >= tail.size() &&
+        vae_prefix.compare(vae_prefix.size() - tail.size(), tail.size(),
+                           tail) == 0) {
+        return vae_prefix.substr(0, vae_prefix.size() - tail.size()) +
+               "encoder.";
+    }
+    // Fallback: caller passed something unusual — just append "encoder.".
+    return vae_prefix + "encoder.";
+}
+
+// img2img t_start: how many steps to skip at the front of the schedule.
+//   init_timestep = max(1, floor(n_steps * strength))   (clamped to 1..n_steps)
+//   t_start       = n_steps - init_timestep             (clamped to 0..n_steps-1)
+// strength=1.0 -> t_start=0 (full schedule); strength near 0 -> t_start near
+// n_steps - 1 (almost no denoising). Mirrors diffusers'
+// StableDiffusionImg2ImgPipeline.get_timesteps.
+int img2img_t_start(int n_steps, float strength) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    int init_t = static_cast<int>(static_cast<float>(n_steps) * strength);
+    if (init_t < 1) init_t = 1;
+    if (init_t > n_steps) init_t = n_steps;
+    int t_start = n_steps - init_t;
+    if (t_start < 0) t_start = 0;
+    if (t_start >= n_steps) t_start = n_steps - 1;
+    return t_start;
+}
+
 // Construct the denoiser matching the model class.
 std::unique_ptr<Denoiser> make_denoiser(const PipelineConfig& cfg) {
     if (cfg.model_class == ModelClass::Flux) {
@@ -129,6 +184,7 @@ Pipeline::Pipeline(const PipelineConfig& cfg, brolm::clip::Tokenizer tokenizer)
       text_encoder_(cfg.text_encoder),
       denoiser_(make_denoiser(cfg)),
       vae_(cfg.vae),
+      vae_encoder_(encoder_config_from_decoder(cfg.vae)),
       scheduler_(make_scheduler(cfg.scheduler)) {
     if (cfg.model_class == ModelClass::Flux) {
         fail("Pipeline: Flux model_class requires the (cfg, clip_tok, t5_tok) "
@@ -146,6 +202,7 @@ Pipeline::Pipeline(const PipelineConfig& cfg, brolm::clip::Tokenizer clip_tok,
       t5_encoder_(std::in_place, cfg.t5),
       denoiser_(make_denoiser(cfg)),
       vae_(cfg.vae),
+      vae_encoder_(encoder_config_from_decoder(cfg.vae)),
       scheduler_(make_scheduler(cfg.scheduler)) {
     if (cfg.model_class != ModelClass::Flux) {
         fail("Pipeline: the (cfg, clip_tok, t5_tok) constructor requires "
@@ -201,6 +258,11 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir) {
 
         p.text_encoder_.load_weights(te_files.front(), "text_model.");
         p.vae_.load_weights(vae_files.front(), "decoder.");
+        // Load the VAE encoder too — Flux img2img isn't wired yet, but the
+        // diffusers Flux VAE ships an encoder and loading it now keeps the
+        // model-dir load complete (and matches the SD branch which loads
+        // the encoder via the (text, unet, vae) load_weights overload).
+        p.vae_encoder_.load_weights(vae_files.front(), "encoder.");
 
         std::vector<const brotensor::safetensors::File*> tf_ptrs;
         for (const auto& f : tf_files) tf_ptrs.push_back(&f);
@@ -241,6 +303,11 @@ void Pipeline::load_weights(const brotensor::safetensors::File& f,
     text_encoder_.load_weights(f, text_prefix);
     denoiser_->load_weights(f, unet_prefix);
     vae_.load_weights(f, vae_prefix);
+    // The encoder prefix is derived from the decoder prefix: strip trailing
+    // "decoder." and append "encoder." (so "first_stage_model.decoder." ->
+    // "first_stage_model.encoder."). Encoder's load_weights handles the
+    // sibling quant_conv lookup off its parent automatically.
+    vae_encoder_.load_weights(f, encoder_prefix_from_decoder(vae_prefix));
 }
 
 void Pipeline::load_weights(const brotensor::safetensors::File& text_file,
@@ -249,6 +316,8 @@ void Pipeline::load_weights(const brotensor::safetensors::File& text_file,
     text_encoder_.load_weights(text_file, "text_model.");
     denoiser_->load_weights(unet_file, "");
     vae_.load_weights(vae_file, "decoder.");
+    // Encoder lives in the same diffusers VAE safetensors as the decoder.
+    vae_encoder_.load_weights(vae_file, "encoder.");
 }
 
 void Pipeline::apply_lora(const brotensor::safetensors::File& f, float scale) {
@@ -303,6 +372,15 @@ PipelineState Pipeline::prime(std::string_view prompt,
         fail("height and width must be positive multiples of 8");
     }
     if (opts.num_inference_steps <= 0) fail("num_inference_steps must be positive");
+    if (!opts.init_image_path.empty() && !opts.init_noise.empty()) {
+        fail("prime: init_image_path and init_noise cannot both be set "
+             "(img2img and explicit-noise priming are mutually exclusive)");
+    }
+    if (!opts.init_image_path.empty() &&
+        model_class_ != ModelClass::StableDiffusion) {
+        fail("prime: img2img (init_image_path) is currently SD1.5 only; "
+             "Flux img2img is not yet supported");
+    }
 
     const int H_lat = opts.height / 8;
     const int W_lat = opts.width  / 8;
@@ -365,7 +443,7 @@ PipelineState Pipeline::prime(std::string_view prompt,
     // across all branched states.
     prepared_ = denoiser_->prepare(conditioning_);
 
-    // 2. Build the initial state.
+    // 2. Build the initial state shell (latent assigned below).
     PipelineState state;
     state.H_lat = H_lat;
     state.W_lat = W_lat;
@@ -374,6 +452,68 @@ PipelineState Pipeline::prime(std::string_view prompt,
     state.rng_key = opts.seed;
     const float sigma = std::visit(
         [](const auto& s) { return s.init_noise_sigma(); }, scheduler_);
+
+    // 3. Set the timestep schedule (lives on the scheduler — shared across
+    // all branches). FlowMatch with dynamic shifting (flux-dev) needs the
+    // image token count; DDIM / LCM ignore the second argument. We set the
+    // schedule *before* building the initial latent so img2img can pick a
+    // t_start off the populated timesteps_ vector.
+    const int image_seq_len = (H_lat / 2) * (W_lat / 2);
+    std::visit([&](auto& s) {
+        using S = std::decay_t<decltype(s)>;
+        if constexpr (std::is_same_v<S, scheduler::FlowMatch>) {
+            s.set_timesteps(opts.num_inference_steps, image_seq_len);
+        } else {
+            s.set_timesteps(opts.num_inference_steps);
+        }
+    }, scheduler_);
+    state.n_steps = std::visit(
+        [](const auto& s) { return s.num_inference_steps(); }, scheduler_);
+
+    if (!opts.init_image_path.empty()) {
+        // ── img2img: VAE-encode the init image, then noise it to t_start ──
+        // Counter layout for the img2img Philox stream:
+        //   counter 0..n_lat               : add_noise noise (reuses the
+        //                                    txt2img initial-latent slot,
+        //                                    which is unused here).
+        //   counter n_lat..2*n_lat         : VAE encoder eps when
+        //                                    vae_encode_sample is true.
+        //   counter (1+step)*n_lat..       : LCM per-step noise (unchanged).
+        // The eps slot at offset n_lat does NOT collide with the LCM
+        // per-step slots because LCM starts at counter (1+0)*n_lat = n_lat
+        // — but step 0's noise is only drawn on the *first* step_once(), by
+        // which time we've already consumed eps. Treat them as
+        // non-overlapping in time even though the counter ranges abut.
+        bt::Tensor image_nchw = load_image_as_latent_input(
+            opts.init_image_path, opts.width, opts.height);
+
+        bt::Tensor x0_latent;
+        if (opts.vae_encode_sample) {
+            bt::Tensor eps;
+            randn_compute(opts.seed,
+                          static_cast<std::uint64_t>(n_lat),
+                          n_lat, eps);
+            vae_encoder_.encode(image_nchw, opts.height, opts.width,
+                                &eps, x0_latent);
+        } else {
+            vae_encoder_.encode(image_nchw, opts.height, opts.width,
+                                /*eps=*/nullptr, x0_latent);
+        }
+
+        // Draw the add-noise noise (raw N(0,1)) from counter 0 — same
+        // Philox slot a txt2img run would have used for its initial latent.
+        bt::Tensor noise;
+        randn_compute(opts.seed, 0, n_lat, noise);
+
+        const int t_start = img2img_t_start(state.n_steps, opts.strength);
+        std::visit([&](auto& s) {
+            s.add_noise(x0_latent, noise, t_start, state.latent, scratch_);
+        }, scheduler_);
+        state.step_index = t_start;
+        return state;
+    }
+
+    // ── txt2img: initial latent is pure Gaussian noise * init_noise_sigma ──
     if (!opts.init_noise.empty()) {
         // Caller-supplied initial noise (raw N(0,1)); used for exact
         // cross-implementation comparison. Still scaled by init_noise_sigma.
@@ -405,20 +545,6 @@ PipelineState Pipeline::prime(std::string_view prompt,
         if (sigma != 1.0f) bt::scale_inplace(state.latent, sigma);
     }
 
-    // 3. Set the timestep schedule (lives on the scheduler — shared across
-    // all branches). FlowMatch with dynamic shifting (flux-dev) needs the
-    // image token count; DDIM / LCM ignore the second argument.
-    const int image_seq_len = (H_lat / 2) * (W_lat / 2);
-    std::visit([&](auto& s) {
-        using S = std::decay_t<decltype(s)>;
-        if constexpr (std::is_same_v<S, scheduler::FlowMatch>) {
-            s.set_timesteps(opts.num_inference_steps, image_seq_len);
-        } else {
-            s.set_timesteps(opts.num_inference_steps);
-        }
-    }, scheduler_);
-    state.n_steps = std::visit(
-        [](const auto& s) { return s.num_inference_steps(); }, scheduler_);
     state.step_index = 0;
     return state;
 }
@@ -507,7 +633,10 @@ std::vector<float> Pipeline::decode(const PipelineState& state) {
 std::vector<float> Pipeline::generate(std::string_view prompt,
                                        const GenerateOptions& opts) {
     PipelineState state = prime(prompt, opts);
-    for (int i = 0; i < state.n_steps; ++i) {
+    // img2img priming sets state.step_index to a non-zero start (t_start);
+    // txt2img leaves it at 0. Loop until the schedule is exhausted —
+    // step_once increments step_index itself.
+    while (state.step_index < state.n_steps) {
         step_once(state, opts, /*trace_out=*/nullptr);
     }
     return decode(state);

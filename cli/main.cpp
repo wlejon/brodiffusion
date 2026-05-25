@@ -45,6 +45,8 @@ static int usage() {
         "                       [--latent-in <f32>] [--latent-out <f32>]\n"
         "                       [--lora <path>[:<scale>]]... [--lcm-lora <path>]\n"
         "                       [--quantize-unet]\n"
+        "  brodiffusion img2img --init <png> [--strength F] [--vae-sample]\n"
+        "                       (all txt2img flags also accepted; SD1.5 only)\n"
         "  brodiffusion bench   --text <st> --unet <st> --vae <st>\n"
         "                       --vocab <vocab.json> --merges <merges.txt>\n"
         "                       [--steps N] [--iters N] [--warmup N]\n"
@@ -208,6 +210,12 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     const char* width_s  = arg_after(argc, argv, "--width");
     const char* height_s = arg_after(argc, argv, "--height");
     const char* seed_s   = arg_after(argc, argv, "--seed");
+    const char* init_path = arg_after(argc, argv, "--init");
+    const char* strength_s = arg_after(argc, argv, "--strength");
+    bool vae_sample = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--vae-sample") == 0) vae_sample = true;
+    }
 
     if (!prompt || !out_path) {
         std::fprintf(stderr,
@@ -232,6 +240,20 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     if (height_s) opts.height = std::atoi(height_s);
     if (seed_s)   opts.seed =
         static_cast<std::uint64_t>(std::strtoull(seed_s, nullptr, 10));
+
+    if (init_path) {
+        if (is_flux) {
+            std::fprintf(stderr,
+                "img2img: --init is not supported for Flux model dirs "
+                "(SD1.5 only for now)\n");
+            return 2;
+        }
+        opts.init_image_path   = init_path;
+        opts.vae_encode_sample = vae_sample;
+        if (strength_s) {
+            opts.strength = static_cast<float>(std::atof(strength_s));
+        }
+    }
 
     std::printf("Generating %dx%d, %d steps, CFG=%.1f, seed=%llu\n",
                 opts.width, opts.height, opts.num_inference_steps,
@@ -267,10 +289,19 @@ int run_txt2img(int argc, char** argv) {
     const char* noise_s     = arg_after(argc, argv, "--noise");
     const char* latent_in   = arg_after(argc, argv, "--latent-in");
     const char* latent_out  = arg_after(argc, argv, "--latent-out");
+    // img2img flags: --init <png> [--strength F] [--vae-sample]. When --init
+    // is present, the same code path constructs the pipeline and just sets
+    // the img2img opts; the `img2img` subcommand routes here too. Keeping
+    // them merged avoids duplicating the full --text/--unet/--vae setup; a
+    // future PR can split if either branch grows.
+    const char* init_path   = arg_after(argc, argv, "--init");
+    const char* strength_s  = arg_after(argc, argv, "--strength");
 
     bool quantize_unet = false;
+    bool vae_sample    = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--quantize-unet") == 0) quantize_unet = true;
+        if (std::strcmp(argv[i], "--vae-sample") == 0)    vae_sample    = true;
     }
 
     if (!text_path || !unet_path || !vae_path ||
@@ -325,6 +356,21 @@ int run_txt2img(int argc, char** argv) {
         } else {
             std::fprintf(stderr,
                 "txt2img: --noise must be 'internal' or 'torch'\n");
+            return 2;
+        }
+    }
+
+    // img2img wiring — empty init_image_path => txt2img (existing behavior).
+    if (init_path) {
+        opts.init_image_path   = init_path;
+        opts.vae_encode_sample = vae_sample;
+        if (strength_s) {
+            opts.strength = static_cast<float>(std::atof(strength_s));
+        }
+        if (latent_in) {
+            std::fprintf(stderr,
+                "img2img: --latent-in is incompatible with --init "
+                "(use one or the other)\n");
             return 2;
         }
     }
@@ -488,6 +534,23 @@ int main(int argc, char** argv) {
             return run_txt2img(argc, argv);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "txt2img: %s\n", e.what());
+            return 1;
+        }
+    }
+    // img2img is sugar for txt2img + img2img-specific flags. Both subcommands
+    // share run_txt2img — the active branch is selected by whether --init was
+    // passed. (img2img without --init falls back to txt2img with a friendly
+    // error from the option-parsing layer.)
+    if (std::strcmp(argv[1], "img2img") == 0) {
+        try {
+            if (!arg_after(argc, argv, "--init")) {
+                std::fprintf(stderr,
+                    "img2img: --init <png> is required\n");
+                return 2;
+            }
+            return run_txt2img(argc, argv);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "img2img: %s\n", e.what());
             return 1;
         }
     }

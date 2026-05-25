@@ -397,6 +397,59 @@ void build_vae(const fs::path& dir) {
           fp16_seq(static_cast<std::size_t>(out_ch) * first_C * 9, 0.04f));
     b.add(p + "conv_out.bias",   {out_ch}, fp16_zeros(out_ch));
 
+    // ── Encoder weights (mirror Decoder topology, forward channel order) ──
+    // Pipeline now loads the encoder unconditionally from a model dir; the
+    // tensors must exist even though Flux img2img isn't supported yet.
+    {
+        const std::string ep = "encoder.";
+        const int twoC = 2 * in_ch;
+        b.add(ep + "conv_in.weight", {first_C, out_ch, 3, 3},
+              fp16_seq(static_cast<std::size_t>(first_C) * out_ch * 9, 0.05f, 600));
+        b.add(ep + "conv_in.bias",   {first_C}, fp16_zeros(first_C));
+
+        int Ce_prev = first_C;
+        for (int i = 0; i < nb; ++i) {
+            const int C_block = kVaeBlocks[static_cast<std::size_t>(i)];
+            for (int j = 0; j < kVaeLayers; ++j) {
+                const int Ci = (j == 0) ? Ce_prev : C_block;
+                emit_resnet(b, ep + "down_blocks." + std::to_string(i) +
+                            ".resnets." + std::to_string(j) + ".",
+                            Ci, C_block);
+            }
+            if (i + 1 < nb) {
+                const std::string dp = ep + "down_blocks." +
+                                       std::to_string(i) +
+                                       ".downsamplers.0.conv.";
+                b.add(dp + "weight", {C_block, C_block, 3, 3},
+                      fp16_seq(static_cast<std::size_t>(C_block) * C_block * 9,
+                               0.02f, static_cast<std::size_t>(700 + i)));
+                b.add(dp + "bias",   {C_block}, fp16_zeros(C_block));
+            }
+            Ce_prev = C_block;
+        }
+
+        emit_resnet(b, ep + "mid_block.resnets.0.", mid_C, mid_C);
+        emit_resnet(b, ep + "mid_block.resnets.1.", mid_C, mid_C);
+
+        const std::string eap = ep + "mid_block.attentions.0.";
+        b.add(eap + "group_norm.weight", {mid_C}, fp16_ones(mid_C));
+        b.add(eap + "group_norm.bias",   {mid_C}, fp16_zeros(mid_C));
+        b.add(eap + "query.weight",      {mid_C, mid_C}, WC(611));
+        b.add(eap + "query.bias",        {mid_C}, fp16_zeros(mid_C));
+        b.add(eap + "key.weight",        {mid_C, mid_C}, WC(613));
+        b.add(eap + "key.bias",          {mid_C}, fp16_zeros(mid_C));
+        b.add(eap + "value.weight",      {mid_C, mid_C}, WC(617));
+        b.add(eap + "value.bias",        {mid_C}, fp16_zeros(mid_C));
+        b.add(eap + "proj_attn.weight",  {mid_C, mid_C}, WC(619));
+        b.add(eap + "proj_attn.bias",    {mid_C}, fp16_zeros(mid_C));
+
+        b.add(ep + "conv_norm_out.weight", {mid_C}, fp16_ones(mid_C));
+        b.add(ep + "conv_norm_out.bias",   {mid_C}, fp16_zeros(mid_C));
+        b.add(ep + "conv_out.weight", {twoC, mid_C, 3, 3},
+              fp16_seq(static_cast<std::size_t>(twoC) * mid_C * 9, 0.04f, 631));
+        b.add(ep + "conv_out.bias",   {twoC}, fp16_zeros(twoC));
+    }
+
     b.write(dir / "vae" / "diffusion_pytorch_model.safetensors");
     std::string blocks = "[";
     for (std::size_t i = 0; i < kVaeBlocks.size(); ++i) {

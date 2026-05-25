@@ -120,6 +120,30 @@ struct GenerateOptions {
     // difference is attributable to the model, not the RNG. The scheduler's
     // init_noise_sigma is still applied on top.
     std::vector<float> init_noise;
+
+    // ── img2img / inpaint priming ─────────────────────────────────────────
+    // If non-empty, prime() encodes this image with the VAE encoder and
+    // noises it to the appropriate point in the schedule (governed by
+    // `strength`) instead of starting from pure Gaussian noise. The image
+    // is decoded by broimage and resized to (width, height). For img2img
+    // the model only denoises the remaining (1 - strength) fraction of the
+    // schedule, so the generated image stays close to the init.
+    //
+    // SD1.5 only for now; throws on Flux. Empty path = txt2img (existing
+    // behavior). Throws if both init_image_path and init_noise are set.
+    // noise_source / init_noise are ignored when init_image_path is set.
+    std::string init_image_path;
+
+    // 0..1. Higher = more noise added = more freedom from the init image.
+    // 1.0 reduces to (almost) full-schedule txt2img against the encoded init.
+    // Ignored when init_image_path is empty.
+    float strength = 0.8f;
+
+    // VAE encode mode: deterministic (use the mean, default) or sampled
+    // (mean + exp(0.5*logvar) * eps, where eps is drawn from the same Philox
+    // stream as the schedule noise at a non-overlapping counter offset).
+    // Ignored when init_image_path is empty.
+    bool vae_encode_sample = false;
 };
 
 class Pipeline {
@@ -242,6 +266,12 @@ private:
     std::optional<brolm::t5::TextEncoder> t5_encoder_;     // Flux only
     std::unique_ptr<Denoiser> denoiser_;
     vae::Decoder              vae_;
+    // VAE encoder mirrors vae_; used by img2img / inpaint priming. Always
+    // constructed (config derived from cfg.vae); weights are loaded by every
+    // load_weights() overload. SD1.5 only — the Flux img2img path is TODO.
+    // Robustness: if encoder weights are missing in the safetensors file
+    // (some decoder-only derivative checkpoints), the load throws clearly.
+    vae::Encoder              vae_encoder_;
     std::variant<scheduler::DDIM, scheduler::LCM, scheduler::FlowMatch>
         scheduler_;
 
