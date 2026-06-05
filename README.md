@@ -3,24 +3,37 @@
 Diffusion-model inference for the bro stack. Pure C++20, built on
 [brotensor](https://github.com/wlejon/brotensor) (tensor + compute kernels),
 [bromath](https://github.com/wlejon/bromath) (scalar / RNG / color helpers),
-and [brolm](https://github.com/wlejon/brolm) (tokenizers + text encoders —
-brodiffusion's text frontend). Runs **CPU-by-default and on a GPU when one is
-available** — FP32 on the CPU backend, FP16 on a GPU — with the device chosen
-at runtime.
+[brolm](https://github.com/wlejon/brolm) (tokenizers + text encoders —
+brodiffusion's text frontend), and
+[broimage](https://github.com/wlejon/broimage) (image decode/encode + host
+preproc, used by img2img / inpaint priming and PNG output). Runs
+**CPU-by-default and on a GPU when one is available** — FP32 on the CPU
+backend, FP16 on a GPU — with the device chosen at runtime.
 
 ## Status
 
-Functional SD1.5 text-to-image inference on the CPU (FP32), CUDA (FP16), and
-Metal (FP16) backends. 
+Functional text-to-image inference on the CPU (FP32), CUDA (FP16), and Metal
+(FP16) backends. Two model families:
+
+- **Stable Diffusion 1.5** — U-Net + CLIP text encoder, DDIM / LCM schedulers,
+  txt2img / img2img / inpaint, ControlNet, LoRA, and optional INT8 (W8A16)
+  U-Net weights.
+- **Flux.1** — DiT (`FluxTransformer2DModel`) + CLIP-pooled + T5-XXL text
+  encoders, rectified-flow (flow-match Euler) scheduler, txt2img.
 
 | Header | Purpose |
 |---|---|
+| `brodiffusion/denoiser.h` | model-agnostic noise / velocity-prediction backbone the pipeline owns (`Denoiser`, `Conditioning`, `AttentionTrace`) |
 | `brodiffusion/unet.h` | SD1.5 U-Net — ResBlock + cross-attention + down/up; optional INT8 weights |
-| `brodiffusion/vae.h` | VAE decoder (latents → RGB) |
+| `brodiffusion/dit/flux.h` | Flux.1 DiT denoiser — double/single-stream joint-attention blocks, axial RoPE, velocity prediction |
+| `brodiffusion/vae.h` | VAE decoder (latents → RGB) **and** encoder (RGB → latents, for img2img / inpaint) |
+| `brodiffusion/controlnet.h` | SD1.5 ControlNet — encoder/mid half + zero-convs producing residuals onto the U-Net skips |
 | `brodiffusion/scheduler.h` | DDIM sampler (eta = 0, deterministic) |
 | `brodiffusion/lcm_scheduler.h` | LCM (latent-consistency) sampler for distilled checkpoints |
+| `brodiffusion/flow_match_scheduler.h` | rectified-flow Euler sampler for Flux / SD3 (continuous sigma schedule, velocity update) |
 | `brodiffusion/lora.h` | LoRA merging — kohya-ss/A1111 and diffusers/PEFT key conventions |
-| `brodiffusion/pipeline.h` | high-level txt2img pipeline + step-wise (`prime`/`step_once`/`decode`) API |
+| `brodiffusion/model_config.h` | parse a diffusers model directory's JSON configs (`model_index.json` + component configs) into brodiffusion's arch structs; auto-detects SD1.5 vs Flux |
+| `brodiffusion/pipeline.h` | high-level pipeline (`generate`, `from_model_dir`) + step-wise (`prime`/`step_once`/`decode`) API + cross-attention trace / logit-bias steering |
 | `brodiffusion/fused_resblock.h`, `fused_transformer.h` | SD1.5-tuned fused kernels (CUDA + Metal, with CPU fallbacks) |
 | `brodiffusion/optim.h` | mixed-precision Adam (FP16 weights, FP32 master copy) for fine-tuning |
 
@@ -72,13 +85,14 @@ projects/
 ├── bromath/          # ../bromath    (header-only math)
 ├── brotensor/        # ../brotensor  (tensor + compute, CPU + GPU)
 ├── brolm/            # ../brolm      (tokenizers + text encoders)
+├── broimage/         # ../broimage   (image decode/encode + host preproc)
 └── brodiffusion/     # this repo
 ```
 
-CMake first looks for siblings at `../bromath`, `../brotensor`, and
-`../brolm`; if not found, it falls back to the matching `third_party/`
+CMake first looks for siblings at `../bromath`, `../brotensor`, `../brolm`,
+and `../broimage`; if not found, it falls back to the matching `third_party/`
 submodules. Override paths with `-DBROMATH_DIR=...` / `-DBROTENSOR_DIR=...` /
-`-DBROLM_DIR=...`.
+`-DBROLM_DIR=...` / `-DBROIMAGE_DIR=...`.
 
 ## Weights
 
@@ -88,9 +102,12 @@ Model weights are not bundled. A download script fetches them into
 
 ```bash
 # macOS / Linux — fetches straight from Hugging Face with curl (no hf CLI).
-scripts/download-weights.sh sd15             # SD1.5 components
-scripts/download-weights.sh lcm-dreamshaper  # LCM-distilled Dreamshaper-7
-scripts/download-weights.sh clip-vit-l-14    # OpenAI CLIP ViT-L/14
+scripts/download-weights.sh sd15                # SD1.5 components
+scripts/download-weights.sh lcm-dreamshaper     # LCM-distilled Dreamshaper-7
+scripts/download-weights.sh clip-vit-l-14       # OpenAI CLIP ViT-L/14
+scripts/download-weights.sh flux-schnell        # Flux.1-schnell (sharded; ~34 GB)
+scripts/download-weights.sh t5-xxl              # just the T5-XXL text encoder (~9.5 GB)
+scripts/download-weights.sh controlnet-canny    # SD1.5 ControlNet (also -depth / -openpose)
 ```
 
 ```powershell
@@ -102,31 +119,59 @@ pwsh scripts/download-weights.ps1 -Model clip-vit-l-14
 
 For rate-limited repos, export `HF_TOKEN=hf_...` before running the `.sh`.
 
-Each model downloads diffusers-format component files — `text_encoder/`,
-`unet/`, `vae/`, and the `tokenizer/` `vocab.json` + `merges.txt`. The
-`weights/` directory is gitignored.
+SD1.5-family models download diffusers-format component files — `text_encoder/`,
+`unet/`, `vae/`, the `tokenizer/` `vocab.json` + `merges.txt`, and each
+component's `config.json` plus the root `model_index.json` (so the directory
+loads directly via `--model`). Flux additionally fetches the sharded
+`transformer/` and T5-XXL `text_encoder_2/` (discovered from each
+`*.index.json`). The ControlNet targets fetch the residual network plus the
+model card's example control image. The `weights/` directory is gitignored.
 
 ## CLI
+
+The simplest invocation points `--model` at a downloaded diffusers model
+directory; the loader reads `model_index.json`, detects SD1.5 vs Flux, and
+loads every component + tokenizer:
 
 ```bash
 brodiffusion --version
 
+# Whole model directory (SD1.5 or Flux, auto-detected).
+brodiffusion txt2img --model <dir> --prompt "a cat astronaut" --out cat.png \
+                     [--negative <text>] [--steps N] [--cfg F] \
+                     [--width N] [--height N] [--seed N]
+
+# Explicit per-component SD1.5 files.
 brodiffusion txt2img --text  <text_encoder.safetensors> \
                      --unet  <unet.safetensors> \
                      --vae   <vae.safetensors> \
                      --vocab <vocab.json> --merges <merges.txt> \
-                     --prompt "a cat astronaut" --out cat.ppm \
+                     --prompt "a cat astronaut" --out cat.png \
                      [--negative <text>] [--steps N] [--cfg F] \
                      [--width N] [--height N] [--seed N] \
-                     [--scheduler ddim|lcm] \
+                     [--scheduler ddim|lcm] [--noise internal|torch] \
+                     [--latent-in <f32>] [--latent-out <f32>] \
                      [--lora <path>[:<scale>]]... [--lcm-lora <path>] \
-                     [--quantize-unet]
+                     [--quantize-unet] \
+                     [--control <weights> --control-image <png> \
+                      [--control-scale F] [--control-window S:E]]...
 
-brodiffusion bench   --text <st> --unet <st> --vae <st> \
-                     --vocab <vocab.json> --merges <merges.txt> \
-                     [--steps N] [--iters N] [--warmup N] [--scheduler ddim|lcm]
+brodiffusion img2img  --init <png> [--strength F] [--vae-sample] ...   # SD1.5 only
+brodiffusion inpaint  --init <png> --mask <png> [--strength F] ...     # SD1.5 only
+brodiffusion make-mask --out <png> [--width N] [--height N]            # center-square mask
+brodiffusion t5       --weights <st> --tokenizer <json> --prompt <text> \
+                      [--max-length N] [--quantize]                    # T5-XXL encoder check
+
+brodiffusion bench    --text <st> --unet <st> --vae <st> \
+                      --vocab <vocab.json> --merges <merges.txt> \
+                      [--steps N] [--iters N] [--warmup N] \
+                      [--scheduler ddim|lcm] [--lora <path>[:<scale>]]...
 ```
 
+- `--model <dir>` loads a diffusers model directory (`model_index.json` +
+  component subdirs). Detects SD1.5 vs Flux automatically; the explicit
+  `--text` / `--unet` / `--vae` / `--vocab` / `--merges` flags are then unused.
+  Flux defaults `--steps` to 4 (flux-schnell).
 - `--scheduler lcm` selects the LCM (Latent Consistency Model) scheduler;
   requires an LCM-distilled U-Net checkpoint (e.g. `SimianLuo/LCM_Dreamshaper_v7`).
   Default `--steps` becomes 4 and the unconditional pass is skipped.
@@ -135,11 +180,22 @@ brodiffusion bench   --text <st> --unet <st> --vae <st> \
   kohya-ss/A1111 and diffusers/PEFT key conventions are auto-detected.
 - `--lcm-lora <path>` is sugar for running an LCM-LoRA on a vanilla SD1.5 U-Net.
 - `--quantize-unet` quantizes U-Net weights to INT8 (W8A16); GPU-only.
+- `--control <weights> --control-image <png>` registers a ControlNet (SD1.5
+  only). Repeat the group to stack multiple nets — residuals are summed
+  position-wise, each weighted by its `--control-scale` (default 1.0).
+  `--control-window S:E` restricts a net to a half-open fraction of the
+  schedule (default `0:1` = full).
+- `img2img` / `inpaint` re-use the txt2img flags; `--init` encodes a source
+  image with the VAE encoder and noises it per `--strength`. `inpaint` adds a
+  binary `--mask` (white = inpaint, black = keep); `make-mask` writes a
+  center-square mask to feed it.
+- `--noise torch` makes `--seed` reproduce a PyTorch reference run's starting
+  latent; `--latent-in` / `--latent-out` load / dump the raw float32 latent for
+  cross-implementation diffing.
 
-`--out` writes an uncompressed PPM (`P6`) — a development convenience for
-sanity-checking generation. The library itself does not encode images:
-`Pipeline::generate()` returns an RGB host buffer (`3 * H * W` FP32 values,
-NCHW, in `[-1, 1]`) and the consumer encodes as it sees fit.
+`--out` writes an RGB **PNG** via broimage. The library itself stays
+codec-agnostic: `Pipeline::generate()` returns an RGB host buffer (`3 * H * W`
+FP32 values, NCHW, in `[-1, 1]`) and the consumer encodes as it sees fit.
 
 ## Tests
 
