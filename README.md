@@ -13,13 +13,24 @@ backend, FP16 on a GPU — with the device chosen at runtime.
 ## Status
 
 Functional text-to-image inference on the CPU (FP32), CUDA (FP16), and Metal
-(FP16) backends. Two model families:
+(FP16) backends. Two image model families:
 
 - **Stable Diffusion 1.5** — U-Net + CLIP text encoder, DDIM / LCM schedulers,
   txt2img / img2img / inpaint, ControlNet, LoRA, and optional INT8 (W8A16)
   U-Net weights.
 - **Flux.1** — DiT (`FluxTransformer2DModel`) + CLIP-pooled + T5-XXL text
   encoders, rectified-flow (flow-match Euler) scheduler, txt2img.
+
+A third path, **TripoSplat** (single-image → 3D Gaussian splats, the generative
+core of [VAST-AI/TripoSplat](https://huggingface.co/VAST-AI/TripoSplat)), is
+implemented as a library module — a Flux.2 VAE image encoder, a flow-matching
+DiT (`LatentSeqMMFlowModel`), the rectified-flow Euler CFG sampler, and the
+`OctreeGaussianDecoder` that turns the clean latent into an explicit 3D Gaussian
+cloud (up to 262144 splats). brodiffusion owns this generative core only; the
+image encoders (DINOv3 + BiRefNet) live in brovisionml and the renderer /
+`GaussianSplatCloud` container lives in bromesh, with `bro` compositing the
+three. It is not yet wired into the CLI — drive it through the headers under
+`brodiffusion/triposplat/`.
 
 | Header | Purpose |
 |---|---|
@@ -36,6 +47,10 @@ Functional text-to-image inference on the CPU (FP32), CUDA (FP16), and Metal
 | `brodiffusion/pipeline.h` | high-level pipeline (`generate`, `from_model_dir`) + step-wise (`prime`/`step_once`/`decode`) API + cross-attention trace / logit-bias steering |
 | `brodiffusion/fused_resblock.h`, `fused_transformer.h` | SD1.5-tuned fused kernels (CUDA + Metal, with CPU fallbacks) |
 | `brodiffusion/optim.h` | mixed-precision Adam (FP16 weights, FP32 master copy) for fine-tuning |
+| `brodiffusion/triposplat/vae_encoder.h` | TripoSplat — Flux.2 VAE image encoder (image → 128-d conditioning tokens, `feature2`) |
+| `brodiffusion/triposplat/flow_model.h` | TripoSplat — flow-matching DiT (`LatentSeqMMFlowModel`): content-dependent 3D RoPE, QK-RMSNorm, adaLN-single |
+| `brodiffusion/triposplat/sampler.h` | TripoSplat — rectified-flow Euler CFG sampler integrating the flow DiT to a clean latent |
+| `brodiffusion/triposplat/octree_decoder.h` | TripoSplat — `OctreeGaussianDecoder`: octree structure predictor + elastic Gaussian head (latent → 3D Gaussian cloud) |
 
 ## Build
 
@@ -115,6 +130,17 @@ scripts/download-weights.sh controlnet-canny    # SD1.5 ControlNet (also -depth 
 pwsh scripts/download-weights.ps1 -Model sd15
 pwsh scripts/download-weights.ps1 -Model lcm-dreamshaper
 pwsh scripts/download-weights.ps1 -Model clip-vit-l-14
+```
+
+TripoSplat's generative-core weights have their own script (the image-encoder
+half is fetched by brovisionml):
+
+```bash
+# Fetches into weights/triposplat/. Default component is `all`.
+scripts/download-triposplat.sh all        # vae + dit + decoder (~1.6 GB)
+scripts/download-triposplat.sh vae        # Flux.2 VAE only         (~336 MB)
+scripts/download-triposplat.sh dit        # flow-matching DiT       (~741 MB)
+scripts/download-triposplat.sh decoder    # OctreeGaussian decoder  (~576 MB)
 ```
 
 For rate-limited repos, export `HF_TOKEN=hf_...` before running the `.sh`.
