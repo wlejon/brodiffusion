@@ -47,3 +47,10 @@ target_compile_definitions(brodiffusion_test_flux2_vae_encoder PRIVATE
 brodiffusion_add_test(brodiffusion_test_flow_model test_flow_model.cpp)
 target_compile_definitions(brodiffusion_test_flow_model PRIVATE
     BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
+
+# TripoSplat OctreeGaussianDecoder (octree occupancy predictor + elastic GS
+# head). Same gating: real decoder checkpoint + golden_decoder.bin under
+# weights/triposplat/vae (out-of-repo).
+brodiffusion_add_test(brodiffusion_test_octree_decoder test_octree_decoder.cpp)
+target_compile_definitions(brodiffusion_test_octree_decoder PRIVATE
+    BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
