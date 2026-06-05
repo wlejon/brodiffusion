@@ -65,12 +65,18 @@ public:
 
 private:
     vae::Encoder enc_;
-    // BatchNorm1d(128, affine=False) latent normalizer: y = (x - mean)/sqrt(var+eps).
-    std::vector<float> bn_mean_;   // (128,)
-    std::vector<float> bn_inv_std_;// (128,) = 1/sqrt(var + eps), precomputed
+    // BatchNorm1d(128, affine=False) with frozen running stats is, at inference,
+    // a per-channel affine y = x*inv_std - mean*inv_std (inv_std=1/sqrt(var+eps)).
+    // It commutes with the spatial->token reshape, so we fold it into modulate's
+    // form Y = X*(1+scale)+shift over the 128 token columns: scale = inv_std - 1,
+    // shift = -mean*inv_std. Both length-128, on device at the compute dtype.
     static constexpr float kBnEps = 1e-5f;
+    brotensor::Tensor bn_mod_scale_;  // (1,128) = inv_std - 1
+    brotensor::Tensor bn_mod_shift_;  // (1,128) = -mean * inv_std
 
-    brotensor::Tensor latent_;     // scratch: raw 32-ch latent (mean)
+    brotensor::Tensor latent_;        // scratch: raw 32-ch latent (mean)
+    brotensor::Tensor shuffled_;      // scratch: pixel-shuffled (128,ho,wo)
+    brotensor::Tensor tokens_;        // scratch: pre-normalize tokens (T,128)
 };
 
 }  // namespace brodiffusion::triposplat
