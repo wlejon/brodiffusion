@@ -167,6 +167,7 @@ target_sources(brodiffusion PRIVATE
     src/triposplat/flow_model.cpp
     src/triposplat/flow_sobol_pe.cpp
     src/triposplat/octree_decoder.cpp
+    src/triposplat/sampler.cpp
 )
 
 # SD1.5-tuned fused GPU kernels. fused.cpp dispatches a GPU-resident tensor to

@@ -54,3 +54,9 @@ target_compile_definitions(brodiffusion_test_flow_model PRIVATE
 brodiffusion_add_test(brodiffusion_test_octree_decoder test_octree_decoder.cpp)
 target_compile_definitions(brodiffusion_test_octree_decoder PRIVATE
     BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
+
+# TripoSplat flow Euler CFG sampler (sample_latent). Gated on the flow
+# checkpoint + golden_sampler.bin under weights/triposplat/diffusion_models.
+brodiffusion_add_test(brodiffusion_test_flow_sampler test_flow_sampler.cpp)
+target_compile_definitions(brodiffusion_test_flow_sampler PRIVATE
+    BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
