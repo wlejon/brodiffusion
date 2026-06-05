@@ -41,3 +41,9 @@ brodiffusion_add_test(brodiffusion_test_flux_pipeline test_flux_pipeline.cpp)
 brodiffusion_add_test(brodiffusion_test_flux2_vae_encoder test_flux2_vae_encoder.cpp)
 target_compile_definitions(brodiffusion_test_flux2_vae_encoder PRIVATE
     BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
+
+# TripoSplat flow DiT (LatentSeqMMFlowModel). Same gating: real flow checkpoint
+# + golden_flow.bin under weights/triposplat/diffusion_models (out-of-repo).
+brodiffusion_add_test(brodiffusion_test_flow_model test_flow_model.cpp)
+target_compile_definitions(brodiffusion_test_flow_model PRIVATE
+    BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
