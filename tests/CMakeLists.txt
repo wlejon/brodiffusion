@@ -32,3 +32,12 @@ brodiffusion_add_test(brodiffusion_test_device_parity  test_device_parity.cpp)
 brodiffusion_add_test(brodiffusion_test_model_config   test_model_config.cpp)
 brodiffusion_add_test(brodiffusion_test_flux_blocks   test_flux_blocks.cpp)
 brodiffusion_add_test(brodiffusion_test_flux_pipeline test_flux_pipeline.cpp)
+
+# TripoSplat Flux.2 VAE image-encoder parity test: structural checks always run;
+# the numeric-parity part is gated on the real checkpoint
+# (weights/triposplat/vae/flux2-vae.safetensors) and golden_flux2vae.bin under
+# weights/triposplat/vae/golden (generated out-of-repo, never committed). Skips
+# cleanly when either is absent.
+brodiffusion_add_test(brodiffusion_test_flux2_vae_encoder test_flux2_vae_encoder.cpp)
+target_compile_definitions(brodiffusion_test_flux2_vae_encoder PRIVATE
+    BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")

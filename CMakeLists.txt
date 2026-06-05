@@ -163,6 +163,7 @@ target_sources(brodiffusion PRIVATE
     src/optim.cpp
     src/dit/common.cpp
     src/dit/flux.cpp
+    src/triposplat/vae_encoder.cpp
 )
 
 # SD1.5-tuned fused GPU kernels. fused.cpp dispatches a GPU-resident tensor to
