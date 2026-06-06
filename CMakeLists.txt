@@ -178,6 +178,7 @@ if(BROTENSOR_WITH_CUDA)
     target_sources(brodiffusion PRIVATE
         src/fused_resblock.cu
         src/fused_transformer.cu
+        src/triposplat/flow_rope.cu
     )
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(brodiffusion PUBLIC CUDA::cudart)

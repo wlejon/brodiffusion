@@ -1,6 +1,7 @@
 #include "brodiffusion/triposplat/flow_model.h"
 
 #include "brodiffusion/detail/compute.h"
+#include "brodiffusion/detail/flow_rope.h"
 #include "brodiffusion/dit/common.h"
 
 #include "brotensor/ops.h"
@@ -78,6 +79,15 @@ void FlowDiT::load_repo(const st::File& f, const std::string& p, Repo& r) {
     r.freqs0 = read_host_f32(need(f, p + ".freqs_0"));
     r.freqs1 = read_host_f32(need(f, p + ".freqs_1"));
     r.freqs2 = read_host_f32(need(f, p + ".freqs_2"));
+
+    // Precompute the (1, half) frequency table (×π) on the compute device for the
+    // GPU rope-table kernel; the host freqs_* above stay for the CPU path.
+    std::vector<float> fpi;
+    fpi.reserve(r.freqs0.size() + r.freqs1.size() + r.freqs2.size());
+    for (float x : r.freqs0) fpi.push_back(x * kPi);
+    for (float x : r.freqs1) fpi.push_back(x * kPi);
+    for (float x : r.freqs2) fpi.push_back(x * kPi);
+    r.freqs_pi = detail::upload_host(fpi.data(), 1, static_cast<int>(fpi.size()));
 }
 
 void FlowDiT::load_block(const st::File& f, const std::string& p, bool modulated,
@@ -239,10 +249,21 @@ void FlowDiT::build_rope(const bt::Tensor& hidden, const Repo& r,
     bt::mul_inplace(g, c);
     detail::linear_batched(r.final_map.W, nullptr, g, dp);
 
-    // The rotary is FP32 in the reference; build cos/sin host-side in FP32
-    // (also satisfies rope_apply_perhead's FP32-table requirement). delta_pos
-    // is small (L*3H); the tables are L*H*half each. A device sincos kernel can
-    // replace this host round-trip later (cf. dit/common.h's pack/unpack note).
+    // The rotary is FP32 in the reference; the cos/sin tables are (L*H, half).
+#if defined(BROTENSOR_HAS_CUDA)
+    // On CUDA build the tables fully on-device: no stream sync, no delta_pos
+    // download, no host trig, no table upload — all of which the host path below
+    // pays per block (~28 blocks/forward). Metal keeps the host path (left to the
+    // Metal backend), so gate specifically on the CUDA device.
+    if (hidden.device == bt::Device::CUDA) {
+        detail::flow_rope_tables_cuda(dp, r.freqs_pi, L, H, half, f0, f1,
+                                      cos_out, sin_out);
+        return;
+    }
+#endif
+
+    // CPU (and non-CUDA) fallback: download delta_pos, build the tables host-side
+    // (also satisfies rope_apply_perhead's FP32-table requirement), upload back.
     bt::sync_all();
     std::vector<float> d = download_f32(dp);        // (L, 3H), [head, axis]
     std::vector<float> cosv(static_cast<std::size_t>(L) * H * half);

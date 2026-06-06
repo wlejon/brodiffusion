@@ -101,7 +101,8 @@ private:
         brotensor::Tensor norm_g, norm_b;       // LayerNorm32(model_channels)
         Linear gate_map, content_map;           // bias-free (1024->128)
         Linear final_map;                        // bias-free (128->3*num_heads)
-        std::vector<float> freqs0, freqs1, freqs2;  // host fp32, per-axis
+        std::vector<float> freqs0, freqs1, freqs2;  // host fp32, per-axis (CPU path)
+        brotensor::Tensor  freqs_pi;                // (1, half) device, [f0|f1|f2]×π
     };
 
     // UnifiedTransformerBlock. Modulated blocks (noise_refiner / blocks) use a
