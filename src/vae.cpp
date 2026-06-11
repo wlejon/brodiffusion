@@ -37,12 +37,14 @@ const st::TensorView& need_enc(const st::File& f, const std::string& key) {
     return *v;
 }
 
-// Accepts F16 (used as-is) or F32 (converted host-side); SD1.5 full
-// checkpoints ship as F32. Uploads at the pipeline compute dtype.
+// Accepts F16 / F32 / BF16 (converted host-side as needed); SD1.5 full
+// checkpoints ship as F32, Flux-family VAEs as BF16. Uploads at the
+// pipeline compute dtype.
 void upload_compute_checked(const st::TensorView& v, int rows, int cols,
                             bt::Tensor& dst, const char* name) {
-    if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
-        fail(std::string(name) + ": expected F16 or F32, got " + st::dtype_name(v.dtype));
+    if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32 &&
+        v.dtype != st::Dtype::BF16) {
+        fail(std::string(name) + ": expected F16/F32/BF16, got " + st::dtype_name(v.dtype));
     }
     int64_t expected = static_cast<int64_t>(rows) * static_cast<int64_t>(cols);
     if (v.numel() != expected) {
@@ -54,8 +56,9 @@ void upload_compute_checked(const st::TensorView& v, int rows, int cols,
 }
 void upload_compute_checked_enc(const st::TensorView& v, int rows, int cols,
                                 bt::Tensor& dst, const char* name) {
-    if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32) {
-        fail_enc(std::string(name) + ": expected F16 or F32, got " + st::dtype_name(v.dtype));
+    if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32 &&
+        v.dtype != st::Dtype::BF16) {
+        fail_enc(std::string(name) + ": expected F16/F32/BF16, got " + st::dtype_name(v.dtype));
     }
     int64_t expected = static_cast<int64_t>(rows) * static_cast<int64_t>(cols);
     if (v.numel() != expected) {
