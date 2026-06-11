@@ -24,7 +24,12 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
+#ifdef BROTENSOR_HAS_CUDA
+#include "brotensor/cuda_graph.h"
+#endif
+
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -168,6 +173,14 @@ int img2img_t_start(int n_steps, float strength) {
     return t_start;
 }
 
+// Escape hatch: set BRODIFFUSION_DISABLE_STEP_GRAPH=1 to force eager
+// denoiser stepping even when the CUDA-graph session would be eligible.
+// Read per step so tests can flip it between generations in-process.
+bool step_graph_disabled() {
+    const char* e = std::getenv("BRODIFFUSION_DISABLE_STEP_GRAPH");
+    return e != nullptr && e[0] != '\0' && e[0] != '0';
+}
+
 // Construct the denoiser matching the model class.
 std::unique_ptr<Denoiser> make_denoiser(const PipelineConfig& cfg) {
     if (cfg.model_class == ModelClass::Flux) {
@@ -177,6 +190,28 @@ std::unique_ptr<Denoiser> make_denoiser(const PipelineConfig& cfg) {
 }
 
 }  // namespace
+
+// CUDA-graph denoising-step session. One per (latent buffer, prepared
+// payload, H, W, CFG mode) identity — see the member doc in pipeline.h.
+// `eager_steps` counts the warm-up steps run through the capture seam for
+// this key; the second one settles every U-Net scratch buffer at its
+// high-water capacity (the x_/y_ ping-pong roles permute per body call, so
+// one step is not enough), after which the body's pointer set is stable and
+// the capture at the end of that step records a replayable graph.
+struct Pipeline::StepGraphSession {
+#ifdef BROTENSOR_HAS_CUDA
+    bt::CudaGraph graph;
+#endif
+    const void* latent_ptr  = nullptr;  // state.latent.data
+    const void* prepared_id = nullptr;  // prepared_.get()
+    int  H = 0, W = 0;
+    bool do_cfg = false;
+    int  eager_steps = 0;
+};
+
+Pipeline::~Pipeline() = default;
+Pipeline::Pipeline(Pipeline&&) noexcept = default;
+Pipeline& Pipeline::operator=(Pipeline&&) noexcept = default;
 
 Pipeline::Pipeline(const PipelineConfig& cfg, brolm::clip::Tokenizer tokenizer)
     : cfg_(cfg),
@@ -694,6 +729,82 @@ PipelineState Pipeline::prime(std::string_view prompt,
     return state;
 }
 
+void Pipeline::step_denoise_captured_(PipelineState& state, float t,
+                                      bool do_cfg) {
+#ifdef BROTENSOR_HAS_CUDA
+    StepGraphSession* s = step_graph_.get();
+    const bool key_match =
+        s != nullptr &&
+        s->latent_ptr  == state.latent.data &&
+        s->prepared_id == prepared_.get() &&
+        s->H == state.H_lat && s->W == state.W_lat &&
+        s->do_cfg == do_cfg;
+    if (!key_match) {
+        step_graph_ = std::make_unique<StepGraphSession>();
+        s = step_graph_.get();
+        s->latent_ptr  = state.latent.data;
+        s->prepared_id = prepared_.get();
+        s->H      = state.H_lat;
+        s->W      = state.W_lat;
+        s->do_cfg = do_cfg;
+    }
+
+    // Host-dependent per-step inputs (time-embedding chain) — always eager,
+    // writes the persistent temb buffers the captured body reads.
+    denoiser_->prepare_step(t, prepared_);
+
+    if (s->graph.valid()) {
+        s->graph.launch();
+        return;
+    }
+
+    // Eager warm-up step through the capture seam: computes this step's real
+    // outputs and settles every body buffer at its high-water capacity.
+    denoiser_->forward_body(state.latent, state.H_lat, state.W_lat,
+                            prepared_, Branch::Cond, noise_pred_cond_);
+    if (do_cfg) {
+        denoiser_->forward_body(state.latent, state.H_lat, state.W_lat,
+                                prepared_, Branch::Uncond, noise_pred_uncond_);
+    }
+    ++s->eager_steps;
+
+    // Capture only once every buffer-role assignment the captured calls can
+    // start from has already been warmed. The UNet body ping-pongs a pool of
+    // three buffers (x_/y_/cat_buf_) via std::swap, so the per-call role
+    // permutation has period at most 3 — after 3 eager body calls, any
+    // subsequent call repeats an already-warmed assignment and performs no
+    // reallocation (an alloc/free of non-graph memory mid-capture is illegal
+    // and poisons the graph).
+    const int body_calls = s->eager_steps * (do_cfg ? 2 : 1);
+    if (body_calls < 3) return;
+
+    // Capture at the end of the second eager step: re-issue the identical
+    // bodies on the capture stream. Capture records the op sequence without
+    // executing it (the eager outputs above stand for this step); every
+    // later step replays the whole sequence with one cudaGraphLaunch.
+    bt::sync_all();
+    {
+        bt::CudaGraphCapture cap;
+        denoiser_->forward_body(state.latent, state.H_lat, state.W_lat,
+                                prepared_, Branch::Cond, noise_pred_cond_);
+        if (do_cfg) {
+            denoiser_->forward_body(state.latent, state.H_lat, state.W_lat,
+                                    prepared_, Branch::Uncond,
+                                    noise_pred_uncond_);
+        }
+        s->graph = cap.finish();
+    }
+#else
+    // No CUDA backend in this build: plain eager forwards.
+    denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
+                       prepared_, Branch::Cond, noise_pred_cond_);
+    if (do_cfg) {
+        denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
+                           prepared_, Branch::Uncond, noise_pred_uncond_);
+    }
+#endif
+}
+
 void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
                          AttentionTrace* trace_out,
                          const std::vector<const bt::Tensor*>*
@@ -847,11 +958,24 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
                                prepared_, Branch::Uncond, noise_pred_uncond_);
         }
     } else {
-        denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
-                           prepared_, Branch::Cond, noise_pred_cond_);
-        if (do_cfg) {
+        // Plain fast path. When the denoiser exposes the step-capture seam
+        // and the latent is CUDA-resident, run it through the CUDA-graph
+        // session (warm-up → capture → single-launch replay); otherwise the
+        // classic eager forwards.
+        const bool graph_eligible =
+            denoiser_->supports_step_capture() &&
+            state.latent.device == bt::Device::CUDA &&
+            !step_graph_disabled();
+        if (graph_eligible) {
+            step_denoise_captured_(state, t, do_cfg);
+        } else {
             denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
-                               prepared_, Branch::Uncond, noise_pred_uncond_);
+                               prepared_, Branch::Cond, noise_pred_cond_);
+            if (do_cfg) {
+                denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
+                                   prepared_, Branch::Uncond,
+                                   noise_pred_uncond_);
+            }
         }
     }
     // CFG combine (DDIM only; LCM has no uncond branch).

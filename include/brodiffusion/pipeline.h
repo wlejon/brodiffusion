@@ -198,9 +198,12 @@ public:
     // directories. Pipeline is move-only; this returns by value.
     static Pipeline from_model_dir(const std::string& model_dir);
 
-    // Move-only (owns move-only sub-modules; copies make no sense).
-    Pipeline(Pipeline&&) noexcept = default;
-    Pipeline& operator=(Pipeline&&) noexcept = default;
+    // Move-only (owns move-only sub-modules; copies make no sense). The
+    // move members and destructor are defined in pipeline.cpp where
+    // StepGraphSession is complete.
+    ~Pipeline();
+    Pipeline(Pipeline&&) noexcept;
+    Pipeline& operator=(Pipeline&&) noexcept;
     Pipeline(const Pipeline&) = delete;
     Pipeline& operator=(const Pipeline&) = delete;
 
@@ -387,6 +390,23 @@ private:
     brotensor::Tensor                                    cn_mid_residual_;
     std::vector<brotensor::Tensor>                       cn_down_residuals_scratch_;
     brotensor::Tensor                                    cn_mid_residual_scratch_;
+
+    // CUDA-graph denoising-step session (defined in pipeline.cpp; CUDA-only
+    // payload). When the denoiser supports step capture and the latent is
+    // CUDA-resident, step_once runs the first two steps of a generation
+    // eagerly through the capture seam (settling every scratch buffer at its
+    // high-water capacity), records the cond(+uncond) forward bodies as one
+    // CUDA graph at the end of the second step, and replays that graph for
+    // every later step — one launch instead of hundreds. The session is keyed
+    // on (latent pointer, prepared payload, H, W, CFG); any mismatch (new
+    // prime(), forked state, resolution change) falls back to eager stepping
+    // and re-captures. Trace-mode and ControlNet steps always run eager.
+    struct StepGraphSession;
+    std::unique_ptr<StepGraphSession> step_graph_;
+    // Runs cond(+uncond) denoiser passes for one step via the capture seam,
+    // managing warm-up / capture / replay. Outputs land in noise_pred_cond_
+    // (+ noise_pred_uncond_), exactly like the eager path.
+    void step_denoise_captured_(PipelineState& state, float t, bool do_cfg);
 };
 
 }  // namespace brodiffusion::pipeline
