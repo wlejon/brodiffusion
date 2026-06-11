@@ -18,6 +18,17 @@
 
 namespace brodiffusion::dit {
 
+// The arithmetic dtype DiT denoisers run at INTERNALLY. On a CUDA backend
+// this is BF16, not the pipeline's FP16: real Flux.1 weights drive the text
+// residual stream past the FP16 finite range (~17k by double block 17,
+// overflowing inside block 18's ff_context — saturating to 65504 produces
+// black images), and upstream reference implementations run Flux in BF16 for
+// the same reason. The pipeline boundary (latent in, velocity out, raw text
+// conditioning) stays at the pipeline compute dtype; the denoiser casts at
+// the edges. CPU stays FP32; Metal (no BF16 op coverage) keeps the pipeline
+// dtype.
+brotensor::Dtype flux_compute_dtype();
+
 // ─── 2x2 latent patch packing ──────────────────────────────────────────────
 //
 // Flux operates on 2x2-patch-packed tokens. The latent is a flat NCHW row

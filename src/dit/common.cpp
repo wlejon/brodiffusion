@@ -24,8 +24,9 @@ namespace {
     throw std::runtime_error("dit::common: " + msg);
 }
 
-// Download a compute-dtype tensor into a host FP32 vector, handling both the
-// FP16 (GPU) and FP32 (CPU) cases — same pattern as pipeline.cpp's decode().
+// Download an FP32/FP16/BF16 tensor into a host FP32 vector — same pattern
+// as pipeline.cpp's decode(), plus the BF16 case (Flux's internal dtype on
+// CUDA).
 std::vector<float> download_fp32(const bt::Tensor& t) {
     const std::size_t n = static_cast<std::size_t>(t.size());
     if (t.dtype == bt::Dtype::FP16) {
@@ -37,10 +38,25 @@ std::vector<float> download_fp32(const bt::Tensor& t) {
         }
         return out;
     }
+    if (t.dtype == bt::Dtype::BF16) {
+        std::vector<std::uint16_t> bits(n);
+        t.copy_to_host_bf16(bits.data());
+        std::vector<float> out(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            out[i] = bt::bf16_bits_to_fp32(bits[i]);
+        }
+        return out;
+    }
     return t.to_host_vector();
 }
 
 }  // namespace
+
+brotensor::Dtype flux_compute_dtype() {
+    return bt::default_device() == bt::Device::CUDA
+               ? bt::Dtype::BF16
+               : brodiffusion::compute_dtype();
+}
 
 // ─── 2x2 latent patch packing ──────────────────────────────────────────────
 
@@ -330,7 +346,20 @@ void joint_attention_traced(const bt::Tensor& Q, const bt::Tensor& K,
         avg_f[i] = static_cast<float>(avg[i]) * inv_h;
     }
 
-    out = detail::upload_host(o.data(), L, D);
+    // The attention output feeds straight back into the denoiser's compute
+    // stream, so it must carry Q's dtype (BF16 for Flux on CUDA — the
+    // pipeline-dtype upload_host would mismatch). The head-averaged map is a
+    // host-facing trace artifact and keeps the pipeline compute dtype.
+    if (Q.dtype == bt::Dtype::BF16) {
+        const std::size_t n = o.size();
+        std::vector<std::uint16_t> bits(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            bits[i] = bt::fp32_to_bf16_bits(o[i]);
+        }
+        out = bt::Tensor::from_host_bf16(bits.data(), L, D);
+    } else {
+        out = detail::upload_host(o.data(), L, D);
+    }
     attn_avg = detail::upload_host(avg_f.data(), L, L);
 }
 

@@ -87,6 +87,7 @@ void populate_vae(const json::Value& cfg, vae::DecoderConfig& out) {
     out.norm_num_groups    = cfg.get_int("norm_num_groups", out.norm_num_groups);
     out.scaling_factor     = cfg.get_float("scaling_factor", out.scaling_factor);
     out.shift_factor       = cfg.get_float("shift_factor", out.shift_factor);
+    out.force_upcast       = cfg.get_bool("force_upcast", out.force_upcast);
 }
 
 void populate_text_encoder(const json::Value& cfg, brolm::clip::TextEncoderConfig& out) {

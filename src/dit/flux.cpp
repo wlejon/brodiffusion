@@ -9,7 +9,13 @@
 #include "brotensor/safetensors.h"
 #include "brotensor/tensor.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -19,12 +25,60 @@ namespace brodiffusion::dit {
 namespace bt = ::brotensor;
 namespace st = ::brotensor::safetensors;
 
-using st::upload_compute_checked;
-
 namespace {
 
 [[noreturn]] void fail(const std::string& msg) {
     throw std::runtime_error("dit::FluxDenoiser: " + msg);
+}
+
+// Upload a checked view at the FLUX compute dtype (BF16 on CUDA — see
+// dit::flux_compute_dtype), not the pipeline dtype.
+void upload_flux_checked(const st::TensorView& v, int rows, int cols,
+                            bt::Tensor& dst, const std::string& name) {
+    if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32 &&
+        v.dtype != st::Dtype::BF16) {
+        fail(name + " ('" + v.name + "'): expected F16/F32/BF16, got " +
+             st::dtype_name(v.dtype));
+    }
+    const std::int64_t expected =
+        static_cast<std::int64_t>(rows) * static_cast<std::int64_t>(cols);
+    if (v.numel() != expected) {
+        fail(name + " ('" + v.name + "'): shape mismatch (expected " +
+             std::to_string(rows) + "x" + std::to_string(cols) + ")");
+    }
+    st::upload_as(v, rows, cols, flux_compute_dtype(), dst);
+}
+
+// Upload host FP32 values at the flux compute dtype.
+bt::Tensor upload_host_flux(const float* src, int rows, int cols) {
+    const bt::Dtype dt = flux_compute_dtype();
+    const std::size_t n =
+        static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+    if (dt == bt::Dtype::BF16) {
+        std::vector<std::uint16_t> bits(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            bits[i] = bt::fp32_to_bf16_bits(src[i]);
+        }
+        return bt::Tensor::from_host_bf16(bits.data(), rows, cols);
+    }
+    if (dt == bt::Dtype::FP16) {
+        std::vector<std::uint16_t> bits(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            bits[i] = bt::fp32_to_fp16_bits(src[i]);
+        }
+        return bt::Tensor::from_host_fp16(bits.data(), rows, cols);
+    }
+    return bt::Tensor::from_host(src, rows, cols);
+}
+
+// Cast `src` to the flux compute dtype into `dst` (no-op pass-through copy
+// avoided when the dtype already matches — `dst` then aliases nothing and
+// the caller uses `src` directly via the returned reference).
+const bt::Tensor& to_flux_dtype(const bt::Tensor& src, bt::Tensor& dst) {
+    const bt::Dtype dt = flux_compute_dtype();
+    if (src.dtype == dt) return src;
+    bt::cast(src, dst, dt);
+    return dst;
 }
 
 // Find a tensor by name across one or more shards; first match wins.
@@ -64,6 +118,51 @@ void slice_block(const bt::Tensor& src, int r0, int nr, int c0, int nc,
     for (int r = 0; r < nr; ++r) {
         bt::copy_d2d(src, (r0 + r) * L_cols + c0, dst, r * nc, nc);
     }
+}
+
+// Diagnostic probe (BRODIFFUSION_FLUX_NANCHECK=1): per-block max-|activation|
+// and non-finite detection, downloaded to host. Slow — debug only.
+bool flux_nancheck() {
+    const char* e = std::getenv("BRODIFFUSION_FLUX_NANCHECK");
+    return e != nullptr && e[0] != '\0' && e[0] != '0';
+}
+
+float max_abs_host(const bt::Tensor& t, bool& nonfinite) {
+    bt::sync_all();
+    bt::Tensor h = t.to(bt::Device::CPU);
+    float mx = 0.0f;
+    nonfinite = false;
+    if (h.dtype == bt::Dtype::FP16) {
+        auto v = h.to_host_vector_fp16();
+        for (auto b : v) {
+            const float f = bt::fp16_bits_to_fp32(b);
+            if (!std::isfinite(f)) { nonfinite = true; continue; }
+            mx = std::max(mx, std::fabs(f));
+        }
+    } else if (h.dtype == bt::Dtype::BF16) {
+        auto v = h.to_host_vector_bf16();
+        for (auto b : v) {
+            const float f = bt::bf16_bits_to_fp32(b);
+            if (!std::isfinite(f)) { nonfinite = true; continue; }
+            mx = std::max(mx, std::fabs(f));
+        }
+    } else {
+        auto v = h.to_host_vector();
+        for (float f : v) {
+            if (!std::isfinite(f)) { nonfinite = true; continue; }
+            mx = std::max(mx, std::fabs(f));
+        }
+    }
+    return mx;
+}
+
+void probe(const char* tag, int idx, const bt::Tensor& a, const bt::Tensor* b) {
+    bool nf_a = false, nf_b = false;
+    const float ma = max_abs_host(a, nf_a);
+    const float mb = b ? max_abs_host(*b, nf_b) : 0.0f;
+    std::fprintf(stderr, "[flux-nan] %s %d: max|a|=%g%s max|b|=%g%s\n",
+                 tag, idx, ma, nf_a ? " NONFINITE" : "",
+                 mb, nf_b ? " NONFINITE" : "");
 }
 
 }  // namespace
@@ -114,10 +213,61 @@ void FluxDenoiser::load_weights(const std::vector<const st::File*>& shards,
     const int PD   = cfg_.pooled_projection_dim;
     const int HD   = cfg_.attention_head_dim;
 
+    bool quant = cfg_.quantize_weights;
+    if (quant && bt::default_device() != bt::Device::CUDA) {
+        std::fprintf(stderr,
+            "FluxDenoiser: quantize_weights requested but the default device "
+            "is not CUDA — loading dense weights instead (the fused INT8 "
+            "dequant matmuls are GPU-only)\n");
+        quant = false;
+    }
+
     auto load_lin = [&](const std::string& key, int out, int in, Linear& lin) {
-        upload_compute_checked(need(shards, key + ".weight"), out, in, lin.W,
+        upload_flux_checked(need(shards, key + ".weight"), out, in, lin.W,
                                key);
-        upload_compute_checked(need(shards, key + ".bias"), out, 1, lin.b, key);
+        upload_flux_checked(need(shards, key + ".bias"), out, 1, lin.b, key);
+    };
+
+    // Quantizing loader for the big block linears: converts the on-disk
+    // weight (F16/F32/BF16) to FP16 bits host-side, quantizes to INT8 with
+    // per-output-row symmetric FP32 scales, and uploads only the INT8 copy —
+    // the FP16 weight never lands on the device, so peak VRAM during load is
+    // the INT8 footprint (~12 GB for Flux.1), not the FP16 one (~24 GB).
+    auto load_lin_q = [&](const std::string& key, int out, int in,
+                          Linear& lin) {
+        if (!quant) { load_lin(key, out, in, lin); return; }
+        const st::TensorView& wv = need(shards, key + ".weight");
+        const std::int64_t expected =
+            static_cast<std::int64_t>(out) * static_cast<std::int64_t>(in);
+        if (wv.numel() != expected) {
+            fail(key + ".weight: shape mismatch (expected " +
+                 std::to_string(out) + "x" + std::to_string(in) + ")");
+        }
+        const std::size_t n = static_cast<std::size_t>(expected);
+        std::vector<std::uint16_t> w16(n);
+        if (wv.dtype == st::Dtype::F16) {
+            std::memcpy(w16.data(), wv.data, n * 2);
+        } else if (wv.dtype == st::Dtype::BF16) {
+            const auto* src = reinterpret_cast<const std::uint16_t*>(wv.data);
+            for (std::size_t i = 0; i < n; ++i) {
+                w16[i] = bt::fp32_to_fp16_bits(bt::bf16_bits_to_fp32(src[i]));
+            }
+        } else if (wv.dtype == st::Dtype::F32) {
+            const auto* src = reinterpret_cast<const float*>(wv.data);
+            for (std::size_t i = 0; i < n; ++i) {
+                w16[i] = bt::fp32_to_fp16_bits(src[i]);
+            }
+        } else {
+            fail(key + ".weight: expected F16/F32/BF16, got " +
+                 st::dtype_name(wv.dtype));
+        }
+        std::vector<std::int8_t> q(n);
+        std::vector<float> sc(static_cast<std::size_t>(out));
+        bt::quantize_int8_per_row_host(w16.data(), out, in, q.data(),
+                                       sc.data());
+        lin.W_int8 = bt::Tensor::from_host_int8(q.data(), out, in);
+        lin.scales = bt::Tensor::from_host(sc.data(), out, 1);
+        upload_flux_checked(need(shards, key + ".bias"), out, 1, lin.b, key);
     };
 
     load_lin(prefix + "x_embedder", D, IC, x_embedder_);
@@ -137,44 +287,44 @@ void FluxDenoiser::load_weights(const std::vector<const st::File*>& shards,
         DoubleBlock& B = double_blocks_[static_cast<std::size_t>(i)];
         const std::string p =
             prefix + "transformer_blocks." + std::to_string(i) + ".";
-        load_lin(p + "norm1.linear", 6 * D, D, B.norm1);
-        load_lin(p + "norm1_context.linear", 6 * D, D, B.norm1_context);
-        load_lin(p + "attn.to_q", D, D, B.to_q);
-        load_lin(p + "attn.to_k", D, D, B.to_k);
-        load_lin(p + "attn.to_v", D, D, B.to_v);
-        load_lin(p + "attn.add_q_proj", D, D, B.add_q);
-        load_lin(p + "attn.add_k_proj", D, D, B.add_k);
-        load_lin(p + "attn.add_v_proj", D, D, B.add_v);
-        load_lin(p + "attn.to_out.0", D, D, B.to_out);
-        load_lin(p + "attn.to_add_out", D, D, B.to_add_out);
-        upload_compute_checked(need(shards, p + "attn.norm_q.weight"), HD, 1,
+        load_lin_q(p + "norm1.linear", 6 * D, D, B.norm1);
+        load_lin_q(p + "norm1_context.linear", 6 * D, D, B.norm1_context);
+        load_lin_q(p + "attn.to_q", D, D, B.to_q);
+        load_lin_q(p + "attn.to_k", D, D, B.to_k);
+        load_lin_q(p + "attn.to_v", D, D, B.to_v);
+        load_lin_q(p + "attn.add_q_proj", D, D, B.add_q);
+        load_lin_q(p + "attn.add_k_proj", D, D, B.add_k);
+        load_lin_q(p + "attn.add_v_proj", D, D, B.add_v);
+        load_lin_q(p + "attn.to_out.0", D, D, B.to_out);
+        load_lin_q(p + "attn.to_add_out", D, D, B.to_add_out);
+        upload_flux_checked(need(shards, p + "attn.norm_q.weight"), HD, 1,
                                B.norm_q, "attn.norm_q");
-        upload_compute_checked(need(shards, p + "attn.norm_k.weight"), HD, 1,
+        upload_flux_checked(need(shards, p + "attn.norm_k.weight"), HD, 1,
                                B.norm_k, "attn.norm_k");
-        upload_compute_checked(need(shards, p + "attn.norm_added_q.weight"), HD, 1,
+        upload_flux_checked(need(shards, p + "attn.norm_added_q.weight"), HD, 1,
                                B.norm_added_q, "attn.norm_added_q");
-        upload_compute_checked(need(shards, p + "attn.norm_added_k.weight"), HD, 1,
+        upload_flux_checked(need(shards, p + "attn.norm_added_k.weight"), HD, 1,
                                B.norm_added_k, "attn.norm_added_k");
-        load_lin(p + "ff.net.0.proj", 4 * D, D, B.ff0);
-        load_lin(p + "ff.net.2", D, 4 * D, B.ff2);
-        load_lin(p + "ff_context.net.0.proj", 4 * D, D, B.ffc0);
-        load_lin(p + "ff_context.net.2", D, 4 * D, B.ffc2);
+        load_lin_q(p + "ff.net.0.proj", 4 * D, D, B.ff0);
+        load_lin_q(p + "ff.net.2", D, 4 * D, B.ff2);
+        load_lin_q(p + "ff_context.net.0.proj", 4 * D, D, B.ffc0);
+        load_lin_q(p + "ff_context.net.2", D, 4 * D, B.ffc2);
     }
 
     for (int i = 0; i < cfg_.num_single_layers; ++i) {
         SingleBlock& B = single_blocks_[static_cast<std::size_t>(i)];
         const std::string p =
             prefix + "single_transformer_blocks." + std::to_string(i) + ".";
-        load_lin(p + "norm.linear", 3 * D, D, B.norm);
-        load_lin(p + "attn.to_q", D, D, B.to_q);
-        load_lin(p + "attn.to_k", D, D, B.to_k);
-        load_lin(p + "attn.to_v", D, D, B.to_v);
-        upload_compute_checked(need(shards, p + "attn.norm_q.weight"), HD, 1,
+        load_lin_q(p + "norm.linear", 3 * D, D, B.norm);
+        load_lin_q(p + "attn.to_q", D, D, B.to_q);
+        load_lin_q(p + "attn.to_k", D, D, B.to_k);
+        load_lin_q(p + "attn.to_v", D, D, B.to_v);
+        upload_flux_checked(need(shards, p + "attn.norm_q.weight"), HD, 1,
                                B.norm_q, "attn.norm_q");
-        upload_compute_checked(need(shards, p + "attn.norm_k.weight"), HD, 1,
+        upload_flux_checked(need(shards, p + "attn.norm_k.weight"), HD, 1,
                                B.norm_k, "attn.norm_k");
-        load_lin(p + "proj_mlp", 4 * D, D, B.proj_mlp);
-        load_lin(p + "proj_out", D, 5 * D, B.proj_out);
+        load_lin_q(p + "proj_mlp", 4 * D, D, B.proj_mlp);
+        load_lin_q(p + "proj_out", D, 5 * D, B.proj_out);
     }
 
     load_lin(prefix + "norm_out.linear", 2 * D, D, norm_out_);
@@ -184,14 +334,23 @@ void FluxDenoiser::load_weights(const std::vector<const st::File*>& shards,
     {
         std::vector<float> ones(static_cast<std::size_t>(D), 1.0f);
         std::vector<float> zeros(static_cast<std::size_t>(D), 0.0f);
-        ada_gamma_ = detail::upload_host(ones.data(), D, 1);
-        ada_beta_  = detail::upload_host(zeros.data(), D, 1);
+        ada_gamma_ = upload_host_flux(ones.data(), D, 1);
+        ada_beta_  = upload_host_flux(zeros.data(), D, 1);
     }
 }
 
 void FluxDenoiser::finalize_weights() {
-    // Flux carries no quantization — finalize is a no-op, idempotent.
+    // Quantization (when enabled) already happened streaming inside
+    // load_weights — finalize is a no-op, idempotent.
     finalized_ = true;
+}
+
+void FluxDenoiser::lin_(const Linear& l, const bt::Tensor& X, bt::Tensor& Y) {
+    if (l.quantized()) {
+        bt::linear_forward_batched_int8w_fp16(l.W_int8, l.scales, &l.b, X, Y);
+    } else {
+        detail::linear_batched(l.W, &l.b, X, Y);
+    }
 }
 
 // ─── prepared conditioning ─────────────────────────────────────────────────
@@ -214,20 +373,25 @@ PreparedConditioning FluxDenoiser::prepare(const Conditioning& cond) {
     auto prep = std::make_unique<FluxPrepared>();
 
     // Project the T5 context sequence (txt_len, joint_attention_dim) → inner.
+    // The raw conditioning arrives at the pipeline dtype; cast to the flux
+    // compute dtype (BF16 on CUDA) before touching flux weights.
     if (cond.text_embeddings.cols != cfg_.joint_attention_dim) {
         fail("prepare: text_embeddings width != joint_attention_dim");
     }
     prep->txt_len = cond.text_embeddings.rows;
+    bt::Tensor ctx_cast, pooled_cast;
+    const bt::Tensor& ctx = to_flux_dtype(cond.text_embeddings, ctx_cast);
     detail::linear_batched(context_embedder_.W, &context_embedder_.b,
-                           cond.text_embeddings, prep->context);
+                           ctx, prep->context);
     prep->context = prep->context.clone();
 
     // text_embedder(pooled CLIP) — depends only on the fixed pooled vector.
     if (cond.pooled.cols != cfg_.pooled_projection_dim || cond.pooled.rows != 1) {
         fail("prepare: pooled must be (1, pooled_projection_dim)");
     }
+    const bt::Tensor& pooled = to_flux_dtype(cond.pooled, pooled_cast);
     bt::Tensor h1, h2;
-    detail::linear_batched(te_text_l1_.W, &te_text_l1_.b, cond.pooled, h1);
+    detail::linear_batched(te_text_l1_.W, &te_text_l1_.b, pooled, h1);
     bt::silu_forward(h1, h1);
     detail::linear_batched(te_text_l2_.W, &te_text_l2_.b, h1, h2);
     prep->text_emb = h2.clone();
@@ -250,7 +414,7 @@ void FluxDenoiser::run_double_block_(const DoubleBlock& blk,
     const int D  = cfg_.inner_dim();
     const int HD = cfg_.attention_head_dim;
     const int NH = cfg_.num_attention_heads;
-    const bt::Dtype dt = compute_dtype();
+    const bt::Dtype dt = flux_compute_dtype();
     const bt::Device dev = img_.device;
 
     // silu(temb) once; both AdaLN modulation MLPs consume it.
@@ -258,14 +422,13 @@ void FluxDenoiser::run_double_block_(const DoubleBlock& blk,
 
     // norm1 (image) and norm1_context (text): 6 chunks each.
     std::vector<bt::Tensor> img_mod, txt_mod;
-    detail::linear_batched(blk.norm1.W, &blk.norm1.b, silu_, chunk_row_);
+    lin_(blk.norm1, silu_, chunk_row_);
     slice_modulation_chunks(chunk_row_, D, 6, img_mod);
     // copy out before reusing chunk_row_
     std::vector<bt::Tensor> img_c;
     img_c.reserve(6);
     for (auto& t : img_mod) img_c.push_back(t.clone());
-    detail::linear_batched(blk.norm1_context.W, &blk.norm1_context.b,
-                           silu_, chunk_row_);
+    lin_(blk.norm1_context, silu_, chunk_row_);
     slice_modulation_chunks(chunk_row_, D, 6, txt_mod);
     std::vector<bt::Tensor> txt_c;
     txt_c.reserve(6);
@@ -307,9 +470,9 @@ void FluxDenoiser::run_double_block_(const DoubleBlock& blk,
     };
 
     // image q/k/v
-    detail::linear_batched(blk.to_q.W, &blk.to_q.b, img_modulated, q_);
-    detail::linear_batched(blk.to_k.W, &blk.to_k.b, img_modulated, k_);
-    detail::linear_batched(blk.to_v.W, &blk.to_v.b, img_modulated, v_);
+    lin_(blk.to_q, img_modulated, q_);
+    lin_(blk.to_k, img_modulated, k_);
+    lin_(blk.to_v, img_modulated, v_);
     bt::Tensor img_q = headnorm(q_, blk.norm_q, qn_);
     bt::Tensor img_k = headnorm(k_, blk.norm_k, kn_);
     bt::Tensor img_q_c = img_q.clone();
@@ -317,9 +480,9 @@ void FluxDenoiser::run_double_block_(const DoubleBlock& blk,
     bt::Tensor img_v_c = v_.clone();
 
     // text q/k/v
-    detail::linear_batched(blk.add_q.W, &blk.add_q.b, txt_modulated, q_);
-    detail::linear_batched(blk.add_k.W, &blk.add_k.b, txt_modulated, k_);
-    detail::linear_batched(blk.add_v.W, &blk.add_v.b, txt_modulated, v_);
+    lin_(blk.add_q, txt_modulated, q_);
+    lin_(blk.add_k, txt_modulated, k_);
+    lin_(blk.add_v, txt_modulated, v_);
     bt::Tensor txt_q = headnorm(q_, blk.norm_added_q, qn_);
     bt::Tensor txt_k = headnorm(k_, blk.norm_added_k, kn_);
     bt::Tensor txt_q_c = txt_q.clone();
@@ -354,12 +517,11 @@ void FluxDenoiser::run_double_block_(const DoubleBlock& blk,
     slice_rows(attn_, txt_len, img_len, img_attn);
 
     // img = img + gate_msa * to_out(img_attn)
-    detail::linear_batched(blk.to_out.W, &blk.to_out.b, img_attn, proj_);
+    lin_(blk.to_out, img_attn, proj_);
     bt::broadcast_mul(proj_, i_gate_msa, gated_);
     bt::add_inplace(img_, gated_);
     // txt = txt + gate_msa_ctx * to_add_out(txt_attn)
-    detail::linear_batched(blk.to_add_out.W, &blk.to_add_out.b,
-                           txt_attn, proj_);
+    lin_(blk.to_add_out, txt_attn, proj_);
     bt::broadcast_mul(proj_, t_gate_msa, gated_);
     bt::add_inplace(txt_, gated_);
 
@@ -367,22 +529,30 @@ void FluxDenoiser::run_double_block_(const DoubleBlock& blk,
     // img = img + gate_mlp * ff(modulate(LN(img), scale_mlp, shift_mlp))
     detail::layernorm_batched(img_, ada_gamma_, ada_beta_, ln_, 1e-6f);
     bt::modulate(ln_, i_scale_mlp, i_shift_mlp, mod_);
-    detail::linear_batched(blk.ff0.W, &blk.ff0.b, mod_, ff_mid_);
+    lin_(blk.ff0, mod_, ff_mid_);
     bt::gelu_forward(ff_mid_, ff_mid_);
-    detail::linear_batched(blk.ff2.W, &blk.ff2.b, ff_mid_, ff_out_);
+    lin_(blk.ff2, ff_mid_, ff_out_);
     bt::broadcast_mul(ff_out_, i_gate_mlp, gated_);
     bt::add_inplace(img_, gated_);
 
     // txt = txt + gate_mlp_ctx * ff_context(modulate(LN(txt), ...))
     detail::layernorm_batched(txt_, ada_gamma_, ada_beta_, ln_, 1e-6f);
     bt::modulate(ln_, t_scale_mlp, t_shift_mlp, mod_);
-    detail::linear_batched(blk.ffc0.W, &blk.ffc0.b, mod_, ff_mid_);
+    lin_(blk.ffc0, mod_, ff_mid_);
     bt::gelu_forward(ff_mid_, ff_mid_);
-    detail::linear_batched(blk.ffc2.W, &blk.ffc2.b, ff_mid_, ff_out_);
+    lin_(blk.ffc2, ff_mid_, ff_out_);
     bt::broadcast_mul(ff_out_, t_gate_mlp, gated_);
     bt::add_inplace(txt_, gated_);
 
-    (void)dt;
+    // FP16 saturation guard, matching diffusers' FluxTransformerBlock: the
+    // text stream's magnitude grows monotonically through the double-stream
+    // stack (real Flux.1 weights reach ~17k by block 17 and overflow FP16
+    // inside block 18's ff_context), so clip the stream to the FP16 finite
+    // range after the MLP residual — saturation instead of inf/NaN.
+    if (dt == bt::Dtype::FP16) {
+        bt::clamp(txt_, -65504.0f, 65504.0f);
+    }
+
     (void)dev;
 }
 
@@ -404,7 +574,7 @@ void FluxDenoiser::run_single_block_(const SingleBlock& blk,
 
     // norm = AdaLayerNormZeroSingle → shift, scale, gate
     std::vector<bt::Tensor> mod_chunks;
-    detail::linear_batched(blk.norm.W, &blk.norm.b, silu_, chunk_row_);
+    lin_(blk.norm, silu_, chunk_row_);
     slice_modulation_chunks(chunk_row_, D, 3, mod_chunks);
     bt::Tensor shift = mod_chunks[0].clone();
     bt::Tensor scale = mod_chunks[1].clone();
@@ -418,13 +588,13 @@ void FluxDenoiser::run_single_block_(const SingleBlock& blk,
     bt::Tensor x_mod = mod_.clone();
 
     // mlp = gelu(proj_mlp(x_mod))   (D → 4D)
-    detail::linear_batched(blk.proj_mlp.W, &blk.proj_mlp.b, x_mod, mlp_);
+    lin_(blk.proj_mlp, x_mod, mlp_);
     bt::gelu_forward(mlp_, mlp_);
 
     // q/k/v from x_mod; per-head RMSNorm on q,k.
-    detail::linear_batched(blk.to_q.W, &blk.to_q.b, x_mod, q_);
-    detail::linear_batched(blk.to_k.W, &blk.to_k.b, x_mod, k_);
-    detail::linear_batched(blk.to_v.W, &blk.to_v.b, x_mod, v_);
+    lin_(blk.to_q, x_mod, q_);
+    lin_(blk.to_k, x_mod, k_);
+    lin_(blk.to_v, x_mod, v_);
 
     auto headnorm = [&](bt::Tensor& src, const bt::Tensor& gain,
                         bt::Tensor& dst) -> bt::Tensor {
@@ -464,12 +634,19 @@ void FluxDenoiser::run_single_block_(const SingleBlock& blk,
         bt::copy_d2d(attn_, r * D, cat5_, r * (D + FF), D);
         bt::copy_d2d(mlp_, r * FF, cat5_, r * (D + FF) + D, FF);
     }
-    detail::linear_batched(blk.proj_out.W, &blk.proj_out.b, cat5_, proj_);
+    lin_(blk.proj_out, cat5_, proj_);
 
     // x = residual + gate * out
     bt::broadcast_mul(proj_, gate, gated_);
     x_ = residual;
     bt::add_inplace(x_, gated_);
+
+    // FP16 saturation guard, matching diffusers' FluxSingleTransformerBlock
+    // (see the double-stream block for why). Inactive under BF16, the normal
+    // CUDA configuration.
+    if (flux_compute_dtype() == bt::Dtype::FP16) {
+        bt::clamp(x_, -65504.0f, 65504.0f);
+    }
 }
 
 // ─── forward ───────────────────────────────────────────────────────────────
@@ -534,11 +711,11 @@ void FluxDenoiser::forward_impl_(const bt::Tensor& latent,
         bt::timestep_embedding(ts_, /*dim=*/256, /*max_period=*/10000.0f,
                                freq_);
     }
-    // freq_ is FP32; on a GPU backend it must be cast to compute dtype before
-    // the linear. On CPU compute dtype is FP32 — no cast.
+    // freq_ is FP32; on a GPU backend it must be cast to the flux compute
+    // dtype before the linear. On CPU that dtype is FP32 — no cast.
     bt::Tensor freq_cd = freq_;
-    if (compute_dtype() != bt::Dtype::FP32) {
-        bt::cast(freq_, freq_cd, compute_dtype());
+    if (flux_compute_dtype() != bt::Dtype::FP32) {
+        bt::cast(freq_, freq_cd, flux_compute_dtype());
     }
     detail::linear_batched(te_time_l1_.W, &te_time_l1_.b, freq_cd, temb_time_);
     bt::silu_forward(temb_time_, temb_time_);
@@ -551,8 +728,8 @@ void FluxDenoiser::forward_impl_(const bt::Tensor& latent,
         bt::Tensor gfreq;
         bt::timestep_embedding(gts, 256, 10000.0f, gfreq);
         bt::Tensor gfreq_cd = gfreq;
-        if (compute_dtype() != bt::Dtype::FP32) {
-            bt::cast(gfreq, gfreq_cd, compute_dtype());
+        if (flux_compute_dtype() != bt::Dtype::FP32) {
+            bt::cast(gfreq, gfreq_cd, flux_compute_dtype());
         }
         detail::linear_batched(te_guidance_l1_.W, &te_guidance_l1_.b,
                                gfreq_cd, temb_guid_);
@@ -565,11 +742,15 @@ void FluxDenoiser::forward_impl_(const bt::Tensor& latent,
     bt::add_inplace(temb_, prep->text_emb);
 
     // ── pack latent + x_embedder ──────────────────────────────────────────
+    // pack_latents produces the pipeline dtype; cast to the flux compute
+    // dtype (BF16 on CUDA) at the boundary.
     bt::Tensor packed = pack_latents(latent, LC, H_lat, W_lat);  // (img_len,64)
     if (packed.cols != cfg_.in_channels) {
         fail("forward: packed latent width != in_channels");
     }
-    detail::linear_batched(x_embedder_.W, &x_embedder_.b, packed, img_);
+    bt::Tensor packed_cast;
+    const bt::Tensor& packed_cd = to_flux_dtype(packed, packed_cast);
+    detail::linear_batched(x_embedder_.W, &x_embedder_.b, packed_cd, img_);
     img_ = img_.clone();                       // (img_len, D)
     txt_ = prep->context.clone();              // (txt_len, D)
 
@@ -601,6 +782,9 @@ void FluxDenoiser::forward_impl_(const bt::Tensor& latent,
         return b;
     };
 
+    const bool nancheck = flux_nancheck();
+    if (nancheck) probe("pre", -1, img_, &txt_);
+
     // ── double-stream blocks ──────────────────────────────────────────────
     for (const DoubleBlock& blk : double_blocks_) {
         bt::Tensor* te = trace_out
@@ -608,6 +792,7 @@ void FluxDenoiser::forward_impl_(const bt::Tensor& latent,
             : nullptr;
         run_double_block_(blk, temb_, rope.cos, rope.sin, txt_len, img_len,
                           te, bias_at(trace_idx));
+        if (nancheck) probe("double", trace_idx, img_, &txt_);
         ++trace_idx;
     }
 
@@ -620,6 +805,7 @@ void FluxDenoiser::forward_impl_(const bt::Tensor& latent,
             : nullptr;
         run_single_block_(blk, temb_, rope.cos, rope.sin, txt_len, img_len,
                           te, bias_at(trace_idx));
+        if (nancheck) probe("single", trace_idx, x_, nullptr);
         ++trace_idx;
     }
 
@@ -640,6 +826,7 @@ void FluxDenoiser::forward_impl_(const bt::Tensor& latent,
 
     // ── unpack → (1, LC*H_lat*W_lat) ──────────────────────────────────────
     unpack_latents(proj_, LC, H_lat, W_lat, out);
+    if (nancheck) probe("velocity-out", -1, out, &temb_);
     (void)D;
 }
 

@@ -561,6 +561,33 @@ int main() {
         // (deterministic graph).
         std::vector<float> img2 = pipeline.generate("a cat", opts);
         CHECK(img == img2);
+
+        // ── INT8 W8A16 quantized load (GPU only) ─────────────────────────
+        // Re-load the same model dir with quantize=true and compare against
+        // the dense run. Per-output-row symmetric INT8 introduces bounded
+        // per-layer error; on this tiny synthetic fixture the end-to-end
+        // image error stays small. On the CPU backend the flag downgrades
+        // to a dense load with a warning, making the outputs identical —
+        // the bound holds trivially.
+        {
+            pl::Pipeline::ModelDirOptions dopts;
+            dopts.quantize = true;
+            pl::Pipeline qp = pl::Pipeline::from_model_dir(base.string(),
+                                                           dopts);
+            std::vector<float> qimg = qp.generate("a cat", opts);
+            CHECK(qimg.size() == img.size());
+            float max_abs_err = 0.0f;
+            int nf = 0;
+            for (std::size_t i = 0; i < qimg.size(); ++i) {
+                if (!std::isfinite(qimg[i])) ++nf;
+                const float e = std::fabs(qimg[i] - img[i]);
+                if (e > max_abs_err) max_abs_err = e;
+            }
+            CHECK(nf == 0);
+            std::printf("flux quantized vs dense: max_abs_err=%.4f\n",
+                        max_abs_err);
+            CHECK(max_abs_err < 0.08f);
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL exception: %s\n", e.what());
         ++g_failures;

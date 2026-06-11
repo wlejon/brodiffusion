@@ -196,7 +196,16 @@ public:
     // JSON configs, constructs the right sub-modules, loads all component
     // weights and tokenizers. Supports StableDiffusion and Flux model
     // directories. Pipeline is move-only; this returns by value.
-    static Pipeline from_model_dir(const std::string& model_dir);
+    struct ModelDirOptions {
+        // Quantize the denoiser (SD1.5 U-Net / Flux transformer) — and, for
+        // Flux, the T5-XXL encoder — to INT8 weight-only (W8A16) while
+        // loading. GPU-only; ignored with a warning on the CPU backend.
+        // Flux.1 FP16 (~24 GB) does not fit a 24 GB card next to T5: INT8
+        // (~12 GB) is how Flux runs there at all.
+        bool quantize = false;
+    };
+    static Pipeline from_model_dir(const std::string& model_dir,
+                                   const ModelDirOptions& opts = {});
 
     // Move-only (owns move-only sub-modules; copies make no sense). The
     // move members and destructor are defined in pipeline.cpp where

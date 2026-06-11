@@ -44,6 +44,11 @@ struct DecoderConfig {
     float shift_factor = 0.0f;
     float eps            = 1e-6f;
     int num_attention_heads = 1;   // SD VAE mid-block is single-head.
+    // diffusers' AutoencoderKL force_upcast: SDXL/Flux-class VAEs overflow
+    // FP16 internally (the Flux 16-channel VAE NaNs every output pixel), so
+    // when set the VAE loads + runs at FP32 on a GPU backend, casting at the
+    // latent/image boundary. SD1.5's VAE is FP16-safe (flag false).
+    bool force_upcast = false;
 };
 
 class Decoder {
@@ -187,6 +192,8 @@ struct EncoderConfig {
     float shift_factor   = 0.0f;
     float eps            = 1e-6f;
     int num_attention_heads = 1;
+    // See DecoderConfig::force_upcast.
+    bool force_upcast = false;
 };
 
 class Encoder {

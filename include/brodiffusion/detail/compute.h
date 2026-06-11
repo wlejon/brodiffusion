@@ -53,7 +53,11 @@ inline void linear_batched(const brotensor::Tensor& W,
                            const brotensor::Tensor* bias,
                            const brotensor::Tensor& X,
                            brotensor::Tensor& Y) {
-    if (W.dtype == brotensor::Dtype::FP16) {
+    if (W.dtype == brotensor::Dtype::FP16 ||
+        W.dtype == brotensor::Dtype::BF16) {
+        // The "_fp16" batched linear dispatches FP16/BF16 on the operand
+        // dtype internally (historical name). BF16 is the Flux compute
+        // dtype on CUDA.
         brotensor::linear_forward_batched_fp16(W, bias, X, Y);
         return;
     }

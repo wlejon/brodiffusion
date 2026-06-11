@@ -13,6 +13,7 @@
 // that needs real Flux weights and lives in image-generation integration.
 
 #include "brodiffusion/dit/flux.h"
+#include "brodiffusion/dit/common.h"
 #include "brodiffusion/denoiser.h"
 #include "brodiffusion/detail/compute.h"
 #include "brotensor/safetensors.h"
@@ -280,6 +281,13 @@ std::vector<float> run_flux(const dit::FluxConfig& cfg,
     CHECK(bad_weight == 0);
 
     // Traced velocity output matches the plain forward output tightly.
+    // Tolerance follows the flux compute dtype: BF16 (CUDA) carries ~8
+    // mantissa bits, so the traced (host FP64 attention re-uploaded as BF16)
+    // vs fused (BF16 flash attention) paths legitimately differ by a few
+    // BF16 ULPs on O(1) values; FP16/FP32 keep the tight bound.
+    const float trace_tol =
+        brodiffusion::dit::flux_compute_dtype() == bt::Dtype::BF16 ? 1e-2f
+                                                                   : 1e-3f;
     std::vector<float> vt = bdtest::bd_download(out_traced);
     CHECK(vt.size() == v1.size());
     float max_abs_diff = 0.0f;
@@ -289,7 +297,7 @@ std::vector<float> run_flux(const dit::FluxConfig& cfg,
             if (d > max_abs_diff) max_abs_diff = d;
         }
     }
-    CHECK(max_abs_diff < 1e-3f);
+    CHECK(max_abs_diff < trace_tol);
 
     // ── joint-attention steering ──────────────────────────────────────────
     // Helper: column sum of an (img_len, txt_len) trace map over all image
@@ -399,7 +407,7 @@ std::vector<float> run_flux(const dit::FluxConfig& cfg,
         }
         std::printf("flux steer: trace vs no-trace out max-abs-diff %.3e\n",
                     op_diff);
-        CHECK(op_diff < 1e-3f);
+        CHECK(op_diff < trace_tol);
     }
 
     // attn_logit_biases with the wrong length must throw.

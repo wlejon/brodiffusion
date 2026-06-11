@@ -37,9 +37,28 @@ const st::TensorView& need_enc(const st::File& f, const std::string& key) {
     return *v;
 }
 
+// The arithmetic dtype for a VAE: BF16 when force_upcast is set on a CUDA
+// backend, otherwise the pipeline compute dtype. SDXL/Flux-class VAEs
+// overflow FP16 internally (the Flux 16-channel VAE NaNs every output
+// pixel); what they need is FP32's RANGE, which BF16 provides at half the
+// bandwidth — and the CUDA backend's fused resblock has FP16/BF16 slots but
+// no FP32 one.
+bt::Dtype vae_arith_dtype(bool force_upcast) {
+    if (force_upcast &&
+        brotensor::default_device() == brotensor::Device::CUDA) {
+        return bt::Dtype::BF16;
+    }
+    return brodiffusion::compute_dtype();
+}
+
+// Target dtype for the upload helpers below. Set by each load_weights()
+// before its upload sequence (single-threaded loads; the helpers are free
+// functions and a parameter would touch every one of ~60 call sites).
+bt::Dtype g_vae_upload_dtype = bt::Dtype::FP32;
+
 // Accepts F16 / F32 / BF16 (converted host-side as needed); SD1.5 full
-// checkpoints ship as F32, Flux-family VAEs as BF16. Uploads at the
-// pipeline compute dtype.
+// checkpoints ship as F32, Flux-family VAEs as BF16. Uploads at
+// g_vae_upload_dtype (the owning module's arithmetic dtype).
 void upload_compute_checked(const st::TensorView& v, int rows, int cols,
                             bt::Tensor& dst, const char* name) {
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32 &&
@@ -52,7 +71,7 @@ void upload_compute_checked(const st::TensorView& v, int rows, int cols,
              std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
              std::to_string(v.numel()) + ")");
     }
-    st::upload_compute(v, rows, cols, dst);
+    st::upload_as(v, rows, cols, g_vae_upload_dtype, dst);
 }
 void upload_compute_checked_enc(const st::TensorView& v, int rows, int cols,
                                 bt::Tensor& dst, const char* name) {
@@ -66,7 +85,7 @@ void upload_compute_checked_enc(const st::TensorView& v, int rows, int cols,
                  std::to_string(rows) + "x" + std::to_string(cols) + ", got " +
                  std::to_string(v.numel()) + ")");
     }
-    st::upload_compute(v, rows, cols, dst);
+    st::upload_as(v, rows, cols, g_vae_upload_dtype, dst);
 }
 
 }  // namespace
@@ -113,6 +132,7 @@ void Decoder::load_resnet_(const st::File& f, const std::string& p,
 }
 
 void Decoder::load_weights(const st::File& f, const std::string& prefix) {
+    g_vae_upload_dtype = vae_arith_dtype(cfg_.force_upcast);
     const int mid_C   = cfg_.block_out_channels.back();
     const int first_C = cfg_.block_out_channels.front();
 
@@ -292,8 +312,16 @@ void Decoder::decode(const bt::Tensor& latent,
     const int first_C = cfg_.block_out_channels.front();
     const int mid_C   = cfg_.block_out_channels.back();
 
-    // 1. Scale (latent /= scaling_factor), then optional shift.
-    x_ = latent.clone();
+    // 1. Scale (latent /= scaling_factor), then optional shift. Under
+    // force_upcast the decoder runs FP32 while the pipeline latent is FP16 —
+    // cast at the boundary (decode output simply stays FP32; the pipeline's
+    // host download handles either dtype).
+    const bt::Dtype adt = vae_arith_dtype(cfg_.force_upcast);
+    if (latent.dtype != adt) {
+        bt::cast(latent, x_, adt);
+    } else {
+        x_ = latent.clone();
+    }
     if (cfg_.scaling_factor != 1.0f) {
         bt::scale_inplace(x_, 1.0f / cfg_.scaling_factor);
     }
@@ -389,6 +417,7 @@ void Encoder::load_resnet_(const st::File& f, const std::string& p,
 }
 
 void Encoder::load_weights(const st::File& f, const std::string& prefix) {
+    g_vae_upload_dtype = vae_arith_dtype(cfg_.force_upcast);
     const int first_C = cfg_.block_out_channels.front();
     const int mid_C   = cfg_.block_out_channels.back();
     const int twoC_lat = 2 * cfg_.in_channels;
@@ -557,8 +586,15 @@ void Encoder::encode(const bt::Tensor& image, int H, int W,
     const int spatial_lat = H_lat * W_lat;
     const int C_lat   = cfg_.in_channels;
 
-    // 1. conv_in: out_channels (3) -> first_C.
-    x_ = image.clone();
+    // 1. conv_in: out_channels (3) -> first_C. Under force_upcast the
+    // encoder runs FP32 while the caller's image is at the pipeline dtype —
+    // cast at the boundary (and back at the end).
+    const bt::Dtype enc_adt = vae_arith_dtype(cfg_.force_upcast);
+    if (image.dtype != enc_adt) {
+        bt::cast(image, x_, enc_adt);
+    } else {
+        x_ = image.clone();
+    }
     apply_conv3x3_(conv_in_W_, conv_in_b_,
                    cfg_.out_channels, first_C, H, W,
                    x_, y_);
@@ -642,6 +678,11 @@ void Encoder::encode(const bt::Tensor& image, int H, int W,
             for (float& v : lv_host) v = std::exp(0.5f * v);
         }
         bt::Tensor std_dev = detail::upload_host(lv_host.data(), 1, half);
+        if (std_dev.dtype != out.dtype) {
+            bt::Tensor cast_buf;
+            bt::cast(std_dev, cast_buf, out.dtype);
+            std_dev = std::move(cast_buf);
+        }
         // std_dev *= eps  (mul elementwise)
         bt::mul_inplace(std_dev, *eps);
         bt::add_inplace(out, std_dev);
@@ -653,6 +694,15 @@ void Encoder::encode(const bt::Tensor& image, int H, int W,
     }
     if (cfg_.scaling_factor != 1.0f) {
         bt::scale_inplace(out, cfg_.scaling_factor);
+    }
+
+    // Hand the latent back at the pipeline compute dtype: the scheduler and
+    // denoiser operate there, not at the VAE's (possibly upcast) dtype.
+    const bt::Dtype pdt = brodiffusion::compute_dtype();
+    if (out.dtype != pdt) {
+        bt::Tensor cast_buf;
+        bt::cast(out, cast_buf, pdt);
+        out = std::move(cast_buf);
     }
 }
 

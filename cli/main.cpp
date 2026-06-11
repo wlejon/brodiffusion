@@ -310,8 +310,10 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     const char* mask_path = arg_after(argc, argv, "--mask");
     const char* strength_s = arg_after(argc, argv, "--strength");
     bool vae_sample = false;
+    bool quantize   = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--vae-sample") == 0) vae_sample = true;
+        if (std::strcmp(argv[i], "--quantize-unet") == 0) quantize = true;
     }
 
     if (!prompt || !out_path) {
@@ -322,8 +324,11 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
 
     brotensor::init();
 
-    std::printf("Loading model directory: %s\n", model_dir);
-    pl::Pipeline pipeline = pl::Pipeline::from_model_dir(model_dir);
+    std::printf("Loading model directory: %s%s\n", model_dir,
+                quantize ? " (INT8 W8A16 denoiser + T5)" : "");
+    pl::Pipeline::ModelDirOptions dir_opts;
+    dir_opts.quantize = quantize;
+    pl::Pipeline pipeline = pl::Pipeline::from_model_dir(model_dir, dir_opts);
     const bool is_flux =
         pipeline.config().model_class == brodiffusion::ModelClass::Flux;
     std::printf("Model class: %s\n", is_flux ? "Flux" : "StableDiffusion");

@@ -47,6 +47,19 @@ struct FluxConfig {
     bool guidance_embeds    = false; // false = flux-schnell, true = flux-dev
     std::vector<int> axes_dims_rope = {16, 56, 56};  // sums to attention_head_dim
 
+    // When true (and the default device is CUDA), load_weights() quantizes
+    // every transformer-block linear (the AdaLN modulation MLPs, all Q/K/V
+    // and output projections, and both FFNs — ~99% of the parameters) to
+    // INT8 weight-only (W8A16, per-output-row symmetric FP32 scales) as the
+    // weights stream in, so the FP16 copy never materialises on the device.
+    // That matters: the FP16 transformer is ~24 GB — beyond a 24 GB card
+    // once the T5 encoder is resident — while INT8 is ~12 GB. Small or
+    // quality-sensitive tensors (time/text/guidance embedders, x_embedder,
+    // context_embedder, norm_out, final proj_out, RMSNorm gains, all biases)
+    // keep the compute dtype. On a non-CUDA backend the flag is ignored
+    // with a warning (the fused dequant matmuls are GPU-only).
+    bool quantize_weights = false;
+
     int inner_dim() const { return num_attention_heads * attention_head_dim; }
     int latent_channels() const { return in_channels / 4; }
 };
@@ -116,11 +129,22 @@ public:
     const FluxConfig& config() const { return cfg_; }
 
 private:
-    // A biased linear layer (weight (out,in), bias (out,1)).
+    // A biased linear layer (weight (out,in), bias (out,1)). When the layer
+    // was quantized at load (cfg.quantize_weights), W is empty and W_int8
+    // (out,in) + scales (out,1 FP32 per-row) carry the weight instead; the
+    // bias always stays at the compute dtype.
     struct Linear {
         brotensor::Tensor W;
         brotensor::Tensor b;
+        brotensor::Tensor W_int8;
+        brotensor::Tensor scales;
+        bool quantized() const { return W_int8.size() > 0; }
     };
+
+    // Dispatch helper: INT8 fused-dequant matmul when the layer is
+    // quantized, dense linear otherwise.
+    static void lin_(const Linear& l, const brotensor::Tensor& X,
+                     brotensor::Tensor& Y);
 
     // Double-stream block (FluxTransformerBlock).
     struct DoubleBlock {

@@ -28,7 +28,10 @@
 #include "brotensor/cuda_graph.h"
 #endif
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
@@ -134,6 +137,7 @@ vae::EncoderConfig encoder_config_from_decoder(const vae::DecoderConfig& d) {
     e.shift_factor        = d.shift_factor;
     e.eps                 = d.eps;
     e.num_attention_heads = d.num_attention_heads;
+    e.force_upcast        = d.force_upcast;
     return e;
 }
 
@@ -252,7 +256,8 @@ const unet::UNet& Pipeline::unet() const {
     return *u;
 }
 
-Pipeline Pipeline::from_model_dir(const std::string& model_dir) {
+Pipeline Pipeline::from_model_dir(const std::string& model_dir,
+                                  const ModelDirOptions& dir_opts) {
     namespace fs = std::filesystem;
     const ModelConfig mc = load_model_config(model_dir);
 
@@ -265,6 +270,11 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir) {
     cfg.t5            = mc.t5;
     cfg.t5_max_length = mc.t5_max_length;
     cfg.scheduler     = mc.scheduler;
+    if (dir_opts.quantize) {
+        cfg.unet.quantize_weights = true;
+        cfg.flux.quantize_weights = true;
+        cfg.t5.quantize_weights   = true;
+    }
 
     const fs::path root(model_dir);
 
@@ -1036,8 +1046,9 @@ std::vector<float> Pipeline::decode(const PipelineState& state) {
     bt::sync_all();
     const int n_img = cfg_.vae.out_channels *
                        (state.H_lat * 8) * (state.W_lat * 8);
-    // The decoded tensor carries the compute dtype — FP16 on a GPU backend,
-    // FP32 on CPU. Convert FP16 bits to float as needed.
+    // The decoded tensor carries the VAE's arithmetic dtype — FP16 on a GPU
+    // backend, BF16 for a force_upcast VAE (Flux), FP32 on CPU. Convert the
+    // 16-bit cases to float as needed.
     if (decoded_.dtype == bt::Dtype::FP16) {
         std::vector<std::uint16_t> dec_bits(static_cast<std::size_t>(n_img));
         decoded_.copy_to_host_fp16(dec_bits.data());
@@ -1045,6 +1056,16 @@ std::vector<float> Pipeline::decode(const PipelineState& state) {
         for (int i = 0; i < n_img; ++i) {
             out[static_cast<std::size_t>(i)] =
                 bt::fp16_bits_to_fp32(dec_bits[static_cast<std::size_t>(i)]);
+        }
+        return out;
+    }
+    if (decoded_.dtype == bt::Dtype::BF16) {
+        std::vector<std::uint16_t> dec_bits(static_cast<std::size_t>(n_img));
+        decoded_.copy_to_host_bf16(dec_bits.data());
+        std::vector<float> out(static_cast<std::size_t>(n_img));
+        for (int i = 0; i < n_img; ++i) {
+            out[static_cast<std::size_t>(i)] =
+                bt::bf16_bits_to_fp32(dec_bits[static_cast<std::size_t>(i)]);
         }
         return out;
     }
