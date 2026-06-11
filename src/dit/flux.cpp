@@ -704,9 +704,13 @@ void FluxDenoiser::forward_impl_(const bt::Tensor& latent,
     const bt::Device dev = bt::default_device();
 
     // ── CombinedTimestep embedding → temb (1, D) ──────────────────────────
-    // time_proj: timestep_embedding(timestep/1000, 256, 10000); FP32 output.
+    // The scheduler passes the continuous timestep sigma*1000 — exactly the
+    // value the reference embeds (BFL's timestep_embedding has a built-in
+    // time_factor=1000 on sigma; diffusers' transformer multiplies its
+    // sigma-valued `timestep` input by 1000 before Timesteps(256)). Embed it
+    // as-is: timestep_embedding(sigma*1000, 256, 10000); FP32 output.
     {
-        std::vector<float> tval = {timestep / 1000.0f};
+        std::vector<float> tval = {timestep};
         ts_ = bt::Tensor::from_host(tval.data(), 1, 1).to(dev);
         bt::timestep_embedding(ts_, /*dim=*/256, /*max_period=*/10000.0f,
                                freq_);
@@ -723,7 +727,9 @@ void FluxDenoiser::forward_impl_(const bt::Tensor& latent,
     temb_ = temb_.clone();  // (1, D), timestep part
 
     if (cfg_.guidance_embeds) {
-        std::vector<float> gval = {prep->guidance};
+        // Same 1000x convention as the timestep: the reference embeds
+        // guidance_scale * 1000 (flux-dev).
+        std::vector<float> gval = {prep->guidance * 1000.0f};
         bt::Tensor gts = bt::Tensor::from_host(gval.data(), 1, 1).to(dev);
         bt::Tensor gfreq;
         bt::timestep_embedding(gts, 256, 10000.0f, gfreq);
