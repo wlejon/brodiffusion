@@ -89,6 +89,34 @@ public:
                  brotensor::Tensor& out_latent,
                  brotensor::Tensor& out_camera);
 
+    // ── CUDA-graph step-capture seam ───────────────────────────────────────
+    //
+    // forward(...) == prepare_step(t) + forward_body(...). The split lets the
+    // sampler record forward_body with brotensor::CudaGraphCapture and replay
+    // it every step after refreshing the inputs in place and re-running
+    // prepare_step.
+    //
+    // prepare_step(t) — the t-dependent head: builds the host timestep
+    // sinusoid, uploads it, and runs the t_embedder MLP + adaLN chain into the
+    // persistent t_emb_/t_mod_ members the captured body reads. Host-dependent,
+    // so it always runs eagerly, OUTSIDE any graph capture.
+    void prepare_step(float t);
+
+    // forward_body — everything after the time embedding (input_layer through
+    // the out layers), reading t_emb_/t_mod_. Capture contract: after warm-up
+    // calls at fixed shapes, a call performs no Tensor (re)allocation (every
+    // intermediate lives in a member scratch buffer settled at its high-water
+    // capacity), no host reads/writes, and launches every kernel on
+    // brotensor's current stream — so a sampler may record it with
+    // brotensor::CudaGraphCapture and replay it each step after refreshing the
+    // input buffers in place and calling prepare_step.
+    void forward_body(const brotensor::Tensor& latent,
+                      const brotensor::Tensor& camera,
+                      const brotensor::Tensor& feature1,
+                      const brotensor::Tensor& feature2,
+                      brotensor::Tensor& out_latent,
+                      brotensor::Tensor& out_camera);
+
     const FlowModelConfig& config() const { return cfg_; }
 
 private:
@@ -154,6 +182,29 @@ private:
 
     brotensor::Tensor pos_emb_;       // precomputed (L, D) absolute position emb
     brotensor::Tensor ada_gamma_, ada_beta_;  // ones / zeros for affine-free LN
+
+    // ── step-capture scratch ────────────────────────────────────────────────
+    // Every intermediate in the prepare_step/forward_body path lives in a
+    // member buffer so the body is allocation-stable after warm-up (capacity-
+    // aware Tensor::resize keeps the device pointer once a buffer has reached
+    // its high-water size). Shapes vary across call sites (L latent rows, K
+    // cond rows, L+K+1 joint rows); each buffer settles at its high-water
+    // capacity during the eager warm-up steps.
+    brotensor::Tensor t_emb_, t_mod_;         // (1,D) / (1,6D), read by the body
+    brotensor::Tensor t_mlp_, t_silu_;        // t_embedder hidden / silu(t_emb)
+    brotensor::Tensor h_x_, h_cond_, c2_;     // input/cond embeddings
+    brotensor::Tensor h_cam_, cam_mid_;       // cam_refiner MLP
+    brotensor::Tensor h_cat_;                 // concat([h_x, h_cond, h_cam])
+    brotensor::Tensor cos_, sin_;             // rope tables, reused per block
+    brotensor::Tensor hx_, hcam_;             // final LN outputs
+    brotensor::Tensor hx_slice_, cam_slice_;  // final LN input slices
+    brotensor::Tensor shift_, scale_;         // shift_table + t_emb gates
+    brotensor::Tensor hx_mod_, hcam_mod_;     // modulated final activations
+    brotensor::Tensor q_, k_, v_, qr_, kr_, fa_;  // attention()
+    brotensor::Tensor blk_ln_, blk_h_, blk_attn_; // run_block()
+    brotensor::Tensor blk_ff_mid_, blk_ff_out_, blk_gated_, blk_mod_;
+    std::vector<brotensor::Tensor> blk_ch_;   // six (1,D) modulation chunks
+    brotensor::Tensor rope_h_, rope_g_, rope_c_, rope_dp_;  // build_rope()
 
     bool loaded_ = false;
 };

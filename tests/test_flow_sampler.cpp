@@ -1,7 +1,10 @@
 // TripoSplat flow Euler CFG sampler (sample_latent) parity test.
 //
-// Structural part: always runs — asserts the schedule reuse is wired (a 1-step
-// sampler with guidance<=1 reduces to one forward + one Euler step).
+// Structural part: always runs — builds a small synthetic FlowDiT fixture and
+// asserts the CUDA-graph step-capture path (sample_latent's capture session)
+// produces bitwise-identical output to the eager path, with CFG on and off.
+// On a CPU-only build both runs are eager and the check degenerates to
+// eager == eager.
 //
 // Golden parity part: gated on the real flow checkpoint and golden_sampler.bin
 // (out-of-repo, FP32 CUDA reference FlowEulerCfgSampler over injected noise).
@@ -22,10 +25,13 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace tsp = brodiffusion::triposplat;
@@ -45,6 +51,192 @@ static int g_failures = 0;
 #endif
 
 namespace {
+
+void set_env(const char* k, const char* v) {
+#ifdef _WIN32
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 1);
+#endif
+}
+
+// ── synthetic FlowDiT fixture (structural captured-vs-eager parity) ────────
+
+// Small deterministic FP16 values bounded around zero (wrapped sawtooth) so
+// the synthetic forward stays numerically tame.
+std::vector<uint16_t> fp16_seq(std::size_t n, float scale) {
+    std::vector<uint16_t> out(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const float v = (static_cast<float>(i % 7) - 3.0f) * scale;
+        out[i] = bt::fp32_to_fp16_bits(v);
+    }
+    return out;
+}
+
+std::vector<uint16_t> fp16_from(const std::vector<float>& v) {
+    std::vector<uint16_t> out(v.size());
+    for (std::size_t i = 0; i < v.size(); ++i) out[i] = bt::fp32_to_fp16_bits(v[i]);
+    return out;
+}
+
+struct Fixture {
+    std::vector<std::unique_ptr<std::vector<uint16_t>>> store;
+    std::vector<st::WriteEntry> entries;
+
+    void add(const std::string& name, std::vector<int64_t> shape,
+             std::vector<uint16_t> data) {
+        store.push_back(std::make_unique<std::vector<uint16_t>>(std::move(data)));
+        st::WriteEntry e;
+        e.name = name;
+        e.dtype = st::Dtype::F16;
+        e.shape = std::move(shape);
+        e.host_data = store.back()->data();
+        e.bytes = store.back()->size() * 2;
+        entries.push_back(std::move(e));
+    }
+
+    void add_linear(const std::string& key, int out, int in, float ws, float bs) {
+        add(key + ".weight", {out, in}, fp16_seq(static_cast<std::size_t>(out) * in, ws));
+        add(key + ".bias", {out}, fp16_seq(static_cast<std::size_t>(out), bs));
+    }
+};
+
+// Shrunk config: same topology as the real model, tiny dimensions.
+brodiffusion::triposplat::FlowModelConfig small_cfg() {
+    tsp::FlowModelConfig c;
+    c.q_token_length     = 64;
+    c.model_channels     = 64;
+    c.cond_channels      = 32;
+    c.cond2_channels     = 8;
+    c.num_refiner_blocks = 1;
+    c.num_blocks         = 2;
+    c.num_heads          = 4;
+    c.head_dim           = 16;
+    return c;
+}
+
+void add_repo(Fixture& fx, const std::string& p, const tsp::FlowModelConfig& c) {
+    const int D = c.model_channels, H = c.num_heads;
+    const int hidden = D / 8;
+    fx.add(p + ".norm.weight", {D}, fp16_seq(static_cast<std::size_t>(D), 0.02f));
+    fx.add(p + ".norm.bias",   {D}, fp16_seq(static_cast<std::size_t>(D), 0.01f));
+    fx.add(p + ".gate_map.weight",    {hidden, D}, fp16_seq(static_cast<std::size_t>(hidden) * D, 0.03f));
+    fx.add(p + ".content_map.weight", {hidden, D}, fp16_seq(static_cast<std::size_t>(hidden) * D, 0.03f));
+    fx.add(p + ".final_map.weight",   {3 * H, hidden}, fp16_seq(static_cast<std::size_t>(3 * H) * hidden, 0.05f));
+    // f0 + f1 + f2 must equal head_dim/2 (= 8 here): 3 + 3 + 2.
+    fx.add(p + ".freqs_0", {3}, fp16_from({0.25f, 0.5f, 1.0f}));
+    fx.add(p + ".freqs_1", {3}, fp16_from({0.25f, 0.5f, 1.0f}));
+    fx.add(p + ".freqs_2", {2}, fp16_from({0.5f, 1.5f}));
+}
+
+void add_block(Fixture& fx, const std::string& p, bool modulated,
+               const tsp::FlowModelConfig& c) {
+    const int D = c.model_channels, FF = D * c.mlp_ratio;
+    const int H = c.num_heads, hd = c.head_dim;
+    fx.add_linear(p + ".attn.qkv", 3 * D, D, 0.03f, 0.01f);
+    fx.add_linear(p + ".attn.out", D, D, 0.03f, 0.01f);
+    fx.add(p + ".attn.q_norm.gamma", {H * hd}, fp16_seq(static_cast<std::size_t>(H) * hd, 0.05f));
+    fx.add(p + ".attn.k_norm.gamma", {H * hd}, fp16_seq(static_cast<std::size_t>(H) * hd, 0.05f));
+    fx.add_linear(p + ".mlp.mlp.0", FF, D, 0.03f, 0.01f);
+    fx.add_linear(p + ".mlp.mlp.2", D, FF, 0.03f, 0.01f);
+    if (modulated) {
+        fx.add(p + ".shift_table", {1, 6 * D}, fp16_seq(static_cast<std::size_t>(6) * D, 0.02f));
+    } else {
+        fx.add(p + ".norm1.weight", {D}, fp16_seq(static_cast<std::size_t>(D), 0.02f));
+        fx.add(p + ".norm1.bias",   {D}, fp16_seq(static_cast<std::size_t>(D), 0.01f));
+        fx.add(p + ".norm2.weight", {D}, fp16_seq(static_cast<std::size_t>(D), 0.02f));
+        fx.add(p + ".norm2.bias",   {D}, fp16_seq(static_cast<std::size_t>(D), 0.01f));
+    }
+}
+
+std::string build_fixture_file(const tsp::FlowModelConfig& c) {
+    const int D = c.model_channels;
+    Fixture fx;
+    fx.add_linear("t_embedder.mlp.0", D, 256, 0.02f, 0.01f);
+    fx.add_linear("t_embedder.mlp.2", D, D, 0.03f, 0.01f);
+    fx.add_linear("adaLN_modulation.1", 6 * D, D, 0.02f, 0.01f);
+    fx.add_linear("input_layer", D, c.in_channels, 0.05f, 0.01f);
+    fx.add_linear("cond_embedder", D, c.cond_channels, 0.05f, 0.01f);
+    fx.add_linear("cond_embedder2", D, c.cond2_channels, 0.05f, 0.01f);
+    fx.add_linear("cam_refiner.mlp.0", D, c.cam_channels, 0.05f, 0.01f);
+    fx.add_linear("cam_refiner.mlp.2", D, D, 0.03f, 0.01f);
+    fx.add("shift_table", {1, 2 * D}, fp16_seq(static_cast<std::size_t>(2) * D, 0.02f));
+    fx.add_linear("out_layer", c.out_channels, D, 0.03f, 0.01f);
+    fx.add_linear("cam_out_layer", c.cam_channels, D, 0.03f, 0.01f);
+    for (int i = 0; i < c.num_refiner_blocks; ++i) {
+        add_repo(fx, "noise_repo_layers." + std::to_string(i), c);
+        add_repo(fx, "context_repo_layers." + std::to_string(i), c);
+        add_block(fx, "noise_refiner." + std::to_string(i), /*modulated=*/true, c);
+        add_block(fx, "context_refiner." + std::to_string(i), /*modulated=*/false, c);
+    }
+    for (int i = 0; i < c.num_blocks; ++i) {
+        add_repo(fx, "repo_layers." + std::to_string(i), c);
+        add_block(fx, "blocks." + std::to_string(i), /*modulated=*/true, c);
+    }
+    const std::string path =
+        (std::filesystem::temp_directory_path() / "bd_flow_capture_fixture.safetensors").string();
+    st::write_file(path, fx.entries);
+    return path;
+}
+
+// Captured vs eager parity: the step-capture session must be a pure execution
+// optimization — bitwise-identical outputs with the graph enabled and with the
+// BRODIFFUSION_DISABLE_STEP_GRAPH hatch forcing eager stepping.
+void structural_capture_parity() {
+    const tsp::FlowModelConfig c = small_cfg();
+    const std::string path = build_fixture_file(c);
+    try {
+        st::File f = st::File::open(path);
+        tsp::FlowDiT m(c);
+        m.load_weights(f);
+
+        const int L = c.q_token_length, K = 8;
+        auto seq = [](std::size_t n, float scale) {
+            std::vector<float> v(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                v[i] = (static_cast<float>(i % 11) - 5.0f) * scale;
+            }
+            return v;
+        };
+        bt::Tensor nl = bdtest::bd_upload(seq(static_cast<std::size_t>(L) * c.in_channels, 0.2f), L, c.in_channels);
+        bt::Tensor nc = bdtest::bd_upload(seq(static_cast<std::size_t>(c.cam_channels), 0.2f), 1, c.cam_channels);
+        bt::Tensor f1 = bdtest::bd_upload(seq(static_cast<std::size_t>(K) * c.cond_channels, 0.1f), K, c.cond_channels);
+        bt::Tensor f2 = bdtest::bd_upload(seq(static_cast<std::size_t>(K) * c.cond2_channels, 0.1f), K, c.cond2_channels);
+
+        auto run = [&](float guidance) {
+            tsp::FlowSampleOptions o;
+            o.steps = 8;
+            o.guidance_scale = guidance;
+            o.shift = 3.0f;
+            bt::Tensor out;
+            tsp::sample_latent(m, f1, f2, nl, nc, o, out);
+            return bdtest::bd_download(out);
+        };
+
+        for (float guidance : {3.0f, 1.0f}) {
+            set_env("BRODIFFUSION_DISABLE_STEP_GRAPH", "");
+            std::vector<float> out_a = run(guidance);          // graph path (on CUDA)
+            set_env("BRODIFFUSION_DISABLE_STEP_GRAPH", "1");
+            std::vector<float> out_b = run(guidance);          // forced eager
+            set_env("BRODIFFUSION_DISABLE_STEP_GRAPH", "");
+
+            CHECK(out_a.size() == out_b.size());
+            const bool identical =
+                out_a.size() == out_b.size() &&
+                std::memcmp(out_a.data(), out_b.data(),
+                            out_a.size() * sizeof(float)) == 0;
+            CHECK(identical);
+            std::printf("  captured-vs-eager guidance=%.1f n=%zu %s\n",
+                        guidance, out_a.size(),
+                        identical ? "bitwise-identical" : "MISMATCH");
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "FAIL structural capture parity threw: %s\n", e.what());
+        ++g_failures;
+    }
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
 
 std::string weights_dir() {
     if (const char* e = std::getenv("BRODIFFUSION_WEIGHTS_DIR")) {
@@ -130,6 +322,11 @@ int main() {
         return 1;
     }
 
+    // ── structural: captured vs eager parity (synthetic weights) ──────────
+    std::printf("test_flow_sampler: structural captured-vs-eager parity\n");
+    structural_capture_parity();
+
+    // ── golden parity (gated) ──────────────────────────────────────────────
     const std::string wd = weights_dir();
     const std::string ckpt = wd + "/triposplat/diffusion_models/triposplat_fp16.safetensors";
     const std::string gpath = wd + "/triposplat/diffusion_models/golden/golden_sampler.bin";
@@ -138,7 +335,8 @@ int main() {
     const bool have_ckpt = !wd.empty() && std::filesystem::exists(ckpt);
     const bool have_gold = !wd.empty() && read_golden(gpath, g);
     if (!have_ckpt || !have_gold) {
-        std::printf("test_flow_sampler: SKIPPED (ckpt=%d golden=%d)\n",
+        std::printf("test_flow_sampler: structural %s; golden SKIPPED (ckpt=%d golden=%d)\n",
+                    g_failures ? "FAILED" : "OK",
                     have_ckpt ? 1 : 0, have_gold ? 1 : 0);
         return g_failures ? 1 : 0;
     }

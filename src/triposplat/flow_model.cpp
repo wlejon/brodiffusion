@@ -1,6 +1,7 @@
 #include "brodiffusion/triposplat/flow_model.h"
 
 #include "brodiffusion/detail/compute.h"
+#include "brodiffusion/detail/device.h"
 #include "brodiffusion/detail/flow_rope.h"
 #include "brodiffusion/dit/common.h"
 
@@ -241,7 +242,12 @@ void FlowDiT::build_rope(const bt::Tensor& hidden, const Repo& r,
     const int f2 = static_cast<int>(r.freqs2.size());  // 12
 
     // norm -> silu(gate)*content -> final_map  =>  delta_pos (L, 3H)
-    bt::Tensor h, g, c, dp;
+    // Member scratch (rope_*_) keeps the CUDA branch allocation-stable for
+    // graph capture; the CPU fallback below never captures.
+    bt::Tensor& h = rope_h_;
+    bt::Tensor& g = rope_g_;
+    bt::Tensor& c = rope_c_;
+    bt::Tensor& dp = rope_dp_;
     detail::layernorm_batched(hidden, r.norm_g, r.norm_b, h, 1e-5f);
     detail::linear_batched(r.gate_map.W, nullptr, h, g);
     bt::silu_forward(g, g);
@@ -293,23 +299,22 @@ void FlowDiT::attention(const bt::Tensor& x, const Block& blk,
                         bt::Tensor& out) {
     const int H = cfg_.num_heads, hd = cfg_.head_dim;
 
-    bt::Tensor q, k, v, qr, kr, attn;
-    detail::linear_batched(blk.q.W, &blk.q.b, x, q);
-    detail::linear_batched(blk.k.W, &blk.k.b, x, k);
-    detail::linear_batched(blk.v.W, &blk.v.b, x, v);
+    detail::linear_batched(blk.q.W, &blk.q.b, x, q_);
+    detail::linear_batched(blk.k.W, &blk.k.b, x, k_);
+    detail::linear_batched(blk.v.W, &blk.v.b, x, v_);
 
     // Rotary first, then qk_rms_norm (reference order).
-    bt::rope_apply_perhead(q, cos, sin, hd, H, qr);
-    bt::rope_apply_perhead(k, cos, sin, hd, H, kr);
+    bt::rope_apply_perhead(q_, cos, sin, hd, H, qr_);
+    bt::rope_apply_perhead(k_, cos, sin, hd, H, kr_);
 
     // MultiHeadRMSNorm = F.normalize(per head) * (gamma*sqrt(hd)).
-    bt::l2_norm_forward(qr, hd, H, 1e-12f, qr);
-    bt::broadcast_mul(qr, blk.q_gamma, qr);
-    bt::l2_norm_forward(kr, hd, H, 1e-12f, kr);
-    bt::broadcast_mul(kr, blk.k_gamma, kr);
+    bt::l2_norm_forward(qr_, hd, H, 1e-12f, qr_);
+    bt::broadcast_mul(qr_, blk.q_gamma, qr_);
+    bt::l2_norm_forward(kr_, hd, H, 1e-12f, kr_);
+    bt::broadcast_mul(kr_, blk.k_gamma, kr_);
 
-    bt::flash_attention_forward(qr, kr, v, /*d_mask=*/nullptr, H, /*causal=*/false, attn);
-    detail::linear_batched(blk.out.W, &blk.out.b, attn, out);
+    bt::flash_attention_forward(qr_, kr_, v_, /*d_mask=*/nullptr, H, /*causal=*/false, fa_);
+    detail::linear_batched(blk.out.W, &blk.out.b, fa_, out);
 }
 
 // ─── one UnifiedTransformerBlock in place ────────────────────────────────────
@@ -317,13 +322,24 @@ void FlowDiT::attention(const bt::Tensor& x, const Block& blk,
 void FlowDiT::run_block(bt::Tensor& x, const Block& blk, const bt::Tensor* t_mod,
                         const bt::Tensor& cos, const bt::Tensor& sin) {
     const int D = cfg_.model_channels;
-    bt::Tensor ln, h, attn, ff_mid, ff_out, gated;
+    // Member scratch (blk_*_). The attention output cannot share a buffer with
+    // ln/h — they are alive while attn feeds broadcast_mul — so the block keeps
+    // its own members, distinct from attention()'s q_/k_/v_/qr_/kr_/fa_.
+    bt::Tensor& ln = blk_ln_;
+    bt::Tensor& h = blk_h_;
+    bt::Tensor& attn = blk_attn_;
+    bt::Tensor& ff_mid = blk_ff_mid_;
+    bt::Tensor& ff_out = blk_ff_out_;
+    bt::Tensor& gated = blk_gated_;
 
     if (blk.modulated) {
         // mod = t_mod + shift_table; chunk into 6 (1,D) modulation vectors.
-        bt::Tensor mod = t_mod->clone();
+        // (clone() -> member resize_like + copy_d2d so capture sees no alloc.)
+        bt::Tensor& mod = blk_mod_;
+        detail::resize_like(mod, 1, t_mod->cols, t_mod->dtype, t_mod->device);
+        bt::copy_d2d(*t_mod, 0, mod, 0, static_cast<std::size_t>(t_mod->cols));
         bt::add_inplace(mod, blk.shift_table);
-        std::vector<bt::Tensor> ch;
+        std::vector<bt::Tensor>& ch = blk_ch_;
         dit::slice_modulation_chunks(mod, D, 6, ch);
         bt::Tensor& shift_msa = ch[0]; bt::Tensor& scale_msa = ch[1]; bt::Tensor& gate_msa = ch[2];
         bt::Tensor& shift_mlp = ch[3]; bt::Tensor& scale_mlp = ch[4]; bt::Tensor& gate_mlp = ch[5];
@@ -356,17 +372,12 @@ void FlowDiT::run_block(bt::Tensor& x, const Block& blk, const bt::Tensor* t_mod
 
 // ─── forward ─────────────────────────────────────────────────────────────────
 
-void FlowDiT::forward(const bt::Tensor& latent, const bt::Tensor& camera,
-                      const bt::Tensor& feature1, const bt::Tensor& feature2,
-                      float t,
-                      bt::Tensor& out_latent, bt::Tensor& out_camera) {
-    if (!loaded_) fail("forward: weights not loaded");
-    const int D = cfg_.model_channels;
-    const int L = latent.rows;
-    if (L != cfg_.q_token_length) fail("forward: latent token count must equal q_token_length");
+void FlowDiT::prepare_step(float t) {
+    if (!loaded_) fail("prepare_step: weights not loaded");
 
     // t_emb = t_embedder(t); timestep_embedding built host-side (one token).
-    bt::Tensor t_emb;
+    // Always eager (the host upload allocates a fresh tensor), but t_emb_ and
+    // t_mod_ are pointer-stable members the captured body reads.
     {
         const int fe = 256, half = fe / 2;
         std::vector<float> e(fe);
@@ -377,83 +388,93 @@ void FlowDiT::forward(const bt::Tensor& latent, const bt::Tensor& camera,
             e[half + i] = std::sin(arg);
         }
         bt::Tensor temb = detail::upload_host(e.data(), 1, fe);
-        bt::Tensor h0;
-        detail::linear_batched(t_emb0_.W, &t_emb0_.b, temb, h0);
-        bt::silu_forward(h0, h0);
-        detail::linear_batched(t_emb1_.W, &t_emb1_.b, h0, t_emb);
+        detail::linear_batched(t_emb0_.W, &t_emb0_.b, temb, t_mlp_);
+        bt::silu_forward(t_mlp_, t_mlp_);
+        detail::linear_batched(t_emb1_.W, &t_emb1_.b, t_mlp_, t_emb_);
     }
     // t_mod = adaLN_modulation(t_emb) = Linear(silu(t_emb))  [share_mod].
-    bt::Tensor t_mod, silu_t;
-    silu_t = t_emb.clone();
-    bt::silu_forward(silu_t, silu_t);
-    detail::linear_batched(adaLN_.W, &adaLN_.b, silu_t, t_mod);
+    bt::silu_forward(t_emb_, t_silu_);
+    detail::linear_batched(adaLN_.W, &adaLN_.b, t_silu_, t_mod_);
+}
+
+void FlowDiT::forward_body(const bt::Tensor& latent, const bt::Tensor& camera,
+                           const bt::Tensor& feature1, const bt::Tensor& feature2,
+                           bt::Tensor& out_latent, bt::Tensor& out_camera) {
+    if (!loaded_) fail("forward_body: weights not loaded");
+    const int D = cfg_.model_channels;
+    const int L = latent.rows;
+    if (L != cfg_.q_token_length) fail("forward_body: latent token count must equal q_token_length");
 
     // h_x = input_layer(z) + pos_embedder(sobol_pe)
-    bt::Tensor h_x;
-    detail::linear_batched(input_layer_.W, &input_layer_.b, latent, h_x);
-    bt::add_inplace(h_x, pos_emb_);
+    detail::linear_batched(input_layer_.W, &input_layer_.b, latent, h_x_);
+    bt::add_inplace(h_x_, pos_emb_);
 
     // h_cond = cond_embedder(feature1) + cond_embedder2(feature2)
-    bt::Tensor h_cond, c2;
-    detail::linear_batched(cond_embedder_.W, &cond_embedder_.b, feature1, h_cond);
-    detail::linear_batched(cond_embedder2_.W, &cond_embedder2_.b, feature2, c2);
-    bt::add_inplace(h_cond, c2);
+    detail::linear_batched(cond_embedder_.W, &cond_embedder_.b, feature1, h_cond_);
+    detail::linear_batched(cond_embedder2_.W, &cond_embedder2_.b, feature2, c2_);
+    bt::add_inplace(h_cond_, c2_);
 
-    bt::Tensor cos, sin;
     for (int i = 0; i < cfg_.num_refiner_blocks; ++i) {
-        build_rope(h_x, noise_repo_[i], cos, sin);
-        run_block(h_x, noise_refiner_[i], &t_mod, cos, sin);
+        build_rope(h_x_, noise_repo_[i], cos_, sin_);
+        run_block(h_x_, noise_refiner_[i], &t_mod_, cos_, sin_);
     }
     for (int i = 0; i < cfg_.num_refiner_blocks; ++i) {
-        build_rope(h_cond, context_repo_[i], cos, sin);
-        run_block(h_cond, context_refiner_[i], /*t_mod=*/nullptr, cos, sin);
+        build_rope(h_cond_, context_repo_[i], cos_, sin_);
+        run_block(h_cond_, context_refiner_[i], /*t_mod=*/nullptr, cos_, sin_);
     }
 
     // h_cam = cam_refiner(camera)  [MLP: Linear, GELU(tanh), Linear]
-    bt::Tensor h_cam, cam_mid;
-    detail::linear_batched(cam0_.W, &cam0_.b, camera, cam_mid);
-    bt::gelu_forward(cam_mid, cam_mid);
-    detail::linear_batched(cam2_.W, &cam2_.b, cam_mid, h_cam);
+    detail::linear_batched(cam0_.W, &cam0_.b, camera, cam_mid_);
+    bt::gelu_forward(cam_mid_, cam_mid_);
+    detail::linear_batched(cam2_.W, &cam2_.b, cam_mid_, h_cam_);
 
-    // h = concat([h_x, h_cond, h_cam])
-    const int Kc = h_cond.rows;
+    // h = concat([h_x, h_cond, h_cam]) — the three copies cover every element
+    // (L*D + Kc*D + D == Lh*D), so a plain capacity-aware resize suffices.
+    const int Kc = h_cond_.rows;
     const int Lh = L + Kc + 1;
-    bt::Tensor h = bt::Tensor::zeros_on(h_x.device, Lh, D, h_x.dtype);
-    bt::copy_d2d(h_x,   0, h, 0,                                static_cast<std::size_t>(L) * D);
-    bt::copy_d2d(h_cond, 0, h, static_cast<std::size_t>(L) * D, static_cast<std::size_t>(Kc) * D);
-    bt::copy_d2d(h_cam,  0, h, static_cast<std::size_t>(L + Kc) * D, static_cast<std::size_t>(1) * D);
+    bt::Tensor& h = h_cat_;
+    detail::resize_like(h, Lh, D, h_x_.dtype, h_x_.device);
+    bt::copy_d2d(h_x_,   0, h, 0,                                static_cast<std::size_t>(L) * D);
+    bt::copy_d2d(h_cond_, 0, h, static_cast<std::size_t>(L) * D, static_cast<std::size_t>(Kc) * D);
+    bt::copy_d2d(h_cam_,  0, h, static_cast<std::size_t>(L + Kc) * D, static_cast<std::size_t>(1) * D);
 
     for (int i = 0; i < cfg_.num_blocks; ++i) {
-        build_rope(h, repo_[i], cos, sin);
-        run_block(h, blocks_[i], &t_mod, cos, sin);
+        build_rope(h, repo_[i], cos_, sin_);
+        run_block(h, blocks_[i], &t_mod_, cos_, sin_);
     }
 
     // Final affine-free LayerNorm over the latent and camera slices, then the
     // shift_table+t_emb gate.  shift = shift_table[:,0]+t_emb, scale = [:,1]+t_emb.
-    bt::Tensor hx, hcam;
     {
-        bt::Tensor hx_slice = bt::Tensor::zeros_on(h.device, L, D, h.dtype);
-        bt::copy_d2d(h, 0, hx_slice, 0, static_cast<std::size_t>(L) * D);
-        detail::layernorm_batched(hx_slice, ada_gamma_, ada_beta_, hx, 1e-5f);
+        detail::resize_like(hx_slice_, L, D, h.dtype, h.device);
+        bt::copy_d2d(h, 0, hx_slice_, 0, static_cast<std::size_t>(L) * D);
+        detail::layernorm_batched(hx_slice_, ada_gamma_, ada_beta_, hx_, 1e-5f);
 
-        bt::Tensor cam_slice = bt::Tensor::zeros_on(h.device, 1, D, h.dtype);
-        bt::copy_d2d(h, static_cast<std::size_t>(L + Kc) * D, cam_slice, 0, static_cast<std::size_t>(D));
-        detail::layernorm_batched(cam_slice, ada_gamma_, ada_beta_, hcam, 1e-5f);
+        detail::resize_like(cam_slice_, 1, D, h.dtype, h.device);
+        bt::copy_d2d(h, static_cast<std::size_t>(L + Kc) * D, cam_slice_, 0, static_cast<std::size_t>(D));
+        detail::layernorm_batched(cam_slice_, ada_gamma_, ada_beta_, hcam_, 1e-5f);
     }
     // shift / scale: each (1, D).
-    bt::Tensor shift = bt::Tensor::zeros_on(h.device, 1, D, h.dtype);
-    bt::Tensor scale = bt::Tensor::zeros_on(h.device, 1, D, h.dtype);
-    bt::copy_d2d(shift_table_, 0, shift, 0, D);
-    bt::copy_d2d(shift_table_, D, scale, 0, D);
-    bt::add_inplace(shift, t_emb);
-    bt::add_inplace(scale, t_emb);
+    detail::resize_like(shift_, 1, D, h.dtype, h.device);
+    detail::resize_like(scale_, 1, D, h.dtype, h.device);
+    bt::copy_d2d(shift_table_, 0, shift_, 0, D);
+    bt::copy_d2d(shift_table_, D, scale_, 0, D);
+    bt::add_inplace(shift_, t_emb_);
+    bt::add_inplace(scale_, t_emb_);
 
-    bt::Tensor hx_mod, hcam_mod;
-    bt::modulate(hx, scale, shift, hx_mod);            // hx*(1+scale)+shift
-    bt::modulate(hcam, scale, shift, hcam_mod);
+    bt::modulate(hx_, scale_, shift_, hx_mod_);        // hx*(1+scale)+shift
+    bt::modulate(hcam_, scale_, shift_, hcam_mod_);
 
-    detail::linear_batched(out_layer_.W, &out_layer_.b, hx_mod, out_latent);
-    detail::linear_batched(cam_out_layer_.W, &cam_out_layer_.b, hcam_mod, out_camera);
+    detail::linear_batched(out_layer_.W, &out_layer_.b, hx_mod_, out_latent);
+    detail::linear_batched(cam_out_layer_.W, &cam_out_layer_.b, hcam_mod_, out_camera);
+}
+
+void FlowDiT::forward(const bt::Tensor& latent, const bt::Tensor& camera,
+                      const bt::Tensor& feature1, const bt::Tensor& feature2,
+                      float t,
+                      bt::Tensor& out_latent, bt::Tensor& out_camera) {
+    prepare_step(t);
+    forward_body(latent, camera, feature1, feature2, out_latent, out_camera);
 }
 
 }  // namespace brodiffusion::triposplat

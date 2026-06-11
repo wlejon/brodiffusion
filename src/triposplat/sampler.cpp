@@ -8,9 +8,12 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
-#include <cstdint>
+#ifdef BROTENSOR_HAS_CUDA
+#include "brotensor/cuda_graph.h"
+#endif
+
+#include <cstdlib>
 #include <stdexcept>
-#include <vector>
 
 namespace brodiffusion::triposplat {
 
@@ -18,38 +21,13 @@ namespace bt = ::brotensor;
 
 namespace {
 
-std::vector<float> download_f32(const bt::Tensor& t) {
-    if (t.dtype == bt::Dtype::FP16) {
-        std::vector<std::uint16_t> bits = t.to_host_vector_fp16();
-        std::vector<float> out(bits.size());
-        for (std::size_t i = 0; i < bits.size(); ++i) out[i] = bt::fp16_bits_to_fp32(bits[i]);
-        return out;
-    }
-    return t.to_host_vector();
-}
-
-bt::Tensor upload_like(const float* src, int rows, int cols, const bt::Tensor& ref) {
-    if (ref.dtype == bt::Dtype::FP16) {
-        std::vector<std::uint16_t> bits(static_cast<std::size_t>(rows) * cols);
-        for (std::size_t i = 0; i < bits.size(); ++i) bits[i] = bt::fp32_to_fp16_bits(src[i]);
-        return bt::Tensor::from_host_fp16_on(ref.device, bits.data(), rows, cols);
-    }
-    return bt::Tensor::from_host_on(ref.device, src, rows, cols);
-}
-
-// CFG blend: v_cond <- s*v_cond - (s-1)*v_unc, computed in FP32 then returned at
-// the compute dtype. On the FP16 path the two velocities are both large
-// (~guidance * |v|), so the combine catastrophically cancels in FP16 — doing
-// the tiny (L, C) elementwise blend in FP32 keeps the velocity precise before
-// the latent step (matches the all-FP32 reference). A device fp32-combine
-// kernel could replace this host round-trip later.
-void cfg_blend(bt::Tensor& v_cond, const bt::Tensor& v_unc, float s) {
-    bt::sync_all();
-    std::vector<float> c = download_f32(v_cond);
-    std::vector<float> u = download_f32(v_unc);
-    const float a = s, b = -(s - 1.0f);
-    for (std::size_t i = 0; i < c.size(); ++i) c[i] = a * c[i] + b * u[i];
-    v_cond = upload_like(c.data(), v_cond.rows, v_cond.cols, v_cond);
+// Escape hatch: set BRODIFFUSION_DISABLE_STEP_GRAPH=1 to force eager stepping
+// even when the CUDA-graph session would be eligible. Same env var as the
+// Pipeline's denoising-step graph — one hatch disables every step graph. Read
+// per call so tests can flip it between runs in-process.
+bool step_graph_disabled() {
+    const char* e = std::getenv("BRODIFFUSION_DISABLE_STEP_GRAPH");
+    return e != nullptr && e[0] != '\0' && e[0] != '0';
 }
 
 }  // namespace
@@ -64,6 +42,7 @@ void sample_latent(FlowDiT& flow,
     if (opts.steps <= 0) throw std::runtime_error("triposplat::sample_latent: steps must be positive");
 
     const bool cfg = opts.guidance_scale > 1.0f;
+    const float s = opts.guidance_scale;
 
     // Zeroed image features for the unconditional pass.
     bt::Tensor zero1, zero2;
@@ -81,15 +60,77 @@ void sample_latent(FlowDiT& flow,
     bt::Tensor latent = noise_latent.clone();
     bt::Tensor camera = noise_camera.clone();
 
+    // All step buffers are function-locals declared before the loop, so their
+    // storage persists across steps; capacity-aware resize keeps the pointers
+    // stable after warm-up. The captured graph reads latent/camera and writes
+    // v_lat/v_cam in place; sched.step updates latent/camera in place —
+    // pointer-stable end to end. The CFG blend runs at FP32 internal precision
+    // on-device: v = s*v_cond + (1-s)*v_uncond ≡ s*v_cond - (s-1)*v_uncond.
     bt::Tensor v_lat, v_cam, v_lat_u, v_cam_u, scratch_l, scratch_c;
+
+#ifdef BROTENSOR_HAS_CUDA
+    // Step-capture session, local to this call: the latent/camera/feature
+    // buffers (and the model's scratch members) are fixed for the whole call,
+    // so the session never needs a cross-call identity key.
+    const bool capture_enabled =
+        bt::default_device() == bt::Device::CUDA && !step_graph_disabled();
+    bt::CudaGraph graph;
+    int eager_steps = 0;
+#endif
+
     for (int i = 0; i < opts.steps; ++i) {
         const float t = sched.timesteps()[static_cast<std::size_t>(i)];   // sigma*1000
-        flow.forward(latent, camera, feature1, feature2, t, v_lat, v_cam);
-        if (cfg) {
-            flow.forward(latent, camera, zero1, zero2, t, v_lat_u, v_cam_u);
-            cfg_blend(v_lat, v_lat_u, opts.guidance_scale);
-            cfg_blend(v_cam, v_cam_u, opts.guidance_scale);
+
+        // Host-dependent per-step head (time-embedding chain) — always eager,
+        // writes the persistent t_emb_/t_mod_ buffers the captured body reads.
+        flow.prepare_step(t);
+
+#ifdef BROTENSOR_HAS_CUDA
+        if (graph.valid()) {
+            graph.launch();
+        } else
+#endif
+        {
+            // Eager warm-up step through the capture seam: computes this
+            // step's real outputs and settles every body buffer at its
+            // high-water capacity.
+            flow.forward_body(latent, camera, feature1, feature2, v_lat, v_cam);
+            if (cfg) {
+                flow.forward_body(latent, camera, zero1, zero2, v_lat_u, v_cam_u);
+                bt::axpby_inplace(v_lat, v_lat_u, s, 1.0f - s);
+                bt::axpby_inplace(v_cam, v_cam_u, s, 1.0f - s);
+            }
+#ifdef BROTENSOR_HAS_CUDA
+            ++eager_steps;
+            // Capture only once every buffer-role assignment the captured
+            // calls can start from has already been warmed (an alloc/free of
+            // non-graph memory mid-capture is illegal and poisons the graph).
+            // Here axpby reads and writes v_lat in place — there is no buffer-
+            // role permutation anywhere in this loop (no std::swap), so the
+            // established >= 3 body-call threshold from the SD1.5 step graph
+            // (period-3 buffer ping-pong) is comfortably sufficient.
+            const int body_calls = eager_steps * (cfg ? 2 : 1);
+            if (capture_enabled && body_calls >= 3 && i + 1 < opts.steps) {
+                // Capture at the end of an eager step: re-issue the identical
+                // body sequence (incl. the in-place CFG blends) on the capture
+                // stream. Capture records the op sequence without executing it
+                // (the eager outputs above stand for this step); every later
+                // step replays the whole sequence with one cudaGraphLaunch.
+                bt::sync_all();
+                bt::CudaGraphCapture cap;
+                flow.forward_body(latent, camera, feature1, feature2, v_lat, v_cam);
+                if (cfg) {
+                    flow.forward_body(latent, camera, zero1, zero2, v_lat_u, v_cam_u);
+                    bt::axpby_inplace(v_lat, v_lat_u, s, 1.0f - s);
+                    bt::axpby_inplace(v_cam, v_cam_u, s, 1.0f - s);
+                }
+                graph = cap.finish();
+            }
+#endif
         }
+
+        // Euler step — eager: the scheduler bakes the per-step d_sigma scalar
+        // into kernel args, different each step, so it stays outside the graph.
         sched.step(v_lat, i, latent, scratch_l);
         sched.step(v_cam, i, camera, scratch_c);
     }
