@@ -3,6 +3,7 @@
 #include "brodiffusion/fused_resblock.h"
 #include "brodiffusion/fused_transformer.h"
 #include "brodiffusion/detail/compute.h"
+#include "brodiffusion/detail/device.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/safetensors.h"
@@ -240,8 +241,13 @@ void apply_transformer(const Transformer2D& t,
         brodiffusion::detail::linear_batched(t.pi_W, &t.pi_b, s.seq, s.proj_in_seq);
     }
 
-    // 5. transformer blocks (always 1 for SD1.5).
-    s.tseq = s.proj_in_seq.clone();
+    // 5. transformer blocks (always 1 for SD1.5). Copy into the persistent
+    // scratch slot rather than clone() — a per-call allocation here would
+    // break CUDA-graph capture of the enclosing forward.
+    brodiffusion::detail::resize_like(s.tseq, s.proj_in_seq.rows,
+                                      s.proj_in_seq.cols, s.proj_in_seq.dtype,
+                                      s.proj_in_seq.device);
+    bt::copy_d2d(s.proj_in_seq, 0, s.tseq, 0, s.proj_in_seq.size());
     for (const AttnFFN& blk : t.blocks) {
         // ── self-attention (Q/K/V bias-less, Wo biased) ───────────────────
         brodiffusion::detail::layernorm_batched(s.tseq, blk.n1g, blk.n1b, s.ln, layernorm_eps);

@@ -405,6 +405,32 @@ void UNet::forward(const bt::Tensor& latent, int H, int W, float timestep,
     }
 }
 
+void UNet::prepare_step(float timestep, const PreparedConditioning& prepared) {
+    auto* p = static_cast<UNetPrepared*>(prepared.get());
+    if (p == nullptr) fail("prepare_step: prepare() was not called");
+    const float* gs = (cfg_.time_cond_proj_dim > 0) ? &p->lcm_guidance
+                                                    : nullptr;
+    compute_step_inputs_(timestep, gs);
+}
+
+void UNet::forward_body(const bt::Tensor& latent, int H, int W,
+                        const PreparedConditioning& prepared, Branch branch,
+                        bt::Tensor& out) {
+    auto* p = static_cast<UNetPrepared*>(prepared.get());
+    if (p == nullptr) fail("forward_body: prepare() was not called");
+    const bool uncond = (branch == Branch::Uncond);
+    if (uncond && p->cache_uncond.empty()) {
+        fail("forward_body: Branch::Uncond requested but no uncond "
+             "conditioning was prepared");
+    }
+    const bt::Tensor& ctx = uncond ? p->ctx_uncond : p->ctx_cond;
+    const CrossAttnKVCache& cache = uncond ? p->cache_uncond : p->cache_cond;
+    forward_body_impl_(latent, H, W, ctx, &cache,
+                       /*attn_logit_biases=*/nullptr, /*trace_out=*/nullptr,
+                       /*down_residuals=*/nullptr, /*mid_residual=*/nullptr,
+                       out);
+}
+
 void UNet::forward_traced(
         const bt::Tensor& latent, int H, int W, float timestep,
         const PreparedConditioning& prepared, Branch branch,
@@ -1065,6 +1091,37 @@ void UNet::prime_xattn_cache(const bt::Tensor& ctx,
     if (idx != n) fail("internal: prime_xattn_cache traversal mismatch");
 }
 
+void UNet::compute_step_inputs_(float timestep, const float* gs_emb) {
+    if (conv_in_W_.size() == 0) fail("forward: weights not loaded");
+
+    std::vector<float> sin_vals;
+    compute_sinusoidal_emb(timestep, freq_dim_, sin_vals);
+    freq_emb_ = brodiffusion::detail::upload_host(sin_vals.data(), 1, freq_dim_);
+
+    // LCM cond_proj: add projected guidance-scale embedding to the freq_emb
+    // *before* linear_1. Matches diffusers' TimestepEmbedding.forward:
+    //   if condition is not None: sample = sample + cond_proj(condition)
+    //   sample = linear_1(sample) -> SiLU -> linear_2
+    // cond_proj projects (cond_proj_dim) -> (freq_dim), not -> (time_embed_dim).
+    if (gs_emb != nullptr) {
+        if (cfg_.time_cond_proj_dim <= 0) fail("forward: internal: gs_emb without cond_proj");
+        // diffusers' get_guidance_scale_embedding scales w by 1000 before the
+        // sinusoidal embedding.
+        std::vector<float> w_vals;
+        compute_guidance_scale_emb((*gs_emb) * 1000.0f, cfg_.time_cond_proj_dim, w_vals);
+        w_emb_ = brodiffusion::detail::upload_host(w_vals.data(), 1, cfg_.time_cond_proj_dim);
+        // cond_proj is bias-free: pass nullptr.
+        brodiffusion::detail::linear_batched(te_cond_W_, /*bias=*/nullptr, w_emb_, temb_cond_);
+        bt::add_inplace(freq_emb_, temb_cond_);
+    }
+
+    brodiffusion::detail::linear_batched(te_l1_W_, &te_l1_b_, freq_emb_, temb_a_);
+    bt::silu_forward(temb_a_, temb_a_);
+    brodiffusion::detail::linear_batched(te_l2_W_, &te_l2_b_, temb_a_, temb_b_);
+    // Master temb in temb_b_. Pre-compute SiLU once for reuse across resblocks.
+    bt::silu_forward(temb_b_, block_scratch_.temb_silu);
+}
+
 void UNet::forward_impl_(const bt::Tensor& sample,
                          int H, int W,
                          float timestep,
@@ -1076,6 +1133,21 @@ void UNet::forward_impl_(const bt::Tensor& sample,
                          const std::vector<const bt::Tensor*>* down_residuals,
                          const bt::Tensor* mid_residual,
                          bt::Tensor& out) {
+    compute_step_inputs_(timestep, gs_emb);
+    forward_body_impl_(sample, H, W, encoder_hidden_states, xattn_cache,
+                       attn_logit_biases, trace_out, down_residuals,
+                       mid_residual, out);
+}
+
+void UNet::forward_body_impl_(const bt::Tensor& sample,
+                              int H, int W,
+                              const bt::Tensor& encoder_hidden_states,
+                              const CrossAttnKVCache* xattn_cache,
+                              const std::vector<const bt::Tensor*>* attn_logit_biases,
+                              CrossAttnTrace* trace_out,
+                              const std::vector<const bt::Tensor*>* down_residuals,
+                              const bt::Tensor* mid_residual,
+                              bt::Tensor& out) {
     if (conv_in_W_.size() == 0) fail("forward: weights not loaded");
 
     const int nb      = static_cast<int>(cfg_.block_out_channels.size());
@@ -1114,39 +1186,12 @@ void UNet::forward_impl_(const bt::Tensor& sample,
              " entries, expected " + std::to_string(expected_skips));
     }
 
-    // ── 1. Build the time embedding ────────────────────────────────────────
-    std::vector<float> sin_vals;
-    compute_sinusoidal_emb(timestep, freq_dim_, sin_vals);
-    freq_emb_ = brodiffusion::detail::upload_host(sin_vals.data(), 1, freq_dim_);
-
-    // LCM cond_proj: add projected guidance-scale embedding to the freq_emb
-    // *before* linear_1. Matches diffusers' TimestepEmbedding.forward:
-    //   if condition is not None: sample = sample + cond_proj(condition)
-    //   sample = linear_1(sample) -> SiLU -> linear_2
-    // cond_proj projects (cond_proj_dim) -> (freq_dim), not -> (time_embed_dim).
-    if (gs_emb != nullptr) {
-        if (cfg_.time_cond_proj_dim <= 0) fail("forward: internal: gs_emb without cond_proj");
-        // diffusers' get_guidance_scale_embedding scales w by 1000 before the
-        // sinusoidal embedding.
-        std::vector<float> w_vals;
-        compute_guidance_scale_emb((*gs_emb) * 1000.0f, cfg_.time_cond_proj_dim, w_vals);
-        w_emb_ = brodiffusion::detail::upload_host(w_vals.data(), 1, cfg_.time_cond_proj_dim);
-        // cond_proj is bias-free: pass nullptr.
-        brodiffusion::detail::linear_batched(te_cond_W_, /*bias=*/nullptr, w_emb_, temb_cond_);
-        bt::add_inplace(freq_emb_, temb_cond_);
-    }
-
-    brodiffusion::detail::linear_batched(te_l1_W_, &te_l1_b_, freq_emb_, temb_a_);
-    bt::silu_forward(temb_a_, temb_a_);
-    brodiffusion::detail::linear_batched(te_l2_W_, &te_l2_b_, temb_a_, temb_b_);
-    // Master temb in temb_b_. Pre-compute SiLU once for reuse across resblocks.
-    bt::silu_forward(temb_b_, block_scratch_.temb_silu);
-
-    // Skip stack: each entry is a deep copy of the residual stream at push time.
+    // Skip stack: each entry is a deep copy of the residual stream at push
+    // time, stored in the persistent skip_pool_ (entry shapes are constant
+    // across steps at fixed (H, W), so after one warm-up forward the pool is
+    // pointer-stable — a per-call clone() would allocate mid-capture).
     // Down-path xattn caches advance xattn_idx (kept in scope for mid + up).
-    std::vector<bt::Tensor> skips;
-    skips.reserve(static_cast<std::size_t>(nb) *
-                  static_cast<std::size_t>(cfg_.layers_per_block + 1));
+    int n_skips = 0;
     int Hc = H, Wc = W;
     int xattn_idx = 0;
     int skip_idx  = 0;
@@ -1160,10 +1205,17 @@ void UNet::forward_impl_(const bt::Tensor& sample,
         return attn_logit_biases ? (*attn_logit_biases)[static_cast<std::size_t>(i)]
                                  : nullptr;
     };
-    // Push the current `x_` onto the skip stack, first applying the
-    // ControlNet residual for this skip index (if any).
+    // Push the current `x_` onto the skip stack (copy into the persistent
+    // pool slot), first applying the ControlNet residual for this skip index
+    // (if any).
     auto push_skip = [&]() {
-        bt::Tensor skip = x_.clone();
+        if (static_cast<int>(skip_pool_.size()) <= n_skips) {
+            skip_pool_.emplace_back();
+        }
+        bt::Tensor& skip = skip_pool_[static_cast<std::size_t>(n_skips)];
+        brodiffusion::detail::resize_like(skip, x_.rows, x_.cols, x_.dtype,
+                                          x_.device);
+        bt::copy_d2d(x_, 0, skip, 0, x_.size());
         if (down_residuals != nullptr) {
             const bt::Tensor* res =
                 (*down_residuals)[static_cast<std::size_t>(skip_idx)];
@@ -1172,11 +1224,13 @@ void UNet::forward_impl_(const bt::Tensor& sample,
             }
         }
         ++skip_idx;
-        skips.push_back(std::move(skip));
+        ++n_skips;
     };
 
     // ── 2. conv_in: in_channels -> first_C ─────────────────────────────────
-    x_ = sample.clone();
+    brodiffusion::detail::resize_like(x_, sample.rows, sample.cols,
+                                      sample.dtype, sample.device);
+    bt::copy_d2d(sample, 0, x_, 0, sample.size());
     detail::apply_conv3x3(conv_in_W_, conv_in_b_, cfg_.in_channels, first_C, H, W,
                           /*stride=*/1, /*pad=*/1, x_, y_);
     std::swap(x_, y_);
@@ -1246,8 +1300,7 @@ void UNet::forward_impl_(const bt::Tensor& sample,
         const int layers = cfg_.layers_per_block + 1;
         for (int j = 0; j < layers; ++j) {
             // Channel-axis concat with popped skip.
-            bt::Tensor skip = std::move(skips.back());
-            skips.pop_back();
+            bt::Tensor& skip = skip_pool_[static_cast<std::size_t>(--n_skips)];
             const int C_x_now    = x_.cols / (Hc * Wc);
             const int C_skip_now = skip.cols / (Hc * Wc);
             const std::vector<int> C_parts    = {C_x_now, C_skip_now};

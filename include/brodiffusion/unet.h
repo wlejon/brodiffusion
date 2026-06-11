@@ -146,6 +146,20 @@ public:
         return PredictionType::Epsilon;
     }
     bool uses_cfg() const override { return true; }
+
+    // ── CUDA-graph step-capture seam (see Denoiser) ──────────────────────
+    // prepare_step computes the host-dependent per-step inputs (the
+    // sinusoidal time embedding + optional LCM cond_proj chain) into
+    // persistent device buffers; forward_body is the remaining pure
+    // device-side op sequence — allocation-stable after a warm-up call at
+    // fixed (H, W), so a Pipeline can capture it as a CUDA graph and replay
+    // it with fresh latent/temb buffer contents each step.
+    bool supports_step_capture() const override { return true; }
+    void prepare_step(float timestep,
+                      const PreparedConditioning& prepared) override;
+    void forward_body(const brotensor::Tensor& latent, int H_lat, int W_lat,
+                      const PreparedConditioning& prepared, Branch branch,
+                      brotensor::Tensor& out) override;
     brotensor::Dtype compute_dtype() const override;
     unet::UNet* as_unet() override { return this; }
     const unet::UNet* as_unet() const override { return this; }
@@ -400,12 +414,21 @@ private:
                            const std::string& prefix,
                            int C, int num_heads, Transformer2D& t);
 
-    // Shared forward worker; xattn_cache may be null (legacy path) or point
-    // at a cache with exactly num_xattn_blocks() entries. If `gs_emb` is
-    // non-null the LCM cond_proj path is used (requires time_cond_proj_dim>0);
-    // otherwise the vanilla SD1.5 time-embedding path is used. `trace_out`
-    // and `attn_logit_biases` (both optional) wire the trace-mode plumbing
-    // for cross-attention research; see UNet::forward_trace.
+    // Per-step input chain: sinusoidal timestep embedding (+ optional LCM
+    // cond_proj when `gs_emb` is non-null; requires time_cond_proj_dim > 0)
+    // through the two time-embedding linears into temb_b_ /
+    // block_scratch_.temb_silu. Host-dependent (host trig + H2D upload) —
+    // must run OUTSIDE any CUDA-graph capture; the body reads its outputs
+    // from the persistent buffers.
+    void compute_step_inputs_(float timestep, const float* gs_emb);
+
+    // Shared forward worker = compute_step_inputs_ + forward_body_impl_.
+    // xattn_cache may be null (legacy path) or point at a cache with exactly
+    // num_xattn_blocks() entries. If `gs_emb` is non-null the LCM cond_proj
+    // path is used (requires time_cond_proj_dim>0); otherwise the vanilla
+    // SD1.5 time-embedding path is used. `trace_out` and `attn_logit_biases`
+    // (both optional) wire the trace-mode plumbing for cross-attention
+    // research; see UNet::forward_trace.
     //
     // `down_residuals` / `mid_residual` are the optional ControlNet
     // contributions (see the public residual-aware forward() above). Pass
@@ -422,6 +445,21 @@ private:
                        const std::vector<const brotensor::Tensor*>* down_residuals,
                        const brotensor::Tensor* mid_residual,
                        brotensor::Tensor& out);
+
+    // Everything after the time-embedding chain (conv_in → conv_out).
+    // Reads temb from block_scratch_ — compute_step_inputs_ must have run
+    // for this step. Allocation-stable: every buffer it touches is a
+    // persistent member (or op-internal stream-ordered scratch), so after a
+    // warm-up call at fixed (H, W) the op sequence is CUDA-graph capturable.
+    void forward_body_impl_(const brotensor::Tensor& sample,
+                            int H, int W,
+                            const brotensor::Tensor& encoder_hidden_states,
+                            const CrossAttnKVCache* xattn_cache,
+                            const std::vector<const brotensor::Tensor*>* attn_logit_biases,
+                            CrossAttnTrace* trace_out,
+                            const std::vector<const brotensor::Tensor*>* down_residuals,
+                            const brotensor::Tensor* mid_residual,
+                            brotensor::Tensor& out);
     // Returns a pointer to the base weight identified by `target_path`
     // (a diffusers tail within the UNet, e.g. "down_blocks.0.attentions.0.
     // transformer_blocks.0.attn1.to_q"). Returns nullptr if the path doesn't
@@ -455,6 +493,10 @@ private:
     brotensor::Tensor conv_out_W_, conv_out_b_;
 
     brotensor::Tensor x_, y_;
+    // Persistent skip-stack storage: one slot per down-pass push, reused
+    // across forwards (a per-call clone() would allocate mid-forward and
+    // break CUDA-graph capture).
+    std::vector<brotensor::Tensor> skip_pool_;
     brotensor::Tensor freq_emb_, temb_a_, temb_b_;
     // LCM scratch: w_emb_ holds the sinusoidal guidance-scale embedding,
     // temb_cond_ holds cond_proj(w_emb_); both unused when time_cond_proj_dim==0.

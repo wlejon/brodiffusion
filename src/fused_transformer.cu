@@ -35,6 +35,12 @@
 
 #include <stdexcept>
 
+// brotensor's CUDA-internal current-stream hook (src/cuda/runtime.cu). All
+// launches below must target it: ops enqueue on a dedicated capture stream
+// during CUDA-graph capture, and a default-stream launch there would escape
+// the graph (and poison the capture).
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brodiffusion {
 
 namespace bt = ::brotensor;
@@ -42,6 +48,10 @@ namespace bt = ::brotensor;
 namespace {
 
 using namespace nvcuda;
+
+inline cudaStream_t current_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 // ─── WMMA fused matmul + GEGLU ────────────────────────────────────────────
 //
@@ -338,7 +348,7 @@ void detail::fused_linear_geglu_cuda(const bt::Tensor& X,
 
     dim3 block(THREADS_PER_CTA);
     dim3 grid((D_out + BN - 1) / BN, (B + BM - 1) / BM);
-    fused_linear_geglu_kernel<<<grid, block>>>(
+    fused_linear_geglu_kernel<<<grid, block, 0, current_stream()>>>(
         reinterpret_cast<const __half*>(X.data),
         reinterpret_cast<const __half*>(W.data),
         reinterpret_cast<const __half*>(b.data),
@@ -410,7 +420,7 @@ void detail::add_inplace_row_bias_cuda(bt::Tensor& Y, const bt::Tensor& bias) {
     if (Y.cols == 0 || Y.rows == 0) return;
     constexpr int kThreads = 256;
     const int blocks = (Y.cols + kThreads - 1) / kThreads;
-    add_inplace_row_bias_fp16_kernel<<<blocks, kThreads>>>(
+    add_inplace_row_bias_fp16_kernel<<<blocks, kThreads, 0, current_stream()>>>(
         reinterpret_cast<__half*>(Y.data),
         reinterpret_cast<const __half*>(bias.data),
         Y.rows, Y.cols);
@@ -434,7 +444,7 @@ void detail::add_inplace_vec_cuda(bt::Tensor& Y, const bt::Tensor& X) {
     int blocks = (work + kThreads - 1) / kThreads;
     if (blocks < 1) blocks = 1;
     if (blocks > 65535) blocks = 65535;
-    add_inplace_fp16_vec_kernel<<<blocks, kThreads>>>(
+    add_inplace_fp16_vec_kernel<<<blocks, kThreads, 0, current_stream()>>>(
         reinterpret_cast<__half*>(Y.data),
         reinterpret_cast<const __half*>(X.data), n);
     BRODIFFUSION_CUDA_CHECK(cudaGetLastError());

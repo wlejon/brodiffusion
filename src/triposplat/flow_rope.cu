@@ -13,6 +13,7 @@
 
 #include "brodiffusion/detail/flow_rope.h"
 #include "brodiffusion/detail/cuda_check.cuh"
+#include "brodiffusion/detail/device.h"
 
 #include "brotensor/tensor.h"
 
@@ -20,6 +21,11 @@
 #include <cuda_runtime.h>
 
 #include <stdexcept>
+
+// brotensor's CUDA-internal current-stream hook (src/cuda/runtime.cu). The
+// launch below must target it so the kernel lands in the right place during
+// CUDA-graph capture (a default-stream launch there escapes the graph).
+namespace brotensor { void* cuda_current_stream(); }
 
 namespace brodiffusion {
 
@@ -60,7 +66,8 @@ void launch(const bt::Tensor& dp, const bt::Tensor& freqs_pi,
     constexpr int kThreads = 256;
     int blocks = (total + kThreads - 1) / kThreads;
     if (blocks < 1) blocks = 1;
-    flow_rope_tables_kernel<T><<<blocks, kThreads>>>(
+    flow_rope_tables_kernel<T><<<blocks, kThreads, 0,
+        reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream())>>>(
         static_cast<const T*>(dp.data),
         static_cast<const T*>(freqs_pi.data),
         rows, half, f0, f1,
@@ -80,9 +87,11 @@ void detail::flow_rope_tables_cuda(const bt::Tensor& delta_pos,
     }
     const int rows = L * num_heads;
     if (rows <= 0 || half <= 0) return;
-    // Tables are FP32 regardless of the input (compute) dtype.
-    cos_out = bt::Tensor::empty_on(delta_pos.device, rows, half, bt::Dtype::FP32);
-    sin_out = bt::Tensor::empty_on(delta_pos.device, rows, half, bt::Dtype::FP32);
+    // Tables are FP32 regardless of the input (compute) dtype. resize_like
+    // (rather than a fresh empty_on) keeps the table pointers stable across
+    // calls — required when the caller's step is CUDA-graph captured.
+    detail::resize_like(cos_out, rows, half, bt::Dtype::FP32, delta_pos.device);
+    detail::resize_like(sin_out, rows, half, bt::Dtype::FP32, delta_pos.device);
 
     switch (delta_pos.dtype) {
         case bt::Dtype::FP32:

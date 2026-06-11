@@ -118,6 +118,48 @@ public:
     virtual bool uses_cfg() const = 0;
     virtual brotensor::Dtype compute_dtype() const = 0;
 
+    // ── CUDA-graph step-capture seam ──────────────────────────────────────
+    //
+    // A denoiser whose per-step forward is a fixed, allocation-stable op
+    // sequence can split it for CUDA-graph capture:
+    //
+    //   prepare_step(timestep, prepared) — the host-dependent per-step work
+    //     (e.g. the time-embedding chain) written into persistent device
+    //     buffers. Runs once per step, OUTSIDE any graph capture.
+    //   forward_body(latent, ..., branch, out) — the remaining pure
+    //     device-side sequence. After prepare_step, calling forward_body for
+    //     a branch must produce exactly what forward() produces for that
+    //     branch and timestep.
+    //
+    // forward_body's contract, when supports_step_capture() is true: after
+    // one warm-up call at a fixed (H_lat, W_lat) it performs no Tensor
+    // (re)allocation of named buffers, no host reads/writes, and launches
+    // every kernel on brotensor's current stream — so a Pipeline may record
+    // it with brotensor::CudaGraphCapture and replay it each step after
+    // refreshing the latent contents and calling prepare_step. Op-internal
+    // scratch that is allocated AND freed within the body is fine (the
+    // stream-ordered allocator turns those into paired graph memory nodes).
+    //
+    // The defaults mark the seam unsupported; the Pipeline then runs the
+    // plain forward() every step.
+    virtual bool supports_step_capture() const { return false; }
+    virtual void prepare_step(float timestep,
+                              const PreparedConditioning& prepared) {
+        (void)timestep; (void)prepared;
+        throw std::runtime_error(
+            "Denoiser::prepare_step: step capture not supported");
+    }
+    virtual void forward_body(const brotensor::Tensor& latent,
+                              int H_lat, int W_lat,
+                              const PreparedConditioning& prepared,
+                              Branch branch,
+                              brotensor::Tensor& out) {
+        (void)latent; (void)H_lat; (void)W_lat; (void)prepared;
+        (void)branch; (void)out;
+        throw std::runtime_error(
+            "Denoiser::forward_body: step capture not supported");
+    }
+
     // ── Attention trace / steering ────────────────────────────────────────
     //
     // Model-agnostic seam for cross-modal attention inspection and steering.

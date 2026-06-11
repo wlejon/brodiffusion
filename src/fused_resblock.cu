@@ -33,6 +33,12 @@
 
 #include <stdexcept>
 
+// brotensor's CUDA-internal current-stream hook (src/cuda/runtime.cu). All
+// launches below must target it: ops enqueue on a dedicated capture stream
+// during CUDA-graph capture, and a default-stream launch there would escape
+// the graph (and poison the capture).
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brodiffusion {
 
 namespace bt = ::brotensor;
@@ -40,6 +46,10 @@ namespace bt = ::brotensor;
 namespace {
 
 using namespace nvcuda;
+
+inline cudaStream_t current_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 // ─── WMMA implicit-GEMM conv2d, N=1, 3x3 s1 p1, with extended epilogue ────
 
@@ -322,7 +332,7 @@ inline void launch_conv3x3_fused(const __half* X, const __half* Wt,
     const int M = H * W;          // N=1
     dim3 block(THREADS_PER_CTA);
     dim3 grid((C_out + BN - 1) / BN, (M + BM - 1) / BM);
-    conv3x3_fused_epilogue_kernel<<<grid, block>>>(
+    conv3x3_fused_epilogue_kernel<<<grid, block, 0, current_stream()>>>(
         X, Wt, bias, shift, skip, Y, C_in, H, W, C_out);
     BRODIFFUSION_CUDA_CHECK(cudaGetLastError());
 }
@@ -373,7 +383,7 @@ void detail::fused_resblock_forward_cuda(
     // GN1 + SiLU on X -> h1.
     {
         dim3 grid(num_groups, 1, 1);
-        gn_silu_n1_kernel<<<grid, GN_BLOCK>>>(
+        gn_silu_n1_kernel<<<grid, GN_BLOCK, 0, current_stream()>>>(
             reinterpret_cast<const __half*>(X.data),
             reinterpret_cast<const __half*>(gn1_g.data),
             reinterpret_cast<const __half*>(gn1_b.data),
@@ -395,7 +405,7 @@ void detail::fused_resblock_forward_cuda(
     // GN2 + SiLU on h2 -> h3.
     {
         dim3 grid(num_groups, 1, 1);
-        gn_silu_n1_kernel<<<grid, GN_BLOCK>>>(
+        gn_silu_n1_kernel<<<grid, GN_BLOCK, 0, current_stream()>>>(
             reinterpret_cast<const __half*>(h2.data),
             reinterpret_cast<const __half*>(gn2_g.data),
             reinterpret_cast<const __half*>(gn2_b.data),
