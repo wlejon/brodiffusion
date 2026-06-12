@@ -424,8 +424,13 @@ GaussianSplats OctreeGaussianDecoder::build_gaussians(
                 cloud.scales[o * 3 + a] = std::sqrt(s * s + min_kernel * min_kernel);
             }
 
-            // rotation: raw*lr (wxyz), normalized, re-emitted xyzw
-            const float w = f[R_ROT + g * 4 + 0] * rot_lr;
+            // rotation: raw*lr + rots_bias [1,0,0,0] (wxyz), normalized,
+            // re-emitted xyzw. The identity bias on w is what makes each quat a
+            // small perturbation of identity (the reference Gaussian wrapper
+            // adds it before normalizing); without it the normalized raw
+            // direction is an arbitrary orientation and the cloud renders as
+            // spiky hair.
+            const float w = f[R_ROT + g * 4 + 0] * rot_lr + 1.0f;
             const float x = f[R_ROT + g * 4 + 1] * rot_lr;
             const float y = f[R_ROT + g * 4 + 2] * rot_lr;
             const float z = f[R_ROT + g * 4 + 3] * rot_lr;
