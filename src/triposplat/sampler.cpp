@@ -27,7 +27,11 @@ namespace {
 // per call so tests can flip it between runs in-process.
 bool step_graph_disabled() {
     const char* e = std::getenv("BRODIFFUSION_DISABLE_STEP_GRAPH");
-    return e != nullptr && e[0] != '\0' && e[0] != '0';
+    if (e != nullptr && e[0] != '\0' && e[0] != '0') return true;
+    // The flow per-op profiler syncs inside forward_body, which is illegal
+    // mid-capture — profiling implies eager steps.
+    const char* p = std::getenv("BRODIFFUSION_FLOW_PROFILE");
+    return p != nullptr && p[0] != '\0' && p[0] != '0';
 }
 
 }  // namespace

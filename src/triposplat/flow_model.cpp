@@ -10,10 +10,14 @@
 #include "brotensor/safetensors.h"
 #include "brotensor/tensor.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace brodiffusion::triposplat {
@@ -58,6 +62,51 @@ std::vector<float> download_f32(const bt::Tensor& t) {
         return out;
     }
     return t.to_host_vector();
+}
+
+// Per-op profiler, enabled with BRODIFFUSION_FLOW_PROFILE=1. Syncs around each
+// op category, accumulates ms per category across one forward_body, prints a
+// summary per forward. Sync mid-capture is illegal, so the sampler's
+// step_graph_disabled() also honours this env var (profiling forces eager
+// steps); the per-op syncs serialise the stream, so the absolute total is a
+// little above production — the split, not the total, is the signal here.
+struct FlowProf {
+    static bool enabled() {
+        static const bool on = [] {
+            const char* e = std::getenv("BRODIFFUSION_FLOW_PROFILE");
+            return e && *e && *e != '0';
+        }();
+        return on;
+    }
+    std::vector<std::pair<const char*, double>> cats;  // insertion-ordered
+    double& at(const char* n) {
+        for (auto& p : cats)
+            if (p.first == n || std::string(p.first) == n) return p.second;
+        cats.emplace_back(n, 0.0);
+        return cats.back().second;
+    }
+    void dump_and_reset(const char* tag) {
+        double total = 0.0;
+        for (auto& p : cats) total += p.second;
+        std::fprintf(stderr, "[flow] ── %s ──\n", tag);
+        for (auto& p : cats)
+            std::fprintf(stderr, "[flow] %-22s %8.1f ms  %4.1f%%\n",
+                         p.first, p.second, total > 0 ? 100.0 * p.second / total : 0.0);
+        std::fprintf(stderr, "[flow] %-22s %8.1f ms\n", "TOTAL", total);
+        cats.clear();
+    }
+};
+FlowProf g_flow_prof;
+
+template <class F>
+inline void prof(const char* name, F&& f) {
+    if (!FlowProf::enabled()) { f(); return; }
+    bt::sync_all();
+    const auto t0 = std::chrono::steady_clock::now();
+    f();
+    bt::sync_all();
+    g_flow_prof.at(name) +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
 }  // namespace
@@ -248,12 +297,14 @@ void FlowDiT::build_rope(const bt::Tensor& hidden, const Repo& r,
     bt::Tensor& g = rope_g_;
     bt::Tensor& c = rope_c_;
     bt::Tensor& dp = rope_dp_;
-    detail::layernorm_batched(hidden, r.norm_g, r.norm_b, h, 1e-5f);
-    detail::linear_batched(r.gate_map.W, nullptr, h, g);
-    bt::silu_forward(g, g);
-    detail::linear_batched(r.content_map.W, nullptr, h, c);
-    bt::mul_inplace(g, c);
-    detail::linear_batched(r.final_map.W, nullptr, g, dp);
+    prof("rope: delta_pos mlp", [&] {
+        detail::layernorm_batched(hidden, r.norm_g, r.norm_b, h, 1e-5f);
+        detail::linear_batched(r.gate_map.W, nullptr, h, g);
+        bt::silu_forward(g, g);
+        detail::linear_batched(r.content_map.W, nullptr, h, c);
+        bt::mul_inplace(g, c);
+        detail::linear_batched(r.final_map.W, nullptr, g, dp);
+    });
 
     // The rotary is FP32 in the reference; the cos/sin tables are (L*H, half).
 #if defined(BROTENSOR_HAS_CUDA)
@@ -262,8 +313,10 @@ void FlowDiT::build_rope(const bt::Tensor& hidden, const Repo& r,
     // pays per block (~28 blocks/forward). Metal keeps the host path (left to the
     // Metal backend), so gate specifically on the CUDA device.
     if (hidden.device == bt::Device::CUDA) {
-        detail::flow_rope_tables_cuda(dp, r.freqs_pi, L, H, half, f0, f1,
-                                      cos_out, sin_out);
+        prof("rope: tables", [&] {
+            detail::flow_rope_tables_cuda(dp, r.freqs_pi, L, H, half, f0, f1,
+                                          cos_out, sin_out);
+        });
         return;
     }
 #endif
@@ -299,22 +352,32 @@ void FlowDiT::attention(const bt::Tensor& x, const Block& blk,
                         bt::Tensor& out) {
     const int H = cfg_.num_heads, hd = cfg_.head_dim;
 
-    detail::linear_batched(blk.q.W, &blk.q.b, x, q_);
-    detail::linear_batched(blk.k.W, &blk.k.b, x, k_);
-    detail::linear_batched(blk.v.W, &blk.v.b, x, v_);
+    prof("attn: qkv proj", [&] {
+        detail::linear_batched(blk.q.W, &blk.q.b, x, q_);
+        detail::linear_batched(blk.k.W, &blk.k.b, x, k_);
+        detail::linear_batched(blk.v.W, &blk.v.b, x, v_);
+    });
 
     // Rotary first, then qk_rms_norm (reference order).
-    bt::rope_apply_perhead(q_, cos, sin, hd, H, qr_);
-    bt::rope_apply_perhead(k_, cos, sin, hd, H, kr_);
+    prof("attn: rope apply", [&] {
+        bt::rope_apply_perhead(q_, cos, sin, hd, H, qr_);
+        bt::rope_apply_perhead(k_, cos, sin, hd, H, kr_);
+    });
 
     // MultiHeadRMSNorm = F.normalize(per head) * (gamma*sqrt(hd)).
-    bt::l2_norm_forward(qr_, hd, H, 1e-12f, qr_);
-    bt::broadcast_mul(qr_, blk.q_gamma, qr_);
-    bt::l2_norm_forward(kr_, hd, H, 1e-12f, kr_);
-    bt::broadcast_mul(kr_, blk.k_gamma, kr_);
+    prof("attn: qk rmsnorm", [&] {
+        bt::l2_norm_forward(qr_, hd, H, 1e-12f, qr_);
+        bt::broadcast_mul(qr_, blk.q_gamma, qr_);
+        bt::l2_norm_forward(kr_, hd, H, 1e-12f, kr_);
+        bt::broadcast_mul(kr_, blk.k_gamma, kr_);
+    });
 
-    bt::flash_attention_forward(qr_, kr_, v_, /*d_mask=*/nullptr, H, /*causal=*/false, fa_);
-    detail::linear_batched(blk.out.W, &blk.out.b, fa_, out);
+    prof("attn: flash", [&] {
+        bt::flash_attention_forward(qr_, kr_, v_, /*d_mask=*/nullptr, H, /*causal=*/false, fa_);
+    });
+    prof("attn: out proj", [&] {
+        detail::linear_batched(blk.out.W, &blk.out.b, fa_, out);
+    });
 }
 
 // ─── one UnifiedTransformerBlock in place ────────────────────────────────────
@@ -336,37 +399,54 @@ void FlowDiT::run_block(bt::Tensor& x, const Block& blk, const bt::Tensor* t_mod
         // mod = t_mod + shift_table; chunk into 6 (1,D) modulation vectors.
         // (clone() -> member resize_like + copy_d2d so capture sees no alloc.)
         bt::Tensor& mod = blk_mod_;
-        detail::resize_like(mod, 1, t_mod->cols, t_mod->dtype, t_mod->device);
-        bt::copy_d2d(*t_mod, 0, mod, 0, static_cast<std::size_t>(t_mod->cols));
-        bt::add_inplace(mod, blk.shift_table);
+        prof("block: modulation", [&] {
+            detail::resize_like(mod, 1, t_mod->cols, t_mod->dtype, t_mod->device);
+            bt::copy_d2d(*t_mod, 0, mod, 0, static_cast<std::size_t>(t_mod->cols));
+            bt::add_inplace(mod, blk.shift_table);
+        });
         std::vector<bt::Tensor>& ch = blk_ch_;
         dit::slice_modulation_chunks(mod, D, 6, ch);
         bt::Tensor& shift_msa = ch[0]; bt::Tensor& scale_msa = ch[1]; bt::Tensor& gate_msa = ch[2];
         bt::Tensor& shift_mlp = ch[3]; bt::Tensor& scale_mlp = ch[4]; bt::Tensor& gate_mlp = ch[5];
 
-        detail::layernorm_batched(x, ada_gamma_, ada_beta_, ln, 1e-6f);
-        bt::modulate(ln, scale_msa, shift_msa, h);
+        prof("block: ln+mod+gate", [&] {
+            detail::layernorm_batched(x, ada_gamma_, ada_beta_, ln, 1e-6f);
+            bt::modulate(ln, scale_msa, shift_msa, h);
+        });
         attention(h, blk, cos, sin, attn);
-        bt::broadcast_mul(attn, gate_msa, gated);
-        bt::add_inplace(x, gated);
+        prof("block: ln+mod+gate", [&] {
+            bt::broadcast_mul(attn, gate_msa, gated);
+            bt::add_inplace(x, gated);
 
-        detail::layernorm_batched(x, ada_gamma_, ada_beta_, ln, 1e-6f);
-        bt::modulate(ln, scale_mlp, shift_mlp, h);
-        detail::linear_batched(blk.ff0.W, &blk.ff0.b, h, ff_mid);
-        bt::gelu_forward(ff_mid, ff_mid);
-        detail::linear_batched(blk.ff2.W, &blk.ff2.b, ff_mid, ff_out);
-        bt::broadcast_mul(ff_out, gate_mlp, gated);
-        bt::add_inplace(x, gated);
+            detail::layernorm_batched(x, ada_gamma_, ada_beta_, ln, 1e-6f);
+            bt::modulate(ln, scale_mlp, shift_mlp, h);
+        });
+        prof("block: mlp", [&] {
+            detail::linear_batched(blk.ff0.W, &blk.ff0.b, h, ff_mid);
+            bt::gelu_forward(ff_mid, ff_mid);
+            detail::linear_batched(blk.ff2.W, &blk.ff2.b, ff_mid, ff_out);
+        });
+        prof("block: ln+mod+gate", [&] {
+            bt::broadcast_mul(ff_out, gate_mlp, gated);
+            bt::add_inplace(x, gated);
+        });
     } else {
-        detail::layernorm_batched(x, blk.norm1_g, blk.norm1_b, ln, 1e-6f);
+        prof("block: ln+mod+gate", [&] {
+            detail::layernorm_batched(x, blk.norm1_g, blk.norm1_b, ln, 1e-6f);
+        });
         attention(ln, blk, cos, sin, attn);
-        bt::add_inplace(x, attn);
-
-        detail::layernorm_batched(x, blk.norm2_g, blk.norm2_b, ln, 1e-6f);
-        detail::linear_batched(blk.ff0.W, &blk.ff0.b, ln, ff_mid);
-        bt::gelu_forward(ff_mid, ff_mid);
-        detail::linear_batched(blk.ff2.W, &blk.ff2.b, ff_mid, ff_out);
-        bt::add_inplace(x, ff_out);
+        prof("block: ln+mod+gate", [&] {
+            bt::add_inplace(x, attn);
+            detail::layernorm_batched(x, blk.norm2_g, blk.norm2_b, ln, 1e-6f);
+        });
+        prof("block: mlp", [&] {
+            detail::linear_batched(blk.ff0.W, &blk.ff0.b, ln, ff_mid);
+            bt::gelu_forward(ff_mid, ff_mid);
+            detail::linear_batched(blk.ff2.W, &blk.ff2.b, ff_mid, ff_out);
+        });
+        prof("block: ln+mod+gate", [&] {
+            bt::add_inplace(x, ff_out);
+        });
     }
 }
 
@@ -406,13 +486,15 @@ void FlowDiT::forward_body(const bt::Tensor& latent, const bt::Tensor& camera,
     if (L != cfg_.q_token_length) fail("forward_body: latent token count must equal q_token_length");
 
     // h_x = input_layer(z) + pos_embedder(sobol_pe)
-    detail::linear_batched(input_layer_.W, &input_layer_.b, latent, h_x_);
-    bt::add_inplace(h_x_, pos_emb_);
+    prof("embed/out layers", [&] {
+        detail::linear_batched(input_layer_.W, &input_layer_.b, latent, h_x_);
+        bt::add_inplace(h_x_, pos_emb_);
 
-    // h_cond = cond_embedder(feature1) + cond_embedder2(feature2)
-    detail::linear_batched(cond_embedder_.W, &cond_embedder_.b, feature1, h_cond_);
-    detail::linear_batched(cond_embedder2_.W, &cond_embedder2_.b, feature2, c2_);
-    bt::add_inplace(h_cond_, c2_);
+        // h_cond = cond_embedder(feature1) + cond_embedder2(feature2)
+        detail::linear_batched(cond_embedder_.W, &cond_embedder_.b, feature1, h_cond_);
+        detail::linear_batched(cond_embedder2_.W, &cond_embedder2_.b, feature2, c2_);
+        bt::add_inplace(h_cond_, c2_);
+    });
 
     for (int i = 0; i < cfg_.num_refiner_blocks; ++i) {
         build_rope(h_x_, noise_repo_[i], cos_, sin_);
@@ -465,8 +547,12 @@ void FlowDiT::forward_body(const bt::Tensor& latent, const bt::Tensor& camera,
     bt::modulate(hx_, scale_, shift_, hx_mod_);        // hx*(1+scale)+shift
     bt::modulate(hcam_, scale_, shift_, hcam_mod_);
 
-    detail::linear_batched(out_layer_.W, &out_layer_.b, hx_mod_, out_latent);
-    detail::linear_batched(cam_out_layer_.W, &cam_out_layer_.b, hcam_mod_, out_camera);
+    prof("embed/out layers", [&] {
+        detail::linear_batched(out_layer_.W, &out_layer_.b, hx_mod_, out_latent);
+        detail::linear_batched(cam_out_layer_.W, &cam_out_layer_.b, hcam_mod_, out_camera);
+    });
+
+    if (FlowProf::enabled()) g_flow_prof.dump_and_reset("forward_body");
 }
 
 void FlowDiT::forward(const bt::Tensor& latent, const bt::Tensor& camera,
