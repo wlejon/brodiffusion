@@ -79,6 +79,10 @@ void sample_latent(FlowDiT& flow,
 #endif
 
     for (int i = 0; i < opts.steps; ++i) {
+        // Cooperative cancellation: bail out between steps if asked. Checked
+        // before any of this step's work so an abort is honoured promptly.
+        if (opts.should_cancel && opts.should_cancel()) throw SampleCancelled();
+
         const float t = sched.timesteps()[static_cast<std::size_t>(i)];   // sigma*1000
 
         // Host-dependent per-step head (time-embedding chain) — always eager,

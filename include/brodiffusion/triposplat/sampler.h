@@ -22,6 +22,8 @@
 
 #include "brotensor/tensor.h"
 
+#include <functional>
+
 namespace brodiffusion::triposplat {
 
 class FlowDiT;
@@ -30,6 +32,18 @@ struct FlowSampleOptions {
     int   steps          = 20;
     float guidance_scale = 3.0f;   // <= 1 disables CFG
     float shift          = 3.0f;   // FlowMatch static shift
+
+    // Optional cooperative cancellation. Checked once per Euler step (before the
+    // step's work). If it returns true, sample_latent throws a SampleCancelled
+    // exception so a long reconstruction can be aborted between steps. Left
+    // empty by default (no cancellation).
+    std::function<bool()> should_cancel;
+};
+
+// Thrown by sample_latent when should_cancel() returns true. Distinct type so
+// callers can tell a user-requested abort apart from a genuine failure.
+struct SampleCancelled : std::exception {
+    const char* what() const noexcept override { return "triposplat: sample cancelled"; }
 };
 
 // Run the sampler. feature1 (K, cond_channels=1280) and feature2
