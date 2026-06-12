@@ -1079,8 +1079,10 @@ std::vector<float> Pipeline::generate(std::string_view prompt,
     // txt2img leaves it at 0. Loop until the schedule is exhausted —
     // step_once increments step_index itself.
     while (state.step_index < state.n_steps) {
+        if (opts.should_cancel && opts.should_cancel()) throw GenerateCancelled();
         step_once(state, opts, /*trace_out=*/nullptr);
     }
+    if (opts.should_cancel && opts.should_cancel()) throw GenerateCancelled();
     return decode(state);
 }
 

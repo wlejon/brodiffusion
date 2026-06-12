@@ -30,6 +30,7 @@
 #include "brotensor/tensor.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -179,6 +180,20 @@ struct GenerateOptions {
     // nearest-neighbor (see load_mask_as_latent). White (>= 128) = inpaint,
     // black = keep. SD1.5 only; throws on Flux.
     std::string mask_image_path;
+
+    // Optional cooperative cancellation, honored by generate() only (the
+    // step-wise prime/step_once API leaves pacing to the caller, who can stop
+    // looping whenever it likes). Checked once per denoising step and once
+    // before the VAE decode; if it returns true, generate() throws
+    // GenerateCancelled. Empty by default (no cancellation). Same convention
+    // as triposplat::SamplerOptions::should_cancel.
+    std::function<bool()> should_cancel;
+};
+
+// Thrown by generate() when should_cancel() returns true. Distinct type so a
+// caller can tell a cancel apart from a real failure.
+struct GenerateCancelled : std::exception {
+    const char* what() const noexcept override { return "pipeline: generate cancelled"; }
 };
 
 class Pipeline {
