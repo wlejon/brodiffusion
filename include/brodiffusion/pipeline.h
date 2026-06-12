@@ -220,7 +220,13 @@ public:
         bool quantize = false;
     };
     static Pipeline from_model_dir(const std::string& model_dir,
-                                   const ModelDirOptions& opts = {});
+                                   const ModelDirOptions& opts);
+    // Overload instead of a defaulted `opts = {}` argument: GCC rejects the
+    // brace-init default because ModelDirOptions has an in-class member
+    // initializer (default member init needed outside a member function).
+    static Pipeline from_model_dir(const std::string& model_dir) {
+        return from_model_dir(model_dir, ModelDirOptions{});
+    }
 
     // Move-only (owns move-only sub-modules; copies make no sense). The
     // move members and destructor are defined in pipeline.cpp where
