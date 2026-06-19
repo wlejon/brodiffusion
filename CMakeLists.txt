@@ -148,6 +148,7 @@ endif()
 target_sources(brodiffusion PRIVATE
     src/version.cpp
     src/vae.cpp
+    src/vae_dcae.cpp
     src/unet.cpp
     src/unet_blocks.cpp
     src/controlnet.cpp
@@ -163,6 +164,7 @@ target_sources(brodiffusion PRIVATE
     src/optim.cpp
     src/dit/common.cpp
     src/dit/flux.cpp
+    src/dit/sana.cpp
     src/triposplat/vae_encoder.cpp
     src/triposplat/flow_model.cpp
     src/triposplat/flow_sobol_pe.cpp

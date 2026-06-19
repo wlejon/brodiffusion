@@ -31,6 +31,7 @@ brodiffusion_add_test(brodiffusion_test_inpaint        test_inpaint.cpp)
 brodiffusion_add_test(brodiffusion_test_fused_parity   test_fused_parity.cpp)
 brodiffusion_add_test(brodiffusion_test_device_parity  test_device_parity.cpp)
 brodiffusion_add_test(brodiffusion_test_model_config   test_model_config.cpp)
+brodiffusion_add_test(brodiffusion_test_sana_config    test_sana_config.cpp)
 brodiffusion_add_test(brodiffusion_test_flux_blocks   test_flux_blocks.cpp)
 brodiffusion_add_test(brodiffusion_test_flux_pipeline test_flux_pipeline.cpp)
 

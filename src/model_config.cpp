@@ -177,6 +177,109 @@ scheduler::FlowMatchConfig parse_flow_match(const json::Value& cfg) {
     return c;
 }
 
+// Sana ships a DPMSolverMultistepScheduler in flow-prediction mode. A dedicated
+// Flow-DPM-Solver scheduler is a later chunk; for now map it onto the existing
+// FlowMatchConfig, taking the flow shift from the `flow_shift` key (the
+// DPM-Solver config spells it differently than FlowMatchEuler's `shift`).
+scheduler::FlowMatchConfig parse_flow_dpm(const json::Value& cfg) {
+    scheduler::FlowMatchConfig c;
+    c.num_train_timesteps =
+        cfg.get_int("num_train_timesteps", c.num_train_timesteps);
+    c.shift = cfg.get_float("flow_shift", c.shift);
+    return c;
+}
+
+void populate_sana(const json::Value& cfg, dit::SanaConfig& out) {
+    out.in_channels         = cfg.get_int("in_channels", out.in_channels);
+    out.out_channels        = cfg.get_int("out_channels", out.out_channels);
+    out.num_layers          = cfg.get_int("num_layers", out.num_layers);
+    out.attention_head_dim  = cfg.get_int("attention_head_dim",
+                                          out.attention_head_dim);
+    out.num_attention_heads = cfg.get_int("num_attention_heads",
+                                          out.num_attention_heads);
+    out.num_cross_attention_heads =
+        cfg.get_int("num_cross_attention_heads", out.num_cross_attention_heads);
+    out.cross_attention_head_dim =
+        cfg.get_int("cross_attention_head_dim", out.cross_attention_head_dim);
+    out.cross_attention_dim =
+        cfg.get_int("cross_attention_dim", out.cross_attention_dim);
+    out.caption_channels    = cfg.get_int("caption_channels",
+                                          out.caption_channels);
+    out.mlp_ratio           = cfg.get_float("mlp_ratio", out.mlp_ratio);
+    out.patch_size          = cfg.get_int("patch_size", out.patch_size);
+    out.sample_size         = cfg.get_int("sample_size", out.sample_size);
+    out.attention_bias      = cfg.get_bool("attention_bias", out.attention_bias);
+    out.norm_elementwise_affine =
+        cfg.get_bool("norm_elementwise_affine", out.norm_elementwise_affine);
+    out.norm_eps            = cfg.get_float("norm_eps", out.norm_eps);
+}
+
+void populate_dcae(const json::Value& cfg, dcae::DecoderConfig& out) {
+    out.latent_channels = cfg.get_int("latent_channels", out.latent_channels);
+    out.image_channels  = cfg.get_int("in_channels", out.image_channels);
+    out.attention_head_dim =
+        cfg.get_int("attention_head_dim", out.attention_head_dim);
+    out.scaling_factor  = cfg.get_float("scaling_factor", out.scaling_factor);
+
+    out.block_out_channels =
+        cfg.get_int_array("decoder_block_out_channels", out.block_out_channels);
+    out.layers_per_block =
+        cfg.get_int_array("decoder_layers_per_block", out.layers_per_block);
+
+    // decoder_block_types: array of strings; EfficientViTBlock -> attention.
+    if (const json::Value* bt = cfg.find("decoder_block_types");
+        bt && bt->is_array()) {
+        std::vector<bool> is_attn;
+        for (const auto& e : bt->as_array()) {
+            is_attn.push_back(e.as_string() == "EfficientViTBlock");
+        }
+        out.is_attention = std::move(is_attn);
+    }
+
+    // decoder_qkv_multiscales: array of int arrays, one per stage.
+    if (const json::Value* qm = cfg.find("decoder_qkv_multiscales");
+        qm && qm->is_array()) {
+        std::vector<std::vector<int>> scales;
+        for (const auto& stage : qm->as_array()) {
+            std::vector<int> s;
+            if (stage.is_array()) {
+                for (const auto& v : stage.as_array()) {
+                    s.push_back(static_cast<int>(v.as_number()));
+                }
+            }
+            scales.push_back(std::move(s));
+        }
+        out.qkv_multiscales = std::move(scales);
+    }
+}
+
+void populate_gemma(const json::Value& cfg, brolm::gemma::Gemma2Config& out) {
+    out.vocab_size          = cfg.get_int("vocab_size", out.vocab_size);
+    out.hidden_size         = cfg.get_int("hidden_size", out.hidden_size);
+    out.intermediate_size   = cfg.get_int("intermediate_size",
+                                          out.intermediate_size);
+    out.num_hidden_layers   = cfg.get_int("num_hidden_layers",
+                                          out.num_hidden_layers);
+    out.num_attention_heads = cfg.get_int("num_attention_heads",
+                                          out.num_attention_heads);
+    out.num_key_value_heads = cfg.get_int("num_key_value_heads",
+                                          out.num_key_value_heads);
+    out.head_dim            = cfg.get_int("head_dim", out.head_dim);
+    out.rms_norm_eps        = cfg.get_float("rms_norm_eps", out.rms_norm_eps);
+    out.rope_theta          = cfg.get_float("rope_theta", out.rope_theta);
+    out.tie_word_embeddings =
+        cfg.get_bool("tie_word_embeddings", out.tie_word_embeddings);
+    out.query_pre_attn_scalar =
+        cfg.get_float("query_pre_attn_scalar", out.query_pre_attn_scalar);
+    out.sliding_window      = cfg.get_int("sliding_window", out.sliding_window);
+    out.attn_logit_softcapping =
+        cfg.get_float("attn_logit_softcapping", out.attn_logit_softcapping);
+    out.final_logit_softcapping =
+        cfg.get_float("final_logit_softcapping", out.final_logit_softcapping);
+    out.max_position_embeddings =
+        cfg.get_int("max_position_embeddings", out.max_position_embeddings);
+}
+
 }  // namespace
 
 ModelConfig load_model_config(const std::string& model_dir) {
@@ -197,14 +300,17 @@ ModelConfig load_model_config(const std::string& model_dir) {
         out.model_class = ModelClass::StableDiffusion;
     } else if (contains_ci(class_name, "Flux")) {
         out.model_class = ModelClass::Flux;
+    } else if (contains_ci(class_name, "Sana")) {
+        out.model_class = ModelClass::Sana;
     } else {
         out.model_class = ModelClass::Unknown;
     }
 
     const bool is_flux = (out.model_class == ModelClass::Flux);
+    const bool is_sana = (out.model_class == ModelClass::Sana);
 
     // --- unet/config.json (StableDiffusion only) ---
-    if (!is_flux) {
+    if (!is_flux && !is_sana) {
         const fs::path unet_cfg = root / "unet" / "config.json";
         if (fs::exists(unet_cfg)) {
             populate_unet(parse_file(unet_cfg), out.unet);
@@ -232,16 +338,32 @@ ModelConfig load_model_config(const std::string& model_dir) {
         }
     }
 
-    // --- vae/config.json (always) ---
-    {
-        const fs::path vae_cfg = root / "vae" / "config.json";
-        if (fs::exists(vae_cfg)) {
-            populate_vae(parse_file(vae_cfg), out.vae);
+    // --- transformer/config.json + text_encoder/config.json (Sana only) ---
+    if (is_sana) {
+        const fs::path tf_cfg = root / "transformer" / "config.json";
+        if (fs::exists(tf_cfg)) {
+            populate_sana(parse_file(tf_cfg), out.sana);
+        }
+        const fs::path gemma_cfg = root / "text_encoder" / "config.json";
+        if (fs::exists(gemma_cfg)) {
+            populate_gemma(parse_file(gemma_cfg), out.gemma);
         }
     }
 
-    // --- text_encoder/config.json (when present) ---
+    // --- vae/config.json (always; AutoencoderDC for Sana, AutoencoderKL else) ---
     {
+        const fs::path vae_cfg = root / "vae" / "config.json";
+        if (fs::exists(vae_cfg)) {
+            if (is_sana) {
+                populate_dcae(parse_file(vae_cfg), out.dcae);
+            } else {
+                populate_vae(parse_file(vae_cfg), out.vae);
+            }
+        }
+    }
+
+    // --- text_encoder/config.json (CLIP; Sana's Gemma-2 handled above) ---
+    if (!is_sana) {
         const fs::path te_cfg = root / "text_encoder" / "config.json";
         if (fs::exists(te_cfg)) {
             populate_text_encoder(parse_file(te_cfg), out.text_encoder);
@@ -257,6 +379,10 @@ ModelConfig load_model_config(const std::string& model_dir) {
             const std::string sched_class = cfg.get_string("_class_name", "");
             if (sched_class == "FlowMatchEulerDiscreteScheduler") {
                 out.scheduler = parse_flow_match(cfg);
+            } else if (sched_class == "DPMSolverMultistepScheduler") {
+                // Sana's flow-prediction DPM-Solver — mapped onto FlowMatch
+                // for now (a dedicated Flow-DPM-Solver scheduler comes later).
+                out.scheduler = parse_flow_dpm(cfg);
             } else if (sched_class == "LCMScheduler") {
                 out.scheduler = parse_lcm(cfg);
             } else {
@@ -264,7 +390,7 @@ ModelConfig load_model_config(const std::string& model_dir) {
             }
         } else {
             // Missing scheduler config: default per model class.
-            if (is_flux) {
+            if (is_flux || is_sana) {
                 out.scheduler = scheduler::FlowMatchConfig{};
             } else {
                 out.scheduler = scheduler::DDIMConfig{};

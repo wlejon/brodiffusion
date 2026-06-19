@@ -15,19 +15,22 @@
 
 #include "brodiffusion/unet.h"
 #include "brodiffusion/vae.h"
+#include "brodiffusion/vae_dcae.h"
 #include "brolm/clip.h"
 #include "brodiffusion/scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
 #include "brodiffusion/flow_match_scheduler.h"
 #include "brodiffusion/dit/flux.h"
+#include "brodiffusion/dit/sana.h"
 #include "brolm/t5.h"
+#include "brolm/gemma2_config.h"
 
 #include <string>
 #include <variant>
 
 namespace brodiffusion {
 
-enum class ModelClass { StableDiffusion, Flux, Unknown };
+enum class ModelClass { StableDiffusion, Flux, Sana, Unknown };
 
 // Architecture + hyper-parameters of a diffusers model directory, read from
 // its JSON config files. The Pipeline factory consumes this to build the
@@ -43,6 +46,11 @@ struct ModelConfig {
     dit::FluxConfig flux;   // populated for ModelClass::Flux
     brolm::t5::T5Config t5; // populated for ModelClass::Flux (the second text encoder)
     int             t5_max_length = 512;  // T5 sequence length (flux-schnell 256, dev 512)
+
+    dcae::DecoderConfig dcae;          // populated for ModelClass::Sana (DC-AE f32c32 VAE)
+    dit::SanaConfig     sana;          // populated for ModelClass::Sana (the transformer)
+    brolm::gemma::Gemma2Config gemma;  // populated for ModelClass::Sana (the Gemma-2 text encoder)
+    int             sana_max_seq_len = 300;  // Gemma caption sequence length
 
     std::variant<scheduler::DDIMConfig,
                  scheduler::LCMConfig,
