@@ -62,10 +62,10 @@ const st::TensorView& need(const st::File& f, const std::string& key) {
     return *v;
 }
 
-// Upload a checkpoint tensor (F16/F32/BF16 source) at the compute dtype,
-// validating its element count.
-void up(const st::File& f, const std::string& key, int rows, int cols,
-        bt::Tensor& dst) {
+// Upload a checkpoint tensor (F16/F32/BF16 source) at `dt`, validating its
+// element count.
+void up(const st::File& f, bt::Dtype dt, const std::string& key, int rows,
+        int cols, bt::Tensor& dst) {
     const st::TensorView& v = need(f, key);
     if (v.dtype != st::Dtype::F16 && v.dtype != st::Dtype::F32 &&
         v.dtype != st::Dtype::BF16) {
@@ -77,7 +77,7 @@ void up(const st::File& f, const std::string& key, int rows, int cols,
         fail(key + ": shape mismatch (expected " + std::to_string(rows) + "x" +
              std::to_string(cols) + ", got " + std::to_string(v.numel()) + ")");
     }
-    st::upload_as(v, rows, cols, brotensor::Dtype::FP32, dst);
+    st::upload_as(v, rows, cols, dt, dst);
 }
 
 // Non-owning (rows, cols) view of `count`=rows*cols elements of `t` from
@@ -115,15 +115,19 @@ SanaDenoiser::SanaDenoiser(const SanaConfig& cfg) : cfg_(cfg) {
 SanaDenoiser::~SanaDenoiser() = default;
 
 brotensor::Dtype SanaDenoiser::compute_dtype() const {
-    // FP32 on every backend. Sana needs BF16/FP32 dynamic range, not FP16:
+    // BF16 on CUDA, FP32 on CPU. Sana needs BF16/FP32 dynamic range, not FP16:
     // the residual stream grows into the hundreds, the GLU-MBConv FFN's GLU
     // product and conv_point sum push intermediates past the FP16 finite range
     // (~65504), and the cross-attention to_q of the raw residual overflows too
-    // — the well-known "Sana in FP16 → NaN" failure. Flux dodges this with an
-    // internal BF16 stream, but brotensor's matmul / rms_norm / conv2d (which
-    // the linear self-attention and the Mix-FFN need) have no BF16 kernel, so
-    // the only correct, kernel-supported choice for this model is FP32.
-    return brotensor::Dtype::FP32;
+    // — the well-known "Sana in FP16 → NaN" failure. BF16 carries FP32's 8-bit
+    // exponent, so none of those overflow, while halving weight/activation
+    // memory traffic and putting every linear projection on Ada's BF16 tensor
+    // cores (linear_forward_batched_fp16's WMMA path). brotensor's matmul,
+    // rms_norm, layernorm, conv2d and flash attention all have BF16 kernels.
+    // The CPU backend is FP32-only, so fall back to FP32 there.
+    return brotensor::default_device() == brotensor::Device::CUDA
+               ? brotensor::Dtype::BF16
+               : brotensor::Dtype::FP32;
 }
 
 // ─── load_weights ──────────────────────────────────────────────────────────
@@ -135,11 +139,12 @@ void SanaDenoiser::load_weights(const st::File& f, const std::string& prefix) {
     const int CAP     = cfg_.caption_channels;      // 2304
     const int hidden  = static_cast<int>(cfg_.mlp_ratio * D);  // 2880
     const int inv     = 2 * hidden;                 // 5760
+    const bt::Dtype cdt = compute_dtype();          // BF16 on CUDA, FP32 on CPU
 
     auto load_lin = [&](const std::string& key, int out, int in, Linear& lin,
                         bool bias) {
-        up(f, prefix + key + ".weight", out, in, lin.W);
-        if (bias) up(f, prefix + key + ".bias", out, 1, lin.b);
+        up(f, cdt, prefix + key + ".weight", out, in, lin.W);
+        if (bias) up(f, cdt, prefix + key + ".bias", out, 1, lin.b);
     };
 
     // patch_embed: 1x1 conv (D, IC, 1, 1) loaded as a (D, IC) linear.
@@ -153,10 +158,10 @@ void SanaDenoiser::load_weights(const st::File& f, const std::string& prefix) {
     // caption_projection (PixArt text MLP) + caption_norm (RMSNorm).
     load_lin("caption_projection.linear_1", D, CAP, cap_l1_, true);
     load_lin("caption_projection.linear_2", D, D, cap_l2_, true);
-    up(f, prefix + "caption_norm.weight", D, 1, caption_norm_g_);
+    up(f, cdt, prefix + "caption_norm.weight", D, 1, caption_norm_g_);
 
     // norm_out top-level scale_shift_table (2, D) flattened, + proj_out.
-    up(f, prefix + "scale_shift_table", 1, 2 * D, norm_out_sst_);
+    up(f, cdt, prefix + "scale_shift_table", 1, 2 * D, norm_out_sst_);
     load_lin("proj_out", cfg_.patch_size * cfg_.patch_size * OC, D, proj_out_,
              true);
 
@@ -164,36 +169,45 @@ void SanaDenoiser::load_weights(const st::File& f, const std::string& prefix) {
         Block& B = blocks_[static_cast<std::size_t>(i)];
         const std::string p =
             prefix + "transformer_blocks." + std::to_string(i) + ".";
-        up(f, p + "scale_shift_table", 1, 6 * D, B.scale_shift);
+        up(f, cdt, p + "scale_shift_table", 1, 6 * D, B.scale_shift);
         // attn1 (self, ReLU linear): q/k/v bias-free; to_out.0 biased.
-        up(f, p + "attn1.to_q.weight", D, D, B.q1.W);
-        up(f, p + "attn1.to_k.weight", D, D, B.k1.W);
-        up(f, p + "attn1.to_v.weight", D, D, B.v1.W);
-        up(f, p + "attn1.to_out.0.weight", D, D, B.out1.W);
-        up(f, p + "attn1.to_out.0.bias",   D, 1, B.out1.b);
+        up(f, cdt, p + "attn1.to_q.weight", D, D, B.q1.W);
+        up(f, cdt, p + "attn1.to_k.weight", D, D, B.k1.W);
+        up(f, cdt, p + "attn1.to_v.weight", D, D, B.v1.W);
+        up(f, cdt, p + "attn1.to_out.0.weight", D, D, B.out1.W);
+        up(f, cdt, p + "attn1.to_out.0.bias",   D, 1, B.out1.b);
         // attn2 (cross, softmax MHA): all biased.
-        up(f, p + "attn2.to_q.weight", D, D, B.q2.W);
-        up(f, p + "attn2.to_q.bias",   D, 1, B.q2.b);
-        up(f, p + "attn2.to_k.weight", D, D, B.k2.W);
-        up(f, p + "attn2.to_k.bias",   D, 1, B.k2.b);
-        up(f, p + "attn2.to_v.weight", D, D, B.v2.W);
-        up(f, p + "attn2.to_v.bias",   D, 1, B.v2.b);
-        up(f, p + "attn2.to_out.0.weight", D, D, B.out2.W);
-        up(f, p + "attn2.to_out.0.bias",   D, 1, B.out2.b);
+        up(f, cdt, p + "attn2.to_q.weight", D, D, B.q2.W);
+        up(f, cdt, p + "attn2.to_q.bias",   D, 1, B.q2.b);
+        up(f, cdt, p + "attn2.to_k.weight", D, D, B.k2.W);
+        up(f, cdt, p + "attn2.to_k.bias",   D, 1, B.k2.b);
+        up(f, cdt, p + "attn2.to_v.weight", D, D, B.v2.W);
+        up(f, cdt, p + "attn2.to_v.bias",   D, 1, B.v2.b);
+        up(f, cdt, p + "attn2.to_out.0.weight", D, D, B.out2.W);
+        up(f, cdt, p + "attn2.to_out.0.bias",   D, 1, B.out2.b);
         // GLU-MBConv ff.
-        up(f, p + "ff.conv_inverted.weight", inv, D, B.ff_inv_W);
-        up(f, p + "ff.conv_inverted.bias",   inv, 1, B.ff_inv_b);
-        up(f, p + "ff.conv_depth.weight", inv, 3 * 3, B.ff_depth_W);
-        up(f, p + "ff.conv_depth.bias",   inv, 1, B.ff_depth_b);
-        up(f, p + "ff.conv_point.weight", D, hidden, B.ff_point_W);
+        up(f, cdt, p + "ff.conv_inverted.weight", inv, D, B.ff_inv_W);
+        up(f, cdt, p + "ff.conv_inverted.bias",   inv, 1, B.ff_inv_b);
+        up(f, cdt, p + "ff.conv_depth.weight", inv, 3 * 3, B.ff_depth_W);
+        up(f, cdt, p + "ff.conv_depth.bias",   inv, 1, B.ff_depth_b);
+        up(f, cdt, p + "ff.conv_point.weight", D, hidden, B.ff_point_W);
     }
 
-    // AdaLN affine-free LayerNorm params: ones gamma, zeros beta (D,1), FP32.
+    // AdaLN affine-free LayerNorm params: ones gamma, zeros beta (D,1). The
+    // layernorm kernel requires gamma/beta to share the activation dtype, so
+    // these follow cdt (BF16 on CUDA).
     {
         std::vector<float> ones(static_cast<std::size_t>(D), 1.0f);
         std::vector<float> zeros(static_cast<std::size_t>(D), 0.0f);
-        ada_gamma_ = bt::Tensor::from_host(ones.data(), D, 1).to(bt::default_device());
-        ada_beta_  = bt::Tensor::from_host(zeros.data(), D, 1).to(bt::default_device());
+        bt::Tensor g = bt::Tensor::from_host(ones.data(), D, 1).to(bt::default_device());
+        bt::Tensor b = bt::Tensor::from_host(zeros.data(), D, 1).to(bt::default_device());
+        if (cdt != bt::Dtype::FP32) {
+            bt::cast(g, ada_gamma_, cdt);
+            bt::cast(b, ada_beta_, cdt);
+        } else {
+            ada_gamma_ = std::move(g);
+            ada_beta_  = std::move(b);
+        }
     }
 }
 
@@ -325,32 +339,29 @@ void SanaDenoiser::self_attention_(const Block& blk, int N, int H, int W,
 void SanaDenoiser::cross_attention_(const Block& blk, const bt::Tensor& ctx,
                                     const bt::Tensor& hidden, bt::Tensor& out) {
     const int nch = cfg_.num_cross_attention_heads;
-    lin_(blk.q2, hidden, ca_q_);   // FP32 (N, D)
-    lin_(blk.k2, ctx, ca_k_);      // FP32 (L, D)
-    lin_(blk.v2, ctx, ca_v_);      // FP32 (L, D)
-    // brotensor's flash attention is FP16/BF16 on a GPU backend (FP32 only on
-    // CPU). Cast Q/K/V to the flash dtype — BF16 on CUDA (full FP32 range, so
-    // the large to_q of the raw residual never overflows), FP32 on CPU. The
-    // attention OUTPUT is a convex combination of the (bounded) value rows, so
-    // it casts back to FP32 losslessly in range.
+    const bt::Dtype cdt = compute_dtype();   // BF16 on CUDA, FP32 on CPU
+    lin_(blk.q2, hidden, ca_q_);   // (N, D) at cdt
+    lin_(blk.k2, ctx, ca_k_);      // (L, D) at cdt
+    lin_(blk.v2, ctx, ca_v_);      // (L, D) at cdt
+    // brotensor's flash attention runs at the flash dtype: BF16 on CUDA (full
+    // FP32 exponent range, so the large to_q of the raw residual never
+    // overflows), FP32 on CPU. With the DiT already at cdt these usually match,
+    // so cast only on a genuine mismatch.
     const bt::Dtype fdt = flux_compute_dtype();
     const bt::Tensor* Q = &ca_q_;
     const bt::Tensor* K = &ca_k_;
     const bt::Tensor* V = &ca_v_;
-    if (fdt != bt::Dtype::FP32) {
-        bt::cast(ca_q_, ca_qf_, fdt);
-        bt::cast(ca_k_, ca_kf_, fdt);
-        bt::cast(ca_v_, ca_vf_, fdt);
-        Q = &ca_qf_; K = &ca_kf_; V = &ca_vf_;
-    }
+    if (ca_q_.dtype != fdt) { bt::cast(ca_q_, ca_qf_, fdt); Q = &ca_qf_; }
+    if (ca_k_.dtype != fdt) { bt::cast(ca_k_, ca_kf_, fdt); K = &ca_kf_; }
+    if (ca_v_.dtype != fdt) { bt::cast(ca_v_, ca_vf_, fdt); V = &ca_vf_; }
     bt::flash_attention_forward(*Q, *K, *V, /*d_mask=*/nullptr, nch,
                                 /*causal=*/false, ca_o_);
-    if (ca_o_.dtype != bt::Dtype::FP32) {
-        bt::cast(ca_o_, ca_of_, bt::Dtype::FP32);
-        lin_(blk.out2, ca_of_, out);   // (N, D)
-    } else {
-        lin_(blk.out2, ca_o_, out);    // (N, D)
-    }
+    // to_out consumes the attention output at the weight dtype (cdt). The
+    // output is a convex combination of the bounded value rows, so the cast is
+    // lossless in range.
+    const bt::Tensor* O = &ca_o_;
+    if (ca_o_.dtype != cdt) { bt::cast(ca_o_, ca_of_, cdt); O = &ca_of_; }
+    lin_(blk.out2, *O, out);   // (N, D)
 }
 
 // ─── Mix-FFN (GLU-MBConv over the spatial reshape) ─────────────────────────
@@ -489,8 +500,15 @@ void SanaDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
                               cfg_.norm_eps);
     bt::modulate(ln_, scale, shift, mod_);
     lin_(proj_out_, mod_, proj_);                       // (N, patch^2*OC)
-    // patch_size == 1 → unpatchify is sequence_to_nchw with OC channels.
-    bt::sequence_to_nchw(proj_, 1, OC, H_lat, W_lat, out);  // (1, OC*N)
+    // patch_size == 1 → unpatchify is sequence_to_nchw with OC channels. The
+    // DiT computes in cdt (BF16 on CUDA); the velocity is returned FP32 so the
+    // sampler integrates the latent at full precision.
+    if (cdt != bt::Dtype::FP32) {
+        bt::sequence_to_nchw(proj_, 1, OC, H_lat, W_lat, out_cd_);
+        bt::cast(out_cd_, out, bt::Dtype::FP32);
+    } else {
+        bt::sequence_to_nchw(proj_, 1, OC, H_lat, W_lat, out);  // (1, OC*N)
+    }
 }
 
 }  // namespace brodiffusion::dit

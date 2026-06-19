@@ -157,6 +157,7 @@ private:
     // mix-ffn
     brotensor::Tensor ff_spatial_, ff_t1_, ff_t2_, ff_out_;
     brotensor::Tensor proj_;
+    brotensor::Tensor out_cd_;   // (1, OC*N) compute-dtype velocity before FP32
 };
 
 }  // namespace brodiffusion::dit
