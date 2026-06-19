@@ -33,9 +33,12 @@
 #include "brotensor/safetensors.h"
 #include "brotensor/tensor.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -94,6 +97,68 @@ struct SanaPrepared : public PreparedConditioning::Impl {
     bt::Tensor ctx_uncond;   // (L_uncond, inner), empty when no uncond
     bool has_uncond = false;
 };
+
+// Per-op profiler, enabled with BRODIFFUSION_FLOW_PROFILE=1 (shared with the
+// triposplat flow DiT). Syncs around each category, accumulates ms across all
+// forwards, dumps once on demand. The per-op syncs serialise the stream, so the
+// absolute total runs a little hot — the split, not the total, is the signal.
+struct SanaProf {
+    static bool enabled() {
+        static const bool on = [] {
+            const char* e = std::getenv("BRODIFFUSION_FLOW_PROFILE");
+            return e && *e && *e != '0';
+        }();
+        return on;
+    }
+    std::vector<std::pair<const char*, double>> cats;  // insertion-ordered
+    int forwards = 0;
+    double& at(const char* n) {
+        for (auto& p : cats)
+            if (p.first == n || std::string(p.first) == n) return p.second;
+        cats.emplace_back(n, 0.0);
+        return cats.back().second;
+    }
+    void dump() {
+        double total = 0.0;
+        for (auto& p : cats) total += p.second;
+        std::fprintf(stderr, "[sana] ── %d forwards ──\n", forwards);
+        for (auto& p : cats)
+            std::fprintf(stderr, "[sana] %-16s %9.1f ms  %4.1f%%  (%6.2f ms/fwd)\n",
+                         p.first, p.second, total > 0 ? 100.0 * p.second / total : 0.0,
+                         forwards > 0 ? p.second / forwards : 0.0);
+        std::fprintf(stderr, "[sana] %-16s %9.1f ms        (%6.2f ms/fwd)\n",
+                     "TOTAL", total, forwards > 0 ? total / forwards : 0.0);
+    }
+};
+SanaProf g_sana_prof;
+
+void sana_dump_profile_impl() {
+    if (SanaProf::enabled()) g_sana_prof.dump();
+}
+
+// Register the atexit dump exactly once (a function-local static in a
+// non-template function — the templated prof() would otherwise register one per
+// distinct lambda type, dumping N times).
+inline void prof_register_atexit() {
+    static const bool registered = [] {
+        std::atexit(+[] { sana_dump_profile_impl(); });
+        return true;
+    }();
+    (void)registered;
+}
+
+template <class F>
+inline void prof(const char* name, F&& f) {
+    if (!SanaProf::enabled()) { f(); return; }
+    prof_register_atexit();
+    bt::sync_all();
+    const auto t0 = std::chrono::steady_clock::now();
+    f();
+    bt::sync_all();
+    g_sana_prof.at(name) +=
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+}
 
 }  // namespace
 
@@ -281,6 +346,7 @@ void SanaDenoiser::self_attention_(const Block& blk, int N, int H, int W,
     const bt::Device dev = x_mod.device;
 
     // To channel-major (D, N): Xcm[c,n] = x_mod[n,c].
+    prof("sa_proj", [&] {
     bt::sequence_to_nchw(x_mod, 1, D, H, W, xcm_);   // (1, D*N)
     bt::Tensor Xcm = sub_view(xcm_, 0, D, N);
     // q/k/v = W @ Xcm  → (D, N) channel-major (bias-free).
@@ -293,7 +359,9 @@ void SanaDenoiser::self_attention_(const Block& blk, int N, int H, int W,
     bt::copy_d2d(k_, 0, qkv_, D * N, D * N);
     bt::copy_d2d(v_, 0, qkv_, 2 * D * N, D * N);
     bt::cast(qkv_, qkv_f_, bt::Dtype::FP32);
+    });
 
+    prof("sa_core", [&] {
     detail::resize_like(attn_f_, D, N, bt::Dtype::FP32, dev);
     ensure_ones_(N);
     for (int h = 0; h < nh; ++h) {
@@ -326,12 +394,15 @@ void SanaDenoiser::self_attention_(const Block& blk, int N, int H, int W,
                                    static_cast<std::int64_t>(base) * N, hd, N);
         bt::broadcast_mul(num, recip_, outh);
     }
+    });
 
+    prof("sa_out", [&] {
     // Back to compute dtype, to sequence (N, D), then to_out (biased).
     bt::cast(attn_f_, attn_c_, cdt);                     // (D, N)
     bt::Tensor attn_nchw = sub_view(attn_c_, 0, 1, D * N);
     bt::nchw_to_sequence(attn_nchw, 1, D, H, W, mod_);   // (N, D); reuse mod_
     lin_(blk.out1, mod_, out);                           // (N, D)
+    });
 }
 
 // ─── cross-attention (softmax MHA to caption) ──────────────────────────────
@@ -455,12 +526,14 @@ void SanaDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
     std::vector<bt::Tensor> ch;
     for (const Block& blk : blocks_) {
         // AdaLN-single: (scale_shift_table + temb6) → 6 chunks.
-        mod_row_ = temb6_.clone();
-        bt::add_inplace(mod_row_, blk.scale_shift);
-        slice_modulation_chunks(mod_row_, D, 6, ch);
         std::vector<bt::Tensor> c;
-        c.reserve(6);
-        for (auto& t : ch) c.push_back(t.clone());
+        prof("adaln", [&] {
+            mod_row_ = temb6_.clone();
+            bt::add_inplace(mod_row_, blk.scale_shift);
+            slice_modulation_chunks(mod_row_, D, 6, ch);
+            c.reserve(6);
+            for (auto& t : ch) c.push_back(t.clone());
+        });
         const bt::Tensor& shift_msa = c[0];
         const bt::Tensor& scale_msa = c[1];
         const bt::Tensor& gate_msa  = c[2];
@@ -469,25 +542,32 @@ void SanaDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
         const bt::Tensor& gate_mlp  = c[5];
 
         // self-attn: h += gate_msa * attn1(modulate(LN(h)))
-        detail::layernorm_batched(hidden_, ada_gamma_, ada_beta_, ln_,
-                                  cfg_.norm_eps);
-        bt::modulate(ln_, scale_msa, shift_msa, mod_);
-        self_attention_(blk, N, H_lat, W_lat, mod_, sub_out_);
-        bt::broadcast_mul(sub_out_, gate_msa, gated_);
-        bt::add_inplace(hidden_, gated_);
+        prof("self_attn", [&] {
+            detail::layernorm_batched(hidden_, ada_gamma_, ada_beta_, ln_,
+                                      cfg_.norm_eps);
+            bt::modulate(ln_, scale_msa, shift_msa, mod_);
+            self_attention_(blk, N, H_lat, W_lat, mod_, sub_out_);
+            bt::broadcast_mul(sub_out_, gate_msa, gated_);
+            bt::add_inplace(hidden_, gated_);
+        });
 
         // cross-attn: h += attn2(h, caption)  (no norm, no modulation)
-        cross_attention_(blk, *ctx, hidden_, sub_out_);
-        bt::add_inplace(hidden_, sub_out_);
+        prof("cross_attn", [&] {
+            cross_attention_(blk, *ctx, hidden_, sub_out_);
+            bt::add_inplace(hidden_, sub_out_);
+        });
 
         // mix-ffn: h += gate_mlp * ff(modulate(LN(h)))
-        detail::layernorm_batched(hidden_, ada_gamma_, ada_beta_, ln_,
-                                  cfg_.norm_eps);
-        bt::modulate(ln_, scale_mlp, shift_mlp, mod_);
-        mix_ffn_(blk, H_lat, W_lat, mod_, sub_out_);
-        bt::broadcast_mul(sub_out_, gate_mlp, gated_);
-        bt::add_inplace(hidden_, gated_);
+        prof("mix_ffn", [&] {
+            detail::layernorm_batched(hidden_, ada_gamma_, ada_beta_, ln_,
+                                      cfg_.norm_eps);
+            bt::modulate(ln_, scale_mlp, shift_mlp, mod_);
+            mix_ffn_(blk, H_lat, W_lat, mod_, sub_out_);
+            bt::broadcast_mul(sub_out_, gate_mlp, gated_);
+            bt::add_inplace(hidden_, gated_);
+        });
     }
+    if (SanaProf::enabled()) ++g_sana_prof.forwards;
 
     // ── norm_out (SanaModulatedNorm) → proj_out → unpatchify ──────────────
     std::vector<bt::Tensor> no;
