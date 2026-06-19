@@ -15,6 +15,7 @@
 // with a "json: ..." message that includes a byte offset.
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -174,6 +175,14 @@ private:
             case '"': return Value::make_string(parse_string());
             case 't': case 'f': return parse_bool();
             case 'n': return parse_null();
+            // Non-finite literals as emitted by Python's json (and therefore by
+            // diffusers config files): Infinity / -Infinity / NaN. RFC 8259
+            // forbids them, but real Sana scheduler configs carry
+            // "lambda_min_clipped": -Infinity, so accept them. '-Infinity' is
+            // reached through parse_number (it starts with '-'); '+Infinity'
+            // and bare 'Infinity' / 'NaN' are routed here.
+            case 'I': return parse_number();  // "Infinity"
+            case 'N': return parse_nan();     // "NaN" (note: 'n'/null is lower)
             default:
                 if (*p_ == '-' || (*p_ >= '0' && *p_ <= '9')) {
                     return parse_number();
@@ -306,9 +315,32 @@ private:
         fail("unterminated string");
     }
 
+    // Match `lit` at the cursor and advance past it, or fail.
+    void expect_literal(const char* lit) {
+        const std::size_t n = std::char_traits<char>::length(lit);
+        if (static_cast<std::size_t>(end_ - p_) < n ||
+            std::string(p_, p_ + n) != lit) {
+            fail(std::string("invalid literal, expected '") + lit + "'");
+        }
+        p_ += n;
+    }
+
+    Value parse_nan() {
+        expect_literal("NaN");
+        return Value::make_number(std::numeric_limits<double>::quiet_NaN());
+    }
+
     Value parse_number() {
         const char* start = p_;
-        if (peek() == '-') ++p_;
+        const bool neg = (peek() == '-');
+        if (neg) ++p_;
+        // Python-json non-finite literal: (-)Infinity. Accept and map to ±inf.
+        if (peek() == 'I') {
+            expect_literal("Infinity");
+            return Value::make_number(
+                neg ? -std::numeric_limits<double>::infinity()
+                    :  std::numeric_limits<double>::infinity());
+        }
         if (peek() == '0') {
             ++p_;
         } else if (peek() >= '1' && peek() <= '9') {

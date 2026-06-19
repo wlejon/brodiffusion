@@ -49,6 +49,13 @@ brodiffusion_add_test(brodiffusion_test_sana_dit test_sana_dit.cpp)
 target_compile_definitions(brodiffusion_test_sana_dit PRIVATE
     BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
 
+# Sana Gemma-2 text encoder (prompt -> last_hidden_state). Gated entirely on the
+# real Sana 0.6B text encoder + tokenizer under weights/sana-600m (skips cleanly
+# when absent). Also exercises the JSON -Infinity fix via load_model_config.
+brodiffusion_add_test(brodiffusion_test_sana_text test_sana_text.cpp)
+target_compile_definitions(brodiffusion_test_sana_text PRIVATE
+    BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
+
 # TripoSplat Flux.2 VAE image-encoder parity test: structural checks always run;
 # the numeric-parity part is gated on the real checkpoint
 # (weights/triposplat/vae/flux2-vae.safetensors) and golden_flux2vae.bin under
