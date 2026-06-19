@@ -347,12 +347,25 @@ void SanaDenoiser::self_attention_(const Block& blk, int N, int H, int W,
 
     // To channel-major (D, N): Xcm[c,n] = x_mod[n,c].
     prof("sa_proj", [&] {
-    bt::sequence_to_nchw(x_mod, 1, D, H, W, xcm_);   // (1, D*N)
-    bt::Tensor Xcm = sub_view(xcm_, 0, D, N);
-    // q/k/v = W @ Xcm  → (D, N) channel-major (bias-free).
-    bt::matmul(blk.q1.W, Xcm, q_);
-    bt::matmul(blk.k1.W, Xcm, k_);
-    bt::matmul(blk.v1.W, Xcm, v_);
+    // q/k/v = W @ x_modᵀ → (D, N) channel-major (bias-free). On CUDA this is a
+    // single WMMA A@Bᵀ per projection: x_mod (N,D) is consumed transposed for
+    // free (no sequence_to_nchw), W (D,D) is A, output is (D,N). On the FP32 CPU
+    // backend matmul_abt is unavailable, so fall back to the naive channel-major
+    // matmul (transpose x_mod, then W @ Xcm).
+    if (cdt == bt::Dtype::FP32) {
+        bt::sequence_to_nchw(x_mod, 1, D, H, W, xcm_);   // (1, D*N)
+        bt::Tensor Xcm = sub_view(xcm_, 0, D, N);
+        bt::matmul(blk.q1.W, Xcm, q_);
+        bt::matmul(blk.k1.W, Xcm, k_);
+        bt::matmul(blk.v1.W, Xcm, v_);
+    } else {
+        detail::resize_like(q_, D, N, cdt, dev);
+        detail::resize_like(k_, D, N, cdt, dev);
+        detail::resize_like(v_, D, N, cdt, dev);
+        bt::matmul_abt(blk.q1.W, x_mod, q_, 1, D, N, D, 0, 0, 0, nullptr, 0);
+        bt::matmul_abt(blk.k1.W, x_mod, k_, 1, D, N, D, 0, 0, 0, nullptr, 0);
+        bt::matmul_abt(blk.v1.W, x_mod, v_, 1, D, N, D, 0, 0, 0, nullptr, 0);
+    }
     // Stack [q; k; v] → (3D, N), then upcast the whole core to FP32.
     detail::resize_like(qkv_, 3 * D, N, cdt, dev);
     bt::copy_d2d(q_, 0, qkv_, 0, D * N);
