@@ -106,8 +106,11 @@ void FlowMatch::step(const bt::Tensor& v,
     const float sigma_next = sigmas_[static_cast<std::size_t>(step_index) + 1];
     const float d_sigma    = sigma_next - sigma_t;
 
+    // Match the operand dtype, not the global compute dtype: Sana runs the
+    // velocity + latent in FP32 even on a GPU backend whose compute_dtype() is
+    // FP16. (For Flux / SD the two coincide, so this is a no-op there.)
     detail::resize_like(scratch, v.rows, v.cols,
-                        compute_dtype(), v.device);
+                        v.dtype, v.device);
 
     bt::copy_d2d(v, 0, scratch, 0, v.size());
     bt::scale_inplace(scratch, d_sigma);
@@ -131,8 +134,9 @@ void FlowMatch::add_noise(const bt::Tensor& x0,
     const float sigma_t = sigmas_[static_cast<std::size_t>(step_index)];
     const float one_minus = 1.0f - sigma_t;
 
-    detail::resize_like(sample,  x0.rows, x0.cols, compute_dtype(), x0.device);
-    detail::resize_like(scratch, x0.rows, x0.cols, compute_dtype(), x0.device);
+    // Match the operand dtype (see step() — FP32 for Sana even on a GPU).
+    detail::resize_like(sample,  x0.rows, x0.cols, x0.dtype, x0.device);
+    detail::resize_like(scratch, x0.rows, x0.cols, x0.dtype, x0.device);
 
     bt::copy_d2d(x0,    0, sample,  0, x0.size());
     bt::scale_inplace(sample, one_minus);

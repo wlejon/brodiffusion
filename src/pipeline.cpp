@@ -18,6 +18,9 @@
 #include "brodiffusion/detail/compute.h"
 #include "brodiffusion/detail/safetensors_dir.h"
 #include "brodiffusion/detail/torch_rng.h"
+#include "brodiffusion/dit/sana.h"
+#include "brodiffusion/sana_text.h"
+#include "brodiffusion/vae_dcae.h"
 #include "brodiffusion/image_io.h"
 
 #include "brotensor/ops.h"
@@ -190,6 +193,9 @@ std::unique_ptr<Denoiser> make_denoiser(const PipelineConfig& cfg) {
     if (cfg.model_class == ModelClass::Flux) {
         return std::make_unique<dit::FluxDenoiser>(cfg.flux);
     }
+    if (cfg.model_class == ModelClass::Sana) {
+        return std::make_unique<dit::SanaDenoiser>(cfg.sana);
+    }
     return std::make_unique<unet::UNet>(cfg.unet);
 }
 
@@ -250,6 +256,24 @@ Pipeline::Pipeline(const PipelineConfig& cfg, brolm::clip::Tokenizer clip_tok,
     }
 }
 
+Pipeline::Pipeline(const PipelineConfig& cfg, brolm::gemma::Tokenizer gemma_tok)
+    : cfg_(cfg),
+      model_class_(cfg.model_class),
+      tokenizer_(std::nullopt),           // CLIP unused for Sana
+      text_encoder_(cfg.text_encoder),    // CLIP unused for Sana
+      denoiser_(make_denoiser(cfg)),
+      vae_(cfg.vae),                       // KL-VAE unused for Sana
+      vae_encoder_(encoder_config_from_decoder(cfg.vae)),
+      scheduler_(make_scheduler(cfg.scheduler)),
+      dcae_(std::in_place, cfg.dcae),
+      gemma_model_(std::in_place, cfg.gemma),
+      gemma_tokenizer_(std::move(gemma_tok)) {
+    if (cfg.model_class != ModelClass::Sana) {
+        fail("Pipeline: the (cfg, gemma_tok) constructor requires "
+             "model_class == Sana");
+    }
+}
+
 const unet::UNet& Pipeline::unet() const {
     const unet::UNet* u = denoiser_->as_unet();
     if (u == nullptr) fail("unet(): the active denoiser is not a UNet");
@@ -265,10 +289,14 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
     cfg.model_class   = mc.model_class;
     cfg.unet          = mc.unet;
     cfg.flux          = mc.flux;
+    cfg.sana          = mc.sana;
     cfg.vae           = mc.vae;
+    cfg.dcae          = mc.dcae;
     cfg.text_encoder  = mc.text_encoder;
     cfg.t5            = mc.t5;
     cfg.t5_max_length = mc.t5_max_length;
+    cfg.gemma         = mc.gemma;
+    cfg.sana_max_seq_len = mc.sana_max_seq_len;
     cfg.scheduler     = mc.scheduler;
     if (dir_opts.quantize) {
         cfg.unet.quantize_weights = true;
@@ -278,7 +306,35 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
 
     const fs::path root(model_dir);
 
-    // CLIP tokenizer (both classes).
+    if (mc.model_class == ModelClass::Sana) {
+        // Sana's text frontend is Gemma-2, not CLIP/T5 — load that tokenizer
+        // (the CLIP vocab.json / merges.txt below don't exist in a Sana dir).
+        brolm::gemma::Tokenizer gemma_tok = brolm::gemma::Tokenizer::load(
+            (root / "tokenizer" / "tokenizer.json").string());
+
+        Pipeline p(cfg, std::move(gemma_tok));
+
+        // transformer (single-file) → SanaDenoiser; DC-AE decoder under the
+        // "decoder." subtree of the VAE file; Gemma-2 text encoder may be
+        // sharded (2 fp16 shards) — search every shard by name.
+        auto tf_files  = detail::open_component_files(
+            (root / "transformer").string());
+        auto vae_files = detail::open_component_files(
+            (root / "vae").string());
+        auto te_files  = detail::open_component_files(
+            (root / "text_encoder").string());
+
+        p.denoiser_->load_weights(tf_files.front(), "");
+        p.dcae_->load_weights(vae_files.front(), "decoder.");
+
+        std::vector<const brotensor::safetensors::File*> te_ptrs;
+        for (const auto& f : te_files) te_ptrs.push_back(&f);
+        p.gemma_model_->load_weights(te_ptrs, "");
+
+        return p;
+    }
+
+    // CLIP tokenizer (SD / Flux).
     brolm::clip::Tokenizer clip_tok = brolm::clip::Tokenizer::load(
         (root / "tokenizer" / "vocab.json").string(),
         (root / "tokenizer" / "merges.txt").string());
@@ -430,7 +486,8 @@ void Pipeline::clear_controlnets() {
 }
 
 void Pipeline::encode_prompt_(std::string_view prompt, bt::Tensor& out) {
-    std::vector<std::int32_t> ids = tokenizer_.encode(prompt);
+    if (!tokenizer_) fail("encode_prompt_: CLIP tokenizer not present");
+    std::vector<std::int32_t> ids = tokenizer_->encode(prompt);
     if (static_cast<int>(ids.size()) != cfg_.text_encoder.max_position) {
         fail("tokenizer returned " + std::to_string(ids.size()) +
              " ids, expected " + std::to_string(cfg_.text_encoder.max_position));
@@ -449,8 +506,112 @@ PipelineState PipelineState::clone() const {
     return out;
 }
 
+PipelineState Pipeline::prime_sana_(std::string_view prompt,
+                                    const GenerateOptions& opts) {
+    // Sana downsamples 32x (DC-AE f32c32), not the 8x of SD / Flux.
+    if (opts.height <= 0 || opts.width <= 0 ||
+        opts.height % 32 != 0 || opts.width % 32 != 0) {
+        fail("Sana: height and width must be positive multiples of 32");
+    }
+    if (opts.num_inference_steps <= 0) {
+        fail("num_inference_steps must be positive");
+    }
+    // img2img / inpaint / ControlNet are not wired for Sana yet (init_noise
+    // and the txt2img RNG paths below are).
+    if (!opts.init_image_path.empty() || !opts.mask_image_path.empty() ||
+        !opts.controls.empty()) {
+        fail("Sana: img2img / inpaint / ControlNet are not supported");
+    }
+    if (!gemma_model_ || !gemma_tokenizer_ || !dcae_) {
+        fail("Sana: pipeline missing Gemma encoder / DC-AE decoder");
+    }
+
+    // Reset the SD-only run state so a previous non-Sana generation can't leak.
+    inpaint_active_    = false;
+    controlnet_active_ = false;
+    control_inputs_.clear();
+    control_images_.clear();
+
+    const int H_lat = opts.height / 32;
+    const int W_lat = opts.width  / 32;
+    const int C_lat = denoiser_->latent_channels();      // 32
+    const int n_lat = C_lat * H_lat * W_lat;
+    // Sana is not guidance-distilled: a separate uncond branch + CFG combine
+    // runs whenever guidance != 1.0 (uses_cfg() is true for the SanaDenoiser).
+    const bool do_cfg = denoiser_->uses_cfg() && (opts.guidance_scale != 1.0f);
+
+    denoiser_->finalize_weights();
+
+    // 1. Gemma-encode the positive prompt (and, under CFG, the negative). The
+    //    Sana DiT cross-attends over exactly the returned valid token rows.
+    conditioning_.text_embeddings = brodiffusion::sana::encode_prompt(
+        *gemma_model_, *gemma_tokenizer_, std::string(prompt),
+        cfg_.sana_max_seq_len);
+    if (do_cfg) {
+        conditioning_.uncond_embeddings = brodiffusion::sana::encode_prompt(
+            *gemma_model_, *gemma_tokenizer_,
+            std::string(opts.negative_prompt), cfg_.sana_max_seq_len);
+        conditioning_.has_uncond = true;
+    } else {
+        conditioning_.has_uncond = false;
+        conditioning_.uncond_embeddings = bt::Tensor{};
+    }
+    conditioning_.guidance = 0.0f;
+
+    // 1b. Project the caption context once per generation (caption_projection
+    //     + caption_norm), shared across all branched states.
+    prepared_ = denoiser_->prepare(conditioning_);
+
+    // 2. State shell + timestep schedule (rectified-flow FlowMatch, shift=3).
+    PipelineState state;
+    state.H_lat   = H_lat;
+    state.W_lat   = W_lat;
+    state.rng_key = opts.seed;
+    std::visit([&](auto& s) { s.set_timesteps(opts.num_inference_steps); },
+               scheduler_);
+    state.n_steps = std::visit(
+        [](const auto& s) { return s.num_inference_steps(); }, scheduler_);
+    const float sigma = std::visit(
+        [](const auto& s) { return s.init_noise_sigma(); }, scheduler_);
+
+    // 3. Initial latent. The Sana DiT runs FP32 (FP16 overflows), so the latent
+    //    — which the rectified-flow velocity is added to in place — must be FP32
+    //    too, regardless of the GPU backend's FP16 compute dtype. brotensor's
+    //    randn is FP32-native, so the device path needs no cast.
+    if (!opts.init_noise.empty()) {
+        if (static_cast<int>(opts.init_noise.size()) != n_lat) {
+            fail("prime: init_noise has " +
+                 std::to_string(opts.init_noise.size()) +
+                 " values, expected " + std::to_string(n_lat));
+        }
+        std::vector<float> noise(static_cast<std::size_t>(n_lat));
+        for (int i = 0; i < n_lat; ++i) noise[i] = sigma * opts.init_noise[i];
+        state.latent =
+            bt::Tensor::from_host(noise.data(), 1, n_lat).to(bt::default_device());
+    } else if (opts.noise_source == NoiseSource::Torch) {
+        std::vector<float> noise =
+            detail::torch_randn_f32(opts.seed, static_cast<std::size_t>(n_lat));
+        if (sigma != 1.0f) for (int i = 0; i < n_lat; ++i) noise[i] *= sigma;
+        state.latent =
+            bt::Tensor::from_host(noise.data(), 1, n_lat).to(bt::default_device());
+    } else {
+        state.latent = bt::Tensor::empty(1, n_lat, bt::Dtype::FP32);
+        bt::randn(opts.seed, 0, state.latent);
+        if (sigma != 1.0f) bt::scale_inplace(state.latent, sigma);
+    }
+
+    state.step_index = 0;
+    return state;
+}
+
 PipelineState Pipeline::prime(std::string_view prompt,
                               const GenerateOptions& opts) {
+    // Sana has its own (32x downsample, FP32 latent, Gemma-encoded) priming
+    // path; the SD / Flux machinery below (8x latent, CLIP / T5, img2img /
+    // inpaint / ControlNet) does not apply.
+    if (model_class_ == ModelClass::Sana) {
+        return prime_sana_(prompt, opts);
+    }
     if (opts.height <= 0 || opts.width <= 0 ||
         opts.height % 8 != 0 || opts.width % 8 != 0) {
         fail("height and width must be positive multiples of 8");
@@ -552,7 +713,7 @@ PipelineState Pipeline::prime(std::string_view prompt,
                              t5_tokenizer_->pad_id());
 
         // CLIP pooled vector — discard the CLIP sequence output for Flux.
-        std::vector<std::int32_t> clip_ids = tokenizer_.encode(prompt);
+        std::vector<std::int32_t> clip_ids = tokenizer_->encode(prompt);
         if (static_cast<int>(clip_ids.size()) !=
             cfg_.text_encoder.max_position) {
             fail("prime: CLIP tokenizer returned " +
@@ -1042,10 +1203,21 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
 }
 
 std::vector<float> Pipeline::decode(const PipelineState& state) {
-    vae_.decode(state.latent, state.H_lat, state.W_lat, decoded_);
+    int n_img;
+    if (model_class_ == ModelClass::Sana) {
+        // DC-AE f32c32 decoder: 32x upsample, 3-channel image. The decoder
+        // applies latent/scaling_factor internally and casts the FP32 latent to
+        // its own compute dtype at the boundary.
+        if (!dcae_) fail("decode: Sana DC-AE decoder not loaded");
+        dcae_->decode(state.latent, state.H_lat, state.W_lat, decoded_);
+        n_img = cfg_.dcae.image_channels *
+                (state.H_lat * 32) * (state.W_lat * 32);
+    } else {
+        vae_.decode(state.latent, state.H_lat, state.W_lat, decoded_);
+        n_img = cfg_.vae.out_channels *
+                (state.H_lat * 8) * (state.W_lat * 8);
+    }
     bt::sync_all();
-    const int n_img = cfg_.vae.out_channels *
-                       (state.H_lat * 8) * (state.W_lat * 8);
     // The decoded tensor carries the VAE's arithmetic dtype — FP16 on a GPU
     // backend, BF16 for a force_upcast VAE (Flux), FP32 on CPU. Convert the
     // 16-bit cases to float as needed.

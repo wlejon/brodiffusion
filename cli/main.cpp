@@ -331,9 +331,16 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     pl::Pipeline pipeline = pl::Pipeline::from_model_dir(model_dir, dir_opts);
     const bool is_flux =
         pipeline.config().model_class == brodiffusion::ModelClass::Flux;
-    std::printf("Model class: %s\n", is_flux ? "Flux" : "StableDiffusion");
+    const bool is_sana =
+        pipeline.config().model_class == brodiffusion::ModelClass::Sana;
+    std::printf("Model class: %s\n",
+                is_flux ? "Flux" : (is_sana ? "Sana" : "StableDiffusion"));
 
     pl::GenerateOptions opts;
+    // Sana reference defaults: 1024px, 20 steps, guidance 4.5 (native 1024
+    // model; DC-AE downsamples 32x so 1024 -> a 32x32 latent).
+    if (is_sana) { opts.width = 1024; opts.height = 1024;
+                   opts.num_inference_steps = 20; opts.guidance_scale = 4.5f; }
     if (neg)      opts.negative_prompt = neg;
     if (steps_s)  opts.num_inference_steps = std::atoi(steps_s);
     else if (is_flux) opts.num_inference_steps = 4;  // flux-schnell default

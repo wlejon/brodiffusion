@@ -17,15 +17,19 @@
 #include "brodiffusion/controlnet.h"
 #include "brodiffusion/denoiser.h"
 #include "brodiffusion/dit/flux.h"
+#include "brodiffusion/dit/sana.h"
 #include "brodiffusion/flow_match_scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
 #include "brodiffusion/model_config.h"
 #include "brodiffusion/scheduler.h"
+#include "brolm/gemma2.h"
+#include "brolm/gemma_tokenizer.h"
 #include "brolm/t5.h"
 #include "brolm/tokenizer.h"
 #include "brolm/tokenizer_t5.h"
 #include "brodiffusion/unet.h"
 #include "brodiffusion/vae.h"
+#include "brodiffusion/vae_dcae.h"
 
 #include "brotensor/tensor.h"
 
@@ -48,10 +52,14 @@ struct PipelineConfig {
     ModelClass               model_class = ModelClass::StableDiffusion;
     unet::UNetConfig         unet;          // StableDiffusion
     dit::FluxConfig          flux;          // Flux
+    dit::SanaConfig          sana;          // Sana (linear DiT transformer)
     vae::DecoderConfig       vae;
-    brolm::clip::TextEncoderConfig  text_encoder;  // CLIP — both classes
+    dcae::DecoderConfig      dcae;          // Sana (DC-AE f32c32 decoder)
+    brolm::clip::TextEncoderConfig  text_encoder;  // CLIP — SD / Flux
     brolm::t5::T5Config             t5;            // Flux
     int                      t5_max_length = 512;
+    brolm::gemma::Gemma2Config gemma;       // Sana (Gemma-2 text encoder)
+    int                      sana_max_seq_len = 300;  // Gemma caption length
     // DDIM (default, vanilla SD1.5) or LCM (latent-consistency, distilled
     // checkpoints with unet.time_cond_proj_dim > 0) or FlowMatch (Flux). The
     // pipeline branches on the active alternative; existing call sites that
@@ -207,6 +215,12 @@ public:
     Pipeline(const PipelineConfig& cfg, brolm::clip::Tokenizer clip_tok,
              brolm::t5::Tokenizer t5_tok);
 
+    // Sana constructor: builds a SanaDenoiser (linear DiT) + the DC-AE f32c32
+    // decoder + the Gemma-2 text encoder, and owns the Gemma tokenizer. Valid
+    // only when cfg.model_class == ModelClass::Sana. The CLIP / KL-VAE members
+    // are default-constructed and unused.
+    Pipeline(const PipelineConfig& cfg, brolm::gemma::Tokenizer gemma_tok);
+
     // Build a fully-loaded Pipeline from a diffusers model directory: reads the
     // JSON configs, constructs the right sub-modules, loads all component
     // weights and tokenizers. Supports StableDiffusion and Flux model
@@ -346,11 +360,18 @@ public:
 
 private:
     void encode_prompt_(std::string_view prompt, brotensor::Tensor& out);
+    // Sana txt2img priming: Gemma-encode prompt(s), prepare conditioning, and
+    // allocate the FP32 initial latent (32x downsample, 32 channels). Returns a
+    // step_index=0 state. Called from prime() when model_class_ == Sana.
+    PipelineState prime_sana_(std::string_view prompt,
+                              const GenerateOptions& opts);
 
     PipelineConfig            cfg_;
     ModelClass                model_class_;
-    brolm::clip::Tokenizer    tokenizer_;       // CLIP — both classes
-    brolm::clip::TextEncoder  text_encoder_;    // CLIP — both classes
+    // CLIP tokenizer for SD / Flux. Empty for Sana (which has no CLIP
+    // tokenizer; clip::Tokenizer is not default-constructible, hence optional).
+    std::optional<brolm::clip::Tokenizer> tokenizer_;
+    brolm::clip::TextEncoder  text_encoder_;    // CLIP — SD / Flux (unused Sana)
     std::optional<brolm::t5::Tokenizer>   t5_tokenizer_;   // Flux only
     std::optional<brolm::t5::TextEncoder> t5_encoder_;     // Flux only
     std::unique_ptr<Denoiser> denoiser_;
@@ -363,6 +384,15 @@ private:
     vae::Encoder              vae_encoder_;
     std::variant<scheduler::DDIM, scheduler::LCM, scheduler::FlowMatch>
         scheduler_;
+
+    // ── Sana-only sub-modules ─────────────────────────────────────────────
+    // The SanaDenoiser lives in denoiser_; these are the pieces that have no
+    // SD / Flux analogue. decode() routes to dcae_ for Sana (vae_ is unused);
+    // prime_sana_ Gemma-encodes the prompt via gemma_model_ / gemma_tokenizer_.
+    // All empty / default for non-Sana pipelines.
+    std::optional<dcae::Decoder>             dcae_;
+    std::optional<brolm::gemma::Gemma2Model> gemma_model_;
+    std::optional<brolm::gemma::Tokenizer>   gemma_tokenizer_;
 
     // Model-agnostic conditioning, rebuilt each prime(). `conditioning_` keeps
     // the raw text context around for trace-mode access; `prepared_` holds the
