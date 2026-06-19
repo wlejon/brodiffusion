@@ -30,6 +30,7 @@
 #include "brotensor/tensor.h"
 
 #include <string>
+#include <vector>
 
 namespace brotensor::safetensors { class File; }
 
@@ -86,8 +87,76 @@ public:
     const SanaConfig& config() const { return cfg_; }
 
 private:
+    // A linear layer (weight (out,in)); bias optional (empty => bias-free).
+    struct Linear {
+        brotensor::Tensor W;
+        brotensor::Tensor b;
+        bool has_bias() const { return b.size() > 0; }
+    };
+
+    // One SanaTransformerBlock's weights.
+    struct Block {
+        // Per-block AdaLN-single offset table, flattened (1, 6*inner).
+        brotensor::Tensor scale_shift;
+        // Self-attention (attn1, ReLU linear attn): q/k/v are bias-free,
+        // to_out.0 carries a bias.
+        Linear q1, k1, v1, out1;
+        // Cross-attention (attn2, softmax MHA to caption): all four projections
+        // have a bias.
+        Linear q2, k2, v2, out2;
+        // GLU-MBConv feed-forward (Mix-FFN). conv_inverted 1x1 (D -> 2*hidden,
+        // biased) -> depthwise 3x3 (2*hidden, biased) -> GLU split -> conv_point
+        // 1x1 (hidden -> D, bias-free). No internal norm / residual.
+        brotensor::Tensor ff_inv_W, ff_inv_b;   // (2*hidden, D), (2*hidden,1)
+        brotensor::Tensor ff_depth_W, ff_depth_b; // (2*hidden, 9), (2*hidden,1)
+        brotensor::Tensor ff_point_W;            // (D, hidden)
+    };
+
+    static void lin_(const Linear& l, const brotensor::Tensor& X,
+                     brotensor::Tensor& Y);
+    void ensure_ones_(int n);
+
+    // Per-block sub-layers. x_mod is the modulated, normalized hidden state
+    // (N, inner); each writes its sub-layer output (N, inner) into `out`.
+    void self_attention_(const Block& blk, int N, int H, int W,
+                         const brotensor::Tensor& x_mod, brotensor::Tensor& out);
+    void cross_attention_(const Block& blk, const brotensor::Tensor& ctx,
+                          const brotensor::Tensor& hidden,
+                          brotensor::Tensor& out);
+    void mix_ffn_(const Block& blk, int H, int W,
+                  const brotensor::Tensor& x_mod, brotensor::Tensor& out);
+
     SanaConfig cfg_;
     bool finalized_ = false;
+
+    // ── weights ───────────────────────────────────────────────────────────
+    Linear patch_embed_;        // (inner, in_channels) 1x1-conv-as-linear
+    Linear te_l1_, te_l2_;      // timestep_embedder (256->inner, inner->inner)
+    Linear te_proj_;            // time_embed.linear (inner -> 6*inner)
+    Linear cap_l1_, cap_l2_;    // caption_projection (PixArt text MLP)
+    brotensor::Tensor caption_norm_g_;  // (inner,1) RMSNorm gain (caption_norm)
+    brotensor::Tensor norm_out_sst_;    // (1, 2*inner) flat scale_shift_table
+    Linear proj_out_;           // (patch^2*out_channels, inner)
+    std::vector<Block> blocks_;
+
+    // AdaLN affine-free LayerNorm params: ones gamma, zeros beta (inner,1).
+    brotensor::Tensor ada_gamma_, ada_beta_;
+
+    // ── per-forward scratch (kept alive across calls to avoid realloc) ─────
+    brotensor::Tensor hidden_;                 // (N, inner) residual stream
+    brotensor::Tensor ts_, freq_, freq_cd_;    // timestep embed scratch
+    brotensor::Tensor emb_, emb_silu_, temb6_; // embedded timestep + AdaLN row
+    brotensor::Tensor mod_row_, ln_, mod_;     // modulation / layernorm
+    brotensor::Tensor gated_, sub_out_;        // gate * sublayer, sub-layer out
+    // self-attention
+    brotensor::Tensor xcm_, q_, k_, v_, qkv_, qkv_f_, attn_f_, attn_c_;
+    brotensor::Tensor vp_, kt_, scores_, hid_, recip_, ones_;
+    // cross-attention (ca_*f_: flash-dtype casts; ca_of_: FP32 output cast)
+    brotensor::Tensor ca_q_, ca_k_, ca_v_, ca_o_;
+    brotensor::Tensor ca_qf_, ca_kf_, ca_vf_, ca_of_;
+    // mix-ffn
+    brotensor::Tensor ff_spatial_, ff_t1_, ff_t2_, ff_out_;
+    brotensor::Tensor proj_;
 };
 
 }  // namespace brodiffusion::dit

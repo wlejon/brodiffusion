@@ -42,6 +42,13 @@ brodiffusion_add_test(brodiffusion_test_dcae_decoder test_dcae_decoder.cpp)
 target_compile_definitions(brodiffusion_test_dcae_decoder PRIVATE
     BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
 
+# Sana Linear DiT (SanaTransformer2DModel) denoiser smoke test. Gated entirely
+# on the real Sana 0.6B transformer checkpoint under weights/sana-600m/transformer
+# (skips cleanly when absent — no compact synthetic fixture for this DiT).
+brodiffusion_add_test(brodiffusion_test_sana_dit test_sana_dit.cpp)
+target_compile_definitions(brodiffusion_test_sana_dit PRIVATE
+    BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
+
 # TripoSplat Flux.2 VAE image-encoder parity test: structural checks always run;
 # the numeric-parity part is gated on the real checkpoint
 # (weights/triposplat/vae/flux2-vae.safetensors) and golden_flux2vae.bin under
