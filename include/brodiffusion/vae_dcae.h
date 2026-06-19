@@ -93,7 +93,77 @@ public:
     const DecoderConfig& config() const { return cfg_; }
 
 private:
+    // ── per-block weight bundles (mirror the diffusers AutoencoderDC modules) ──
+
+    // ResBlock: conv1(3x3) → SiLU → conv2(3x3, no bias) → RMSNorm(channels)
+    //           → + residual. C_in == C_out for every decoder ResBlock.
+    struct ResBlock {
+        brotensor::Tensor conv1_W, conv1_b;   // (C, C*9), (C,1)
+        brotensor::Tensor conv2_W;            // (C, C*9) — bias=False
+        brotensor::Tensor norm_g, norm_b;     // (C,1) RMSNorm weight+bias
+        int C = 0;
+    };
+
+    // GLUMBConv: 1x1 inverted (C→8C) → SiLU → 3x3 depthwise (8C) → GLU split
+    //   (h, gate) → h*SiLU(gate) → 1x1 point (4C→C, no bias) → RMSNorm → +res.
+    struct GLUMB {
+        brotensor::Tensor inv_W, inv_b;       // (8C, C), (8C,1)
+        brotensor::Tensor depth_W, depth_b;   // (8C, 9), (8C,1) depthwise
+        brotensor::Tensor point_W;            // (C, 4C) — bias=False
+        brotensor::Tensor norm_g, norm_b;     // (C,1)
+        int C = 0;                            // hidden2 = 8C, gated = 4C
+    };
+
+    // SanaMultiscaleLinearAttention (ReLU linear attention, +1 multiscale scale).
+    struct Attn {
+        brotensor::Tensor Wq, Wk, Wv;         // (inner, C) — bias=False
+        brotensor::Tensor ms_in_W;            // (3*inner, 25) depthwise 5x5
+        brotensor::Tensor ms_out_W;           // (3*inner, head_dim) grouped 1x1
+        brotensor::Tensor Wo;                 // (C, (1+S)*inner) — bias=False
+        brotensor::Tensor norm_g, norm_b;     // (C,1) RMSNorm
+        int C = 0, inner = 0, num_heads = 0;
+    };
+
+    struct EViT {
+        Attn  attn;
+        GLUMB glu;
+    };
+
+    struct UpBlock {
+        bool is_attention = false;
+        bool has_upsampler = false;
+        // DCUpBlock2d (interpolate): nearest-2x → conv(3x3) + pixel-shuffle skip.
+        brotensor::Tensor up_W, up_b;         // (C_out, C_in*9), (C_out,1)
+        int up_Cin = 0, up_Cout = 0;
+        std::vector<ResBlock> resblocks;      // populated when !is_attention
+        std::vector<EViT>     evitblocks;     // populated when is_attention
+        int C = 0;                            // stage output channels
+    };
+
+    // ── forward helpers (channel-major NCHW, N=1, compute dtype) ──
+    void apply_rmsnorm_(const brotensor::Tensor& g, const brotensor::Tensor& b,
+                        int C, int H, int W,
+                        brotensor::Tensor& x, brotensor::Tensor& out);
+    void apply_resblock_(const ResBlock& r, int H, int W, brotensor::Tensor& x);
+    void apply_glumb_(const GLUMB& m, int H, int W, brotensor::Tensor& x);
+    void apply_attn_(const Attn& a, int H, int W, brotensor::Tensor& x);
+    void apply_upsample_(const UpBlock& u, int H, int W, brotensor::Tensor& x);
+    void ensure_ones_(int n);
+
     DecoderConfig cfg_;
+
+    // Weights.
+    brotensor::Tensor conv_in_W_, conv_in_b_;
+    std::vector<UpBlock> up_blocks_;          // indexed by checkpoint order 0..5
+    brotensor::Tensor norm_out_g_, norm_out_b_;
+    brotensor::Tensor conv_out_W_, conv_out_b_;
+    int in_shortcut_repeats_ = 0;             // 0 ⇒ no input shortcut
+
+    // Scratch (re-used across decode calls; ping-pong + per-op temporaries).
+    brotensor::Tensor x_, y_, t1_, t2_, t3_;
+    brotensor::Tensor seq_, seq2_, repbuf_, up_t_, short_t_;
+    brotensor::Tensor qkv_, ms_, hs_, hsf_, attn_f_, attn_c_, toout_;
+    brotensor::Tensor vp_, kt_, scores_, hidden_, recip_, ones_;
 };
 
 }  // namespace brodiffusion::dcae

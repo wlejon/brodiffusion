@@ -35,6 +35,13 @@ brodiffusion_add_test(brodiffusion_test_sana_config    test_sana_config.cpp)
 brodiffusion_add_test(brodiffusion_test_flux_blocks   test_flux_blocks.cpp)
 brodiffusion_add_test(brodiffusion_test_flux_pipeline test_flux_pipeline.cpp)
 
+# DC-AE (AutoencoderDC f32c32) Sana decoder smoke test. Gated entirely on the
+# real Sana VAE checkpoint under weights/sana-600m/vae (skips cleanly when
+# absent — there is no compact synthetic fixture for this decoder).
+brodiffusion_add_test(brodiffusion_test_dcae_decoder test_dcae_decoder.cpp)
+target_compile_definitions(brodiffusion_test_dcae_decoder PRIVATE
+    BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
+
 # TripoSplat Flux.2 VAE image-encoder parity test: structural checks always run;
 # the numeric-parity part is gated on the real checkpoint
 # (weights/triposplat/vae/flux2-vae.safetensors) and golden_flux2vae.bin under
