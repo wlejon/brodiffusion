@@ -10,7 +10,8 @@
 #   scripts/download-weights.sh [model] [--repo R] [--out-dir D] [--force]
 #
 #   model            sd15 (default) | lcm-dreamshaper | clip-vit-l-14 |
-#                    flux-schnell
+#                    flux-schnell | sana-600m | sana-1.6b |
+#                    sana-sprint-0.6b | sana-sprint-1.6b
 #   --repo R         override the Hugging Face repo id
 #   --out-dir D      override the output directory
 #   --force          re-download even if the file already exists
@@ -40,6 +41,24 @@
 #                    diffusion_pytorch_model + the model card's example
 #                    control image (so a clean checkout has something concrete
 #                    to feed --control-image). ~1.4 GB each.
+#   sana-600m        NVIDIA Sana 0.6B 1024px from
+#                    Efficient-Large-Model/Sana_600M_1024px_diffusers (FP16).
+#                    SanaTransformer2DModel DiT + DC-AE VAE + sharded Gemma-2
+#                    text encoder. 0.6B is FP16-stable.
+#   sana-1.6b        NVIDIA Sana 1.6B 1024px. The DiT is pulled as the BF16
+#                    variant from Efficient-Large-Model/Sana_1600M_1024px_BF16_diffusers
+#                    because the 1.6B transformer is numerically UNSTABLE in FP16
+#                    (the shipped .fp16 weights decode to confetti — confirmed in
+#                    both diffusers and brodiffusion); everything else (VAE,
+#                    Gemma-2 encoder, tokenizer, scheduler) is the FP16 set from
+#                    Efficient-Large-Model/Sana_1600M_1024px_diffusers, identical
+#                    to the 0.6B components.
+#   sana-sprint-0.6b / sana-sprint-1.6b
+#                    NVIDIA Sana-Sprint (few-step, guidance-distilled) from
+#                    Efficient-Large-Model/Sana_Sprint_{0.6B,1.6B}_1024px_diffusers.
+#                    Same SanaTransformer2DModel/DC-AE/Gemma-2 components plus a
+#                    guidance embedding and an SCMScheduler (TrigFlow, 1-4 steps).
+#                    Single (unsharded, non-variant) transformer safetensors.
 #
 # Auth: the SD1.5 mirror is public and needs no token. For rate-limited repos,
 # export HF_TOKEN=hf_... and it will be sent as a bearer token.
@@ -62,11 +81,12 @@ FORCE=0
 while [ $# -gt 0 ]; do
     case "$1" in
         sd15|lcm-dreamshaper|clip-vit-l-14|flux-schnell|t5-xxl|controlnet-canny|controlnet-depth|controlnet-openpose) MODEL="$1"; shift ;;
+        sana-600m|sana-1.6b|sana-sprint-0.6b|sana-sprint-1.6b) MODEL="$1"; shift ;;
         --repo)    REPO="${2:?--repo needs a value}"; shift 2 ;;
         --out-dir) OUT_DIR="${2:?--out-dir needs a value}"; shift 2 ;;
         --force)   FORCE=1; shift ;;
         -h|--help)
-            sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,71p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) echo "error: unknown argument '$1' (try --help)" >&2; exit 2 ;;
     esac
@@ -185,6 +205,83 @@ case "$MODEL" in
             "tokenizer_2/tokenizer.json"
         )
         ;;
+    sana-600m)
+        # Sana 0.6B, diffusers format, FP16. The Gemma-2 text encoder ships
+        # SHARDED — only the `*.index.fp16.json` weight-map is listed; the shard
+        # files are discovered from it below (same mechanism as flux-schnell, but
+        # the index lives under text_encoder/ with an `.fp16` infix).
+        [ -n "$REPO" ]    || REPO="Efficient-Large-Model/Sana_600M_1024px_diffusers"
+        [ -n "$OUT_DIR" ] || OUT_DIR="$REPO_ROOT/weights/sana-600m"
+        FILES=(
+            "model_index.json"
+            "scheduler/scheduler_config.json"
+            "transformer/config.json"
+            "transformer/diffusion_pytorch_model.fp16.safetensors"
+            "vae/config.json"
+            "vae/diffusion_pytorch_model.fp16.safetensors"
+            "text_encoder/config.json"
+            "text_encoder/model.safetensors.index.fp16.json"
+            "tokenizer/special_tokens_map.json"
+            "tokenizer/tokenizer.json"
+            "tokenizer/tokenizer.model"
+            "tokenizer/tokenizer_config.json"
+        )
+        ;;
+    sana-1.6b)
+        # Sana 1.6B. The DiT MUST be the BF16 variant: the 1.6B transformer
+        # overflows/loses precision in FP16, and the shipped `.fp16` weights
+        # decode to colorful confetti (verified in both diffusers and
+        # brodiffusion). So the transformer (config + weights) is pulled from the
+        # BF16 repo via per-file `repo|path` overrides; the VAE, Gemma-2 encoder,
+        # tokenizer and scheduler are the FP16 set from the main 1.6B repo (those
+        # components are FP16-stable and byte-identical to the 0.6B ones).
+        [ -n "$REPO" ]    || REPO="Efficient-Large-Model/Sana_1600M_1024px_diffusers"
+        [ -n "$OUT_DIR" ] || OUT_DIR="$REPO_ROOT/weights/sana-1.6b"
+        sana_bf16="Efficient-Large-Model/Sana_1600M_1024px_BF16_diffusers"
+        FILES=(
+            "model_index.json"
+            "scheduler/scheduler_config.json"
+            "${sana_bf16}|transformer/config.json"
+            "${sana_bf16}|transformer/diffusion_pytorch_model.bf16.safetensors"
+            "vae/config.json"
+            "vae/diffusion_pytorch_model.fp16.safetensors"
+            "text_encoder/config.json"
+            "text_encoder/model.safetensors.index.fp16.json"
+            "tokenizer/special_tokens_map.json"
+            "tokenizer/tokenizer.json"
+            "tokenizer/tokenizer.model"
+            "tokenizer/tokenizer_config.json"
+        )
+        ;;
+    sana-sprint-0.6b|sana-sprint-1.6b)
+        # Sana-Sprint (few-step, guidance-distilled). Same component classes as
+        # standard Sana (SanaTransformer2DModel + DC-AE + Gemma-2) but with a
+        # guidance embedding in the DiT and an SCMScheduler (TrigFlow, 1-4 steps,
+        # no CFG). The weights ship without fp16/bf16 filename variants — one
+        # file per component (transformer is a single, unsharded safetensors;
+        # the text encoder is sharded via `model.safetensors.index.json`). Run
+        # the DiT in BF16.
+        case "$MODEL" in
+            sana-sprint-0.6b) sprint_repo="Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers" ;;
+            sana-sprint-1.6b) sprint_repo="Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers" ;;
+        esac
+        [ -n "$REPO" ]    || REPO="$sprint_repo"
+        [ -n "$OUT_DIR" ] || OUT_DIR="$REPO_ROOT/weights/$MODEL"
+        FILES=(
+            "model_index.json"
+            "scheduler/scheduler_config.json"
+            "transformer/config.json"
+            "transformer/diffusion_pytorch_model.safetensors"
+            "vae/config.json"
+            "vae/diffusion_pytorch_model.safetensors"
+            "text_encoder/config.json"
+            "text_encoder/model.safetensors.index.json"
+            "tokenizer/special_tokens_map.json"
+            "tokenizer/tokenizer.json"
+            "tokenizer/tokenizer.model"
+            "tokenizer/tokenizer_config.json"
+        )
+        ;;
 esac
 
 mkdir -p "$OUT_DIR"
@@ -262,6 +359,8 @@ done
 # fetched the `*.index.json` weight-maps. Extract the shard filenames from
 # each index and fetch every shard.
 for idx in "$OUT_DIR"/transformer/*.index.json \
+           "$OUT_DIR"/text_encoder/*.index.json \
+           "$OUT_DIR"/text_encoder/*.index.*.json \
            "$OUT_DIR"/text_encoder_2/*.index.json; do
     [ -e "$idx" ] || continue
     comp_dir="$(dirname "$idx")"
