@@ -357,6 +357,14 @@ public:
     // type. Always valid — never throws.
     int num_xattn_blocks() const { return denoiser_->num_xattn_blocks(); }
 
+    // Latent→pixel upscale factor of the active autoencoder: 8 for the SD /
+    // Flux KL-VAE, 32 for Sana's DC-AE f32c32. A decoded image is therefore
+    // (state.H_lat * vae_scale_factor()) × (state.W_lat * vae_scale_factor())
+    // pixels — the dimensions of decode()'s buffer. Always valid; never throws.
+    int vae_scale_factor() const {
+        return model_class_ == ModelClass::Sana ? 32 : 8;
+    }
+
     const PipelineConfig& config() const { return cfg_; }
 
 private:
