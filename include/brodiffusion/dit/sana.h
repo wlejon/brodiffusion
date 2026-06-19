@@ -151,6 +151,11 @@ private:
     // self-attention
     brotensor::Tensor xcm_, q_, k_, v_, qkv_, qkv_f_, attn_f_, attn_c_;
     brotensor::Tensor vp_, kt_, scores_, hid_, recip_, ones_;
+    // Batched ReLU-linear-attention core (CUDA/BF16 path).
+    brotensor::Tensor ones_bf_;                  // (1,N) ones at compute dtype
+    brotensor::Tensor sa_S_, sa_z_, sa_qt_;      // KᵀV (nh,hd,hd), colsum (D,1), Qrᵀ (nh,N,hd)
+    brotensor::Tensor sa_num_, sa_den_;          // (D,N) numerator, (nh,N) denominator
+    brotensor::Tensor sa_denf_, sa_recip_;       // FP32 1/den scratch, (nh,N) recip
     // cross-attention (ca_*f_: flash-dtype casts; ca_of_: FP32 output cast)
     brotensor::Tensor ca_q_, ca_k_, ca_v_, ca_o_;
     brotensor::Tensor ca_qf_, ca_kf_, ca_vf_, ca_of_;

@@ -366,52 +366,95 @@ void SanaDenoiser::self_attention_(const Block& blk, int N, int H, int W,
         bt::matmul_abt(blk.k1.W, x_mod, k_, 1, D, N, D, 0, 0, 0, nullptr, 0);
         bt::matmul_abt(blk.v1.W, x_mod, v_, 1, D, N, D, 0, 0, 0, nullptr, 0);
     }
-    // Stack [q; k; v] → (3D, N), then upcast the whole core to FP32.
-    detail::resize_like(qkv_, 3 * D, N, cdt, dev);
-    bt::copy_d2d(q_, 0, qkv_, 0, D * N);
-    bt::copy_d2d(k_, 0, qkv_, D * N, D * N);
-    bt::copy_d2d(v_, 0, qkv_, 2 * D * N, D * N);
-    bt::cast(qkv_, qkv_f_, bt::Dtype::FP32);
     });
 
+    // The ReLU linear-attention core, per head h (channel-major (hd,N) blocks of
+    // the (D,N) q/k/v):  relu(q), relu(k); then with Vaug = [V; 1]:
+    //   out_h = (relu(q_h)ᵀ · (relu(k_h) · Vᵀ))   normalised by
+    //           (relu(q_h)ᵀ · Σ_n relu(k_h)).
+    // The result lands in attn_c_ (D,N) at the compute dtype.
     prof("sa_core", [&] {
-    detail::resize_like(attn_f_, D, N, bt::Dtype::FP32, dev);
-    ensure_ones_(N);
-    for (int h = 0; h < nh; ++h) {
-        const int base = h * hd;                         // row offset in [0, D)
-        bt::Tensor Qh = sub_view(qkv_f_, static_cast<std::int64_t>(base) * N,
-                                 hd, N);
-        bt::Tensor Kh = sub_view(qkv_f_,
-                                 static_cast<std::int64_t>(D + base) * N, hd, N);
-        bt::relu_forward(Qh, Qh);
-        bt::relu_forward(Kh, Kh);
-        // Vp = pad(value, +1 ones row) → (hd+1, N).
-        detail::resize_like(vp_, hd + 1, N, bt::Dtype::FP32, dev);
-        bt::copy_d2d(qkv_f_, (2 * D + base) * N, vp_, 0, hd * N);
-        bt::copy_d2d(ones_, 0, vp_, hd * N, N);
-        // Kt = Khᵀ → (N, hd).
-        bt::Tensor KhN = sub_view(qkv_f_,
-                                  static_cast<std::int64_t>(D + base) * N,
-                                  1, hd * N);
-        bt::nchw_to_sequence(KhN, 1, hd, H, W, kt_);     // (N, hd)
-        bt::matmul(vp_, kt_, scores_);                   // (hd+1, hd)
-        bt::matmul(scores_, Qh, hid_);                   // (hd+1, N)
-        // out_h = hid[:hd] / (hid[hd] + eps).
-        detail::resize_like(recip_, 1, N, bt::Dtype::FP32, dev);
-        bt::copy_d2d(hid_, hd * N, recip_, 0, N);
-        bt::add_scalar_inplace(recip_, kAttnEps);
-        bt::rsqrt_forward(recip_, recip_);
-        bt::mul_inplace(recip_, recip_);                 // 1/(denom+eps)
-        bt::Tensor num  = sub_view(hid_, 0, hd, N);
-        bt::Tensor outh = sub_view(attn_f_,
-                                   static_cast<std::int64_t>(base) * N, hd, N);
-        bt::broadcast_mul(num, recip_, outh);
+    if (cdt == bt::Dtype::FP32) {
+        // ── FP32 per-head reference (CPU backend; matmul_abt is 16-bit) ──
+        detail::resize_like(attn_c_, D, N, bt::Dtype::FP32, dev);
+        ensure_ones_(N);
+        for (int h = 0; h < nh; ++h) {
+            const int base = h * hd;
+            bt::Tensor Qh = sub_view(q_, static_cast<std::int64_t>(base) * N, hd, N);
+            bt::Tensor Kh = sub_view(k_, static_cast<std::int64_t>(base) * N, hd, N);
+            bt::relu_forward(Qh, Qh);
+            bt::relu_forward(Kh, Kh);
+            // Vp = [V_h; ones] → (hd+1, N).
+            detail::resize_like(vp_, hd + 1, N, bt::Dtype::FP32, dev);
+            bt::copy_d2d(v_, static_cast<std::int64_t>(base) * N, vp_, 0, hd * N);
+            bt::copy_d2d(ones_, 0, vp_, hd * N, N);
+            // Kt = Khᵀ → (N, hd).
+            bt::Tensor KhN = sub_view(k_, static_cast<std::int64_t>(base) * N,
+                                      1, hd * N);
+            bt::nchw_to_sequence(KhN, 1, hd, H, W, kt_);  // (N, hd)
+            bt::matmul(vp_, kt_, scores_);                // (hd+1, hd)
+            bt::matmul(scores_, Qh, hid_);                // (hd+1, N)
+            detail::resize_like(recip_, 1, N, bt::Dtype::FP32, dev);
+            bt::copy_d2d(hid_, hd * N, recip_, 0, N);
+            bt::add_scalar_inplace(recip_, kAttnEps);
+            bt::rsqrt_forward(recip_, recip_);
+            bt::mul_inplace(recip_, recip_);              // 1/(denom+eps)
+            bt::Tensor num  = sub_view(hid_, 0, hd, N);
+            bt::Tensor outh = sub_view(attn_c_,
+                                       static_cast<std::int64_t>(base) * N, hd, N);
+            bt::broadcast_mul(num, recip_, outh);
+        }
+    } else {
+        // ── Batched WMMA path (CUDA, BF16) ──────────────────────────────
+        // All heads at once: 2 elementwise relus, 1 transpose, 4 batched A@Bᵀ
+        // GEMMs and a per-head broadcast divide — instead of ~10 ops × nh heads.
+        const std::int64_t hdN = static_cast<std::int64_t>(hd) * N;
+        const std::int64_t hdhd = static_cast<std::int64_t>(hd) * hd;
+        const std::int64_t Nhd = static_cast<std::int64_t>(N) * hd;
+        bt::relu_forward(q_, q_);                          // relu(Q) (D,N)
+        bt::relu_forward(k_, k_);                          // relu(K) (D,N)
+        // S[h] = V[h] @ relu(K)[h]ᵀ → (hd, hd), batched over heads.
+        detail::resize_like(sa_S_, nh * hd, hd, cdt, dev);
+        bt::matmul_abt(v_, k_, sa_S_, nh, hd, hd, N, hdN, hdN, hdhd, nullptr, 0);
+        // z[r] = Σ_n relu(K)[r,n] → (D,1) via relu(K) @ onesᵀ.
+        if (ones_bf_.cols != N || ones_bf_.dtype != cdt ||
+            ones_bf_.data == nullptr) {
+            ensure_ones_(N);
+            bt::cast(ones_, ones_bf_, cdt);
+        }
+        detail::resize_like(sa_z_, D, 1, cdt, dev);
+        bt::matmul_abt(k_, ones_bf_, sa_z_, 1, D, 1, N, 0, 0, 0, nullptr, 0);
+        // Qrᵀ: (nh,hd,N) → (nh,N,hd) channel→token transpose, batched over heads.
+        bt::nchw_to_sequence(q_, nh, hd, H, W, sa_qt_);    // (nh*N, hd)
+        // num[h] = S[h] @ Qrᵀ[h]ᵀ → (hd, N), batched.
+        detail::resize_like(sa_num_, D, N, cdt, dev);
+        bt::matmul_abt(sa_S_, sa_qt_, sa_num_, nh, hd, N, hd, hdhd, Nhd, hdN,
+                       nullptr, 0);
+        // den[h] = z[h] @ Qrᵀ[h]ᵀ → (1, N), batched (z[h] is a (1,hd) row).
+        detail::resize_like(sa_den_, nh, N, cdt, dev);
+        bt::matmul_abt(sa_z_, sa_qt_, sa_den_, nh, 1, N, hd, hd, Nhd,
+                       static_cast<std::int64_t>(N), nullptr, 0);
+        // recip = 1/(den+eps), computed in FP32 for a stable reciprocal.
+        bt::cast(sa_den_, sa_denf_, bt::Dtype::FP32);
+        bt::add_scalar_inplace(sa_denf_, kAttnEps);
+        bt::rsqrt_forward(sa_denf_, sa_denf_);
+        bt::mul_inplace(sa_denf_, sa_denf_);               // 1/(den+eps)
+        bt::cast(sa_denf_, sa_recip_, cdt);                // (nh, N)
+        // out[h] = num[h] * recip[h] (broadcast the (1,N) row over hd).
+        detail::resize_like(attn_c_, D, N, cdt, dev);
+        for (int h = 0; h < nh; ++h) {
+            const std::int64_t base = static_cast<std::int64_t>(h) * hd;
+            bt::Tensor num_h = sub_view(sa_num_, base * N, hd, N);
+            bt::Tensor rec_h = sub_view(sa_recip_,
+                                        static_cast<std::int64_t>(h) * N, 1, N);
+            bt::Tensor out_h = sub_view(attn_c_, base * N, hd, N);
+            bt::broadcast_mul(num_h, rec_h, out_h);
+        }
     }
     });
 
     prof("sa_out", [&] {
-    // Back to compute dtype, to sequence (N, D), then to_out (biased).
-    bt::cast(attn_f_, attn_c_, cdt);                     // (D, N)
+    // attn_c_ (D,N) at the compute dtype → sequence (N,D), then to_out (biased).
     bt::Tensor attn_nchw = sub_view(attn_c_, 0, 1, D * N);
     bt::nchw_to_sequence(attn_nchw, 1, D, H, W, mod_);   // (N, D); reuse mod_
     lin_(blk.out1, mod_, out);                           // (N, D)
