@@ -96,6 +96,9 @@ struct SanaPrepared : public PreparedConditioning::Impl {
     bt::Tensor ctx_cond;     // (L_cond, inner)
     bt::Tensor ctx_uncond;   // (L_uncond, inner), empty when no uncond
     bool has_uncond = false;
+    // Sana-Sprint embedded guidance scalar (raw guidance scale already
+    // multiplied by guidance_embeds_scale). Unused unless cfg_.guidance_embeds.
+    float guidance = 0.0f;
 };
 
 // Per-op profiler, enabled with BRODIFFUSION_FLOW_PROFILE=1 (shared with the
@@ -215,9 +218,18 @@ void SanaDenoiser::load_weights(const st::File& f, const std::string& prefix) {
     // patch_embed: 1x1 conv (D, IC, 1, 1) loaded as a (D, IC) linear.
     load_lin("patch_embed.proj", D, IC, patch_embed_, /*bias=*/true);
 
-    // AdaLayerNormSingle: timestep_embedder (256->D->D) then linear (D->6D).
-    load_lin("time_embed.emb.timestep_embedder.linear_1", D, 256, te_l1_, true);
-    load_lin("time_embed.emb.timestep_embedder.linear_2", D, D, te_l2_, true);
+    // Timestep conditioning → 6D AdaLN modulation. Base Sana wraps the
+    // timestep_embedder under AdaLayerNormSingle ("time_embed.emb."); Sana-Sprint
+    // (SanaCombinedTimestepGuidanceEmbeddings) drops the ".emb." nesting and adds
+    // a parallel guidance_embedder summed into the conditioning.
+    const std::string te_pre =
+        cfg_.guidance_embeds ? "time_embed." : "time_embed.emb.";
+    load_lin(te_pre + "timestep_embedder.linear_1", D, 256, te_l1_, true);
+    load_lin(te_pre + "timestep_embedder.linear_2", D, D, te_l2_, true);
+    if (cfg_.guidance_embeds) {
+        load_lin("time_embed.guidance_embedder.linear_1", D, 256, ge_l1_, true);
+        load_lin("time_embed.guidance_embedder.linear_2", D, D, ge_l2_, true);
+    }
     load_lin("time_embed.linear", 6 * D, D, te_proj_, true);
 
     // caption_projection (PixArt text MLP) + caption_norm (RMSNorm).
@@ -250,6 +262,14 @@ void SanaDenoiser::load_weights(const st::File& f, const std::string& prefix) {
         up(f, cdt, p + "attn2.to_v.bias",   D, 1, B.v2.b);
         up(f, cdt, p + "attn2.to_out.0.weight", D, D, B.out2.W);
         up(f, cdt, p + "attn2.to_out.0.bias",   D, 1, B.out2.b);
+        // qk_norm (Sana-Sprint): RMSNorm-across-heads gains over the full inner
+        // dim for self- and cross-attention q/k (elementwise_affine, no bias).
+        if (cfg_.qk_norm) {
+            up(f, cdt, p + "attn1.norm_q.weight", D, 1, B.nq1);
+            up(f, cdt, p + "attn1.norm_k.weight", D, 1, B.nk1);
+            up(f, cdt, p + "attn2.norm_q.weight", D, 1, B.nq2);
+            up(f, cdt, p + "attn2.norm_k.weight", D, 1, B.nk2);
+        }
         // GLU-MBConv ff.
         up(f, cdt, p + "ff.conv_inverted.weight", inv, D, B.ff_inv_W);
         up(f, cdt, p + "ff.conv_inverted.bias",   inv, 1, B.ff_inv_b);
@@ -327,6 +347,9 @@ PreparedConditioning SanaDenoiser::prepare(const Conditioning& cond) {
         prep->has_uncond = true;
         project(cond.uncond_embeddings, prep->ctx_uncond);
     }
+    // Sana-Sprint: pre-scale the raw guidance scale by guidance_embeds_scale,
+    // exactly as the diffusers SanaSprintPipeline does before embedding it.
+    prep->guidance = cond.guidance * cfg_.guidance_embeds_scale;
     (void)D;
     return PreparedConditioning(std::move(prep));
 }
@@ -367,6 +390,23 @@ void SanaDenoiser::self_attention_(const Block& blk, int N, int H, int W,
         bt::matmul_abt(blk.v1.W, x_mod, v_, 1, D, N, D, 0, 0, 0, nullptr, 0);
     }
     });
+
+    // qk_norm (Sana-Sprint): RMSNorm across the full inner_dim per token, applied
+    // to q/k before the head split and ReLU. The projections produced q_/k_ in
+    // (D,N) channel-major; rms_norm operates per row over the last dim, so
+    // transpose to (N,D), normalise with the per-channel gain, transpose back.
+    if (cfg_.qk_norm) {
+        prof("sa_qknorm", [&] {
+            bt::Tensor qf = sub_view(q_, 0, 1, static_cast<std::int64_t>(D) * N);
+            bt::nchw_to_sequence(qf, 1, D, H, W, qn_);       // (N, D)
+            bt::rms_norm_forward(qn_, blk.nq1, kRmsEps, qn_);
+            bt::sequence_to_nchw(qn_, 1, D, H, W, q_);        // (D, N)
+            bt::Tensor kf = sub_view(k_, 0, 1, static_cast<std::int64_t>(D) * N);
+            bt::nchw_to_sequence(kf, 1, D, H, W, kn_);
+            bt::rms_norm_forward(kn_, blk.nk1, kRmsEps, kn_);
+            bt::sequence_to_nchw(kn_, 1, D, H, W, k_);
+        });
+    }
 
     // The ReLU linear-attention core, per head h (channel-major (hd,N) blocks of
     // the (D,N) q/k/v):  relu(q), relu(k); then with Vaug = [V; 1]:
@@ -470,6 +510,12 @@ void SanaDenoiser::cross_attention_(const Block& blk, const bt::Tensor& ctx,
     lin_(blk.q2, hidden, ca_q_);   // (N, D) at cdt
     lin_(blk.k2, ctx, ca_k_);      // (L, D) at cdt
     lin_(blk.v2, ctx, ca_v_);      // (L, D) at cdt
+    // qk_norm (Sana-Sprint): RMSNorm across the full inner_dim per token. q/k are
+    // already token-major here, so normalise in place before the head split.
+    if (cfg_.qk_norm) {
+        bt::rms_norm_forward(ca_q_, blk.nq2, kRmsEps, ca_q_);
+        bt::rms_norm_forward(ca_k_, blk.nk2, kRmsEps, ca_k_);
+    }
     // brotensor's flash attention runs at the flash dtype: BF16 on CUDA (full
     // FP32 exponent range, so the large to_q of the raw residual never
     // overflows), FP32 on CPU. With the DiT already at cdt these usually match,
@@ -565,7 +611,26 @@ void SanaDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
     lin_(te_l1_, *tin, emb_);
     bt::silu_forward(emb_, emb_);
     lin_(te_l2_, emb_, emb_);
-    emb_ = emb_.clone();                         // embedded_timestep (1, D)
+    emb_ = emb_.clone();                         // timesteps_emb (1, D)
+
+    // Sana-Sprint: SanaCombinedTimestepGuidanceEmbeddings adds an embedded
+    // guidance scalar. conditioning = timesteps_emb + guidance_emb becomes the
+    // embedded_timestep (consumed by norm_out) and feeds the 6D AdaLN proj.
+    if (cfg_.guidance_embeds) {
+        std::vector<float> gval = {prep->guidance};
+        gv_ = bt::Tensor::from_host(gval.data(), 1, 1).to(dev);
+        bt::timestep_embedding(gv_, /*dim=*/256, /*max_period=*/10000.0f, gfreq_);
+        const bt::Tensor* gin = &gfreq_;
+        if (cdt != bt::Dtype::FP32) {
+            bt::cast(gfreq_, gfreq_cd_, cdt);
+            gin = &gfreq_cd_;
+        }
+        lin_(ge_l1_, *gin, gemb_);
+        bt::silu_forward(gemb_, gemb_);
+        lin_(ge_l2_, gemb_, gemb_);
+        bt::add_inplace(emb_, gemb_);             // conditioning (embedded_timestep)
+    }
+
     bt::silu_forward(emb_, emb_silu_);
     lin_(te_proj_, emb_silu_, temb6_);
     temb6_ = temb6_.clone();                     // (1, 6D)

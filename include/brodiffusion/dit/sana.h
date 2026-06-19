@@ -52,6 +52,15 @@ struct SanaConfig {
     bool attention_bias          = false;
     bool norm_elementwise_affine = false;
     float norm_eps               = 1e-6f;
+    // Sana-Sprint extras. guidance_embeds: the DiT is guidance-distilled and
+    // takes an embedded guidance scalar (no CFG) via
+    // SanaCombinedTimestepGuidanceEmbeddings; guidance_embeds_scale multiplies
+    // the raw guidance scale before embedding. qk_norm: apply RMSNorm across the
+    // full inner_dim ("rms_norm_across_heads") to the self- and cross-attention
+    // queries/keys. Both are false for the base Sana 0.6B / 1.6B models.
+    bool  guidance_embeds        = false;
+    float guidance_embeds_scale  = 0.1f;
+    bool  qk_norm                = false;
 
     int inner_dim() const { return num_attention_heads * attention_head_dim; }
     int latent_channels() const { return in_channels; }
@@ -79,9 +88,11 @@ public:
     PredictionType prediction_type() const override {
         return PredictionType::Velocity;
     }
-    // Sana 0.6B is not guidance-distilled — it runs true classifier-free
+    // Base Sana is not guidance-distilled — it runs true classifier-free
     // guidance (a separate uncond branch + CFG combine), unlike Flux.
-    bool uses_cfg() const override { return true; }
+    // Sana-Sprint IS guidance-distilled (guidance_embeds): the guidance scale
+    // is fed in as an embedding, so no uncond branch / CFG combine runs.
+    bool uses_cfg() const override { return !cfg_.guidance_embeds; }
     brotensor::Dtype compute_dtype() const override;
 
     const SanaConfig& config() const { return cfg_; }
@@ -104,6 +115,10 @@ private:
         // Cross-attention (attn2, softmax MHA to caption): all four projections
         // have a bias.
         Linear q2, k2, v2, out2;
+        // qk_norm gains (Sana-Sprint only): RMSNorm-across-heads weights over
+        // the full inner_dim for the self- (nq1/nk1) and cross- (nq2/nk2)
+        // attention queries/keys. Empty (size 0) when cfg_.qk_norm is false.
+        brotensor::Tensor nq1, nk1, nq2, nk2;
         // GLU-MBConv feed-forward (Mix-FFN). conv_inverted 1x1 (D -> 2*hidden,
         // biased) -> depthwise 3x3 (2*hidden, biased) -> GLU split -> conv_point
         // 1x1 (hidden -> D, bias-free). No internal norm / residual.
@@ -132,6 +147,8 @@ private:
     // ── weights ───────────────────────────────────────────────────────────
     Linear patch_embed_;        // (inner, in_channels) 1x1-conv-as-linear
     Linear te_l1_, te_l2_;      // timestep_embedder (256->inner, inner->inner)
+    Linear ge_l1_, ge_l2_;      // guidance_embedder (256->inner, inner->inner),
+                                //   Sana-Sprint only (cfg_.guidance_embeds)
     Linear te_proj_;            // time_embed.linear (inner -> 6*inner)
     Linear cap_l1_, cap_l2_;    // caption_projection (PixArt text MLP)
     brotensor::Tensor caption_norm_g_;  // (inner,1) RMSNorm gain (caption_norm)
@@ -145,6 +162,9 @@ private:
     // ── per-forward scratch (kept alive across calls to avoid realloc) ─────
     brotensor::Tensor hidden_;                 // (N, inner) residual stream
     brotensor::Tensor ts_, freq_, freq_cd_;    // timestep embed scratch
+    brotensor::Tensor gv_, gfreq_, gfreq_cd_;  // guidance embed scratch (Sprint)
+    brotensor::Tensor gemb_, cond_;            // guidance embedding + sum (Sprint)
+    brotensor::Tensor qn_, kn_;                // qk-norm transpose scratch (Sprint)
     brotensor::Tensor emb_, emb_silu_, temb6_; // embedded timestep + AdaLN row
     brotensor::Tensor mod_row_, ln_, mod_;     // modulation / layernorm
     brotensor::Tensor gated_, sub_out_;        // gate * sublayer, sub-layer out

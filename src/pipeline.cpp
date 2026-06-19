@@ -5,7 +5,9 @@
 #include "brodiffusion/denoiser.h"
 #include "brodiffusion/dit/flux.h"
 #include "brodiffusion/flow_match_scheduler.h"
+#include "brodiffusion/scm_scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
+#include "brodiffusion/detail/device.h"
 #include "brodiffusion/lora.h"
 #include "brodiffusion/model_config.h"
 #include "brotensor/safetensors.h"
@@ -57,12 +59,14 @@ namespace {
 }
 
 using SchedulerVariant =
-    std::variant<scheduler::DDIM, scheduler::LCM, scheduler::FlowMatch>;
+    std::variant<scheduler::DDIM, scheduler::LCM, scheduler::FlowMatch,
+                 scheduler::SCM>;
 
 // Construct the scheduler variant from the matching config variant.
 SchedulerVariant
 make_scheduler(const std::variant<scheduler::DDIMConfig, scheduler::LCMConfig,
-                                  scheduler::FlowMatchConfig>& v) {
+                                  scheduler::FlowMatchConfig,
+                                  scheduler::SCMConfig>& v) {
     if (std::holds_alternative<scheduler::LCMConfig>(v)) {
         return SchedulerVariant{std::in_place_type<scheduler::LCM>,
                                 std::get<scheduler::LCMConfig>(v)};
@@ -70,6 +74,10 @@ make_scheduler(const std::variant<scheduler::DDIMConfig, scheduler::LCMConfig,
     if (std::holds_alternative<scheduler::FlowMatchConfig>(v)) {
         return SchedulerVariant{std::in_place_type<scheduler::FlowMatch>,
                                 std::get<scheduler::FlowMatchConfig>(v)};
+    }
+    if (std::holds_alternative<scheduler::SCMConfig>(v)) {
+        return SchedulerVariant{std::in_place_type<scheduler::SCM>,
+                                std::get<scheduler::SCMConfig>(v)};
     }
     return SchedulerVariant{std::in_place_type<scheduler::DDIM>,
                             std::get<scheduler::DDIMConfig>(v)};
@@ -550,8 +558,11 @@ PipelineState Pipeline::prime_sana_(std::string_view prompt,
     const int W_lat = opts.width  / 32;
     const int C_lat = denoiser_->latent_channels();      // 32
     const int n_lat = C_lat * H_lat * W_lat;
-    // Sana is not guidance-distilled: a separate uncond branch + CFG combine
-    // runs whenever guidance != 1.0 (uses_cfg() is true for the SanaDenoiser).
+    // Base Sana is not guidance-distilled: a separate uncond branch + CFG
+    // combine runs whenever guidance != 1.0 (uses_cfg() is true). Sana-Sprint
+    // (SCMScheduler) is guidance-distilled — uses_cfg() is false, so do_cfg
+    // stays false and the guidance scale is fed in as an embedding instead.
+    const bool is_scm = std::holds_alternative<scheduler::SCM>(scheduler_);
     const bool do_cfg = denoiser_->uses_cfg() && (opts.guidance_scale != 1.0f);
 
     denoiser_->finalize_weights();
@@ -570,7 +581,9 @@ PipelineState Pipeline::prime_sana_(std::string_view prompt,
         conditioning_.has_uncond = false;
         conditioning_.uncond_embeddings = bt::Tensor{};
     }
-    conditioning_.guidance = 0.0f;
+    // Sana-Sprint embeds the raw guidance scale (the denoiser applies
+    // guidance_embeds_scale); base Sana uses CFG instead, so leaves it at 0.
+    conditioning_.guidance = is_scm ? opts.guidance_scale : 0.0f;
 
     // 1b. Project the caption context once per generation (caption_projection
     //     + caption_norm), shared across all branched states.
@@ -612,6 +625,14 @@ PipelineState Pipeline::prime_sana_(std::string_view prompt,
         state.latent = bt::Tensor::empty(1, n_lat, bt::Dtype::FP32);
         bt::randn(opts.seed, 0, state.latent);
         if (sigma != 1.0f) bt::scale_inplace(state.latent, sigma);
+    }
+
+    // Sana-Sprint works in sCM coordinates: the initial latent is scaled by
+    // sigma_data (diffusers: `latents = latents * sigma_data`). The matching
+    // 1/sigma_data is applied to the denoised latent after the final step.
+    if (is_scm) {
+        bt::scale_inplace(state.latent,
+                          std::get<scheduler::SCM>(scheduler_).sigma_data());
     }
 
     state.step_index = 0;
@@ -872,7 +893,15 @@ PipelineState Pipeline::prime(std::string_view prompt,
         }
 
         std::visit([&](auto& s) {
-            s.add_noise(x0_latent, noise, t_start, state.latent, scratch_);
+            using S = std::decay_t<decltype(s)>;
+            if constexpr (std::is_same_v<S, scheduler::DDIM> ||
+                          std::is_same_v<S, scheduler::LCM> ||
+                          std::is_same_v<S, scheduler::FlowMatch>) {
+                s.add_noise(x0_latent, noise, t_start, state.latent, scratch_);
+            } else {
+                fail("prime: img2img add_noise is not supported for the "
+                     "active scheduler");
+            }
         }, scheduler_);
         state.step_index = t_start;
         return state;
@@ -990,6 +1019,64 @@ void Pipeline::step_denoise_captured_(PipelineState& state, float t,
 #endif
 }
 
+void Pipeline::step_once_scm_(PipelineState& state,
+                              const GenerateOptions& opts) {
+    (void)opts;  // guidance is baked into prepared_; steps/seed live elsewhere
+    auto& sched = std::get<scheduler::SCM>(scheduler_);
+    const int i      = state.step_index;
+    const int n_lat  = denoiser_->latent_channels() *
+                       state.H_lat * state.W_lat;
+    const float sigma_data = sched.sigma_data();
+
+    // sCM time transform. The schedule angle s maps to the network's input
+    // timestep scm_t = sin(s)/(cos(s)+sin(s)); the latent is rescaled into the
+    // network's input parameterisation by `scale`. (diffusers
+    // SanaSprintPipeline.__call__ denoising loop.)
+    const float s     = sched.timesteps()[i];
+    const float scm_t = std::sin(s) / (std::cos(s) + std::sin(s));
+    const float scale =
+        std::sqrt(scm_t * scm_t + (1.0f - scm_t) * (1.0f - scm_t));
+
+    // latent_model_input = (latent / sigma_data) * scale, into scratch_. This
+    // tensor is both the DiT input and the `lmi` term in the output
+    // reconstruction below, so it must survive the forward (which reads, never
+    // writes, its latent argument).
+    detail::resize_like(scratch_, 1, n_lat, state.latent.dtype,
+                        state.latent.device);
+    bt::copy_d2d(state.latent, 0, scratch_, 0, n_lat);
+    bt::scale_inplace(scratch_, scale / sigma_data);
+
+    // One DiT forward at the sCM input timestep. Guidance (already embedded via
+    // the prepared conditioning) makes this a single, CFG-free pass.
+    denoiser_->forward(scratch_, state.H_lat, state.W_lat, scm_t, prepared_,
+                       Branch::Cond, noise_pred_cond_);
+
+    // Reconstruct the scheduler's model_output from the network output:
+    //   np = ((1 - 2t)·lmi + (1 - 2t + 2t²)·np) / scale · sigma_data
+    const float a = 1.0f - 2.0f * scm_t;
+    const float b = 1.0f - 2.0f * scm_t + 2.0f * scm_t * scm_t;
+    bt::axpby_inplace(noise_pred_cond_, scratch_, /*a=*/b, /*b=*/a);
+    bt::scale_inplace(noise_pred_cond_, sigma_data / scale);
+
+    // Fresh unit-variance noise for the inter-step injection (the scheduler
+    // applies sigma_data). FP32 to match Sana's FP32 latent. Counter offset
+    // past the initial-latent draw (counters 0..n_lat), mirroring LCM.
+    const std::uint64_t counter =
+        static_cast<std::uint64_t>(1 + i) * static_cast<std::uint64_t>(n_lat);
+    noise_step_ = bt::Tensor::empty(1, n_lat, bt::Dtype::FP32);
+    bt::randn(state.rng_key, counter, noise_step_);
+
+    sched.step(noise_pred_cond_, i, state.latent, noise_step_);
+    ++state.step_index;
+
+    // The final step returns the denoised latent in sCM coordinates; diffusers
+    // decodes `denoised / sigma_data`. Undo the sigma_data scaling applied in
+    // prime_sana_ so decode() sees a plain DC-AE latent.
+    if (state.step_index >= state.n_steps) {
+        bt::scale_inplace(state.latent, 1.0f / sigma_data);
+    }
+}
+
 void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
                          AttentionTrace* trace_out,
                          const std::vector<const bt::Tensor*>*
@@ -997,6 +1084,16 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
     if (state.step_index >= state.n_steps) {
         fail("step_once: step_index (" + std::to_string(state.step_index) +
              ") >= n_steps (" + std::to_string(state.n_steps) + ")");
+    }
+    // Sana-Sprint (SCMScheduler / TrigFlow): a dedicated few-step, no-CFG,
+    // no-trace path with model-specific input/output parameterisation.
+    if (std::holds_alternative<scheduler::SCM>(scheduler_)) {
+        if (trace_out != nullptr || attn_logit_biases != nullptr) {
+            fail("step_once: attention trace / steering is not supported for "
+                 "Sana-Sprint (SCMScheduler)");
+        }
+        step_once_scm_(state, opts);
+        return;
     }
     const bool is_lcm = std::holds_alternative<scheduler::LCM>(scheduler_);
     const bool do_cfg = denoiser_->uses_cfg() && !is_lcm &&

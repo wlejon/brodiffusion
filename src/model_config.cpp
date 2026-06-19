@@ -189,6 +189,15 @@ scheduler::FlowMatchConfig parse_flow_dpm(const json::Value& cfg) {
     return c;
 }
 
+// Sana-Sprint ships an SCMScheduler (TrigFlow few-step sampler).
+scheduler::SCMConfig parse_scm(const json::Value& cfg) {
+    scheduler::SCMConfig c;
+    c.num_train_timesteps =
+        cfg.get_int("num_train_timesteps", c.num_train_timesteps);
+    c.sigma_data = cfg.get_float("sigma_data", c.sigma_data);
+    return c;
+}
+
 void populate_sana(const json::Value& cfg, dit::SanaConfig& out) {
     out.in_channels         = cfg.get_int("in_channels", out.in_channels);
     out.out_channels        = cfg.get_int("out_channels", out.out_channels);
@@ -212,6 +221,13 @@ void populate_sana(const json::Value& cfg, dit::SanaConfig& out) {
     out.norm_elementwise_affine =
         cfg.get_bool("norm_elementwise_affine", out.norm_elementwise_affine);
     out.norm_eps            = cfg.get_float("norm_eps", out.norm_eps);
+    // Sana-Sprint extras. guidance_embeds gates the combined timestep+guidance
+    // embedding (and disables CFG); qk_norm is a string in the config
+    // ("rms_norm_across_heads") — the only variant Sana ships — mapped to a bool.
+    out.guidance_embeds     = cfg.get_bool("guidance_embeds", out.guidance_embeds);
+    out.guidance_embeds_scale =
+        cfg.get_float("guidance_embeds_scale", out.guidance_embeds_scale);
+    out.qk_norm             = !cfg.get_string("qk_norm", "").empty();
 }
 
 void populate_dcae(const json::Value& cfg, dcae::DecoderConfig& out) {
@@ -385,6 +401,8 @@ ModelConfig load_model_config(const std::string& model_dir) {
                 out.scheduler = parse_flow_dpm(cfg);
             } else if (sched_class == "LCMScheduler") {
                 out.scheduler = parse_lcm(cfg);
+            } else if (sched_class == "SCMScheduler") {
+                out.scheduler = parse_scm(cfg);
             } else {
                 out.scheduler = parse_ddim(cfg);
             }

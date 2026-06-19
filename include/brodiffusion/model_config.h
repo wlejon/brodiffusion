@@ -20,6 +20,7 @@
 #include "brodiffusion/scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
 #include "brodiffusion/flow_match_scheduler.h"
+#include "brodiffusion/scm_scheduler.h"
 #include "brodiffusion/dit/flux.h"
 #include "brodiffusion/dit/sana.h"
 #include "brolm/t5.h"
@@ -54,7 +55,8 @@ struct ModelConfig {
 
     std::variant<scheduler::DDIMConfig,
                  scheduler::LCMConfig,
-                 scheduler::FlowMatchConfig> scheduler;
+                 scheduler::FlowMatchConfig,
+                 scheduler::SCMConfig> scheduler;
 };
 
 // Read `model_index.json` + each component config from `model_dir`.

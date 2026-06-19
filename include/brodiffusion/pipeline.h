@@ -19,6 +19,7 @@
 #include "brodiffusion/dit/flux.h"
 #include "brodiffusion/dit/sana.h"
 #include "brodiffusion/flow_match_scheduler.h"
+#include "brodiffusion/scm_scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
 #include "brodiffusion/model_config.h"
 #include "brodiffusion/scheduler.h"
@@ -65,7 +66,7 @@ struct PipelineConfig {
     // pipeline branches on the active alternative; existing call sites that
     // don't set this keep working unchanged.
     std::variant<scheduler::DDIMConfig, scheduler::LCMConfig,
-                 scheduler::FlowMatchConfig> scheduler;
+                 scheduler::FlowMatchConfig, scheduler::SCMConfig> scheduler;
 };
 
 // Snapshot of mid-generation state. Cheap to fork — only the latent
@@ -365,6 +366,12 @@ private:
     // step_index=0 state. Called from prime() when model_class_ == Sana.
     PipelineState prime_sana_(std::string_view prompt,
                               const GenerateOptions& opts);
+    // Sana-Sprint denoising step (SCMScheduler / TrigFlow). The few-step,
+    // guidance-distilled (no-CFG) path: maps the latent into the sCM input
+    // parameterisation, runs one DiT forward with the embedded guidance scale,
+    // reconstructs the model output, and applies one TrigFlow scheduler step.
+    // Called from step_once() when the active scheduler is scheduler::SCM.
+    void step_once_scm_(PipelineState& state, const GenerateOptions& opts);
 
     PipelineConfig            cfg_;
     ModelClass                model_class_;
@@ -382,7 +389,8 @@ private:
     // Robustness: if encoder weights are missing in the safetensors file
     // (some decoder-only derivative checkpoints), the load throws clearly.
     vae::Encoder              vae_encoder_;
-    std::variant<scheduler::DDIM, scheduler::LCM, scheduler::FlowMatch>
+    std::variant<scheduler::DDIM, scheduler::LCM, scheduler::FlowMatch,
+                 scheduler::SCM>
         scheduler_;
 
     // ── Sana-only sub-modules ─────────────────────────────────────────────
