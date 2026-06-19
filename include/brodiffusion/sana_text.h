@@ -22,10 +22,18 @@
 //   4. Gemma runs causally over those ids; the post-final-norm hidden states
 //      are returned.
 //
-// No padding and no attention mask: the returned tensor holds exactly the L
-// valid (non-pad) rows, and the Sana DiT cross-attends over precisely those
-// rows. The negative / unconditional prompt is encoded the SAME way — an empty
-// negative prompt still gets the CHI, so its sequence is the CHI tokens alone.
+//   5. diffusers' token selection (SanaPipeline "Section 3.1"):
+//      select_index = [0] + range(-max_seq_len+1, 0). With the CHI present this
+//      keeps the <bos> plus the trailing window starting at the last CHI token,
+//      dropping the CHI body (so the DiT never cross-attends over the
+//      instruction's example prompts) and spanning the user prompt. With no CHI
+//      the window covers the whole sequence (all rows kept).
+//
+// No padding and no attention mask: the returned tensor holds exactly the
+// selected valid (non-pad) rows, and the Sana DiT cross-attends over precisely
+// those rows. The negative / unconditional prompt is encoded the SAME way — an
+// empty negative prompt still gets the CHI, so after selection its sequence is
+// just the <bos> + final CHI token(s).
 //
 // Construct + load the model and tokenizer once, then call encode_prompt() for
 // both the positive and the negative prompt (each call (re)allocates the model
