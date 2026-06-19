@@ -306,6 +306,9 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     const char* width_s  = arg_after(argc, argv, "--width");
     const char* height_s = arg_after(argc, argv, "--height");
     const char* seed_s   = arg_after(argc, argv, "--seed");
+    const char* latent_out = arg_after(argc, argv, "--latent-out");
+    const char* latent_in  = arg_after(argc, argv, "--latent-in");
+    const char* noise_s    = arg_after(argc, argv, "--noise");
     const char* init_path = arg_after(argc, argv, "--init");
     const char* mask_path = arg_after(argc, argv, "--mask");
     const char* strength_s = arg_after(argc, argv, "--strength");
@@ -342,11 +345,17 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     std::printf("Model class: %s\n",
                 is_flux ? "Flux" : (is_sana ? "Sana" : "StableDiffusion"));
 
+    // Sana-Sprint is the guidance-distilled (guidance_embeds), SCM/TrigFlow
+    // few-step variant — it defaults to 2 steps, vs base Sana's 20.
+    const bool is_sana_sprint = is_sana && pipeline.config().sana.guidance_embeds;
+
     pl::GenerateOptions opts;
-    // Sana reference defaults: 1024px, 20 steps, guidance 4.5 (native 1024
-    // model; DC-AE downsamples 32x so 1024 -> a 32x32 latent).
+    // Sana reference defaults: 1024px, guidance 4.5 (native 1024 model; DC-AE
+    // downsamples 32x so 1024 -> a 32x32 latent). Base Sana takes 20 steps;
+    // Sana-Sprint just 2.
     if (is_sana) { opts.width = 1024; opts.height = 1024;
-                   opts.num_inference_steps = 20; opts.guidance_scale = 4.5f; }
+                   opts.num_inference_steps = is_sana_sprint ? 2 : 20;
+                   opts.guidance_scale = 4.5f; }
     if (neg)      opts.negative_prompt = neg;
     if (steps_s)  opts.num_inference_steps = std::atoi(steps_s);
     else if (is_flux) opts.num_inference_steps = 4;  // flux-schnell default
@@ -355,6 +364,31 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     if (height_s) opts.height = std::atoi(height_s);
     if (seed_s)   opts.seed =
         static_cast<std::uint64_t>(std::strtoull(seed_s, nullptr, 10));
+
+    // --noise selects the initial-latent RNG ('torch' reproduces a PyTorch
+    // reference run's starting latent; default internal).
+    if (noise_s) {
+        if (std::strcmp(noise_s, "torch") == 0) {
+            opts.noise_source = pl::NoiseSource::Torch;
+        } else if (std::strcmp(noise_s, "internal") == 0) {
+            opts.noise_source = pl::NoiseSource::Internal;
+        } else {
+            std::fprintf(stderr, "txt2img: --noise must be 'internal' or 'torch'\n");
+            return 2;
+        }
+    }
+    // --latent-in overrides the RNG entirely with raw N(0,1) noise from a file
+    // (NCHW flat float32) — the strongest form of cross-impl parity. The latent
+    // element count is model-class-specific: Sana DC-AE is 32 channels at 32x
+    // downsample, Flux 16ch / 8x, SD1.5 4ch / 8x.
+    if (latent_in) {
+        const int ds = is_sana ? 32 : 8;
+        const int ch = is_sana ? 32 : (is_flux ? 16 : 4);
+        const int n_lat = ch * (opts.height / ds) * (opts.width / ds);
+        opts.init_noise = load_latent_f32(latent_in, n_lat);
+        std::printf("Initial latent noise loaded from %s (%d float32)\n",
+                    latent_in, n_lat);
+    }
 
     if (init_path) {
         if (is_flux) {
@@ -412,7 +446,18 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
                 static_cast<unsigned long long>(opts.seed));
 
     const auto t_gen0 = std::chrono::steady_clock::now();
-    auto img = pipeline.generate(prompt, opts);
+    std::vector<float> img;
+    if (latent_out) {
+        // Step-wise API (bit-equivalent to generate()) so the final denoised
+        // latent can be dumped before the VAE decode for cross-impl comparison.
+        auto state = pipeline.prime(prompt, opts);
+        while (state.step_index < state.n_steps) pipeline.step_once(state, opts);
+        dump_latent_f32(latent_out, state.latent);
+        std::printf("Final latent written to %s\n", latent_out);
+        img = pipeline.decode(state);
+    } else {
+        img = pipeline.generate(prompt, opts);
+    }
     if (std::getenv("BRODIFFUSION_TIME")) {
         std::fprintf(stderr, "[time] generate (encode+sample+decode): %.2f s\n",
                      std::chrono::duration<double>(
