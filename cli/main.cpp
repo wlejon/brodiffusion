@@ -328,7 +328,13 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
                 quantize ? " (INT8 W8A16 denoiser + T5)" : "");
     pl::Pipeline::ModelDirOptions dir_opts;
     dir_opts.quantize = quantize;
+    const auto t_load0 = std::chrono::steady_clock::now();
     pl::Pipeline pipeline = pl::Pipeline::from_model_dir(model_dir, dir_opts);
+    if (std::getenv("BRODIFFUSION_TIME")) {
+        std::fprintf(stderr, "[time] model load: %.2f s\n",
+                     std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t_load0).count());
+    }
     const bool is_flux =
         pipeline.config().model_class == brodiffusion::ModelClass::Flux;
     const bool is_sana =
@@ -405,7 +411,13 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
                 static_cast<double>(opts.guidance_scale),
                 static_cast<unsigned long long>(opts.seed));
 
+    const auto t_gen0 = std::chrono::steady_clock::now();
     auto img = pipeline.generate(prompt, opts);
+    if (std::getenv("BRODIFFUSION_TIME")) {
+        std::fprintf(stderr, "[time] generate (encode+sample+decode): %.2f s\n",
+                     std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t_gen0).count());
+    }
     return write_png(out_path, img, opts.width, opts.height);
 }
 

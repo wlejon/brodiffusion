@@ -317,19 +317,33 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
         // transformer (single-file) → SanaDenoiser; DC-AE decoder under the
         // "decoder." subtree of the VAE file; Gemma-2 text encoder may be
         // sharded (2 fp16 shards) — search every shard by name.
+        const bool time_load = std::getenv("BRODIFFUSION_TIME") != nullptr;
+        auto stamp = [&](const char* what, auto t0) {
+            if (time_load) {
+                std::fprintf(stderr, "[time]   %s: %.2f s\n", what,
+                             std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - t0).count());
+            }
+            return std::chrono::steady_clock::now();
+        };
+        auto t = std::chrono::steady_clock::now();
         auto tf_files  = detail::open_component_files(
             (root / "transformer").string());
         auto vae_files = detail::open_component_files(
             (root / "vae").string());
         auto te_files  = detail::open_component_files(
             (root / "text_encoder").string());
+        t = stamp("open files (mmap)", t);
 
         p.denoiser_->load_weights(tf_files.front(), "");
+        t = stamp("DiT weights", t);
         p.dcae_->load_weights(vae_files.front(), "decoder.");
+        t = stamp("DC-AE weights", t);
 
         std::vector<const brotensor::safetensors::File*> te_ptrs;
         for (const auto& f : te_files) te_ptrs.push_back(&f);
         p.gemma_model_->load_weights(te_ptrs, "");
+        t = stamp("Gemma weights", t);
 
         return p;
     }
