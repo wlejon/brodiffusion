@@ -130,6 +130,11 @@ static void test_sana(const fs::path& dir) {
     CHECK(mc.sana.attention_bias == false);
     CHECK(mc.sana.norm_elementwise_affine == false);
 
+    // Base Sana is not guidance-distilled: the Sprint extras default off.
+    CHECK(mc.sana.guidance_embeds == false);
+    CHECK(mc.sana.qk_norm == false);
+    CHECK(approx(mc.sana.guidance_embeds_scale, 0.1f));  // default carried
+
     // DC-AE VAE.
     CHECK(mc.dcae.latent_channels == 32);
     CHECK(mc.dcae.image_channels == 3);
@@ -172,6 +177,88 @@ static void test_sana(const fs::path& dir) {
     }
 }
 
+// ── Sana-Sprint variant ────────────────────────────────────────────────────
+// Same architecture as base Sana plus the guidance-distillation extras
+// (guidance_embeds / guidance_embeds_scale / qk_norm) and an SCMScheduler.
+static void test_sana_sprint(const fs::path& dir) {
+    write_file(dir / "model_index.json",
+        R"({"_class_name": "SanaSprintPipeline"})");
+
+    write_file(dir / "transformer" / "config.json", R"({
+        "_class_name": "SanaTransformer2DModel",
+        "attention_head_dim": 32,
+        "caption_channels": 2304,
+        "cross_attention_dim": 1152,
+        "cross_attention_head_dim": 72,
+        "in_channels": 32,
+        "mlp_ratio": 2.5,
+        "num_attention_heads": 36,
+        "num_cross_attention_heads": 16,
+        "num_layers": 28,
+        "out_channels": 32,
+        "patch_size": 1,
+        "sample_size": 32,
+        "guidance_embeds": true,
+        "guidance_embeds_scale": 0.1,
+        "qk_norm": "rms_norm_across_heads"
+    })");
+
+    write_file(dir / "vae" / "config.json", R"({
+        "_class_name": "AutoencoderDC",
+        "decoder_block_out_channels": [128, 256, 512, 512, 1024, 1024],
+        "decoder_block_types": ["ResBlock", "ResBlock", "ResBlock",
+            "EfficientViTBlock", "EfficientViTBlock", "EfficientViTBlock"],
+        "decoder_layers_per_block": [3, 3, 3, 3, 3, 3],
+        "decoder_qkv_multiscales": [[], [], [], [5], [5], [5]],
+        "in_channels": 3,
+        "latent_channels": 32,
+        "scaling_factor": 0.41407
+    })");
+
+    write_file(dir / "text_encoder" / "config.json", R"({
+        "architectures": ["Gemma2Model"],
+        "head_dim": 256,
+        "hidden_size": 2304,
+        "intermediate_size": 9216,
+        "num_attention_heads": 8,
+        "num_hidden_layers": 26,
+        "num_key_value_heads": 4,
+        "query_pre_attn_scalar": 256,
+        "rms_norm_eps": 1e-06,
+        "sliding_window": 4096,
+        "vocab_size": 256000
+    })");
+
+    write_file(dir / "scheduler" / "scheduler_config.json", R"({
+        "_class_name": "SCMScheduler",
+        "num_train_timesteps": 1000,
+        "prediction_type": "trigflow",
+        "sigma_data": 0.5
+    })");
+
+    bd::ModelConfig mc = bd::load_model_config(dir.string());
+
+    CHECK(mc.model_class == bd::ModelClass::Sana);
+
+    // Guidance-distillation extras parsed.
+    CHECK(mc.sana.guidance_embeds == true);
+    CHECK(approx(mc.sana.guidance_embeds_scale, 0.1f));
+    CHECK(mc.sana.qk_norm == true);   // non-empty qk_norm string -> true
+
+    // Shared architecture still parses.
+    CHECK(mc.sana.num_layers == 28);
+    CHECK(mc.sana.inner_dim() == 1152);
+    CHECK(mc.dcae.latent_channels == 32);
+
+    // Scheduler: SCMScheduler -> SCMConfig.
+    CHECK(std::holds_alternative<bd::scheduler::SCMConfig>(mc.scheduler));
+    if (std::holds_alternative<bd::scheduler::SCMConfig>(mc.scheduler)) {
+        const auto& sc = std::get<bd::scheduler::SCMConfig>(mc.scheduler);
+        CHECK(sc.num_train_timesteps == 1000);
+        CHECK(approx(sc.sigma_data, 0.5f));
+    }
+}
+
 int main() {
     fs::path base = fs::temp_directory_path()
                   / ("brodiffusion_sana_config_test_"
@@ -183,6 +270,7 @@ int main() {
 
     try {
         test_sana(base / "sana");
+        test_sana_sprint(base / "sana_sprint");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL exception: %s\n", e.what());
         ++g_failures;
