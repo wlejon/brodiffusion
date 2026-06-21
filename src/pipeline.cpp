@@ -1509,6 +1509,9 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
 }
 
 std::vector<float> Pipeline::decode(const PipelineState& state) {
+    const bool vae_time = std::getenv("BRODIFFUSION_TIME") != nullptr;
+    if (vae_time) brotensor::sync_all();
+    const auto vae_t0 = std::chrono::steady_clock::now();
     int n_img;
     if (model_class_ == ModelClass::Sana) {
         // DC-AE f32c32 decoder: 32x upsample, 3-channel image. The decoder
@@ -1524,6 +1527,11 @@ std::vector<float> Pipeline::decode(const PipelineState& state) {
                 (state.H_lat * 8) * (state.W_lat * 8);
     }
     bt::sync_all();
+    if (vae_time) {
+        std::fprintf(stderr, "[time] VAE decode: %.3f s\n",
+                     std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - vae_t0).count());
+    }
     // The decoded tensor carries the VAE's arithmetic dtype — FP16 on a GPU
     // backend, BF16 for a force_upcast VAE (Flux), FP32 on CPU. Convert the
     // 16-bit cases to float as needed.
