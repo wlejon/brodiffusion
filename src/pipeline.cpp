@@ -930,6 +930,9 @@ PipelineState Pipeline::prime(std::string_view prompt,
                 emb = v.clone();
             }
         };
+        const bool t5_time = std::getenv("BRODIFFUSION_TIME") != nullptr;
+        if (t5_time) brotensor::sync_all();
+        const auto t5_t0 = std::chrono::steady_clock::now();
         encode_trim(prompt, conditioning_.text_embeddings);
         if (do_cfg) {
             encode_trim(opts.negative_prompt, conditioning_.uncond_embeddings);
@@ -937,6 +940,13 @@ PipelineState Pipeline::prime(std::string_view prompt,
         } else {
             conditioning_.has_uncond = false;
             conditioning_.uncond_embeddings = brotensor::Tensor{};
+        }
+        if (t5_time) {
+            brotensor::sync_all();
+            std::fprintf(stderr, "[time] T5 encode (%d pass%s): %.3f s\n",
+                         do_cfg ? 2 : 1, do_cfg ? "es" : "",
+                         std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t5_t0).count());
         }
         conditioning_.guidance = 0.0f;
     } else {
