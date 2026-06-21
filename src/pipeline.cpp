@@ -524,7 +524,8 @@ bt::Tensor Pipeline::encode_conditioning(std::string_view prompt) {
         }
         return brodiffusion::sana::encode_prompt(
             *gemma_model_, *gemma_tokenizer_, std::string(prompt),
-            cfg_.sana_max_seq_len);
+            cfg_.sana_max_seq_len,
+            brodiffusion::sana::default_complex_human_instruction());
     }
     // CLIP-based models (SD / Flux): reuse the fixed-length CLIP encode path.
     bt::Tensor out;
@@ -584,9 +585,14 @@ PipelineState Pipeline::prime_sana_(std::string_view prompt,
 
     // 1. Gemma-encode the positive prompt (and, under CFG, the negative). The
     //    Sana DiT cross-attends over exactly the returned valid token rows.
+    //    The positive prompt is wrapped in Sana's Complex Human Instruction
+    //    (diffusers' default) — the DiT was trained on CHI-prefixed conditioning,
+    //    so omitting it yields soft, under-detailed images. The negative branch
+    //    uses the plain prompt (no CHI), matching diffusers.
     conditioning_.text_embeddings = brodiffusion::sana::encode_prompt(
         *gemma_model_, *gemma_tokenizer_, std::string(prompt),
-        cfg_.sana_max_seq_len);
+        cfg_.sana_max_seq_len,
+        brodiffusion::sana::default_complex_human_instruction());
     // Conditioning-space control seam: add the weighted control axes to the
     // positive caption embeddings (rows [1, L), BOS untouched) before the DiT
     // projects them. No-op unless a dictionary is loaded with a nonzero weight.
@@ -595,7 +601,8 @@ PipelineState Pipeline::prime_sana_(std::string_view prompt,
     if (do_cfg) {
         conditioning_.uncond_embeddings = brodiffusion::sana::encode_prompt(
             *gemma_model_, *gemma_tokenizer_,
-            std::string(opts.negative_prompt), cfg_.sana_max_seq_len);
+            std::string(opts.negative_prompt), cfg_.sana_max_seq_len,
+            /*chi=*/{});
         conditioning_.has_uncond = true;
     } else {
         conditioning_.has_uncond = false;
