@@ -17,3 +17,6 @@ compile_commands.json
 
 # Downloaded model weights and tokenizer files (see scripts/download-weights.ps1).
 weights/
+
+# Parity / reference dumps from scripts/pixart_ref.py + scripts/pixart_parity.sh
+.parity/

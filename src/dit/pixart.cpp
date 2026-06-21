@@ -117,17 +117,27 @@ PixArtDenoiser::PixArtDenoiser(const PixArtConfig& cfg) : cfg_(cfg) {
 PixArtDenoiser::~PixArtDenoiser() = default;
 
 brotensor::Dtype PixArtDenoiser::compute_dtype() const {
-    // FP32 everywhere, on CPU and CUDA alike — only flash attention drops to
-    // BF16 (it has no FP32 CUDA kernel; see self/cross_attention_). PixArt's
-    // residual stream grows to ~±300 over 28 blocks: FP16 overflows the
+    // The RESIDUAL stream is FP32, on CPU and CUDA alike. PixArt's residual grows
+    // to ~±300 over 28 blocks: storing the residual itself in FP16 overflows the
     // layernorm variance (sum of 1152 squares ≈ 1e8 > 65504 → NaN), and BF16's
     // 7-bit mantissa rounds away each block's O(1) sublayer contribution on top
     // of the O(300) residual (cosine vs the reference falls to ~0.89 → the
-    // denoise diverges to noise). FP32 keeps the residual accumulation exact
-    // (cosine ~0.99); brotensor's CUDA linear/conv/layernorm all have FP32
-    // kernels. (A future optimisation can keep BF16 matmuls with an FP32
-    // residual stream for tensor-core speed.)
+    // denoise diverges to noise). So the residual, layernorms, modulation and
+    // gating all stay FP32 (cosine ~0.99).
+    //
+    // The compute-HEAVY per-sublayer GEMMs and attention are a different story:
+    // their operands are bounded (post-layernorm activations are O(1); the
+    // cross-attn query off the residual is ~±300, well within FP16 range), and
+    // brotensor's FP16 WMMA / flash kernels accumulate in FP32 internally. So
+    // those run at mm_dtype() (FP16 on CUDA) for tensor-core speed, casting the
+    // result back into the FP32 residual. See mm_dtype() and the sublayers.
     return brotensor::Dtype::FP32;
+}
+
+brotensor::Dtype PixArtDenoiser::mm_dtype() const {
+    return brotensor::default_device() == brotensor::Device::CUDA
+               ? brotensor::Dtype::FP16
+               : brotensor::Dtype::FP32;
 }
 
 // ─── load_weights ──────────────────────────────────────────────────────────
@@ -139,11 +149,16 @@ void PixArtDenoiser::load_weights(const st::File& f, const std::string& prefix) 
     const int CAP = cfg_.caption_channels;      // 4096
     const int P   = cfg_.patch_size;            // 2
     const int FF  = 4 * D;                       // gelu MLP hidden (4608)
-    const bt::Dtype cdt = compute_dtype();
+    const bt::Dtype cdt = compute_dtype();       // FP32 — light / residual-path
+    const bt::Dtype mdt = mm_dtype();            // FP16 on CUDA — heavy GEMMs
 
+    auto load_lin_dt = [&](bt::Dtype dt, const std::string& key, int out, int in,
+                           Linear& lin) {
+        up(f, dt, prefix + key + ".weight", out, in, lin.W);
+        up(f, dt, prefix + key + ".bias",   out, 1,  lin.b);
+    };
     auto load_lin = [&](const std::string& key, int out, int in, Linear& lin) {
-        up(f, cdt, prefix + key + ".weight", out, in, lin.W);
-        up(f, cdt, prefix + key + ".bias",   out, 1,  lin.b);
+        load_lin_dt(cdt, key, out, in, lin);
     };
 
     // pos_embed.proj: P x P stride-P conv (D, IC, P, P) loaded as (D, IC*P*P).
@@ -167,18 +182,19 @@ void PixArtDenoiser::load_weights(const st::File& f, const std::string& prefix) 
         const std::string p =
             prefix + "transformer_blocks." + std::to_string(i) + ".";
         up(f, cdt, p + "scale_shift_table", 1, 6 * D, B.scale_shift);
-        // attn1 (self) and attn2 (cross): both fully biased.
-        load_lin(p + "attn1.to_q", D, D, B.q1);
-        load_lin(p + "attn1.to_k", D, D, B.k1);
-        load_lin(p + "attn1.to_v", D, D, B.v1);
-        load_lin(p + "attn1.to_out.0", D, D, B.out1);
-        load_lin(p + "attn2.to_q", D, D, B.q2);
-        load_lin(p + "attn2.to_k", D, D, B.k2);
-        load_lin(p + "attn2.to_v", D, D, B.v2);
-        load_lin(p + "attn2.to_out.0", D, D, B.out2);
+        // attn1 (self), attn2 (cross), ff: the per-block compute-heavy GEMMs —
+        // loaded at mm_dtype() (FP16 on CUDA) so they hit the WMMA / flash path.
+        load_lin_dt(mdt, p + "attn1.to_q", D, D, B.q1);
+        load_lin_dt(mdt, p + "attn1.to_k", D, D, B.k1);
+        load_lin_dt(mdt, p + "attn1.to_v", D, D, B.v1);
+        load_lin_dt(mdt, p + "attn1.to_out.0", D, D, B.out1);
+        load_lin_dt(mdt, p + "attn2.to_q", D, D, B.q2);
+        load_lin_dt(mdt, p + "attn2.to_k", D, D, B.k2);
+        load_lin_dt(mdt, p + "attn2.to_v", D, D, B.v2);
+        load_lin_dt(mdt, p + "attn2.to_out.0", D, D, B.out2);
         // ff: net.0.proj (D -> 4D, GELU) then net.2 (4D -> D).
-        load_lin(p + "ff.net.0.proj", FF, D,  B.ff1);
-        load_lin(p + "ff.net.2",      D,  FF, B.ff2);
+        load_lin_dt(mdt, p + "ff.net.0.proj", FF, D,  B.ff1);
+        load_lin_dt(mdt, p + "ff.net.2",      D,  FF, B.ff2);
     }
 
     // AdaLN affine-free LayerNorm params: ones gamma, zeros beta (D,1) at cdt.
@@ -244,9 +260,8 @@ const bt::Tensor& PixArtDenoiser::pos_embed_for_(int hp, int wp) {
         }
     }
 
-    // Upload at the denoiser compute dtype (BF16 on CUDA) so it adds cleanly to
-    // the BF16 hidden stream — not detail::upload_host, which targets the
-    // (FP16) pipeline dtype.
+    // Upload at the denoiser compute dtype (FP32) so it adds cleanly to the FP32
+    // hidden stream — not detail::upload_host, which targets the pipeline dtype.
     const bt::Dtype cdt = compute_dtype();
     bt::Tensor p = bt::Tensor::from_host(host.data(), N, D).to(bt::default_device());
     if (cdt != bt::Dtype::FP32) {
@@ -259,46 +274,10 @@ const bt::Tensor& PixArtDenoiser::pos_embed_for_(int hp, int wp) {
     return pos_embed_;
 }
 
-// ─── attention (standard softmax MHA via flash) ────────────────────────────
+// ─── attention ─────────────────────────────────────────────────────────────
 
-// Run flash attention, bridging precision: brotensor's flash kernel is FP16/
-// BF16 on CUDA (no FP32 kernel), so cast Q/K/V from the FP32 compute dtype to
-// the flash dtype (BF16 on CUDA, FP32 on CPU) and cast the output back. The
-// attention output is a convex combination of bounded value rows, so the
-// round-trip is cheap in range.
-void PixArtDenoiser::attention_(int nh, const bt::Tensor& q, const bt::Tensor& k,
-                                const bt::Tensor& v, const Linear& out_proj,
-                                bt::Tensor& out, bool wide_range) {
-    const bt::Dtype cdt = compute_dtype();
-    // Flash dtype: brotensor has no FP32 flash kernel on CUDA, so cast the FP32
-    // operands to a 16-bit dtype there (FP32 on CPU). FP16's 10-bit mantissa is
-    // far more accurate than BF16's 7-bit (BF16 attention drops the per-forward
-    // cosine vs the reference from ~0.97 to ~0.89), so self-attention — whose
-    // operands are bounded (post-layernorm Q/K, softmax-convex V) — uses FP16.
-    // Cross-attention's query is the RAW residual stream (~±300; PixArt applies
-    // no norm before attn2), which would overflow FP16 → NaN, so `wide_range`
-    // selects BF16 there for the exponent range, accepting its coarser mantissa
-    // (the context is short, so the loss is minor).
-    bt::Dtype fdt = brotensor::Dtype::FP32;
-    if (brotensor::default_device() == brotensor::Device::CUDA) {
-        fdt = wide_range ? brotensor::Dtype::BF16 : brotensor::Dtype::FP16;
-    }
-    const bt::Tensor* Q = &q;
-    const bt::Tensor* K = &k;
-    const bt::Tensor* V = &v;
-    if (q.dtype != fdt) { bt::cast(q, qf_, fdt); Q = &qf_; }
-    if (k.dtype != fdt) { bt::cast(k, kf_, fdt); K = &kf_; }
-    if (v.dtype != fdt) { bt::cast(v, vf_, fdt); V = &vf_; }
-    bt::flash_attention_forward(*Q, *K, *V, /*d_mask=*/nullptr, nh,
-                                /*causal=*/false, attn_o_);
-    const bt::Tensor* O = &attn_o_;
-    if (attn_o_.dtype != cdt) { bt::cast(attn_o_, of_, cdt); O = &of_; }
-    lin_(out_proj, *O, out);
-}
-
-void PixArtDenoiser::manual_attention_(int nh, const bt::Tensor& Q,
-                                       const bt::Tensor& K, const bt::Tensor& V,
-                                       const Linear& out_proj, bt::Tensor& out) {
+void PixArtDenoiser::manual_core_(int nh, const bt::Tensor& Q,
+                                  const bt::Tensor& K, const bt::Tensor& V) {
     const int D = cfg_.inner_dim();
     const int hd = D / nh;
     const int Lq = Q.rows, Lk = K.rows;
@@ -326,59 +305,113 @@ void PixArtDenoiser::manual_attention_(int nh, const bt::Tensor& Q,
         // Scatter head h back: ocat[r, h*hd:] = Oh[r, :].
         bt::copy_d2d_strided(ca_oh_, 0, hd, ca_ocat_, off, D, hd, Lq);
     }
+}
+
+void PixArtDenoiser::manual_attention_(int nh, const bt::Tensor& Q,
+                                       const bt::Tensor& K, const bt::Tensor& V,
+                                       const Linear& out_proj, bt::Tensor& out) {
+    manual_core_(nh, Q, K, V);
     lin_(out_proj, ca_ocat_, out);   // output projection (+ bias)
 }
 
 void PixArtDenoiser::self_attention_(const Block& blk, const bt::Tensor& x_mod,
                                      bt::Tensor& out) {
-    // Full FP32 multi-head self-attention (projections + attention + out-proj in
-    // one op). brotensor's mha_forward runs FP32 on CUDA — accurate, unlike the
-    // 16-bit-only flash kernel — which the long (H_lat/2 * W_lat/2) self-attention
-    // sequence needs to keep the denoise from diverging. Biases are applied
-    // post-projection (q1/k1/v1) and post-out1.
-    bt::mha_forward(x_mod, blk.q1.W, blk.k1.W, blk.v1.W, blk.out1.W,
-                    &blk.q1.b, &blk.k1.b, &blk.v1.b, &blk.out1.b,
-                    /*d_mask=*/nullptr, cfg_.num_attention_heads,
-                    mha_qh_, mha_kh_, mha_vh_, mha_attn_, mha_yc_, out);
+    const int nh = cfg_.num_attention_heads;
+    if (mm_dtype() == bt::Dtype::FP32) {
+        // CPU: fused FP32 multi-head self-attention (brotensor has no FP32 flash
+        // kernel, and mha_forward composes the projections + attention + out-proj
+        // in one op). Biases applied post-q/k/v and post-out1.
+        bt::mha_forward(x_mod, blk.q1.W, blk.k1.W, blk.v1.W, blk.out1.W,
+                        &blk.q1.b, &blk.k1.b, &blk.v1.b, &blk.out1.b,
+                        /*d_mask=*/nullptr, nh,
+                        mha_qh_, mha_kh_, mha_vh_, mha_attn_, mha_yc_, out);
+        return;
+    }
+    // CUDA: FP16 projections (WMMA) + FP16 flash attention (FP32 softmax accum
+    // internally) + FP16 out-proj, then cast back into the FP32 residual. The
+    // operands are bounded — x_mod is a post-layernorm modulation, Q/K stay O(1)
+    // and the attention output is convex over the value rows — so FP16's 10-bit
+    // mantissa is accurate here (unlike a 16-bit residual stream).
+    bt::cast(x_mod, mod16_, bt::Dtype::FP16);
+    lin_(blk.q1, mod16_, q_);     // (N, D) FP16
+    lin_(blk.k1, mod16_, k_);
+    lin_(blk.v1, mod16_, v_);
+    bt::flash_attention_forward(q_, k_, v_, /*d_mask=*/nullptr, nh,
+                                /*causal=*/false, attn_o_);   // FP16
+    lin_(blk.out1, attn_o_, sub16_);                          // (N, D) FP16
+    bt::cast(sub16_, out, compute_dtype());                   // → FP32 residual
 }
 
 void PixArtDenoiser::cross_attention_(const Block& blk, const bt::Tensor& ctx,
                                       const bt::Tensor& hidden,
                                       bt::Tensor& out) {
-    // Project (FP32, biased) then attend in FP32 via the manual per-head path.
-    // Flash is 16-bit-only on CUDA and the cross-attn query is the unnormed
-    // residual (~±300) — FP16 overflows, BF16 is too coarse (cosine ~0.88 →
-    // noise). The context is short, so the manual FP32 path is cheap.
-    lin_(blk.q2, hidden, q_);   // (Lq, D)
-    lin_(blk.k2, ctx, k_);      // (Lk, D)
-    lin_(blk.v2, ctx, v_);      // (Lk, D)
-    manual_attention_(cfg_.num_attention_heads, q_, k_, v_, blk.out2, out);
+    const int nh = cfg_.num_attention_heads;
+    if (mm_dtype() == bt::Dtype::FP32) {
+        // CPU: project (FP32, biased) then attend in FP32 via the manual
+        // per-head path.
+        lin_(blk.q2, hidden, q_);   // (Lq, D)
+        lin_(blk.k2, ctx, k_);      // (Lk, D)
+        lin_(blk.v2, ctx, v_);      // (Lk, D)
+        manual_attention_(nh, q_, k_, v_, blk.out2, out);
+        return;
+    }
+    // CUDA: FP16 projections on tensor cores (the dominant cross-attn cost — the
+    // Lq×D Q and out projections), but an FP32 attention core. PixArt's head_dim
+    // (72) isn't in flash's fused FP32-score path, so flash falls to the per-head
+    // WMMA kernel which stores scores in the operand dtype; the cross query is the
+    // unnormed ±300 residual, so FP16 scores overflow → NaN and BF16 is too
+    // coarse. The core is cheap here (caption context ~hundreds of tokens), so it
+    // stays FP32 while the big projections ride FP16. ctx is already FP16.
+    bt::cast(hidden, hid16_, bt::Dtype::FP16);
+    lin_(blk.q2, hid16_, q_);   // (Lq, D) FP16
+    lin_(blk.k2, ctx, k_);      // (Lk, D) FP16
+    lin_(blk.v2, ctx, v_);      // (Lk, D) FP16
+    bt::cast(q_, qf32_, bt::Dtype::FP32);
+    bt::cast(k_, kf32_, bt::Dtype::FP32);
+    bt::cast(v_, vf32_, bt::Dtype::FP32);
+    manual_core_(nh, qf32_, kf32_, vf32_);   // FP32 attention → ca_ocat_ (Lq, D)
+    bt::cast(ca_ocat_, o16_, bt::Dtype::FP16);
+    lin_(blk.out2, o16_, sub16_);            // (Lq, D) FP16 out-projection
+    bt::cast(sub16_, out, compute_dtype());  // → FP32 residual
 }
 
 void PixArtDenoiser::feed_forward_(const Block& blk, const bt::Tensor& x_mod,
                                    bt::Tensor& out) {
-    lin_(blk.ff1, x_mod, ff_h_);     // (N, 4D)
-    bt::gelu_forward(ff_h_, ff_h_);  // GELU(tanh) — activation_fn gelu-approximate
-    lin_(blk.ff2, ff_h_, out);       // (N, D)
+    if (mm_dtype() == bt::Dtype::FP32) {
+        lin_(blk.ff1, x_mod, ff_h_);     // (N, 4D)
+        bt::gelu_forward(ff_h_, ff_h_);  // GELU(tanh)
+        lin_(blk.ff2, ff_h_, out);       // (N, D)
+        return;
+    }
+    // CUDA: FP16 WMMA GEMMs around a FP16 GELU, cast back into the FP32 residual.
+    bt::cast(x_mod, mod16_, bt::Dtype::FP16);
+    lin_(blk.ff1, mod16_, ff_h_);    // (N, 4D) FP16
+    bt::gelu_forward(ff_h_, ff_h_);  // GELU(tanh)
+    lin_(blk.ff2, ff_h_, sub16_);    // (N, D) FP16
+    bt::cast(sub16_, out, compute_dtype());   // → FP32 residual
 }
 
 // ─── prepared conditioning ─────────────────────────────────────────────────
 
 PreparedConditioning PixArtDenoiser::prepare(const Conditioning& cond) {
     if (cap_l1_.W.size() == 0) fail("prepare: weights not loaded");
-    const bt::Dtype cdt = compute_dtype();
+    const bt::Dtype cdt = compute_dtype();   // FP32 caption projection
+    const bt::Dtype mdt = mm_dtype();         // cross-attn K/V dtype (FP16 on CUDA)
 
     auto project = [&](const bt::Tensor& seq, bt::Tensor& out) {
         if (seq.cols != cfg_.caption_channels) {
             fail("prepare: text_embeddings width != caption_channels");
         }
-        bt::Tensor seq_cd, h1;
+        bt::Tensor seq_cd, h1, proj;
         const bt::Tensor* in = &seq;
         if (seq.dtype != cdt) { bt::cast(seq, seq_cd, cdt); in = &seq_cd; }
         lin_(cap_l1_, *in, h1);
         bt::gelu_forward(h1, h1);
-        lin_(cap_l2_, h1, out);               // (L, D)
-        out = out.clone();
+        lin_(cap_l2_, h1, proj);              // (L, D) FP32
+        // Store the context at mm_dtype so the per-block cross-attn K/V
+        // projections (FP16 weights on CUDA) take it directly.
+        if (mdt != cdt) { bt::cast(proj, out, mdt); }
+        else            { out = proj.clone(); }
     };
 
     auto prep = std::make_unique<PixArtPrepared>();

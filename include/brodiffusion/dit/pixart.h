@@ -107,14 +107,21 @@ private:
     // grid at the compute dtype.
     const brotensor::Tensor& pos_embed_for_(int hp, int wp);
 
-    // Shared flash-attention helper (casts to the flash dtype, projects out).
-    void attention_(int nh, const brotensor::Tensor& q,
-                    const brotensor::Tensor& k, const brotensor::Tensor& v,
-                    const Linear& out_proj, brotensor::Tensor& out,
-                    bool wide_range);
-    // Manual FP32 multi-head attention from already-projected Q/K/V (per-head
-    // matmul + softmax + matmul). Accurate on CUDA where flash is 16-bit only;
-    // used for cross-attention (whose query is the unnormed wide-range residual).
+    // Matmul / attention storage dtype. FP16 on CUDA (tensor-core WMMA + flash;
+    // accumulation stays FP32 inside those kernels), FP32 on CPU. The residual
+    // stream, layernorms, modulation and gating all stay at compute_dtype()
+    // (FP32) — only the heavy per-sublayer GEMMs and attention drop to FP16.
+    brotensor::Dtype mm_dtype() const;
+
+    // Manual FP32 multi-head attention core from already-projected (FP32) Q/K/V
+    // (per-head matmul + softmax + matmul); writes ca_ocat_ (FP32), no out-proj.
+    // Used by cross-attention, whose query is the unnormed wide-range residual:
+    // FP16 score storage overflows and BF16 is too coarse, so the core stays
+    // FP32 (cheap — the caption context is short) while its projections ride the
+    // FP16 tensor-core path.
+    void manual_core_(int nh, const brotensor::Tensor& Q,
+                      const brotensor::Tensor& K, const brotensor::Tensor& V);
+    // FP32 manual attention + out-proj in one (CPU path).
     void manual_attention_(int nh, const brotensor::Tensor& Q,
                            const brotensor::Tensor& K, const brotensor::Tensor& V,
                            const Linear& out_proj, brotensor::Tensor& out);
@@ -153,11 +160,16 @@ private:
     brotensor::Tensor mod_row_, ln_, mod_;
     brotensor::Tensor hidden_, patch_nchw_;
     brotensor::Tensor gated_, sub_out_;
-    // attention scratch. Self-attention uses FP32 mha_forward (its own caches);
-    // cross-attention uses the flash path with BF16 casts.
+    // Mixed-precision scratch: FP16 (mm_dtype) views of the FP32 modulated input
+    // / residual that feed the tensor-core GEMMs, and the FP16 sublayer output
+    // before it is cast back into the FP32 residual.
+    brotensor::Tensor mod16_, hid16_, sub16_;
+    // Cross-attn FP32 upcasts of the FP16 Q/K/V projections (for the exact core),
+    // and the FP16 view of its output ahead of the FP16 out-projection.
+    brotensor::Tensor qf32_, kf32_, vf32_, o16_;
+    // attention scratch: FP16 projections + flash output on CUDA, FP32 on CPU.
     brotensor::Tensor q_, k_, v_, attn_o_;
-    brotensor::Tensor qf_, kf_, vf_, of_;   // flash-dtype casts (cross-attn)
-    brotensor::Tensor mha_qh_, mha_kh_, mha_vh_, mha_attn_, mha_yc_;  // mha caches
+    brotensor::Tensor mha_qh_, mha_kh_, mha_vh_, mha_attn_, mha_yc_;  // mha caches (CPU)
     // manual_attention_ per-head scratch (FP32).
     brotensor::Tensor ca_qh_, ca_kh_, ca_vh_, ca_kt_, ca_sc_, ca_oh_, ca_ocat_;
     // feed-forward scratch
