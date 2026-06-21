@@ -63,11 +63,17 @@ public:
     // True iff any axis has a nonzero weight (apply() is a no-op otherwise).
     bool active() const;
 
-    // Add the active weighted control vector to rows [1, emb.rows) of `emb`
-    // in place (BOS row 0 untouched). No-op when inactive or emb has < 2 rows.
-    // `emb` is (L, dim) on any device/dtype (FP32 / FP16 / BF16). Throws if
-    // emb.cols != dim(). The injection is built in FP32 and cast to emb.dtype.
-    void apply(brotensor::Tensor& emb) const;
+    // Add the active weighted control vector to rows [1, end) of `emb` in place
+    // (BOS row 0 untouched), where end = row_end if 0 < row_end <= emb.rows, else
+    // emb.rows. No-op when inactive or fewer than 2 steerable rows. `emb` is
+    // (L, dim) on any device/dtype (FP32 / FP16 / BF16). Throws if emb.cols !=
+    // dim(). The injection is built in FP32 and cast to emb.dtype.
+    //
+    // row_end exists for the CLIP fixed-77 path: pass the EOS index so only the
+    // CONTENT rows [1, eos) are steered, not the live EOS/padding tail (clip-
+    // research found injecting the padding rows over-drives generation). Sana's
+    // conditioning carries no padding, so it leaves row_end at the default.
+    void apply(brotensor::Tensor& emb, int row_end = -1) const;
 
 private:
     int dim_ = 0;

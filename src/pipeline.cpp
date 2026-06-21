@@ -507,12 +507,19 @@ void Pipeline::clear_controlnets() {
     controlnet_active_ = false;
 }
 
-void Pipeline::encode_prompt_(std::string_view prompt, bt::Tensor& out) {
+void Pipeline::encode_prompt_(std::string_view prompt, bt::Tensor& out,
+                              int* content_end) {
     if (!tokenizer_) fail("encode_prompt_: CLIP tokenizer not present");
     std::vector<std::int32_t> ids = tokenizer_->encode(prompt);
     if (static_cast<int>(ids.size()) != cfg_.text_encoder.max_position) {
         fail("tokenizer returned " + std::to_string(ids.size()) +
              " ids, expected " + std::to_string(cfg_.text_encoder.max_position));
+    }
+    if (content_end) {
+        // First EOS marks the end of the content rows (ids are BOS + content +
+        // EOS + EOS-padding); default to the full length if none is found.
+        auto it = std::find(ids.begin(), ids.end(), brolm::clip::eos_id);
+        *content_end = static_cast<int>(it - ids.begin());
     }
     text_encoder_.forward(ids.data(), out);
 }
@@ -790,7 +797,15 @@ PipelineState Pipeline::prime(std::string_view prompt,
         conditioning_.guidance =
             cfg_.flux.guidance_embeds ? opts.guidance_scale : 0.0f;
     } else {
-        encode_prompt_(prompt, conditioning_.text_embeddings);
+        int content_end = -1;
+        encode_prompt_(prompt, conditioning_.text_embeddings, &content_end);
+        // Conditioning-space control seam (CLIP): add the weighted control axes to
+        // the positive prompt's CONTENT rows [1, eos) — BOS and the EOS/padding
+        // tail untouched (content-rows policy; clip-research found steering the
+        // live padding rows over-drives generation). No-op unless an axis carries
+        // a nonzero weight. The negative branch is left clean (steer the prompt,
+        // not the baseline) — mirrors the Sana path.
+        cond_control_.apply(conditioning_.text_embeddings, content_end);
         if (do_cfg) {
             encode_prompt_(opts.negative_prompt,
                            conditioning_.uncond_embeddings);

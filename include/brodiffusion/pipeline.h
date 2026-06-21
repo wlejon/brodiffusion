@@ -384,7 +384,11 @@ public:
     brotensor::Tensor encode_conditioning(std::string_view prompt);
 
 private:
-    void encode_prompt_(std::string_view prompt, brotensor::Tensor& out);
+    // Encode a prompt to the CLIP (77, hidden) conditioning. If content_end is
+    // non-null, it receives the EOS index (first eos_id) = end of the content
+    // rows, for the conditioning-control seam's content-rows policy.
+    void encode_prompt_(std::string_view prompt, brotensor::Tensor& out,
+                        int* content_end = nullptr);
     // Sana txt2img priming: Gemma-encode prompt(s), prepare conditioning, and
     // allocate the FP32 initial latent (32x downsample, 32 channels). Returns a
     // step_index=0 state. Called from prime() when model_class_ == Sana.
