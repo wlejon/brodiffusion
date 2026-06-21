@@ -19,9 +19,11 @@
 #include "brodiffusion/denoiser.h"
 #include "brodiffusion/dit/flux.h"
 #include "brodiffusion/dit/sana.h"
+#include "brodiffusion/dit/pixart.h"
 #include "brodiffusion/flow_match_scheduler.h"
 #include "brodiffusion/scm_scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
+#include "brodiffusion/dpm_solver.h"
 #include "brodiffusion/model_config.h"
 #include "brodiffusion/scheduler.h"
 #include "brolm/gemma2.h"
@@ -55,6 +57,7 @@ struct PipelineConfig {
     unet::UNetConfig         unet;          // StableDiffusion
     dit::FluxConfig          flux;          // Flux
     dit::SanaConfig          sana;          // Sana (linear DiT transformer)
+    dit::PixArtConfig        pixart;        // PixArt-Sigma (DiT transformer)
     vae::DecoderConfig       vae;
     dcae::DecoderConfig      dcae;          // Sana (DC-AE f32c32 decoder)
     brolm::clip::TextEncoderConfig  text_encoder;  // CLIP — SD / Flux
@@ -67,7 +70,8 @@ struct PipelineConfig {
     // pipeline branches on the active alternative; existing call sites that
     // don't set this keep working unchanged.
     std::variant<scheduler::DDIMConfig, scheduler::LCMConfig,
-                 scheduler::FlowMatchConfig, scheduler::SCMConfig> scheduler;
+                 scheduler::FlowMatchConfig, scheduler::SCMConfig,
+                 scheduler::DPMSolverConfig> scheduler;
 };
 
 // Snapshot of mid-generation state. Cheap to fork — only the latent
@@ -222,6 +226,12 @@ public:
     // only when cfg.model_class == ModelClass::Sana. The CLIP / KL-VAE members
     // are default-constructed and unused.
     Pipeline(const PipelineConfig& cfg, brolm::gemma::Tokenizer gemma_tok);
+
+    // PixArt constructor: builds a PixArtDenoiser (DiT) + the KL-VAE decoder +
+    // the T5-XXL text encoder, and owns the T5 tokenizer. Valid only when
+    // cfg.model_class == ModelClass::PixArt. There is no CLIP frontend (the
+    // CLIP tokenizer/encoder members stay default-constructed and unused).
+    Pipeline(const PipelineConfig& cfg, brolm::t5::Tokenizer t5_tok);
 
     // Build a fully-loaded Pipeline from a diffusers model directory: reads the
     // JSON configs, constructs the right sub-modules, loads all component
@@ -418,7 +428,7 @@ private:
     // (some decoder-only derivative checkpoints), the load throws clearly.
     vae::Encoder              vae_encoder_;
     std::variant<scheduler::DDIM, scheduler::LCM, scheduler::FlowMatch,
-                 scheduler::SCM>
+                 scheduler::SCM, scheduler::DPMSolverMultistep>
         scheduler_;
 
     // ── Sana-only sub-modules ─────────────────────────────────────────────

@@ -11,7 +11,7 @@
 #
 #   model            sd15 (default) | lcm-dreamshaper | clip-vit-l-14 |
 #                    flux-schnell | sana-600m | sana-1.6b |
-#                    sana-sprint-0.6b | sana-sprint-1.6b
+#                    sana-sprint-0.6b | sana-sprint-1.6b | pixart-sigma
 #   --repo R         override the Hugging Face repo id
 #   --out-dir D      override the output directory
 #   --force          re-download even if the file already exists
@@ -59,6 +59,17 @@
 #                    Same SanaTransformer2DModel/DC-AE/Gemma-2 components plus a
 #                    guidance embedding and an SCMScheduler (TrigFlow, 1-4 steps).
 #                    Single (unsharded, non-variant) transformer safetensors.
+#   pixart-sigma     PixArt-Sigma-XL-2-1024-MS from PixArt-alpha. A ~0.6B DiT
+#                    (PixArtTransformer2DModel: AdaLN-single, softmax self +
+#                    text cross-attention; epsilon / discrete linear-beta;
+#                    DPM-Solver++) with the SDXL VAE (scale 0.13025) and a
+#                    T5-XXL text encoder. The ~19 GB T5 encoder is the SAME one
+#                    as Flux's and is NOT fetched here — run `download-weights.sh
+#                    t5-xxl` once and the PixArt pipeline reuses weights/t5-xxl.
+#                    This entry pulls only the PixArt-specific parts: the FP32
+#                    transformer (~2.4 GB), the FP16 SDXL VAE (~0.3 GB), the T5
+#                    SentencePiece tokenizer (spiece.model), and the config /
+#                    scheduler JSON. text_encoder/config.json is informational.
 #
 # Auth: the SD1.5 mirror is public and needs no token. For rate-limited repos,
 # export HF_TOKEN=hf_... and it will be sent as a bearer token.
@@ -82,11 +93,12 @@ while [ $# -gt 0 ]; do
     case "$1" in
         sd15|lcm-dreamshaper|clip-vit-l-14|flux-schnell|t5-xxl|controlnet-canny|controlnet-depth|controlnet-openpose) MODEL="$1"; shift ;;
         sana-600m|sana-1.6b|sana-sprint-0.6b|sana-sprint-1.6b) MODEL="$1"; shift ;;
+        pixart-sigma) MODEL="$1"; shift ;;
         --repo)    REPO="${2:?--repo needs a value}"; shift 2 ;;
         --out-dir) OUT_DIR="${2:?--out-dir needs a value}"; shift 2 ;;
         --force)   FORCE=1; shift ;;
         -h|--help)
-            sed -n '2,71p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,82p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) echo "error: unknown argument '$1' (try --help)" >&2; exit 2 ;;
     esac
@@ -279,6 +291,27 @@ case "$MODEL" in
             "tokenizer/special_tokens_map.json"
             "tokenizer/tokenizer.json"
             "tokenizer/tokenizer.model"
+            "tokenizer/tokenizer_config.json"
+        )
+        ;;
+    pixart-sigma)
+        # PixArt-Sigma-XL-2-1024-MS. PixArt-specific parts only — the ~19 GB
+        # T5-XXL text encoder (text_encoder/model-*.safetensors) is deliberately
+        # NOT listed: it is byte-identical to Flux's T5-XXL, so the pipeline reuses
+        # weights/t5-xxl (fetch that once with `download-weights.sh t5-xxl`). The
+        # transformer is FP32 (no .fp16 variant); the VAE is the FP16 SDXL VAE.
+        [ -n "$REPO" ]    || REPO="PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+        [ -n "$OUT_DIR" ] || OUT_DIR="$REPO_ROOT/weights/pixart-sigma"
+        FILES=(
+            "model_index.json"
+            "scheduler/scheduler_config.json"
+            "transformer/config.json"
+            "transformer/diffusion_pytorch_model.safetensors"
+            "vae/config.json"
+            "vae/diffusion_pytorch_model.safetensors"
+            "text_encoder/config.json"
+            "tokenizer/special_tokens_map.json"
+            "tokenizer/spiece.model"
             "tokenizer/tokenizer_config.json"
         )
         ;;

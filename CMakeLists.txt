@@ -156,6 +156,7 @@ target_sources(brodiffusion PRIVATE
     src/lcm_scheduler.cpp
     src/flow_match_scheduler.cpp
     src/scm_scheduler.cpp
+    src/dpm_solver.cpp
     src/model_config.cpp
     src/sana_text.cpp
     src/cond_control.cpp
@@ -168,6 +169,7 @@ target_sources(brodiffusion PRIVATE
     src/dit/common.cpp
     src/dit/flux.cpp
     src/dit/sana.cpp
+    src/dit/pixart.cpp
     src/triposplat/vae_encoder.cpp
     src/triposplat/flow_model.cpp
     src/triposplat/flow_sobol_pe.cpp

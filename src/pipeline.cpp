@@ -7,6 +7,8 @@
 #include "brodiffusion/flow_match_scheduler.h"
 #include "brodiffusion/scm_scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
+#include "brodiffusion/dpm_solver.h"
+#include "brodiffusion/dit/pixart.h"
 #include "brodiffusion/detail/device.h"
 #include "brodiffusion/lora.h"
 #include "brodiffusion/model_config.h"
@@ -60,13 +62,14 @@ namespace {
 
 using SchedulerVariant =
     std::variant<scheduler::DDIM, scheduler::LCM, scheduler::FlowMatch,
-                 scheduler::SCM>;
+                 scheduler::SCM, scheduler::DPMSolverMultistep>;
 
 // Construct the scheduler variant from the matching config variant.
 SchedulerVariant
 make_scheduler(const std::variant<scheduler::DDIMConfig, scheduler::LCMConfig,
                                   scheduler::FlowMatchConfig,
-                                  scheduler::SCMConfig>& v) {
+                                  scheduler::SCMConfig,
+                                  scheduler::DPMSolverConfig>& v) {
     if (std::holds_alternative<scheduler::LCMConfig>(v)) {
         return SchedulerVariant{std::in_place_type<scheduler::LCM>,
                                 std::get<scheduler::LCMConfig>(v)};
@@ -78,6 +81,10 @@ make_scheduler(const std::variant<scheduler::DDIMConfig, scheduler::LCMConfig,
     if (std::holds_alternative<scheduler::SCMConfig>(v)) {
         return SchedulerVariant{std::in_place_type<scheduler::SCM>,
                                 std::get<scheduler::SCMConfig>(v)};
+    }
+    if (std::holds_alternative<scheduler::DPMSolverConfig>(v)) {
+        return SchedulerVariant{std::in_place_type<scheduler::DPMSolverMultistep>,
+                                std::get<scheduler::DPMSolverConfig>(v)};
     }
     return SchedulerVariant{std::in_place_type<scheduler::DDIM>,
                             std::get<scheduler::DDIMConfig>(v)};
@@ -126,6 +133,11 @@ void scheduler_step(SchedulerVariant& sched, const bt::Tensor& pred,
             pred, step_index, state.latent, noise_step, scratch);
     } else if (std::holds_alternative<scheduler::FlowMatch>(sched)) {
         std::get<scheduler::FlowMatch>(sched).step(
+            pred, step_index, state.latent, scratch);
+    } else if (std::holds_alternative<scheduler::DPMSolverMultistep>(sched)) {
+        // DPM-Solver multistep keeps per-generation history, so step() is
+        // non-const (sched is a non-const ref here).
+        std::get<scheduler::DPMSolverMultistep>(sched).step(
             pred, step_index, state.latent, scratch);
     } else {
         std::get<scheduler::DDIM>(sched).step(
@@ -203,6 +215,9 @@ std::unique_ptr<Denoiser> make_denoiser(const PipelineConfig& cfg) {
     }
     if (cfg.model_class == ModelClass::Sana) {
         return std::make_unique<dit::SanaDenoiser>(cfg.sana);
+    }
+    if (cfg.model_class == ModelClass::PixArt) {
+        return std::make_unique<dit::PixArtDenoiser>(cfg.pixart);
     }
     return std::make_unique<unet::UNet>(cfg.unet);
 }
@@ -282,6 +297,23 @@ Pipeline::Pipeline(const PipelineConfig& cfg, brolm::gemma::Tokenizer gemma_tok)
     }
 }
 
+Pipeline::Pipeline(const PipelineConfig& cfg, brolm::t5::Tokenizer t5_tok)
+    : cfg_(cfg),
+      model_class_(cfg.model_class),
+      tokenizer_(std::nullopt),           // no CLIP frontend for PixArt
+      text_encoder_(cfg.text_encoder),    // CLIP unused for PixArt
+      t5_tokenizer_(std::move(t5_tok)),
+      t5_encoder_(std::in_place, cfg.t5),
+      denoiser_(make_denoiser(cfg)),
+      vae_(cfg.vae),
+      vae_encoder_(encoder_config_from_decoder(cfg.vae)),
+      scheduler_(make_scheduler(cfg.scheduler)) {
+    if (cfg.model_class != ModelClass::PixArt) {
+        fail("Pipeline: the (cfg, t5_tok) constructor requires "
+             "model_class == PixArt");
+    }
+}
+
 const unet::UNet& Pipeline::unet() const {
     const unet::UNet* u = denoiser_->as_unet();
     if (u == nullptr) fail("unet(): the active denoiser is not a UNet");
@@ -352,6 +384,80 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
         for (const auto& f : te_files) te_ptrs.push_back(&f);
         p.gemma_model_->load_weights(te_ptrs, "");
         t = stamp("Gemma weights", t);
+
+        return p;
+    }
+
+    if (mc.model_class == ModelClass::PixArt) {
+        // PixArt-Sigma uses the SDXL KL-VAE, which overflows FP16 internally
+        // (its config ships force_upcast=false, but diffusers always runs this
+        // VAE upcast). Force the upcast so the decoder runs in BF16's FP32-range
+        // — without it every decoded pixel saturates to black.
+        cfg.vae.force_upcast = true;
+        // PixArt-Sigma: T5-XXL frontend (no CLIP), KL-VAE, PixArt DiT. The
+        // T5-XXL encoder is byte-identical to Flux's and is typically NOT
+        // bundled in a PixArt model dir (it dominates the download). Resolve it
+        // from, in priority order: $BRODIFFUSION_T5_DIR, a bundled
+        // <dir>/text_encoder, or a sibling <dir>/../t5-xxl.
+        fs::path t5_weights_dir;
+        fs::path t5_tok_path;
+        if (const char* e = std::getenv("BRODIFFUSION_T5_DIR"); e && *e) {
+            t5_weights_dir = fs::path(e);
+            t5_tok_path    = t5_weights_dir / "tokenizer.json";
+        } else {
+            bool bundled = false;
+            const fs::path te_dir = root / "text_encoder";
+            if (fs::exists(te_dir)) {
+                for (const auto& de : fs::directory_iterator(te_dir)) {
+                    if (de.path().extension() == ".safetensors") {
+                        bundled = true;
+                        break;
+                    }
+                }
+            }
+            if (bundled) {
+                t5_weights_dir = te_dir;
+                t5_tok_path    = root / "tokenizer" / "tokenizer.json";
+            } else {
+                t5_weights_dir = root.parent_path() / "t5-xxl";
+                t5_tok_path    = t5_weights_dir / "tokenizer.json";
+            }
+        }
+        // Tokenizer fallback to a sibling t5-xxl if the resolved path is absent
+        // (e.g. a bundled dir that ships spiece.model but no tokenizer.json).
+        if (!fs::exists(t5_tok_path)) {
+            const fs::path alt = root.parent_path() / "t5-xxl" / "tokenizer.json";
+            if (fs::exists(alt)) t5_tok_path = alt;
+        }
+        if (!fs::exists(t5_tok_path)) {
+            fail("from_model_dir: PixArt T5 tokenizer.json not found (looked at '" +
+                 t5_tok_path.string() + "'). Set BRODIFFUSION_T5_DIR to a "
+                 "t5-xxl directory or place one alongside the model dir.");
+        }
+
+        brolm::t5::Tokenizer t5_tok =
+            brolm::t5::Tokenizer::load(t5_tok_path.string());
+        Pipeline p(cfg, std::move(t5_tok));
+
+        auto vae_files = detail::open_component_files((root / "vae").string());
+        auto tf_files  = detail::open_component_files(
+            (root / "transformer").string());
+        auto t5_files  = detail::open_component_files(t5_weights_dir.string());
+        if (t5_files.empty()) {
+            fail("from_model_dir: PixArt T5 weights not found in '" +
+                 t5_weights_dir.string() + "'. Set BRODIFFUSION_T5_DIR or "
+                 "run scripts/download-weights.sh t5-xxl.");
+        }
+
+        auto* pix = dynamic_cast<dit::PixArtDenoiser*>(p.denoiser_.get());
+        if (!pix) fail("from_model_dir: PixArt denoiser construction failed");
+        pix->load_weights(tf_files.front(), "");
+        p.vae_.load_weights(vae_files.front(), "decoder.");
+        p.vae_encoder_.load_weights(vae_files.front(), "encoder.");
+
+        std::vector<const brotensor::safetensors::File*> t5_ptrs;
+        for (const auto& f : t5_files) t5_ptrs.push_back(&f);
+        p.t5_encoder_->load_weights(t5_ptrs, "");
 
         return p;
     }
@@ -796,6 +902,43 @@ PipelineState Pipeline::prime(std::string_view prompt,
         conditioning_.uncond_embeddings = brotensor::Tensor{};
         conditioning_.guidance =
             cfg_.flux.guidance_embeds ? opts.guidance_scale : 0.0f;
+    } else if (model_class_ == ModelClass::PixArt) {
+        // PixArt-Sigma: the T5-XXL token sequence is the cross-attention
+        // context; there is no CLIP pooled vector. Runs true classifier-free
+        // guidance, so the negative prompt (empty by default) gets its own T5
+        // pass for the uncond branch.
+        if (!t5_tokenizer_ || !t5_encoder_) {
+            fail("prime: PixArt pipeline missing T5 tokenizer / encoder");
+        }
+        // Encode, then TRIM the (max_length, 4096) sequence to its valid
+        // (non-pad) leading rows. T5 pads contiguously at the end, so trimming
+        // is exactly equivalent to diffusers' cross-attention padding mask: the
+        // DiT then cross-attends over precisely the real tokens (the same
+        // mask-free convention Sana uses for its Gemma caption).
+        const int t5_pad = t5_tokenizer_->pad_id();
+        auto encode_trim = [&](std::string_view text, bt::Tensor& emb) {
+            std::vector<std::int32_t> ids =
+                t5_tokenizer_->encode(text, cfg_.t5_max_length);
+            t5_encoder_->forward(ids.data(), static_cast<int>(ids.size()),
+                                 emb, t5_pad);
+            int valid = 0;
+            for (std::int32_t id : ids) if (id != t5_pad) ++valid;
+            if (valid < 1) valid = 1;
+            if (valid < emb.rows) {
+                bt::Tensor v = bt::Tensor::view(emb.device, emb.data, valid,
+                                                emb.cols, emb.dtype);
+                emb = v.clone();
+            }
+        };
+        encode_trim(prompt, conditioning_.text_embeddings);
+        if (do_cfg) {
+            encode_trim(opts.negative_prompt, conditioning_.uncond_embeddings);
+            conditioning_.has_uncond = true;
+        } else {
+            conditioning_.has_uncond = false;
+            conditioning_.uncond_embeddings = brotensor::Tensor{};
+        }
+        conditioning_.guidance = 0.0f;
     } else {
         int content_end = -1;
         encode_prompt_(prompt, conditioning_.text_embeddings, &content_end);

@@ -21,8 +21,10 @@
 #include "brodiffusion/lcm_scheduler.h"
 #include "brodiffusion/flow_match_scheduler.h"
 #include "brodiffusion/scm_scheduler.h"
+#include "brodiffusion/dpm_solver.h"
 #include "brodiffusion/dit/flux.h"
 #include "brodiffusion/dit/sana.h"
+#include "brodiffusion/dit/pixart.h"
 #include "brolm/t5.h"
 #include "brolm/gemma2_config.h"
 
@@ -31,7 +33,7 @@
 
 namespace brodiffusion {
 
-enum class ModelClass { StableDiffusion, Flux, Sana, Unknown };
+enum class ModelClass { StableDiffusion, Flux, Sana, PixArt, Unknown };
 
 // Architecture + hyper-parameters of a diffusers model directory, read from
 // its JSON config files. The Pipeline factory consumes this to build the
@@ -53,10 +55,16 @@ struct ModelConfig {
     brolm::gemma::Gemma2Config gemma;  // populated for ModelClass::Sana (the Gemma-2 text encoder)
     int             sana_max_seq_len = 300;  // Gemma caption sequence length
 
+    dit::PixArtConfig pixart;          // populated for ModelClass::PixArt (the DiT)
+    // PixArt-Sigma shares Flux's T5-XXL text encoder (the `t5` field above) but
+    // caps captions at 300 tokens. The encoder weights are NOT bundled in a
+    // PixArt model dir — from_model_dir resolves them from a sibling t5-xxl dir.
+
     std::variant<scheduler::DDIMConfig,
                  scheduler::LCMConfig,
                  scheduler::FlowMatchConfig,
-                 scheduler::SCMConfig> scheduler;
+                 scheduler::SCMConfig,
+                 scheduler::DPMSolverConfig> scheduler;
 };
 
 // Read `model_index.json` + each component config from `model_dir`.

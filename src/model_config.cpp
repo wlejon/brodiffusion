@@ -189,6 +189,21 @@ scheduler::FlowMatchConfig parse_flow_dpm(const json::Value& cfg) {
     return c;
 }
 
+// PixArt-Sigma ships a DPMSolverMultistepScheduler in epsilon-prediction mode
+// (dpmsolver++, order 2). Distinct from Sana's flow-prediction DPM, which is
+// mapped onto FlowMatch above.
+scheduler::DPMSolverConfig parse_dpm_solver(const json::Value& cfg) {
+    scheduler::DPMSolverConfig c;
+    c.num_train_timesteps =
+        cfg.get_int("num_train_timesteps", c.num_train_timesteps);
+    c.beta_start        = cfg.get_float("beta_start", c.beta_start);
+    c.beta_end          = cfg.get_float("beta_end", c.beta_end);
+    c.solver_order      = cfg.get_int("solver_order", c.solver_order);
+    c.lower_order_final = cfg.get_bool("lower_order_final", c.lower_order_final);
+    c.steps_offset      = cfg.get_int("steps_offset", c.steps_offset);
+    return c;
+}
+
 // Sana-Sprint ships an SCMScheduler (TrigFlow few-step sampler).
 scheduler::SCMConfig parse_scm(const json::Value& cfg) {
     scheduler::SCMConfig c;
@@ -228,6 +243,25 @@ void populate_sana(const json::Value& cfg, dit::SanaConfig& out) {
     out.guidance_embeds_scale =
         cfg.get_float("guidance_embeds_scale", out.guidance_embeds_scale);
     out.qk_norm             = !cfg.get_string("qk_norm", "").empty();
+}
+
+void populate_pixart(const json::Value& cfg, dit::PixArtConfig& out) {
+    out.in_channels         = cfg.get_int("in_channels", out.in_channels);
+    out.out_channels        = cfg.get_int("out_channels", out.out_channels);
+    out.num_layers          = cfg.get_int("num_layers", out.num_layers);
+    out.attention_head_dim  = cfg.get_int("attention_head_dim",
+                                          out.attention_head_dim);
+    out.num_attention_heads = cfg.get_int("num_attention_heads",
+                                          out.num_attention_heads);
+    out.cross_attention_dim = cfg.get_int("cross_attention_dim",
+                                          out.cross_attention_dim);
+    out.caption_channels    = cfg.get_int("caption_channels",
+                                          out.caption_channels);
+    out.patch_size          = cfg.get_int("patch_size", out.patch_size);
+    out.sample_size         = cfg.get_int("sample_size", out.sample_size);
+    out.interpolation_scale = cfg.get_int("interpolation_scale",
+                                          out.interpolation_scale);
+    out.norm_eps            = cfg.get_float("norm_eps", out.norm_eps);
 }
 
 void populate_dcae(const json::Value& cfg, dcae::DecoderConfig& out) {
@@ -318,15 +352,18 @@ ModelConfig load_model_config(const std::string& model_dir) {
         out.model_class = ModelClass::Flux;
     } else if (contains_ci(class_name, "Sana")) {
         out.model_class = ModelClass::Sana;
+    } else if (contains_ci(class_name, "PixArt")) {
+        out.model_class = ModelClass::PixArt;
     } else {
         out.model_class = ModelClass::Unknown;
     }
 
-    const bool is_flux = (out.model_class == ModelClass::Flux);
-    const bool is_sana = (out.model_class == ModelClass::Sana);
+    const bool is_flux   = (out.model_class == ModelClass::Flux);
+    const bool is_sana   = (out.model_class == ModelClass::Sana);
+    const bool is_pixart = (out.model_class == ModelClass::PixArt);
 
     // --- unet/config.json (StableDiffusion only) ---
-    if (!is_flux && !is_sana) {
+    if (!is_flux && !is_sana && !is_pixart) {
         const fs::path unet_cfg = root / "unet" / "config.json";
         if (fs::exists(unet_cfg)) {
             populate_unet(parse_file(unet_cfg), out.unet);
@@ -366,6 +403,22 @@ ModelConfig load_model_config(const std::string& model_dir) {
         }
     }
 
+    // --- transformer/config.json + text_encoder/config.json (PixArt only) ---
+    if (is_pixart) {
+        const fs::path tf_cfg = root / "transformer" / "config.json";
+        if (fs::exists(tf_cfg)) {
+            populate_pixart(parse_file(tf_cfg), out.pixart);
+        }
+        // PixArt's text encoder is T5-XXL (text_encoder/config.json is a T5
+        // config). The encoder weights aren't bundled here — but the config is,
+        // so the T5 hyper-params come from it.
+        const fs::path t5_cfg = root / "text_encoder" / "config.json";
+        if (fs::exists(t5_cfg)) {
+            populate_t5(parse_file(t5_cfg), out.t5);
+        }
+        out.t5_max_length = 300;  // PixArt-Sigma caption cap (alpha was 120)
+    }
+
     // --- vae/config.json (always; AutoencoderDC for Sana, AutoencoderKL else) ---
     {
         const fs::path vae_cfg = root / "vae" / "config.json";
@@ -378,8 +431,8 @@ ModelConfig load_model_config(const std::string& model_dir) {
         }
     }
 
-    // --- text_encoder/config.json (CLIP; Sana's Gemma-2 handled above) ---
-    if (!is_sana) {
+    // --- text_encoder/config.json (CLIP; Sana's Gemma-2 + PixArt's T5 above) ---
+    if (!is_sana && !is_pixart) {
         const fs::path te_cfg = root / "text_encoder" / "config.json";
         if (fs::exists(te_cfg)) {
             populate_text_encoder(parse_file(te_cfg), out.text_encoder);
@@ -396,9 +449,17 @@ ModelConfig load_model_config(const std::string& model_dir) {
             if (sched_class == "FlowMatchEulerDiscreteScheduler") {
                 out.scheduler = parse_flow_match(cfg);
             } else if (sched_class == "DPMSolverMultistepScheduler") {
-                // Sana's flow-prediction DPM-Solver — mapped onto FlowMatch
-                // for now (a dedicated Flow-DPM-Solver scheduler comes later).
-                out.scheduler = parse_flow_dpm(cfg);
+                // Two flavours share this class name: PixArt-Sigma's epsilon
+                // DPM-Solver++ (a real discrete-time DPM) and Sana's
+                // flow-prediction DPM (mapped onto FlowMatch for now). Branch
+                // on prediction_type.
+                const std::string pred =
+                    cfg.get_string("prediction_type", "epsilon");
+                if (pred == "epsilon" || pred == "v_prediction") {
+                    out.scheduler = parse_dpm_solver(cfg);
+                } else {
+                    out.scheduler = parse_flow_dpm(cfg);
+                }
             } else if (sched_class == "LCMScheduler") {
                 out.scheduler = parse_lcm(cfg);
             } else if (sched_class == "SCMScheduler") {
@@ -410,6 +471,8 @@ ModelConfig load_model_config(const std::string& model_dir) {
             // Missing scheduler config: default per model class.
             if (is_flux || is_sana) {
                 out.scheduler = scheduler::FlowMatchConfig{};
+            } else if (is_pixart) {
+                out.scheduler = scheduler::DPMSolverConfig{};
             } else {
                 out.scheduler = scheduler::DDIMConfig{};
             }

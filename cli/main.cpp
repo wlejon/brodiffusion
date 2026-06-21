@@ -342,8 +342,11 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
         pipeline.config().model_class == brodiffusion::ModelClass::Flux;
     const bool is_sana =
         pipeline.config().model_class == brodiffusion::ModelClass::Sana;
+    const bool is_pixart =
+        pipeline.config().model_class == brodiffusion::ModelClass::PixArt;
     std::printf("Model class: %s\n",
-                is_flux ? "Flux" : (is_sana ? "Sana" : "StableDiffusion"));
+                is_flux ? "Flux" : (is_sana ? "Sana"
+                       : (is_pixart ? "PixArt-Sigma" : "StableDiffusion")));
 
     // Sana-Sprint is the guidance-distilled (guidance_embeds), SCM/TrigFlow
     // few-step variant — it defaults to 2 steps, vs base Sana's 20.
@@ -356,6 +359,11 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     if (is_sana) { opts.width = 1024; opts.height = 1024;
                    opts.num_inference_steps = is_sana_sprint ? 2 : 20;
                    opts.guidance_scale = 4.5f; }
+    // PixArt-Sigma-XL-2-1024-MS native resolution + reference sampling defaults
+    // (DPM-Solver++ 20 steps, CFG 4.5).
+    if (is_pixart) { opts.width = 1024; opts.height = 1024;
+                     opts.num_inference_steps = 20;
+                     opts.guidance_scale = 4.5f; }
     if (neg)      opts.negative_prompt = neg;
     if (steps_s)  opts.num_inference_steps = std::atoi(steps_s);
     else if (is_flux) opts.num_inference_steps = 4;  // flux-schnell default
@@ -674,6 +682,7 @@ int run_t5(int argc, char** argv) {
     const char* tok_path     = arg_after(argc, argv, "--tokenizer");
     const char* prompt       = arg_after(argc, argv, "--prompt");
     const char* maxlen_s     = arg_after(argc, argv, "--max-length");
+    const char* dump_path    = arg_after(argc, argv, "--out");
     bool quantize = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--quantize") == 0) quantize = true;
@@ -724,6 +733,14 @@ int run_t5(int argc, char** argv) {
         for (std::size_t i = 0; i < bits.size(); ++i) {
             vals[i] = brotensor::fp16_bits_to_fp32(bits[i]);
         }
+    } else if (out.dtype == brotensor::Dtype::BF16) {
+        std::vector<std::uint16_t> bits(static_cast<std::size_t>(L) * D);
+        out.copy_to_host_bf16(bits.data());
+        brotensor::sync_all();
+        vals.resize(bits.size());
+        for (std::size_t i = 0; i < bits.size(); ++i) {
+            vals[i] = brotensor::bf16_bits_to_fp32(bits[i]);
+        }
     } else {
         vals = out.to_host_vector();
     }
@@ -747,13 +764,72 @@ int run_t5(int argc, char** argv) {
         std::printf("  first 5    : %.5f %.5f %.5f %.5f %.5f\n",
                     vals[0], vals[1], vals[2], vals[3], vals[4]);
     }
+    if (dump_path) {
+        std::ofstream of(dump_path, std::ios::binary | std::ios::trunc);
+        of.write(reinterpret_cast<const char*>(vals.data()),
+                 static_cast<std::streamsize>(vals.size() * sizeof(float)));
+        std::printf("  dumped (%d,%d) to %s\n", L, D, dump_path);
+    }
     return nonfinite == 0 ? 0 : 1;
+}
+
+// Hidden debug subcommand: run ONE PixArtDenoiser forward on fixed inputs read
+// from raw float32 files, dump the epsilon. Used to diff against a diffusers
+// reference (scripts/pixart_ref.py). Not in usage().
+int run_pixart_fwd(int argc, char** argv) {
+    const char* w  = arg_after(argc, argv, "--weights");
+    const char* lp = arg_after(argc, argv, "--latent");
+    const char* cp = arg_after(argc, argv, "--ctx");
+    const char* op = arg_after(argc, argv, "--out");
+    const char* ts = arg_after(argc, argv, "--t");
+    const char* Hs = arg_after(argc, argv, "--H");
+    const char* Ws = arg_after(argc, argv, "--W");
+    const char* Ls = arg_after(argc, argv, "--L");
+    if (!w || !lp || !cp || !op || !ts || !Hs || !Ws || !Ls) {
+        std::fprintf(stderr, "pixart-fwd: need --weights --latent --ctx --out "
+                             "--t --H --W --L\n");
+        return 2;
+    }
+    const int H = std::atoi(Hs), W = std::atoi(Ws), L = std::atoi(Ls);
+    const float t = static_cast<float>(std::atof(ts));
+    brotensor::init();
+    brodiffusion::dit::PixArtConfig cfg;
+    brodiffusion::dit::PixArtDenoiser den(cfg);
+    auto f = st::File::open(w);
+    den.load_weights(f, "");
+    den.finalize_weights();
+
+    auto lat_h = load_latent_f32(lp, cfg.in_channels * H * W);
+    auto ctx_h = load_latent_f32(cp, L * cfg.caption_channels);
+    brotensor::Tensor lat =
+        brotensor::Tensor::from_host(lat_h.data(), 1, cfg.in_channels * H * W)
+            .to(brotensor::default_device());
+    brotensor::Tensor ctx =
+        brotensor::Tensor::from_host(ctx_h.data(), L, cfg.caption_channels)
+            .to(brotensor::default_device());
+    // Cast latent to the denoiser compute dtype (forward also handles this).
+    brodiffusion::Conditioning cond;
+    cond.text_embeddings = ctx;
+    cond.has_uncond = false;
+    auto prep = den.prepare(cond);
+    brotensor::Tensor out;
+    den.forward(lat, H, W, t, prep, brodiffusion::Branch::Cond, out);
+    brotensor::sync_all();
+    dump_latent_f32(op, out);
+    std::printf("pixart-fwd: wrote epsilon (%d,%d) to %s\n", out.rows, out.cols, op);
+    return 0;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) return usage();
+    if (std::strcmp(argv[1], "pixart-fwd") == 0) {
+        try { return run_pixart_fwd(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "pixart-fwd: %s\n", e.what()); return 1;
+        }
+    }
     if (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-v") == 0) {
         std::printf("brodiffusion %s\n", brodiffusion::version_string());
         return 0;
