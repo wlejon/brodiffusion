@@ -158,6 +158,7 @@ target_sources(brodiffusion PRIVATE
     src/scm_scheduler.cpp
     src/model_config.cpp
     src/sana_text.cpp
+    src/cond_control.cpp
     src/detail/safetensors_dir.cpp
     src/lora.cpp
     src/pipeline.cpp

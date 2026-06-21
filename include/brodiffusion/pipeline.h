@@ -14,6 +14,7 @@
 // rather than batching, since the rest of the inference stack is N=1.
 
 #include "brolm/clip.h"
+#include "brodiffusion/cond_control.h"
 #include "brodiffusion/controlnet.h"
 #include "brodiffusion/denoiser.h"
 #include "brodiffusion/dit/flux.h"
@@ -367,6 +368,13 @@ public:
 
     const PipelineConfig& config() const { return cfg_; }
 
+    // Conditioning-space control axes (the sana-research seam). Load a
+    // dictionary, set per-axis weights, and every subsequent prime() injects
+    // the weighted directions into the positive text conditioning before the
+    // denoiser. Empty / all-zero by default (no effect). See cond_control.h.
+    CondControl&       cond_control()       { return cond_control_; }
+    const CondControl& cond_control() const { return cond_control_; }
+
 private:
     void encode_prompt_(std::string_view prompt, brotensor::Tensor& out);
     // Sana txt2img priming: Gemma-encode prompt(s), prepare conditioning, and
@@ -416,6 +424,10 @@ private:
     // states from the same prime().
     Conditioning          conditioning_;
     PreparedConditioning  prepared_;
+
+    // Conditioning-space control axes, applied to the positive text embeddings
+    // in every prime() (no-op until a dictionary is loaded + a weight set).
+    CondControl           cond_control_;
 
     // Working buffers reused across step_once() calls. The current latent
     // lives on PipelineState, not here.

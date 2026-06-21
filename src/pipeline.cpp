@@ -572,6 +572,11 @@ PipelineState Pipeline::prime_sana_(std::string_view prompt,
     conditioning_.text_embeddings = brodiffusion::sana::encode_prompt(
         *gemma_model_, *gemma_tokenizer_, std::string(prompt),
         cfg_.sana_max_seq_len);
+    // Conditioning-space control seam: add the weighted control axes to the
+    // positive caption embeddings (rows [1, L), BOS untouched) before the DiT
+    // projects them. No-op unless a dictionary is loaded with a nonzero weight.
+    // The negative branch is left clean (steer the prompt, not the baseline).
+    cond_control_.apply(conditioning_.text_embeddings);
     if (do_cfg) {
         conditioning_.uncond_embeddings = brodiffusion::sana::encode_prompt(
             *gemma_model_, *gemma_tokenizer_,
