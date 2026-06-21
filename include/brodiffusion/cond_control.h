@@ -45,6 +45,19 @@ public:
 
     // Set axis `name`'s weight (alpha, in natural units). Throws if unknown.
     void set(const std::string& name, float alpha);
+
+    // Register (or replace) a runtime axis with an explicit direction + scale,
+    // and set its weight. Unlike load()'s dictionary axes these are built live —
+    // e.g. a diff-of-means search from user phrases. `dir` is taken as-is (the
+    // caller normalizes / MASSIVE-zeros as the recipe requires); its length sets
+    // dim() on the first call and must match it afterward. Coexists with loaded
+    // dictionary axes; apply()/clear()/names()/set() all see it uniformly.
+    void set_vector(const std::string& name, float alpha,
+                    const std::vector<float>& dir, float scale = 1.0f);
+
+    // Remove a single axis (runtime or dictionary) by name. No-op if unknown.
+    void remove(const std::string& name);
+
     // Reset every axis weight to zero (no injection); keeps the loaded dictionary.
     void clear();
     // True iff any axis has a nonzero weight (apply() is a no-op otherwise).

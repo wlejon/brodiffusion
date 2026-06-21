@@ -517,6 +517,21 @@ void Pipeline::encode_prompt_(std::string_view prompt, bt::Tensor& out) {
     text_encoder_.forward(ids.data(), out);
 }
 
+bt::Tensor Pipeline::encode_conditioning(std::string_view prompt) {
+    if (model_class_ == ModelClass::Sana) {
+        if (!gemma_model_ || !gemma_tokenizer_) {
+            fail("encode_conditioning: Gemma model/tokenizer not loaded");
+        }
+        return brodiffusion::sana::encode_prompt(
+            *gemma_model_, *gemma_tokenizer_, std::string(prompt),
+            cfg_.sana_max_seq_len);
+    }
+    // CLIP-based models (SD / Flux): reuse the fixed-length CLIP encode path.
+    bt::Tensor out;
+    encode_prompt_(prompt, out);
+    return out;
+}
+
 PipelineState PipelineState::clone() const {
     PipelineState out;
     out.latent     = latent.clone();

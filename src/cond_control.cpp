@@ -4,6 +4,7 @@
 
 #include "brotensor/ops/elementwise.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -76,6 +77,48 @@ void CondControl::set(const std::string& name, float alpha) {
         throw std::runtime_error("CondControl::set: no such axis '" + name + "'");
     }
     weight_[static_cast<std::size_t>(it->second)] = alpha;
+}
+
+void CondControl::set_vector(const std::string& name, float alpha,
+                             const std::vector<float>& dir, float scale) {
+    if (dir.empty()) {
+        throw std::runtime_error("CondControl::set_vector: empty direction");
+    }
+    if (dim_ == 0) {
+        dim_ = static_cast<int>(dir.size());
+    } else if (static_cast<int>(dir.size()) != dim_) {
+        throw std::runtime_error(
+            "CondControl::set_vector: direction width " + std::to_string(dir.size()) +
+            " != dim " + std::to_string(dim_));
+    }
+    auto it = index_.find(name);
+    if (it == index_.end()) {
+        const int k = static_cast<int>(names_.size());
+        index_[name] = k;
+        names_.push_back(name);
+        scale_.push_back(scale);
+        weight_.push_back(alpha);
+        dirs_.insert(dirs_.end(), dir.begin(), dir.end());
+    } else {
+        const int k = it->second;
+        scale_[static_cast<std::size_t>(k)]  = scale;
+        weight_[static_cast<std::size_t>(k)] = alpha;
+        std::copy(dir.begin(), dir.end(),
+                  dirs_.begin() + static_cast<std::size_t>(k) * dim_);
+    }
+}
+
+void CondControl::remove(const std::string& name) {
+    auto it = index_.find(name);
+    if (it == index_.end()) return;
+    const std::size_t k = static_cast<std::size_t>(it->second);
+    names_.erase(names_.begin() + k);
+    scale_.erase(scale_.begin() + k);
+    weight_.erase(weight_.begin() + k);
+    dirs_.erase(dirs_.begin() + k * dim_, dirs_.begin() + (k + 1) * dim_);
+    index_.clear();
+    for (int i = 0; i < static_cast<int>(names_.size()); ++i) index_[names_[i]] = i;
+    if (names_.empty()) dim_ = 0;
 }
 
 void CondControl::clear() {

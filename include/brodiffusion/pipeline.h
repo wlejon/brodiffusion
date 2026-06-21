@@ -375,6 +375,14 @@ public:
     CondControl&       cond_control()       { return cond_control_; }
     const CondControl& cond_control() const { return cond_control_; }
 
+    // Encode `prompt` into the model's text-conditioning sequence — the exact
+    // (L, hidden) embeddings the denoiser cross-attends to (row 0 = BOS). This
+    // is the same encode prime() runs, exposed so callers can build control
+    // directions in the encoder's own space (e.g. a diff-of-means axis from two
+    // phrase sets). Routes by model class: Gemma-2 for Sana, CLIP otherwise.
+    // Requires weights to be loaded.
+    brotensor::Tensor encode_conditioning(std::string_view prompt);
+
 private:
     void encode_prompt_(std::string_view prompt, brotensor::Tensor& out);
     // Sana txt2img priming: Gemma-encode prompt(s), prepare conditioning, and
