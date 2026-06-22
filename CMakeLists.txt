@@ -218,6 +218,10 @@ if(BRODIFFUSION_CLI)
     add_executable(brodiffusion_cli cli/main.cpp)
     target_link_libraries(brodiffusion_cli PRIVATE brodiffusion)
     set_target_properties(brodiffusion_cli PROPERTIES OUTPUT_NAME brodiffusion)
+
+    # DiT-only nondeterminism harness (no T5/VAE) — compute-sanitizer target.
+    add_executable(dit_race tools/dit_race.cpp)
+    target_link_libraries(dit_race PRIVATE brodiffusion)
 endif()
 
 # --- Install / export ---
