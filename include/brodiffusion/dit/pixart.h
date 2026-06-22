@@ -83,6 +83,20 @@ public:
     bool uses_cfg() const override { return true; }
     brotensor::Dtype compute_dtype() const override;
 
+    // ── CUDA-graph step-capture seam ──────────────────────────────────────
+    // The per-step time-embedding chain (host-dependent) is prepare_step; the
+    // remaining device-only block stack + GPU unpatchify is forward_body, which
+    // after warm-up is allocation-stable and host-free (no proj download — the
+    // unpatchify runs on the GPU via brotensor::patch_unpack_forward). forward()
+    // is exactly prepare_step + forward_body, so the eager and captured paths
+    // share one body.
+    bool supports_step_capture() const override { return true; }
+    void prepare_step(float timestep,
+                      const PreparedConditioning& prepared) override;
+    void forward_body(const brotensor::Tensor& latent, int H_lat, int W_lat,
+                      const PreparedConditioning& prepared, Branch branch,
+                      brotensor::Tensor& out) override;
+
     const PixArtConfig& config() const { return cfg_; }
 
 private:
@@ -126,6 +140,14 @@ private:
                            const brotensor::Tensor& K, const brotensor::Tensor& V,
                            const Linear& out_proj, brotensor::Tensor& out);
 
+    // Shared device-side body: patch-embed -> blocks -> norm_out -> proj_out ->
+    // GPU unpatchify, against an already-selected (and projected) caption
+    // context. Reads the persistent emb_/temb6_ written by prepare_step. After
+    // one warm-up call it allocates no named buffer and reads/writes no host
+    // memory, so the Pipeline can record it with CudaGraphCapture.
+    void body_(const brotensor::Tensor& latent, int H_lat, int W_lat,
+               const brotensor::Tensor& ctx, brotensor::Tensor& out);
+
     // Per-block sub-layers; each writes its (N, inner) output into `out`.
     void self_attention_(const Block& blk, const brotensor::Tensor& x_mod,
                          brotensor::Tensor& out);
@@ -154,12 +176,21 @@ private:
     brotensor::Tensor pos_embed_;
     int pos_hp_ = -1, pos_wp_ = -1;
 
-    // ── per-forward scratch (kept alive to avoid realloc) ──────────────────
+    // ── per-step scratch (kept alive to avoid realloc) ─────────────────────
+    // Time-embedding chain (written by prepare_step into STABLE buffers — the
+    // captured body reads emb_ and temb6_ by pointer, so prepare_step must never
+    // reassign/clone them, only overwrite via ops). ts_ is consumed inside
+    // prepare_step itself, so its per-step reallocation is harmless.
     brotensor::Tensor ts_, freq_, freq_cd_;
-    brotensor::Tensor emb_, emb_silu_, temb6_;
+    brotensor::Tensor te_h_, emb_, emb_silu_, temb6_;
+    // Body scratch.
+    brotensor::Tensor lat_cd_;                 // FP32 latent (cast of the input)
     brotensor::Tensor mod_row_, ln_, mod_;
+    std::vector<brotensor::Tensor> ch_, no_;   // sliced modulation chunks
+    brotensor::Tensor shift_, scale_;          // norm_out shift/scale (no clone)
     brotensor::Tensor hidden_, patch_nchw_;
     brotensor::Tensor gated_, sub_out_;
+    brotensor::Tensor out_unpack_;             // GPU unpatchify result (pre-cast)
     // Mixed-precision scratch: FP16 (mm_dtype) views of the FP32 modulated input
     // / residual that feed the tensor-core GEMMs, and the FP16 sublayer output
     // before it is cast back into the FP32 residual.
@@ -175,7 +206,6 @@ private:
     // feed-forward scratch
     brotensor::Tensor ff_h_;
     brotensor::Tensor proj_;                // proj_out output (N, p^2*OC)
-    brotensor::Tensor out_full_;            // unpatchified (1, OC*N) host-built
 };
 
 }  // namespace brodiffusion::dit

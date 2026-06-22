@@ -233,13 +233,15 @@ std::unique_ptr<Denoiser> make_denoiser(const PipelineConfig& cfg) {
 // the capture at the end of that step records a replayable graph.
 struct Pipeline::StepGraphSession {
 #ifdef BROTENSOR_HAS_CUDA
-    bt::CudaGraph graph;
+    bt::CudaGraph graph;          // cond branch (also the single graph when no CFG)
+    bt::CudaGraph graph_uncond;   // uncond branch — a SEPARATE graph under CFG
 #endif
     const void* latent_ptr  = nullptr;  // state.latent.data
     const void* prepared_id = nullptr;  // prepared_.get()
     int  H = 0, W = 0;
     bool do_cfg = false;
     int  eager_steps = 0;
+    bool captured = false;   // warm-up done, graph(s) instantiated
 };
 
 Pipeline::~Pipeline() = default;
@@ -1162,8 +1164,9 @@ void Pipeline::step_denoise_captured_(PipelineState& state, float t,
     // writes the persistent temb buffers the captured body reads.
     denoiser_->prepare_step(t, prepared_);
 
-    if (s->graph.valid()) {
-        s->graph.launch();
+    if (s->captured) {
+        s->graph.launch();                       // cond branch
+        if (do_cfg) s->graph_uncond.launch();    // uncond branch
         return;
     }
 
@@ -1187,22 +1190,26 @@ void Pipeline::step_denoise_captured_(PipelineState& state, float t,
     const int body_calls = s->eager_steps * (do_cfg ? 2 : 1);
     if (body_calls < 3) return;
 
-    // Capture at the end of the second eager step: re-issue the identical
-    // bodies on the capture stream. Capture records the op sequence without
-    // executing it (the eager outputs above stand for this step); every
-    // later step replays the whole sequence with one cudaGraphLaunch.
-    bt::sync_all();
+    // Capture at the end of the second eager step: re-issue each body on the
+    // capture stream into its OWN graph. Capture records the op sequence without
+    // executing it (the eager outputs above stand for this step); every later
+    // step replays each branch with one cudaGraphLaunch. Each CFG branch gets its
+    // own graph (the bodies share all scratch buffers).
     {
+        bt::sync_all();
         bt::CudaGraphCapture cap;
         denoiser_->forward_body(state.latent, state.H_lat, state.W_lat,
                                 prepared_, Branch::Cond, noise_pred_cond_);
-        if (do_cfg) {
-            denoiser_->forward_body(state.latent, state.H_lat, state.W_lat,
-                                    prepared_, Branch::Uncond,
-                                    noise_pred_uncond_);
-        }
         s->graph = cap.finish();
     }
+    if (do_cfg) {
+        bt::sync_all();
+        bt::CudaGraphCapture cap;
+        denoiser_->forward_body(state.latent, state.H_lat, state.W_lat,
+                                prepared_, Branch::Uncond, noise_pred_uncond_);
+        s->graph_uncond = cap.finish();
+    }
+    s->captured = true;
 #else
     // No CUDA backend in this build: plain eager forwards.
     denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,

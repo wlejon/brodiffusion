@@ -423,15 +423,62 @@ PreparedConditioning PixArtDenoiser::prepare(const Conditioning& cond) {
     return PreparedConditioning(std::move(prep));
 }
 
-// ─── forward ───────────────────────────────────────────────────────────────
+// ─── forward / CUDA-graph step capture ───────────────────────────────────────
+
+void PixArtDenoiser::prepare_step(float timestep,
+                                  const PreparedConditioning& prepared) {
+    (void)prepared;  // PixArt's per-step inputs depend only on the timestep
+    if (patch_proj_.W.size() == 0) fail("prepare_step: weights not loaded");
+    const bt::Dtype cdt = compute_dtype();
+    const bt::Device dev = bt::default_device();
+
+    // timestep → sinusoidal embedding (host scalar in, device buffer out).
+    std::vector<float> tval = {timestep};
+    ts_ = bt::Tensor::from_host(tval.data(), 1, 1).to(dev);
+    bt::timestep_embedding(ts_, /*dim=*/256, /*max_period=*/10000.0f, freq_);
+    const bt::Tensor* tin = &freq_;
+    if (cdt != bt::Dtype::FP32) { bt::cast(freq_, freq_cd_, cdt); tin = &freq_cd_; }
+
+    // timestep_embedder (256→D, SiLU, D→D) then AdaLN-single proj (D→6D). emb_
+    // (embedded_timestep) and temb6_ are read again by the captured body, so
+    // they must be STABLE buffers — written through ops, never cloned/reassigned
+    // (a clone would hand the body a fresh pointer the captured graph never saw).
+    // te_l2's output must not alias its input, so te_h_ is a distinct buffer.
+    lin_(te_l1_, *tin, te_h_);
+    bt::silu_forward(te_h_, te_h_);
+    lin_(te_l2_, te_h_, emb_);              // embedded_timestep (1, D)
+    bt::silu_forward(emb_, emb_silu_);
+    lin_(adaln_proj_, emb_silu_, temb6_);  // global 6D modulation row (1, 6D)
+}
 
 void PixArtDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
                              float timestep,
                              const PreparedConditioning& prepared,
                              Branch branch, bt::Tensor& out) {
-    if (!prepared) fail("forward: prepared conditioning is empty");
+    // forward() == prepare_step + forward_body, so the eager and CUDA-graph
+    // captured paths run the exact same device-side body.
+    prepare_step(timestep, prepared);
+    forward_body(latent, H_lat, W_lat, prepared, branch, out);
+}
+
+void PixArtDenoiser::forward_body(const bt::Tensor& latent, int H_lat, int W_lat,
+                                  const PreparedConditioning& prepared,
+                                  Branch branch, bt::Tensor& out) {
+    if (!prepared) fail("forward_body: prepared conditioning is empty");
     const auto* prep = dynamic_cast<const PixArtPrepared*>(prepared.get());
-    if (!prep) fail("forward: prepared conditioning has the wrong type");
+    if (!prep) fail("forward_body: prepared conditioning has the wrong type");
+    const bt::Tensor* ctx = &prep->ctx_cond;
+    if (branch == Branch::Uncond) {
+        if (!prep->has_uncond) {
+            fail("forward_body: uncond branch but no uncond ctx");
+        }
+        ctx = &prep->ctx_uncond;
+    }
+    body_(latent, H_lat, W_lat, *ctx, out);
+}
+
+void PixArtDenoiser::body_(const bt::Tensor& latent, int H_lat, int W_lat,
+                           const bt::Tensor& ctx, bt::Tensor& out) {
     if (patch_proj_.W.size() == 0) fail("forward: weights not loaded");
     if (H_lat <= 0 || W_lat <= 0) fail("forward: H_lat/W_lat must be positive");
     if ((H_lat % cfg_.patch_size) != 0 || (W_lat % cfg_.patch_size) != 0) {
@@ -444,62 +491,34 @@ void PixArtDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
     const int P   = cfg_.patch_size;
     const int hp  = H_lat / P;
     const int wp  = W_lat / P;
-    const int N   = hp * wp;                 // patch tokens
     const bt::Dtype cdt = compute_dtype();
-    const bt::Device dev = bt::default_device();
 
     if (latent.rows != 1 || latent.cols != IC * H_lat * W_lat) {
         fail("forward: latent must be (1, in_channels*H_lat*W_lat)");
     }
 
-    const bt::Tensor* ctx = &prep->ctx_cond;
-    if (branch == Branch::Uncond) {
-        if (!prep->has_uncond) fail("forward: uncond branch but no uncond ctx");
-        ctx = &prep->ctx_uncond;
-    }
-
-    // ── timestep → AdaLN-single ───────────────────────────────────────────
-    {
-        std::vector<float> tval = {timestep};
-        ts_ = bt::Tensor::from_host(tval.data(), 1, 1).to(dev);
-        bt::timestep_embedding(ts_, /*dim=*/256, /*max_period=*/10000.0f, freq_);
-    }
-    const bt::Tensor* tin = &freq_;
-    if (cdt != bt::Dtype::FP32) { bt::cast(freq_, freq_cd_, cdt); tin = &freq_cd_; }
-    // NOTE: te_l2's output must NOT alias its input — a matmul that reads and
-    // writes the same buffer corrupts. (te_l1 is safe: its output has a
-    // different shape than the freq input, so it reallocates.)
-    lin_(te_l1_, *tin, emb_);
-    bt::silu_forward(emb_, emb_);          // elementwise in-place is fine
-    lin_(te_l2_, emb_, emb_silu_);         // separate output buffer
-    emb_ = emb_silu_.clone();              // embedded_timestep (1, D)
-
-    bt::silu_forward(emb_, emb_silu_);
-    lin_(adaln_proj_, emb_silu_, temb6_);
-    temb6_ = temb6_.clone();                      // (1, 6D)
-
     // ── patch embed: conv 2x2 stride 2 → tokens, + positional embedding ────
-    bt::Tensor lat_cd;
     const bt::Tensor* lat = &latent;
-    if (latent.dtype != cdt) { bt::cast(latent, lat_cd, cdt); lat = &lat_cd; }
+    if (latent.dtype != cdt) { bt::cast(latent, lat_cd_, cdt); lat = &lat_cd_; }
     bt::conv2d_forward(*lat, patch_proj_.W, &patch_proj_.b, 1, IC, H_lat, W_lat,
                        D, P, P, P, P, 0, 0, 1, 1, /*groups=*/1, patch_nchw_);
     bt::nchw_to_sequence(patch_nchw_, 1, D, hp, wp, hidden_);   // (N, D)
     bt::add_inplace(hidden_, pos_embed_for_(hp, wp));
-    hidden_ = hidden_.clone();
 
     // ── transformer blocks ────────────────────────────────────────────────
-    std::vector<bt::Tensor> ch;
     for (const Block& blk : blocks_) {
-        mod_row_ = temb6_.clone();
+        // mod_row = temb6 + per-block scale_shift, into a stable buffer (no
+        // clone — the captured body must not reallocate named buffers).
+        detail::resize_like(mod_row_, 1, 6 * D, temb6_.dtype, temb6_.device);
+        bt::copy_d2d(temb6_, 0, mod_row_, 0, 6 * D);
         bt::add_inplace(mod_row_, blk.scale_shift);
-        slice_modulation_chunks(mod_row_, D, 6, ch);
-        const bt::Tensor& shift_msa = ch[0];
-        const bt::Tensor& scale_msa = ch[1];
-        const bt::Tensor& gate_msa  = ch[2];
-        const bt::Tensor& shift_mlp = ch[3];
-        const bt::Tensor& scale_mlp = ch[4];
-        const bt::Tensor& gate_mlp  = ch[5];
+        slice_modulation_chunks(mod_row_, D, 6, ch_);
+        const bt::Tensor& shift_msa = ch_[0];
+        const bt::Tensor& scale_msa = ch_[1];
+        const bt::Tensor& gate_msa  = ch_[2];
+        const bt::Tensor& shift_mlp = ch_[3];
+        const bt::Tensor& scale_mlp = ch_[4];
+        const bt::Tensor& gate_mlp  = ch_[5];
 
         // 1. self-attn: h += gate_msa * attn1(modulate(LN(h)))
         detail::layernorm_batched(hidden_, ada_gamma_, ada_beta_, ln_,
@@ -510,7 +529,7 @@ void PixArtDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
         bt::add_inplace(hidden_, gated_);
 
         // 2. cross-attn: h += attn2(h, caption)   (no norm, no modulation)
-        cross_attention_(blk, *ctx, hidden_, sub_out_);
+        cross_attention_(blk, ctx, hidden_, sub_out_);
         bt::add_inplace(hidden_, sub_out_);
 
         // 3. feed-forward: h += gate_mlp * ff(modulate(LN(h)))
@@ -523,67 +542,35 @@ void PixArtDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
     }
 
     // ── norm_out → proj_out ───────────────────────────────────────────────
-    std::vector<bt::Tensor> no;
-    slice_modulation_chunks(norm_out_sst_, D, 2, no);   // shift, scale
-    bt::Tensor shift = no[0].clone();
-    bt::Tensor scale = no[1].clone();
-    bt::add_inplace(shift, emb_);                       // + embedded_timestep
-    bt::add_inplace(scale, emb_);
+    slice_modulation_chunks(norm_out_sst_, D, 2, no_);   // shift, scale
+    // shift/scale = top-level table row + embedded_timestep, into stable buffers
+    // (no clone — see the per-block note above).
+    detail::resize_like(shift_, 1, D, no_[0].dtype, no_[0].device);
+    detail::resize_like(scale_, 1, D, no_[1].dtype, no_[1].device);
+    bt::copy_d2d(no_[0], 0, shift_, 0, D);
+    bt::copy_d2d(no_[1], 0, scale_, 0, D);
+    bt::add_inplace(shift_, emb_);                       // + embedded_timestep
+    bt::add_inplace(scale_, emb_);
     detail::layernorm_batched(hidden_, ada_gamma_, ada_beta_, ln_,
                               cfg_.norm_eps);
-    bt::modulate(ln_, scale, shift, mod_);
-    lin_(proj_out_, mod_, proj_);                       // (N, P*P*OC)
+    bt::modulate(ln_, scale_, shift_, mod_);
+    lin_(proj_out_, mod_, proj_);                       // (N, P*P*OC), FP32
 
-    // ── unpatchify, keeping the first in_channels (drop the variance half) ──
-    // proj_[tok][(py*P+px)*OC + c]  ->  out[c, P*i+py, P*j+px], for c < IC.
-    bt::sync_all();
-    const std::size_t proj_n =
-        static_cast<std::size_t>(proj_.rows) * static_cast<std::size_t>(proj_.cols);
-    std::vector<float> proj_host(proj_n);
-    if (proj_.dtype == bt::Dtype::FP16) {
-        std::vector<std::uint16_t> bits(proj_n);
-        proj_.copy_to_host_fp16(bits.data());
-        bt::sync_all();
-        for (std::size_t k = 0; k < proj_n; ++k) {
-            proj_host[k] = bt::fp16_bits_to_fp32(bits[k]);
-        }
-    } else if (proj_.dtype == bt::Dtype::BF16) {
-        std::vector<std::uint16_t> bits(proj_n);
-        proj_.copy_to_host_bf16(bits.data());
-        bt::sync_all();
-        for (std::size_t k = 0; k < proj_n; ++k) {
-            proj_host[k] = bt::bf16_bits_to_fp32(bits[k]);
-        }
+    // ── unpatchify on the GPU, keeping the first in_channels (drop the learned
+    // variance half). proj_ is block-major: col = (py*P+px)*OC + c. A pure
+    // device-side gather (no proj download) — this is what makes the body
+    // CUDA-graph capturable. See brotensor::patch_unpack_forward.
+    if (brodiffusion::compute_dtype() == bt::Dtype::FP32) {
+        // CPU path: proj_ and the output are both FP32 — gather straight to out.
+        bt::patch_unpack_forward(proj_, hp, wp, P, OC, IC,
+                                 /*channel_major=*/false, out);
     } else {
-        proj_host = proj_.to_host_vector();
+        // GPU path: gather the FP32 proj_, then cast into the pipeline dtype
+        // (FP16), matching exactly what the old host upload produced.
+        bt::patch_unpack_forward(proj_, hp, wp, P, OC, IC,
+                                 /*channel_major=*/false, out_unpack_);
+        bt::cast(out_unpack_, out, brodiffusion::compute_dtype());
     }
-
-    const int HW = H_lat * W_lat;
-    std::vector<float> host_out(static_cast<std::size_t>(IC) *
-                                static_cast<std::size_t>(HW));
-    const int pp_oc = P * P * OC;
-    for (int i = 0; i < hp; ++i) {
-        for (int j = 0; j < wp; ++j) {
-            const int tok = i * wp + j;
-            const float* tv =
-                proj_host.data() + static_cast<std::size_t>(tok) *
-                                       static_cast<std::size_t>(pp_oc);
-            for (int py = 0; py < P; ++py) {
-                for (int px = 0; px < P; ++px) {
-                    const int y = i * P + py;
-                    const int x = j * P + px;
-                    const int blk = (py * P + px) * OC;
-                    for (int c = 0; c < IC; ++c) {
-                        host_out[static_cast<std::size_t>(c) * HW +
-                                 static_cast<std::size_t>(y) * W_lat + x] =
-                            tv[blk + c];
-                    }
-                }
-            }
-        }
-    }
-    out = detail::upload_host(host_out.data(), 1, IC * HW);
-    (void)N; (void)dev;
 }
 
 }  // namespace brodiffusion::dit
