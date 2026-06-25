@@ -393,6 +393,34 @@ public:
     // Requires weights to be loaded.
     brotensor::Tensor encode_conditioning(std::string_view prompt);
 
+    // ── Reference-attention identity anchor (the frame/sana-research seam) ──
+    //
+    // Sana's self-attention is linear, so a reference image's appearance can be
+    // injected training-free: capture a neutral anchor's per-(branch,step,block)
+    // attention summaries during one denoise, then add them (scaled by a weight)
+    // into every later generation. The anchor carries visual IDENTITY; each
+    // generation's own prompt still sets pose / expression. This lets a steered
+    // attribute (e.g. an emotion cond_control axis pushed to the extreme) move
+    // freely while the subject stays the same person — text-carries-structure,
+    // image-carries-identity, no training and no clamp. Sana-only (throws on
+    // other model classes); see dit::SanaDenoiser's ref_* methods.
+    //
+    // capture_identity_anchor() runs one full generation of `prompt` with the
+    // denoiser recording, returns that anchor image, and arms the seam. The
+    // captured step count should match later generations' num_inference_steps
+    // for tight t-alignment (a shorter run reuses the anchor's final step).
+    std::vector<float> capture_identity_anchor(std::string_view prompt,
+                                               const GenerateOptions& opts);
+    // Injection strength. 0 (default) disables injection even with an anchor
+    // armed; ~1 reproduces the reference faithfully; higher over-anchors. Takes
+    // effect on the next generate() / prime().
+    void  set_identity_weight(float weight);
+    float identity_weight() const;
+    // True once an anchor has been captured (until clear_identity_anchor()).
+    bool  has_identity_anchor() const;
+    // Drop the cached anchor and zero the weight (frees the summary cache).
+    void  clear_identity_anchor();
+
 private:
     // Encode a prompt to the CLIP (77, hidden) conditioning. If content_end is
     // non-null, it receives the EOS index (first eos_id) = end of the content
@@ -450,6 +478,15 @@ private:
     // Conditioning-space control axes, applied to the positive text embeddings
     // in every prime() (no-op until a dictionary is loaded + a weight set).
     CondControl           cond_control_;
+
+    // Reference-attention identity anchor state (Sana only). identity_anchor_ is
+    // set once capture_identity_anchor() succeeds; identity_weight_ scales the
+    // injection (0 = off). capturing_anchor_ is true only while
+    // capture_identity_anchor() drives the recording generation, so prime_sana_
+    // leaves the denoiser in Capture mode instead of switching it to Inject.
+    bool  identity_anchor_   = false;
+    bool  capturing_anchor_  = false;
+    float identity_weight_   = 0.0f;
 
     // Working buffers reused across step_once() calls. The current latent
     // lives on PipelineState, not here.

@@ -316,6 +316,58 @@ void SanaDenoiser::ensure_ones_(int n) {
     }
 }
 
+// ─── reference-attention identity seam ─────────────────────────────────────
+
+void SanaDenoiser::ref_begin_capture(int n_steps) {
+    if (n_steps <= 0) fail("ref_begin_capture: n_steps must be positive");
+    ref_mode_   = RefMode::Capture;
+    ref_steps_  = n_steps;
+    ref_weight_ = 0.0f;
+    ref_have_   = false;
+    ref_step_[0] = ref_step_[1] = -1;
+    const std::size_t slots =
+        static_cast<std::size_t>(2) * n_steps * cfg_.num_layers;
+    ref_S_.assign(slots, bt::Tensor{});   // lazily filled per (branch,step,block)
+    ref_z_.assign(slots, bt::Tensor{});
+}
+
+void SanaDenoiser::ref_mark_anchor() {
+    ref_have_ = true;        // the just-captured summaries are now the anchor
+    ref_mode_ = RefMode::Off;
+}
+
+void SanaDenoiser::ref_begin_inject(float weight) {
+    if (!ref_have_) { ref_mode_ = RefMode::Off; return; }
+    ref_mode_   = RefMode::Inject;
+    ref_weight_ = weight;
+    ref_step_[0] = ref_step_[1] = -1;
+}
+
+void SanaDenoiser::ref_set_off() { ref_mode_ = RefMode::Off; }
+
+void SanaDenoiser::ref_clear() {
+    ref_mode_  = RefMode::Off;
+    ref_have_  = false;
+    ref_steps_ = 0;
+    ref_S_.clear();
+    ref_z_.clear();
+}
+
+int SanaDenoiser::ref_slot_() const {
+    const int b = ref_cur_branch_;
+    int s = ref_step_[b];
+    if (s < 0) return -1;
+    if (ref_mode_ == RefMode::Inject) {
+        if (s >= ref_steps_) s = ref_steps_ - 1;   // shorter run reuses last step
+    } else if (s >= ref_steps_) {
+        return -1;                                  // capture overflow guard
+    }
+    const long slot =
+        (static_cast<long>(b) * ref_steps_ + s) * cfg_.num_layers + ref_block_;
+    if (slot < 0 || slot >= static_cast<long>(ref_S_.size())) return -1;
+    return static_cast<int>(slot);
+}
+
 // ─── prepared conditioning ─────────────────────────────────────────────────
 
 PreparedConditioning SanaDenoiser::prepare(const Conditioning& cond) {
@@ -367,6 +419,11 @@ void SanaDenoiser::self_attention_(const Block& blk, int N, int H, int W,
     const int nh = cfg_.num_attention_heads;
     const bt::Dtype cdt = compute_dtype();
     const bt::Device dev = x_mod.device;
+
+    // Reference-attention identity seam: the cache slot for this (branch, step,
+    // block), or -1 when neither capturing nor injecting. Resolved once here and
+    // consumed inside the attention core below.
+    const int ref_slot = (ref_mode_ != RefMode::Off) ? ref_slot_() : -1;
 
     // To channel-major (D, N): Xcm[c,n] = x_mod[n,c].
     prof("sa_proj", [&] {
@@ -432,7 +489,28 @@ void SanaDenoiser::self_attention_(const Block& blk, int N, int H, int W,
             bt::Tensor KhN = sub_view(k_, static_cast<std::int64_t>(base) * N,
                                       1, hd * N);
             bt::nchw_to_sequence(KhN, 1, hd, H, W, kt_);  // (N, hd)
-            bt::matmul(vp_, kt_, scores_);                // (hd+1, hd)
+            bt::matmul(vp_, kt_, scores_);                // (hd+1, hd) = [S_h; z_h]
+            // Identity seam: scores_ rows 0..hd-1 are S_h = V_h·relu(K_h)ᵀ and
+            // row hd is z_h = Σ relu(K_h), so capturing / injecting scores_ is
+            // exactly (S, z) per head. Cache layout: nh stacked (hd+1, hd) blocks.
+            if (ref_slot >= 0) {
+                const std::int64_t hh = static_cast<std::int64_t>(hd + 1) * hd;
+                if (ref_mode_ == RefMode::Capture) {
+                    if (ref_S_[ref_slot].size() == 0) {
+                        detail::resize_like(ref_S_[ref_slot], nh * (hd + 1), hd,
+                                            bt::Dtype::FP32, dev);
+                    }
+                    bt::copy_d2d(scores_, 0, ref_S_[ref_slot],
+                                 static_cast<std::int64_t>(h) * hh, hh);
+                } else if (ref_mode_ == RefMode::Inject &&
+                           ref_S_[ref_slot].size() > 0) {
+                    // scores_ += w · anchor[h]  (S += w·S_anchor, z += w·z_anchor).
+                    bt::Tensor anchor_h = sub_view(
+                        ref_S_[ref_slot], static_cast<std::int64_t>(h) * hh,
+                        hd + 1, hd);
+                    bt::axpby_inplace(scores_, anchor_h, 1.0f, ref_weight_);
+                }
+            }
             bt::matmul(scores_, Qh, hid_);                // (hd+1, N)
             detail::resize_like(recip_, 1, N, bt::Dtype::FP32, dev);
             bt::copy_d2d(hid_, hd * N, recip_, 0, N);
@@ -464,6 +542,19 @@ void SanaDenoiser::self_attention_(const Block& blk, int N, int H, int W,
         }
         detail::resize_like(sa_z_, D, 1, cdt, dev);
         bt::matmul_abt(k_, ones_bf_, sa_z_, 1, D, 1, N, 0, 0, 0, nullptr, 0);
+        // Identity seam: capture or inject the (S, z) summaries before the
+        // query read. Inject is sa_S_ += w·anchorS, sa_z_ += w·anchorz — the
+        // exact linear-attention equivalent of concatenating the anchor's K,V.
+        if (ref_slot >= 0) {
+            if (ref_mode_ == RefMode::Capture) {
+                ref_S_[ref_slot] = sa_S_.clone();
+                ref_z_[ref_slot] = sa_z_.clone();
+            } else if (ref_mode_ == RefMode::Inject &&
+                       ref_S_[ref_slot].size() > 0) {
+                bt::axpby_inplace(sa_S_, ref_S_[ref_slot], 1.0f, ref_weight_);
+                bt::axpby_inplace(sa_z_, ref_z_[ref_slot], 1.0f, ref_weight_);
+            }
+        }
         // Qrᵀ: (nh,hd,N) → (nh,N,hd) channel→token transpose, batched over heads.
         bt::nchw_to_sequence(q_, nh, hd, H, W, sa_qt_);    // (nh*N, hd)
         // num[h] = S[h] @ Qrᵀ[h]ᵀ → (hd, N), batched.
@@ -580,6 +671,15 @@ void SanaDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
     if (patch_embed_.W.size() == 0) fail("forward: weights not loaded");
     if (H_lat <= 0 || W_lat <= 0) fail("forward: H_lat/W_lat must be positive");
 
+    // Reference-attention step tracking: the pipeline runs one Cond then one
+    // Uncond forward per denoising step, so advancing a per-branch counter here
+    // recovers the step index for the (branch, step, block) cache without
+    // changing the Denoiser interface. No-op unless capturing or injecting.
+    if (ref_mode_ != RefMode::Off) {
+        ref_cur_branch_ = (branch == Branch::Uncond) ? 1 : 0;
+        ++ref_step_[ref_cur_branch_];
+    }
+
     const int D   = cfg_.inner_dim();
     const int IC  = cfg_.in_channels;
     const int OC  = cfg_.out_channels;
@@ -645,7 +745,9 @@ void SanaDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
 
     // ── 28 SanaTransformerBlocks ──────────────────────────────────────────
     std::vector<bt::Tensor> ch;
+    int blk_i = 0;
     for (const Block& blk : blocks_) {
+        ref_block_ = blk_i++;   // identity-seam cache index for self_attention_
         // AdaLN-single: (scale_shift_table + temb6) → 6 chunks.
         std::vector<bt::Tensor> c;
         prof("adaln", [&] {

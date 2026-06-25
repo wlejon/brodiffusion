@@ -97,6 +97,33 @@ public:
 
     const SanaConfig& config() const { return cfg_; }
 
+    // ── Reference-attention identity seam (Sana linear-attention only) ──────
+    //
+    // Sana's self-attention is LINEAR: per head, with S = V·relu(K)ᵀ and
+    // z = Σₙ relu(K), the output is out = (relu(q)·S) / (relu(q)·z + eps).
+    // Concatenating a reference image's K,V tokens into that attention is
+    // therefore mathematically identical to ADDING the reference's (S, z) to
+    // the target's — no token-dimension surgery, no variable-length tensors.
+    //
+    // So we capture a neutral anchor's per-(branch, step, block) summaries
+    // during one full denoise (ref_begin_capture → run → ref_mark_anchor),
+    // then ADD weight·them into every subsequent denoise (ref_begin_inject).
+    // The anchor's visual identity rides into each generation while that
+    // generation's own text query still sets pose / expression — the
+    // text-carries-structure / image-carries-identity split, training-free.
+    //
+    // The summaries are token-count independent (S is (hd,hd), z is (hd,1) per
+    // head — both summed over tokens), so the anchor and target may differ in
+    // size; only the step count must match for t-alignment, and the step index
+    // is clamped if a later run uses fewer steps.
+    void ref_begin_capture(int n_steps);  // record summaries during this denoise
+    void ref_mark_anchor();               // promote the just-captured run to the anchor
+    void ref_begin_inject(float weight);  // add weight·anchor summaries this denoise
+    void ref_set_off();                   // neither capture nor inject
+    void ref_clear();                     // drop the cached anchor entirely
+    bool ref_has_anchor() const { return ref_have_; }
+    int  ref_anchor_steps() const { return ref_steps_; }
+
 private:
     // A linear layer (weight (out,in)); bias optional (empty => bias-free).
     struct Linear {
@@ -183,6 +210,30 @@ private:
     brotensor::Tensor ff_spatial_, ff_t1_, ff_t2_, ff_out_;
     brotensor::Tensor proj_;
     brotensor::Tensor out_cd_;   // (1, OC*N) compute-dtype velocity before FP32
+
+    // ── reference-attention identity seam (see the public block above) ──────
+    // ref_mode_ drives self_attention_. ref_step_[branch] is self-advanced at
+    // the top of forward(): the pipeline runs the Cond then the Uncond forward
+    // once per step, so a per-branch counter recovers the step index without
+    // threading it through the Denoiser interface. ref_block_ is set in the
+    // block loop. The cache is indexed [(branch*steps + step)*num_layers + block];
+    // for the CUDA/BF16 core ref_S_ holds S (D,hd) and ref_z_ holds z (D,1);
+    // for the FP32 reference core ref_S_ holds the per-head stacked [S;z]
+    // ((nh*(hd+1), hd)) and ref_z_ is unused.
+    enum class RefMode { Off, Capture, Inject };
+    RefMode ref_mode_  = RefMode::Off;
+    bool    ref_have_  = false;        // a captured anchor is resident
+    int     ref_steps_ = 0;            // step count the anchor was captured at
+    float   ref_weight_ = 0.0f;        // inject strength
+    int     ref_step_[2] = {-1, -1};   // per-branch step counter (Cond=0, Uncond=1)
+    int     ref_cur_branch_ = 0;       // branch of the in-flight forward
+    int     ref_block_ = 0;            // block index within the in-flight forward
+    std::vector<brotensor::Tensor> ref_S_;     // per-(branch,step,block) summary
+    std::vector<brotensor::Tensor> ref_z_;     // per-(branch,step,block) denom (CUDA)
+    // Flat cache index for the in-flight (branch, step, block), or -1 to skip
+    // (step not yet started, capture overflow, or out of range). Clamps the
+    // step on inject so a shorter run reuses the anchor's final-step summary.
+    int ref_slot_() const;
 };
 
 }  // namespace brodiffusion::dit

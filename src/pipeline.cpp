@@ -731,6 +731,22 @@ PipelineState Pipeline::prime_sana_(std::string_view prompt,
     //     + caption_norm), shared across all branched states.
     prepared_ = denoiser_->prepare(conditioning_);
 
+    // Reference-attention identity seam (Sana linear-attention only). When
+    // capture_identity_anchor() is driving this run the denoiser is already in
+    // Capture mode (left as-is). Otherwise, inject the cached anchor's summaries
+    // when a positive weight is set, or disable the seam. Done once per
+    // generation, before the stepping loop advances the per-branch step counter.
+    {
+        auto* sana = static_cast<dit::SanaDenoiser*>(denoiser_.get());
+        if (capturing_anchor_) {
+            // leave Capture mode as set by capture_identity_anchor()
+        } else if (sana->ref_has_anchor() && identity_weight_ > 0.0f) {
+            sana->ref_begin_inject(identity_weight_);
+        } else {
+            sana->ref_set_off();
+        }
+    }
+
     // 2. State shell + timestep schedule (rectified-flow FlowMatch, shift=3).
     PipelineState state;
     state.H_lat   = H_lat;
@@ -1563,6 +1579,48 @@ std::vector<float> Pipeline::decode(const PipelineState& state) {
         return out;
     }
     return decoded_.to_host_vector();
+}
+
+// ── reference-attention identity anchor (Sana only) ────────────────────────
+
+std::vector<float> Pipeline::capture_identity_anchor(std::string_view prompt,
+                                                     const GenerateOptions& opts) {
+    if (model_class_ != ModelClass::Sana) {
+        fail("capture_identity_anchor: the identity anchor is Sana-only");
+    }
+    auto* sana = static_cast<dit::SanaDenoiser*>(denoiser_.get());
+    // Record the anchor's per-(branch, step, block) linear-attention summaries
+    // across one full denoise. generate() → prime_sana_() sees capturing_anchor_
+    // and leaves the denoiser in Capture mode; the returned image is the anchor
+    // itself (e.g. a neutral portrait), handed back so the caller can show it.
+    sana->ref_begin_capture(opts.num_inference_steps);
+    capturing_anchor_ = true;
+    std::vector<float> img;
+    try {
+        img = generate(prompt, opts);
+    } catch (...) {
+        capturing_anchor_ = false;
+        sana->ref_clear();
+        throw;
+    }
+    capturing_anchor_ = false;
+    sana->ref_mark_anchor();
+    identity_anchor_ = true;
+    return img;
+}
+
+void Pipeline::set_identity_weight(float weight) { identity_weight_ = weight; }
+
+float Pipeline::identity_weight() const { return identity_weight_; }
+
+bool Pipeline::has_identity_anchor() const { return identity_anchor_; }
+
+void Pipeline::clear_identity_anchor() {
+    identity_anchor_ = false;
+    identity_weight_ = 0.0f;
+    if (model_class_ == ModelClass::Sana) {
+        static_cast<dit::SanaDenoiser*>(denoiser_.get())->ref_clear();
+    }
 }
 
 std::vector<float> Pipeline::generate(std::string_view prompt,
