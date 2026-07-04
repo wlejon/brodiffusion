@@ -85,27 +85,23 @@ bt::Tensor upload_as(const std::vector<float>& h, int rows, int cols,
 // gelu with the tanh approximation (reference approximate="tanh").
 void gelu_tanh_inplace(bt::Tensor& t) { bt::gelu_forward(t, t); }
 
-// FP32 RMSNorm with a preloaded (1+weight) FP32 gain. Upcasts the activations
-// so the norm runs in FP32, then casts back to the input dtype.
-bt::Tensor rmsnorm(const bt::Tensor& X, const bt::Tensor& gain_fp32, float eps) {
+// RMSNorm with a preloaded (1+weight) FP32 gain. rms_norm_forward accepts
+// the FP32 gain against FP16/BF16 activations directly (its kernels
+// accumulate and multiply in FP32 internally, rounding once at the store),
+// so this is a single kernel call with no cast round-trip and no gain
+// precision loss — matching the reference's _keep_in_fp32_modules.
+bt::Tensor rmsnorm(const bt::Tensor& X, const bt::Tensor& gain, float eps) {
     bt::Tensor out;
-    if (X.dtype == bt::Dtype::FP32) {
-        bt::rms_norm_forward(X, gain_fp32, eps, out);
-        return out;
-    }
-    bt::Tensor xf, yf;
-    bt::cast(X, xf, bt::Dtype::FP32);
-    bt::rms_norm_forward(xf, gain_fp32, eps, yf);
-    bt::cast(yf, out, X.dtype);
+    bt::rms_norm_forward(X, gain, eps, out);
     return out;
 }
 
-// Per-head FP32 RMSNorm: view (L, nh*hd) as (L*nh, hd), norm, relabel (L, nh*hd).
-bt::Tensor headnorm(const bt::Tensor& X, const bt::Tensor& gain_fp32, float eps,
+// Per-head RMSNorm: view (L, nh*hd) as (L*nh, hd), norm, relabel (L, nh*hd).
+bt::Tensor headnorm(const bt::Tensor& X, const bt::Tensor& gain, float eps,
                     int nh, int hd) {
     const int L = X.rows;
     bt::Tensor xv = bt::Tensor::view(X.device, X.data, L * nh, hd, X.dtype);
-    bt::Tensor normed = rmsnorm(xv, gain_fp32, eps);   // owns (L*nh, hd)
+    bt::Tensor normed = rmsnorm(xv, gain, eps);        // owns (L*nh, hd)
     normed.rows = L;
     normed.cols = nh * hd;
     return normed;
@@ -193,7 +189,10 @@ void Krea2Transformer2DModel::load_impl_(
                             out, 1, dt);
         }
     };
-    // RMSNorm gain: store (1 + weight) in FP32 (see krea2.h).
+    // RMSNorm gain: store (1 + weight) in FP32 (see krea2.h). rms_norm_forward
+    // takes the FP32 gain directly against 16-bit activations — full gain
+    // precision (the reference's _keep_in_fp32_modules) without upcasting
+    // the activation tensor.
     auto norm = [&](const std::string& key, int dim, bt::Tensor& g) {
         std::vector<float> h = view_to_fp32(need(shards, prefix + key + ".weight"),
                                             dim, 1, key);
