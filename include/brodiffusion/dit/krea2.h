@@ -47,6 +47,7 @@
 // Pairs with the FlowMatch (rectified-flow Euler) scheduler; the forward
 // predicts the velocity for the image tokens (prediction_type Velocity).
 
+#include "brodiffusion/denoiser.h"
 #include "brotensor/tensor.h"
 
 #include <string>
@@ -165,6 +166,63 @@ private:
     brotensor::Tensor final_scale_shift_table_;   // (2, hidden)
     brotensor::Tensor final_norm_;                // (hidden,1) FP32 (1+weight)
     Linear final_linear_;
+};
+
+// Krea2Denoiser — Krea2Transformer2DModel behind brodiffusion's model-agnostic
+// Denoiser interface (the sibling of FluxDenoiser / SanaDenoiser the Pipeline
+// drives). Wraps one Krea2Transformer2DModel; the Pipeline supplies the packed
+// latent as the flat NCHW (1, latent_channels*H_lat*W_lat) the Denoiser contract
+// uses, and this class does the 2x2 pack/unpack around the transformer's
+// packed-token interface, exactly as FluxDenoiser does.
+//
+// CFG convention. Krea 2's Raw checkpoint runs REAL classifier-free guidance
+// (uses_cfg() == true): the Pipeline evaluates a cond and an uncond branch and
+// combines them with the standard formula uncond + scale*(cond-uncond). Krea 2's
+// own model card quotes a guidance number `g` under the algebraically identical
+// convention cond + g*(cond-uncond), i.e. standard_scale = 1 + g. So the card's
+// recommended Raw setting g=4.5 maps to brodiffusion's --guidance-scale 5.5, and
+// Turbo's g=0.0 maps to --guidance-scale 1.0 (the default, which disables CFG —
+// matching Turbo's intended no-CFG behaviour). GenerateOptions::guidance_scale
+// keeps its usual meaning everywhere; only the doc translates.
+class Krea2Denoiser final : public Denoiser {
+public:
+    // patch_size is model_index.json's patch_size (2 for Krea 2); the 2x2
+    // pack/unpack helpers assume it, so a value other than 2 is rejected.
+    explicit Krea2Denoiser(const Krea2Config& cfg, int patch_size = 2);
+    ~Krea2Denoiser();
+
+    Krea2Denoiser(const Krea2Denoiser&) = delete;
+    Krea2Denoiser& operator=(const Krea2Denoiser&) = delete;
+    Krea2Denoiser(Krea2Denoiser&&) noexcept = default;
+    Krea2Denoiser& operator=(Krea2Denoiser&&) noexcept = default;
+
+    // ── Denoiser interface ────────────────────────────────────────────────
+    void load_weights(const brotensor::safetensors::File& f,
+                      const std::string& prefix = "") override;
+    // Sharded overload — the Krea 2 transformer ships in 3 shards.
+    void load_weights(
+        const std::vector<const brotensor::safetensors::File*>& shards,
+        const std::string& prefix = "");
+    void finalize_weights() override {}   // no quantisation for Krea 2
+    PreparedConditioning prepare(const Conditioning& cond) override;
+    void forward(const brotensor::Tensor& latent, int H_lat, int W_lat,
+                 float timestep, const PreparedConditioning& prepared,
+                 Branch branch, brotensor::Tensor& out) override;
+    int latent_channels() const override { return model_.config().latent_channels(); }
+    PredictionType prediction_type() const override {
+        return PredictionType::Velocity;
+    }
+    bool uses_cfg() const override { return true; }
+    brotensor::Dtype compute_dtype() const override {
+        return model_.compute_dtype();
+    }
+
+    const Krea2Config& config() const { return model_.config(); }
+
+private:
+    Krea2Transformer2DModel model_;
+    int patch_size_;
+    brotensor::Tensor tf_out_;   // transformer output scratch (packed velocity)
 };
 
 }  // namespace brodiffusion::dit

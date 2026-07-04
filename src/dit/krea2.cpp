@@ -489,4 +489,108 @@ void Krea2Transformer2DModel::forward(const bt::Tensor& packed_latent,
     bt::sync_all();
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Krea2Denoiser — Denoiser-interface wrapper
+// ═══════════════════════════════════════════════════════════════════════
+
+namespace {
+
+[[noreturn]] void fail_den(const std::string& msg) {
+    throw std::runtime_error("dit::Krea2Denoiser: " + msg);
+}
+
+// Per-model prepared payload: the (embeds, mask) pairs the transformer's
+// text_fusion consumes, one for each CFG branch. No heavy precompute —
+// Krea2Transformer2DModel::forward re-runs text_fusion itself every step.
+struct Krea2Prepared : PreparedConditioning::Impl {
+    bt::Tensor text_embeds, text_mask;
+    bt::Tensor uncond_embeds, uncond_mask;
+    bool has_uncond = false;
+};
+
+}  // namespace
+
+Krea2Denoiser::Krea2Denoiser(const Krea2Config& cfg, int patch_size)
+    : model_(cfg), patch_size_(patch_size) {
+    // The 2x2 pack/unpack helpers (dit::pack_latents) hardcode a 2x2 patch;
+    // Krea 2 is always patch_size=2. Reject anything else at the boundary
+    // rather than silently mis-packing.
+    if (patch_size_ != 2) {
+        fail_den("only patch_size=2 is supported (got " +
+                 std::to_string(patch_size_) + ")");
+    }
+}
+
+Krea2Denoiser::~Krea2Denoiser() = default;
+
+void Krea2Denoiser::load_weights(const st::File& f, const std::string& prefix) {
+    model_.load_weights(f, prefix);
+}
+
+void Krea2Denoiser::load_weights(const std::vector<const st::File*>& shards,
+                                 const std::string& prefix) {
+    model_.load_weights(shards, prefix);
+}
+
+PreparedConditioning Krea2Denoiser::prepare(const Conditioning& cond) {
+    auto prep = std::make_unique<Krea2Prepared>();
+    if (cond.text_embeddings.size() == 0 ||
+        cond.text_embeddings_mask.size() == 0) {
+        fail_den("prepare: text_embeddings / text_embeddings_mask are empty");
+    }
+    prep->text_embeds = cond.text_embeddings;
+    prep->text_mask   = cond.text_embeddings_mask;
+    prep->has_uncond  = cond.has_uncond;
+    if (cond.has_uncond) {
+        if (cond.uncond_embeddings.size() == 0 ||
+            cond.uncond_embeddings_mask.size() == 0) {
+            fail_den("prepare: has_uncond but uncond embeddings/mask are empty");
+        }
+        prep->uncond_embeds = cond.uncond_embeddings;
+        prep->uncond_mask   = cond.uncond_embeddings_mask;
+    }
+    return PreparedConditioning(std::move(prep));
+}
+
+void Krea2Denoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
+                            float timestep,
+                            const PreparedConditioning& prepared,
+                            Branch branch, bt::Tensor& out) {
+    if (!prepared) fail_den("forward: prepared conditioning is empty");
+    const auto* prep = dynamic_cast<const Krea2Prepared*>(prepared.get());
+    if (!prep) fail_den("forward: prepared conditioning has the wrong type");
+    if (H_lat % patch_size_ != 0 || W_lat % patch_size_ != 0) {
+        fail_den("forward: H_lat and W_lat must be multiples of patch_size");
+    }
+
+    const bt::Tensor* emb = &prep->text_embeds;
+    const bt::Tensor* msk = &prep->text_mask;
+    if (branch == Branch::Uncond) {
+        if (!prep->has_uncond) {
+            fail_den("forward: Uncond branch requested but no uncond "
+                     "conditioning was prepared");
+        }
+        emb = &prep->uncond_embeds;
+        msk = &prep->uncond_mask;
+    }
+
+    const int LC = model_.config().latent_channels();
+    const int hp = H_lat / patch_size_;
+    const int wp = W_lat / patch_size_;
+
+    // The Denoiser contract passes the flat NCHW latent; the transformer wants
+    // 2x2-packed tokens. Pack (pipeline dtype) → transformer (casts to BF16
+    // internally) → unpack the packed velocity back to NCHW (pipeline dtype).
+    bt::Tensor packed = pack_latents(latent, LC, H_lat, W_lat);
+
+    // The scheduler passes the continuous timestep sigma*num_train_timesteps
+    // (sigma*1000); Krea2Transformer2DModel::forward expects the flow-time
+    // sigma in [0,1] and re-multiplies by 1000 for its own embedding (matching
+    // Flux's embedded value). So divide by 1000 here to invert that.
+    const float t_flow = timestep / 1000.0f;
+
+    model_.forward(packed, hp, wp, *emb, *msk, t_flow, tf_out_);
+    unpack_latents(tf_out_, LC, H_lat, W_lat, out);
+}
+
 }  // namespace brodiffusion::dit
