@@ -8,6 +8,7 @@
 #include "brotensor/runtime.h"
 #include "brotensor/safetensors.h"
 #include "brotensor/tensor.h"
+#include "brotensor/detail/cpu/thread_pool.h"
 
 #include <cmath>
 #include <cstddef>
@@ -234,10 +235,18 @@ void Krea2Transformer2DModel::load_impl_(
         if (wv.dtype == st::Dtype::F16) {
             std::memcpy(w16.data(), wv.data, n * 2);
         } else if (wv.dtype == st::Dtype::BF16) {
+            // Row-parallel conversion: the 25 GB BF16 checkpoint makes this
+            // loop a large share of quantized-load time when run serially.
             const auto* src = reinterpret_cast<const std::uint16_t*>(wv.data);
-            for (std::size_t i = 0; i < n; ++i) {
-                w16[i] = bt::fp32_to_fp16_bits(bt::bf16_bits_to_fp32(src[i]));
-            }
+            bt::detail::cpu::parallel_for(
+                static_cast<std::size_t>(out), [&](std::size_t r) {
+                    const std::size_t base = r * static_cast<std::size_t>(in);
+                    for (std::size_t i = base;
+                         i < base + static_cast<std::size_t>(in); ++i) {
+                        w16[i] = bt::fp32_to_fp16_bits(
+                            bt::bf16_bits_to_fp32(src[i]));
+                    }
+                });
         } else if (wv.dtype == st::Dtype::F32) {
             const auto* src = reinterpret_cast<const float*>(wv.data);
             for (std::size_t i = 0; i < n; ++i) {
