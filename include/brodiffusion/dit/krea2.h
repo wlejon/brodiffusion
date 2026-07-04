@@ -159,6 +159,18 @@ public:
     void compute_time_mod(float timestep, brotensor::Tensor& temb_out,
                           brotensor::Tensor& mod_out);
 
+    // Research hooks (body attention gates): scale the sigmoid output gate
+    // of body-block attention — text rows and image rows separately — for
+    // blocks [block_lo, block_hi). (1, 1) clears.
+    void set_gate_scale(float txt_scale, float img_scale, int block_lo,
+                        int block_hi);
+
+    // Gate activity capture: when `sink` is non-null, every subsequent
+    // forward_with_text overwrites it with the per-row mean sigmoid gate of
+    // each body block, layout (num_blocks, text_seq + img_len) row-major.
+    // nullptr disables. The pointer must outlive captures.
+    void capture_gates(std::vector<float>* sink);
+
     const Krea2Config& config() const { return cfg_; }
     brotensor::Dtype compute_dtype() const;
 
@@ -235,6 +247,12 @@ private:
     // AdaLN research hook state (set_mod_delta).
     brotensor::Tensor mod_delta_;   // (1, 6*hidden) compute dtype; empty = off
     int mod_delta_lo_ = 0, mod_delta_hi_ = 0;
+
+    // Gate research hook state (set_gate_scale / capture_gates).
+    float gate_txt_scale_ = 1.0f, gate_img_scale_ = 1.0f;
+    int gate_lo_ = 0, gate_hi_ = 0;
+    std::vector<float>* gate_sink_ = nullptr;
+    brotensor::Tensor gate_ones_;   // (hidden, 1) scratch for row means
 };
 
 // Krea2Denoiser — Krea2Transformer2DModel behind brodiffusion's model-agnostic

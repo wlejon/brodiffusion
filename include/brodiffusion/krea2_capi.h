@@ -99,6 +99,19 @@ K2_API int k2_set_mod_delta(k2_ctx* c, const float* delta, int block_lo,
 K2_API int k2_time_mod(k2_ctx* c, float timestep, float* temb_out,
                        float* mod_out);
 
+/* Gate research hook: scale the sigmoid attention gate of body blocks
+ * [block_lo, block_hi) — text rows and image rows separately. 1/1 clears. */
+K2_API int k2_set_gate_scale(k2_ctx* c, float txt_scale, float img_scale,
+                             int block_lo, int block_hi);
+
+/* Gate activity capture: enable, run k2_forward, then read the per-block
+ * per-row mean sigmoid gate. Layout (28, n_txt + hp*wp) row-major from the
+ * most recent forward; k2_gates_size gives the float count (0 if none).
+ * Capture slows the forward (one readback per block) — disable when done. */
+K2_API int     k2_capture_gates(k2_ctx* c, int enable);
+K2_API int64_t k2_gates_size(k2_ctx* c);
+K2_API int     k2_get_gates(k2_ctx* c, float* out);
+
 /* ── VAE (K2_LOAD_VAE) ────────────────────────────────────────────────────
  * latent: (latent_channels * h_lat * w_lat) NCHW plane-major, raw pipeline
  * scale. out: (3 * 8*h_lat * 8*w_lat) NCHW in [-1, 1]. */

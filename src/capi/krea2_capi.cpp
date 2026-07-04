@@ -70,6 +70,7 @@ struct k2_ctx {
     std::optional<brolm::qwen3vl::TextModel> te;
     std::optional<bd::dit::Krea2Transformer2DModel> dit;
     std::optional<bd::vae_qwenimage::Decoder> vae;
+    std::vector<float> gates;   // capture sink for k2_capture_gates
 };
 
 extern "C" {
@@ -211,6 +212,40 @@ int k2_set_mod_delta(k2_ctx* c, const float* delta, int block_lo,
         bt::Tensor d = bt::Tensor::from_host(delta, 1, 6 * h)
                            .to(bt::default_device());
         c->dit->set_mod_delta(d, block_lo, block_hi);
+    });
+}
+
+int k2_set_gate_scale(k2_ctx* c, float txt_scale, float img_scale,
+                      int block_lo, int block_hi) {
+    return guarded([&] {
+        if (!c->dit) {
+            throw std::runtime_error("k2_set_gate_scale: DiT not loaded "
+                                     "(open with K2_LOAD_DIT)");
+        }
+        c->dit->set_gate_scale(txt_scale, img_scale, block_lo, block_hi);
+    });
+}
+
+int k2_capture_gates(k2_ctx* c, int enable) {
+    return guarded([&] {
+        if (!c->dit) {
+            throw std::runtime_error("k2_capture_gates: DiT not loaded "
+                                     "(open with K2_LOAD_DIT)");
+        }
+        c->dit->capture_gates(enable ? &c->gates : nullptr);
+        if (!enable) c->gates.clear();
+    });
+}
+
+int64_t k2_gates_size(k2_ctx* c) {
+    return static_cast<int64_t>(c->gates.size());
+}
+
+int k2_get_gates(k2_ctx* c, float* out) {
+    return guarded([&] {
+        if (c->gates.empty())
+            throw std::runtime_error("k2_get_gates: nothing captured");
+        std::memcpy(out, c->gates.data(), c->gates.size() * sizeof(float));
     });
 }
 

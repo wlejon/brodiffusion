@@ -513,6 +513,19 @@ void Krea2Transformer2DModel::set_mod_delta(const bt::Tensor& delta,
     mod_delta_hi_ = block_hi;
 }
 
+void Krea2Transformer2DModel::set_gate_scale(float txt_scale,
+                                             float img_scale, int block_lo,
+                                             int block_hi) {
+    gate_txt_scale_ = txt_scale;
+    gate_img_scale_ = img_scale;
+    gate_lo_ = block_lo;
+    gate_hi_ = block_hi;
+}
+
+void Krea2Transformer2DModel::capture_gates(std::vector<float>* sink) {
+    gate_sink_ = sink;
+}
+
 void Krea2Transformer2DModel::compute_time_mod(float timestep,
                                                bt::Tensor& temb_out,
                                                bt::Tensor& mod_out) {
@@ -552,6 +565,10 @@ void Krea2Transformer2DModel::forward_with_text(const bt::Tensor& packed_latent,
     // Attention scratch, reused across every attention call.
     bt::Tensor Qr, Kr, Krep, Vrep;
 
+    // Body-block index, visible to attn_apply for the gate research hooks
+    // (this lambda only ever runs for body blocks in this method).
+    int block_idx = 0;
+
     // Attention sublayer (Krea2AttnProcessor): project q/k/v/gate, per-head
     // qk-norm, optional RoPE, GQA masked attention, sigmoid gate, out proj.
     auto attn_apply = [&](const Attention& a, const bt::Tensor& x,
@@ -567,6 +584,37 @@ void Krea2Transformer2DModel::forward_with_text(const bt::Tensor& packed_latent,
         gqa_attention_masked(q, k, v, cos, sin, hd, nq, nkv, dmask, attn,
                              Qr, Kr, Krep, Vrep);
         bt::sigmoid_forward(gate, gate);
+        if (gate_sink_) {   // research: per-row mean gate for this block
+            if ((int)gate_ones_.rows != H || gate_ones_.dtype != dt) {
+                gate_ones_ = bt::Tensor::zeros_on(bt::default_device(), H, 1, dt);
+                bt::add_scalar_inplace(gate_ones_, 1.0f);
+            }
+            bt::Tensor gm;
+            bt::matmul(gate, gate_ones_, gm);           // (seq, 1)
+            bt::Tensor gm32 = gm;
+            if (gm.dtype != bt::Dtype::FP32) bt::cast(gm, gm32, bt::Dtype::FP32);
+            bt::sync_all();
+            bt::Tensor gh = gm32.to(bt::Device::CPU);
+            const float* p = gh.host_f32();
+            const float inv_h = 1.0f / (float)H;
+            float* dst = gate_sink_->data() + (size_t)block_idx * gate.rows;
+            for (int r = 0; r < gate.rows; ++r) dst[r] = p[r] * inv_h;
+        }
+        if (block_idx >= gate_lo_ && block_idx < gate_hi_) {  // research hook
+            const int isz = bt::dtype_size_bytes(dt);
+            if (gate_txt_scale_ != 1.0f && text_seq > 0) {
+                bt::Tensor gt = bt::Tensor::view(
+                    bt::default_device(), gate.data, text_seq, H, dt);
+                bt::scale_inplace(gt, gate_txt_scale_);
+            }
+            if (gate_img_scale_ != 1.0f) {
+                bt::Tensor gi = bt::Tensor::view(
+                    bt::default_device(),
+                    (char*)gate.data + (size_t)text_seq * H * isz,
+                    gate.rows - text_seq, H, dt);
+                bt::scale_inplace(gi, gate_img_scale_);
+            }
+        }
         bt::mul_inplace(attn, gate);
         return linb(a.to_out, attn);
     };
@@ -596,9 +644,13 @@ void Krea2Transformer2DModel::forward_with_text(const bt::Tensor& packed_latent,
                                               cfg_.axes_dims_rope, cfg_.rope_theta);
 
     // ── transformer blocks ───────────────────────────────────────────────
+    if (gate_sink_) {
+        gate_sink_->assign((size_t)blocks_.size() * (text_seq + img_len),
+                           0.0f);
+    }
+
     bt::Tensor table_flat;   // scratch: (1, 6H) view of a block's table
     std::vector<bt::Tensor> chunks;
-    int block_idx = 0;
     for (const TransformerBlock& b : blocks_) {
         // modulation = temb_mod + scale_shift_table (flattened), sliced to 6.
         bt::Tensor mod;
@@ -609,7 +661,6 @@ void Krea2Transformer2DModel::forward_with_text(const bt::Tensor& packed_latent,
             block_idx < mod_delta_hi_) {
             bt::add_inplace(mod, mod_delta_);   // research hook (set_mod_delta)
         }
-        ++block_idx;
         slice_modulation_chunks(mod, H, 6, chunks);
         const bt::Tensor& prescale = chunks[0];
         const bt::Tensor& preshift = chunks[1];
@@ -634,6 +685,7 @@ void Krea2Transformer2DModel::forward_with_text(const bt::Tensor& packed_latent,
         bt::Tensor fo = ff_apply(b.ff, n2m);
         bt::broadcast_mul(fo, postgate, gated);
         bt::add_inplace(x, gated);
+        ++block_idx;
     }
 
     // ── final layer over image rows (uses the RAW temb) ──────────────────
