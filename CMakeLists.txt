@@ -149,6 +149,7 @@ target_sources(brodiffusion PRIVATE
     src/version.cpp
     src/vae.cpp
     src/vae_dcae.cpp
+    src/vae_qwenimage.cpp
     src/unet.cpp
     src/unet_blocks.cpp
     src/controlnet.cpp

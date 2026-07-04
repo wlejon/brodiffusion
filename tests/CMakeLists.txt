@@ -43,6 +43,13 @@ brodiffusion_add_test(brodiffusion_test_dcae_decoder test_dcae_decoder.cpp)
 target_compile_definitions(brodiffusion_test_dcae_decoder PRIVATE
     BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
 
+# Qwen-Image VAE (Krea 2 decoder) test: an unconditional synthetic-weights
+# smoke test plus a real-weights numerical smoke test gated on
+# weights/krea-2-raw/vae (skips cleanly when absent).
+brodiffusion_add_test(brodiffusion_test_krea2_vae test_krea2_vae.cpp)
+target_compile_definitions(brodiffusion_test_krea2_vae PRIVATE
+    BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
+
 # Sana Linear DiT (SanaTransformer2DModel) denoiser smoke test. Gated entirely
 # on the real Sana 0.6B transformer checkpoint under weights/sana-600m/transformer
 # (skips cleanly when absent — no compact synthetic fixture for this DiT).

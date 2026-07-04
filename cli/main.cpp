@@ -1,10 +1,12 @@
 #include "brodiffusion/pipeline.h"
+#include "brodiffusion/vae_qwenimage.h"
 #include "brotensor/safetensors.h"
 #include "brolm/tokenizer.h"
 #include "brolm/t5.h"
 #include "brolm/tokenizer_t5.h"
 #include "brodiffusion/version.h"
 
+#include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
@@ -820,6 +822,50 @@ int run_pixart_fwd(int argc, char** argv) {
     return 0;
 }
 
+// Hidden debug subcommand: run ONE Qwen-Image VAE (Krea 2) decode on a fixed
+// latent read from a raw float32 file, dump the RGB output. Used to diff
+// against a diffusers reference (scripts/krea2_vae_ref.py). Not in usage().
+int run_krea2_vae_fwd(int argc, char** argv) {
+    const char* w  = arg_after(argc, argv, "--weights");
+    const char* lp = arg_after(argc, argv, "--latent");
+    const char* op = arg_after(argc, argv, "--out");
+    const char* Hs = arg_after(argc, argv, "--H");
+    const char* Ws = arg_after(argc, argv, "--W");
+    if (!w || !lp || !op || !Hs || !Ws) {
+        std::fprintf(stderr, "krea2-vae-fwd: need --weights --latent --out --H --W\n");
+        return 2;
+    }
+    const int H = std::atoi(Hs), W = std::atoi(Ws);
+    brotensor::init();
+
+    namespace vq = brodiffusion::vae_qwenimage;
+    vq::Config cfg;
+    vq::Decoder dec(cfg);
+    auto f = st::File::open(w);
+    dec.load_weights(f, "");
+
+    auto lat_h = load_latent_f32(lp, cfg.z_dim * H * W);
+    brotensor::Tensor lat =
+        brotensor::Tensor::from_host(lat_h.data(), 1, cfg.z_dim * H * W)
+            .to(brotensor::default_device());
+
+    brotensor::Tensor out;
+    dec.decode(lat, H, W, out);
+    brotensor::sync_all();
+
+    // dump_latent_f32 only special-cases FP16; force_upcast may put `out` at
+    // BF16 on a CUDA backend, so normalize to FP32 before dumping.
+    if (out.dtype != brotensor::Dtype::FP32) {
+        brotensor::Tensor out_f32;
+        brotensor::cast(out, out_f32, brotensor::Dtype::FP32);
+        brotensor::sync_all();
+        out = std::move(out_f32);
+    }
+    dump_latent_f32(op, out);
+    std::printf("krea2-vae-fwd: wrote image (%d,%d) to %s\n", out.rows, out.cols, op);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -828,6 +874,12 @@ int main(int argc, char** argv) {
         try { return run_pixart_fwd(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "pixart-fwd: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "krea2-vae-fwd") == 0) {
+        try { return run_krea2_vae_fwd(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "krea2-vae-fwd: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-v") == 0) {
