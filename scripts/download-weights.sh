@@ -11,7 +11,8 @@
 #
 #   model            sd15 (default) | lcm-dreamshaper | clip-vit-l-14 |
 #                    flux-schnell | sana-600m | sana-1.6b |
-#                    sana-sprint-0.6b | sana-sprint-1.6b | pixart-sigma
+#                    sana-sprint-0.6b | sana-sprint-1.6b | pixart-sigma |
+#                    krea-2-raw | krea-2-turbo
 #   --repo R         override the Hugging Face repo id
 #   --out-dir D      override the output directory
 #   --force          re-download even if the file already exists
@@ -70,6 +71,27 @@
 #                    transformer (~2.4 GB), the FP16 SDXL VAE (~0.3 GB), the T5
 #                    SentencePiece tokenizer (spiece.model), and the config /
 #                    scheduler JSON. text_encoder/config.json is informational.
+#   krea-2-raw       Krea 2 (K2), the undistilled/midtrain checkpoint (28-step
+#                    CFG sampling). A 12.9B single-stream MMDiT
+#                    (Krea2Transformer2DModel: GQA, per-head QK-norm, 3-axis
+#                    RoPE, SwiGLU) conditioned by 12 tapped hidden-state layers
+#                    of a Qwen3-VL-4B-Instruct text encoder, decoded by the
+#                    Qwen-Image VAE (AutoencoderKLQwenImage: causal Conv3d,
+#                    f8, 16 latent channels). The transformer ships SHARDED
+#                    (~26 GB across 3 files); the VAE (~0.5 GB) and text
+#                    encoder (~8.9 GB, unsharded) are bundled in the same repo.
+#                    brolm's qwen3vl_tokenizer needs vocab.json/merges.txt,
+#                    which this repo's tokenizer/ does NOT ship (only
+#                    tokenizer.json) — those two files are fetched separately
+#                    from the base Qwen/Qwen3-VL-4B-Instruct repo; the text
+#                    encoder WEIGHTS still come from krea-2-raw/text_encoder
+#                    (guaranteed to match what the
+#                    Krea 2 authors validated against, even if in practice it's
+#                    the same checkpoint as the base Qwen repo).
+#   krea-2-turbo     Krea 2, the few-step distilled (TDM) checkpoint —
+#                    `num_inference_steps=8`, guidance disabled
+#                    (`guidance_scale=0.0`), fixed timestep shift `mu=1.15`.
+#                    Same component layout/sizes as krea-2-raw.
 #
 # Auth: the SD1.5 mirror is public and needs no token. For rate-limited repos,
 # export HF_TOKEN=hf_... and it will be sent as a bearer token.
@@ -94,11 +116,12 @@ while [ $# -gt 0 ]; do
         sd15|lcm-dreamshaper|clip-vit-l-14|flux-schnell|t5-xxl|controlnet-canny|controlnet-depth|controlnet-openpose) MODEL="$1"; shift ;;
         sana-600m|sana-1.6b|sana-sprint-0.6b|sana-sprint-1.6b) MODEL="$1"; shift ;;
         pixart-sigma) MODEL="$1"; shift ;;
+        krea-2-raw|krea-2-turbo) MODEL="$1"; shift ;;
         --repo)    REPO="${2:?--repo needs a value}"; shift 2 ;;
         --out-dir) OUT_DIR="${2:?--out-dir needs a value}"; shift 2 ;;
         --force)   FORCE=1; shift ;;
         -h|--help)
-            sed -n '2,82p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,96p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) echo "error: unknown argument '$1' (try --help)" >&2; exit 2 ;;
     esac
@@ -315,6 +338,30 @@ case "$MODEL" in
             "tokenizer/tokenizer_config.json"
         )
         ;;
+    krea-2-raw|krea-2-turbo)
+        case "$MODEL" in
+            krea-2-raw)   krea_repo="krea/Krea-2-Raw" ;;
+            krea-2-turbo) krea_repo="krea/Krea-2-Turbo" ;;
+        esac
+        [ -n "$REPO" ]    || REPO="$krea_repo"
+        [ -n "$OUT_DIR" ] || OUT_DIR="$REPO_ROOT/weights/$MODEL"
+        FILES=(
+            "model_index.json"
+            "scheduler/scheduler_config.json"
+            "transformer/config.json"
+            "transformer/diffusion_pytorch_model.safetensors.index.json"
+            "vae/config.json"
+            "vae/diffusion_pytorch_model.safetensors"
+            "text_encoder/config.json"
+            "text_encoder/model.safetensors"
+            "tokenizer/tokenizer_config.json"
+        )
+        # See the krea-2-raw comment above: vocab.json/merges.txt aren't shipped
+        # in this repo's tokenizer/ (only tokenizer.json) but brolm's
+        # qwen3vl_tokenizer needs them by name — pulled separately below since
+        # they live at the base repo's root, not under a tokenizer/ subfolder.
+        KREA2_QWEN3VL_REPO="Qwen/Qwen3-VL-4B-Instruct"
+        ;;
 esac
 
 mkdir -p "$OUT_DIR"
@@ -386,6 +433,22 @@ for entry in "${FILES[@]}"; do
         fi
     fi
 done
+
+# --- krea-2-{raw,turbo}: tokenizer files from the base Qwen3-VL repo -------
+if [ -n "${KREA2_QWEN3VL_REPO:-}" ]; then
+    for f in vocab.json merges.txt; do
+        dest="$OUT_DIR/tokenizer/$f"
+        if [ "$FORCE" -eq 0 ] && [ -s "$dest" ]; then
+            echo "==> tokenizer/$f  (cached, skipping)"
+            continue
+        fi
+        echo "==> tokenizer/$f  [$KREA2_QWEN3VL_REPO]"
+        if ! fetch "$f" "$dest" "$KREA2_QWEN3VL_REPO"; then
+            echo "error: download failed for tokenizer/$f from $KREA2_QWEN3VL_REPO" >&2
+            exit 1
+        fi
+    done
+fi
 
 # --- sharded components -----------------------------------------------------
 # For models whose components ship sharded (flux-schnell), the loop above
