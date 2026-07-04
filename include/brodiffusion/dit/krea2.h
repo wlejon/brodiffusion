@@ -145,6 +145,20 @@ public:
                  const brotensor::Tensor& prompt_embeds_mask,
                  float timestep, brotensor::Tensor& out);
 
+    // Research hook (AdaLN seam): add `delta` (1, 6*hidden_size, FP32 host
+    // or device) to the shared temb_mod for blocks [block_lo, block_hi) on
+    // every subsequent forward_with_text. An empty tensor clears the hook.
+    // The per-block scale_shift_table is untouched, so the delta shifts the
+    // dynamic (timestep-shared) half of the modulation only.
+    void set_mod_delta(const brotensor::Tensor& delta, int block_lo,
+                       int block_hi);
+
+    // Timestep-embedding readout: raw temb (1, hidden_size) and shared
+    // temb_mod (1, 6*hidden_size) at flow time `timestep`, both FP32 —
+    // lets research map the AdaLN space without running image tokens.
+    void compute_time_mod(float timestep, brotensor::Tensor& temb_out,
+                          brotensor::Tensor& mod_out);
+
     const Krea2Config& config() const { return cfg_; }
     brotensor::Dtype compute_dtype() const;
 
@@ -191,6 +205,12 @@ private:
     // One linear at the compute dtype, dispatching dense vs INT8 (W8A16).
     brotensor::Tensor linb_(const Linear& l, const brotensor::Tensor& X);
 
+    // The timestep-embedding path shared by forward_with_text and
+    // compute_time_mod: temb (1, hidden), temb_mod (1, 6*hidden), both at
+    // the compute dtype.
+    void time_embed_(float timestep, brotensor::Tensor& temb,
+                     brotensor::Tensor& temb_mod);
+
     Krea2Config cfg_;
     bool loaded_ = false;
 
@@ -211,6 +231,10 @@ private:
     brotensor::Tensor final_scale_shift_table_;   // (2, hidden)
     brotensor::Tensor final_norm_;                // (hidden,1) FP32 (1+weight)
     Linear final_linear_;
+
+    // AdaLN research hook state (set_mod_delta).
+    brotensor::Tensor mod_delta_;   // (1, 6*hidden) compute dtype; empty = off
+    int mod_delta_lo_ = 0, mod_delta_hi_ = 0;
 };
 
 // Krea2Denoiser — Krea2Transformer2DModel behind brodiffusion's model-agnostic

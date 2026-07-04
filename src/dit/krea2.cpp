@@ -477,6 +477,55 @@ void Krea2Transformer2DModel::encode_text(const bt::Tensor& prompt_embeds,
     txt_out = linb(txt_in_l2_, txt);             // (n_valid, H)
 }
 
+void Krea2Transformer2DModel::time_embed_(float timestep, bt::Tensor& temb,
+                                          bt::Tensor& temb_mod) {
+    const bt::Dtype dt = flux_compute_dtype();
+    const float ts_val = timestep * 1000.0f;   // Krea 2 scales flow-time by 1000
+    bt::Tensor ts = bt::Tensor::from_host_on(bt::Device::CPU, &ts_val, 1, 1);
+    bt::Tensor freq;
+    bt::timestep_embedding(ts, cfg_.timestep_embed_dim, 10000.0f, freq);  // (1,TE) FP32
+    bt::Tensor freq_dev = freq.to(bt::default_device());
+    bt::Tensor freq_cd = freq_dev;
+    if (dt != bt::Dtype::FP32) bt::cast(freq_dev, freq_cd, dt);
+    temb = linb_(time_l1_, freq_cd);
+    gelu_tanh_inplace(temb);
+    temb = linb_(time_l2_, temb);                // (1, H)  raw time embedding
+    bt::Tensor temb_gelu = temb.clone();
+    gelu_tanh_inplace(temb_gelu);
+    temb_mod = linb_(time_mod_proj_, temb_gelu); // (1, 6H)
+}
+
+void Krea2Transformer2DModel::set_mod_delta(const bt::Tensor& delta,
+                                            int block_lo, int block_hi) {
+    if (delta.size() == 0) {
+        mod_delta_ = bt::Tensor();
+        mod_delta_lo_ = mod_delta_hi_ = 0;
+        return;
+    }
+    const int H = cfg_.hidden_size();
+    if ((int64_t)delta.size() != (int64_t)6 * H)
+        fail("set_mod_delta: delta must have 6*hidden_size elements");
+    const bt::Dtype dt = flux_compute_dtype();
+    bt::Tensor d = delta.to(bt::default_device());
+    if (d.dtype != dt) { bt::Tensor t; bt::cast(d, t, dt); d = t; }
+    mod_delta_ = d;
+    mod_delta_lo_ = block_lo;
+    mod_delta_hi_ = block_hi;
+}
+
+void Krea2Transformer2DModel::compute_time_mod(float timestep,
+                                               bt::Tensor& temb_out,
+                                               bt::Tensor& mod_out) {
+    if (!loaded_) fail("compute_time_mod: weights not loaded");
+    bt::Tensor temb, temb_mod;
+    time_embed_(timestep, temb, temb_mod);
+    if (temb.dtype != bt::Dtype::FP32) bt::cast(temb, temb_out, bt::Dtype::FP32);
+    else temb_out = temb;
+    if (temb_mod.dtype != bt::Dtype::FP32) bt::cast(temb_mod, mod_out, bt::Dtype::FP32);
+    else mod_out = temb_mod;
+    bt::sync_all();
+}
+
 void Krea2Transformer2DModel::forward_with_text(const bt::Tensor& packed_latent,
                                                 int hp, int wp,
                                                 const bt::Tensor& txt,
@@ -497,19 +546,8 @@ void Krea2Transformer2DModel::forward_with_text(const bt::Tensor& packed_latent,
     auto linb = [&](const Linear& l, const bt::Tensor& X) { return linb_(l, X); };
 
     // ── timestep embeddings ──────────────────────────────────────────────
-    const float ts_val = timestep * 1000.0f;   // Krea 2 scales flow-time by 1000
-    bt::Tensor ts = bt::Tensor::from_host_on(bt::Device::CPU, &ts_val, 1, 1);
-    bt::Tensor freq;
-    bt::timestep_embedding(ts, cfg_.timestep_embed_dim, 10000.0f, freq);  // (1,TE) FP32
-    bt::Tensor freq_dev = freq.to(bt::default_device());
-    bt::Tensor freq_cd = freq_dev;
-    if (dt != bt::Dtype::FP32) bt::cast(freq_dev, freq_cd, dt);
-    bt::Tensor temb = linb(time_l1_, freq_cd);
-    gelu_tanh_inplace(temb);
-    temb = linb(time_l2_, temb);                 // (1, H)  raw time embedding
-    bt::Tensor temb_gelu = temb.clone();
-    gelu_tanh_inplace(temb_gelu);
-    bt::Tensor temb_mod = linb(time_mod_proj_, temb_gelu);   // (1, 6H)
+    bt::Tensor temb, temb_mod;
+    time_embed_(timestep, temb, temb_mod);
 
     // Attention scratch, reused across every attention call.
     bt::Tensor Qr, Kr, Krep, Vrep;
@@ -560,12 +598,18 @@ void Krea2Transformer2DModel::forward_with_text(const bt::Tensor& packed_latent,
     // ── transformer blocks ───────────────────────────────────────────────
     bt::Tensor table_flat;   // scratch: (1, 6H) view of a block's table
     std::vector<bt::Tensor> chunks;
+    int block_idx = 0;
     for (const TransformerBlock& b : blocks_) {
         // modulation = temb_mod + scale_shift_table (flattened), sliced to 6.
         bt::Tensor mod;
         detail::resize_like(mod, 1, 6 * H, dt, bt::default_device());
         bt::copy_d2d(b.scale_shift_table, 0, mod, 0, 6 * H);
         bt::add_inplace(mod, temb_mod);
+        if (mod_delta_.size() > 0 && block_idx >= mod_delta_lo_ &&
+            block_idx < mod_delta_hi_) {
+            bt::add_inplace(mod, mod_delta_);   // research hook (set_mod_delta)
+        }
+        ++block_idx;
         slice_modulation_chunks(mod, H, 6, chunks);
         const bt::Tensor& prescale = chunks[0];
         const bt::Tensor& preshift = chunks[1];

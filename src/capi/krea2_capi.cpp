@@ -196,6 +196,37 @@ int k2_forward(k2_ctx* c, const float* packed, int hp, int wp,
     });
 }
 
+int k2_set_mod_delta(k2_ctx* c, const float* delta, int block_lo,
+                     int block_hi) {
+    return guarded([&] {
+        if (!c->dit) {
+            throw std::runtime_error("k2_set_mod_delta: DiT not loaded "
+                                     "(open with K2_LOAD_DIT)");
+        }
+        if (!delta) {
+            c->dit->set_mod_delta(bt::Tensor(), 0, 0);
+            return;
+        }
+        const int h = c->mc.krea2.transformer.hidden_size();
+        bt::Tensor d = bt::Tensor::from_host(delta, 1, 6 * h)
+                           .to(bt::default_device());
+        c->dit->set_mod_delta(d, block_lo, block_hi);
+    });
+}
+
+int k2_time_mod(k2_ctx* c, float timestep, float* temb_out, float* mod_out) {
+    return guarded([&] {
+        if (!c->dit) {
+            throw std::runtime_error("k2_time_mod: DiT not loaded "
+                                     "(open with K2_LOAD_DIT)");
+        }
+        bt::Tensor temb, mod;
+        c->dit->compute_time_mod(timestep, temb, mod);
+        if (temb_out) download_fp32(temb, temb_out);
+        if (mod_out) download_fp32(mod, mod_out);
+    });
+}
+
 int k2_decode(k2_ctx* c, const float* latent, int h_lat, int w_lat,
               float* out) {
     return guarded([&] {

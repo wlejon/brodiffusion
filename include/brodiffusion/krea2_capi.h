@@ -87,6 +87,18 @@ K2_API int k2_forward(k2_ctx* c, const float* packed, int hp, int wp,
                       const float* txt, int n_txt, float timestep,
                       float* out);
 
+/* AdaLN research hook: add delta (6 * hidden_size) to the shared temb_mod
+ * for body blocks [block_lo, block_hi) on every subsequent k2_forward.
+ * The per-block scale_shift_table is untouched. delta == NULL clears. */
+K2_API int k2_set_mod_delta(k2_ctx* c, const float* delta, int block_lo,
+                            int block_hi);
+
+/* Timestep-embedding readout, no image forward: temb_out (hidden_size),
+ * mod_out (6 * hidden_size) at flow time `timestep` — the raw material for
+ * mapping the AdaLN space before steering it. Either out may be NULL. */
+K2_API int k2_time_mod(k2_ctx* c, float timestep, float* temb_out,
+                       float* mod_out);
+
 /* ── VAE (K2_LOAD_VAE) ────────────────────────────────────────────────────
  * latent: (latent_channels * h_lat * w_lat) NCHW plane-major, raw pipeline
  * scale. out: (3 * 8*h_lat * 8*w_lat) NCHW in [-1, 1]. */
