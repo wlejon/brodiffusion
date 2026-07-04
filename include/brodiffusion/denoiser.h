@@ -38,10 +38,22 @@ enum class Branch { Cond, Uncond };
 //   Flux:  text_embeddings  = T5 token sequence (L, 4096).
 //          pooled            = CLIP pooled vector (1, 768).
 //          guidance          = distilled guidance scalar (flux-dev; 0 schnell).
+//   Krea 2: text_embeddings  = Qwen3-VL tapped hidden states, flattened
+//                              (max_seq*num_text_layers, text_hidden_dim); the
+//                              partner text_embeddings_mask carries the
+//                              per-token validity the DiT's text-fusion masks on.
+//                              uncond_embeddings / uncond_embeddings_mask are
+//                              the negative-prompt pair when has_uncond (real CFG).
 struct Conditioning {
     brotensor::Tensor text_embeddings;
     brotensor::Tensor uncond_embeddings;
     brotensor::Tensor pooled;
+    // Per-token validity mask travelling alongside text_embeddings /
+    // uncond_embeddings. Empty (default) for every model that needs no mask
+    // (SD1.5 / Flux / Sana / PixArt); Krea 2 fills it — an (max_seq, 1) FP32
+    // tensor, 1.0 for a valid token row and 0.0 for a pad/filler row.
+    brotensor::Tensor text_embeddings_mask;
+    brotensor::Tensor uncond_embeddings_mask;
     float guidance   = 0.0f;
     bool  has_uncond = false;
 };
