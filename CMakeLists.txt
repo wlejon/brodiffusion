@@ -231,6 +231,14 @@ if(BRODIFFUSION_CLI)
     target_link_libraries(bench_krea2_kernels PRIVATE brodiffusion)
 endif()
 
+# --- Krea 2 research C API (krea2_capi.dll, consumed via ctypes) ---
+option(BRODIFFUSION_KREA2_CAPI "Build the Krea 2 research C API DLL" ${PROJECT_IS_TOP_LEVEL})
+if(BRODIFFUSION_KREA2_CAPI)
+    add_library(krea2_capi SHARED src/capi/krea2_capi.cpp)
+    target_link_libraries(krea2_capi PRIVATE brodiffusion)
+    target_compile_definitions(krea2_capi PRIVATE K2_CAPI_BUILD)
+endif()
+
 # --- Install / export ---
 #
 # Off by default: brodiffusion is consumed as a sibling repo via the same
