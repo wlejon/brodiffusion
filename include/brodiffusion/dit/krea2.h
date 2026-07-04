@@ -109,15 +109,37 @@ public:
         const std::vector<const brotensor::safetensors::File*>& shards,
         const std::string& prefix = "");
 
-    // Predict the flow-matching velocity for the image tokens.
-    //   packed_latent: (hp*wp, in_channels) packed noisy latent (FP32 or the
-    //       compute dtype; cast internally).
-    //   hp, wp: packed latent grid (image_seq_len = hp*wp).
+    // Run the timestep-independent half of the model once per prompt: compact
+    // the padded text block to its valid tokens (every text row shares the
+    // identity RoPE position and masked rows are excluded from all attention,
+    // so dropping them is exact), then run the text_fusion stack (layerwise
+    // blocks, projector, refiner blocks) and txt_in.
     //   prompt_embeds: (text_seq*num_text_layers, text_hidden_dim) tapped text
     //       hidden states, token-major/layer-minor (krea2::encode_prompt layout).
     //   prompt_embeds_mask: (text_seq, 1) FP32 validity mask (1 valid / 0 pad).
+    //   txt_out: (n_valid, hidden_size) text rows for forward_with_text.
+    // Nothing in here sees the timestep, so re-running it every denoise step
+    // (the reference pipeline layout) is pure waste: Krea2Denoiser::prepare
+    // calls this once per CFG branch per generation.
+    void encode_text(const brotensor::Tensor& prompt_embeds,
+                     const brotensor::Tensor& prompt_embeds_mask,
+                     brotensor::Tensor& txt_out);
+
+    // Predict the flow-matching velocity for the image tokens, from text rows
+    // precomputed by encode_text. The joint sequence is (txt.rows + hp*wp)
+    // fully-valid rows — no attention mask.
+    //   packed_latent: (hp*wp, in_channels) packed noisy latent (FP32 or the
+    //       compute dtype; cast internally).
+    //   hp, wp: packed latent grid (image_seq_len = hp*wp).
     //   timestep: flow-matching time in [0,1].
     //   out: (hp*wp, in_channels) velocity, at the compute dtype.
+    void forward_with_text(const brotensor::Tensor& packed_latent, int hp,
+                           int wp, const brotensor::Tensor& txt,
+                           float timestep, brotensor::Tensor& out);
+
+    // Single-shot convenience: encode_text + forward_with_text. Kept for the
+    // krea2-fwd debug CLI and the DiT parity harness, which drive one forward
+    // from raw (embeds, mask) conditioning.
     void forward(const brotensor::Tensor& packed_latent, int hp, int wp,
                  const brotensor::Tensor& prompt_embeds,
                  const brotensor::Tensor& prompt_embeds_mask,
@@ -165,6 +187,9 @@ private:
 
     void load_impl_(const std::vector<const brotensor::safetensors::File*>& shards,
                     const std::string& prefix);
+
+    // One linear at the compute dtype, dispatching dense vs INT8 (W8A16).
+    brotensor::Tensor linb_(const Linear& l, const brotensor::Tensor& X);
 
     Krea2Config cfg_;
     bool loaded_ = false;

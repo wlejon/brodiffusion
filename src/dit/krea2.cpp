@@ -325,40 +325,177 @@ void Krea2Transformer2DModel::load_impl_(
 
 // ─── forward ───────────────────────────────────────────────────────────────
 
-void Krea2Transformer2DModel::forward(const bt::Tensor& packed_latent,
-                                      int hp, int wp,
-                                      const bt::Tensor& prompt_embeds,
-                                      const bt::Tensor& prompt_embeds_mask,
-                                      float timestep, bt::Tensor& out) {
-    if (!loaded_) fail("forward: weights not loaded");
+bt::Tensor Krea2Transformer2DModel::linb_(const Linear& l, const bt::Tensor& X) {
+    bt::Tensor Y;
+    if (l.quantized()) {
+        bt::linear_forward_batched_int8w_fp16(
+            l.W_int8, l.scales, l.has_bias() ? &l.b : nullptr, X, Y);
+    } else {
+        detail::linear_batched(l.W, l.has_bias() ? &l.b : nullptr, X, Y);
+    }
+    return Y;
+}
+
+void Krea2Transformer2DModel::encode_text(const bt::Tensor& prompt_embeds,
+                                          const bt::Tensor& prompt_embeds_mask,
+                                          bt::Tensor& txt_out) {
+    if (!loaded_) fail("encode_text: weights not loaded");
     const bt::Dtype dt = flux_compute_dtype();
-    const int H = cfg_.hidden_size();
     const int NL = cfg_.num_text_layers;
     const int TH = cfg_.text_hidden_dim;
-    const int hd_img = cfg_.attention_head_dim;
-    const int nq_img = cfg_.num_attention_heads;
-    const int nkv_img = cfg_.num_key_value_heads;
     const int hd_txt = TH / cfg_.text_num_attention_heads;
     const int nq_txt = cfg_.text_num_attention_heads;
-    const int img_len = hp * wp;
     if (prompt_embeds.cols != TH || prompt_embeds.rows % NL != 0) {
-        fail("forward: prompt_embeds shape mismatch");
+        fail("encode_text: prompt_embeds shape mismatch");
     }
     const int text_seq = prompt_embeds.rows / NL;
     if (prompt_embeds_mask.rows != text_seq) {
-        fail("forward: prompt_embeds_mask length mismatch");
+        fail("encode_text: prompt_embeds_mask length mismatch");
     }
 
-    auto linb = [&](const Linear& l, const bt::Tensor& X) -> bt::Tensor {
-        bt::Tensor Y;
-        if (l.quantized()) {
-            bt::linear_forward_batched_int8w_fp16(
-                l.W_int8, l.scales, l.has_bias() ? &l.b : nullptr, X, Y);
-        } else {
-            detail::linear_batched(l.W, l.has_bias() ? &l.b : nullptr, X, Y);
+    auto linb = [&](const Linear& l, const bt::Tensor& X) { return linb_(l, X); };
+
+    bt::Tensor hs;   // (text_seq*NL, TH)
+    if (prompt_embeds.dtype != dt) bt::cast(prompt_embeds, hs, dt);
+    else hs = prompt_embeds.to(bt::default_device());
+
+    // ── compact to the valid tokens ──────────────────────────────────────
+    // Every text row carries the identity RoPE position and masked rows are
+    // excluded from every attention (fusion and body alike), so dropping
+    // them is exact — and shrinks both the fusion stack below and the joint
+    // sequence every body block runs on (512-token block → ~a few dozen).
+    bt::Tensor mask_f32 = prompt_embeds_mask;
+    if (mask_f32.dtype != bt::Dtype::FP32) {
+        bt::Tensor t; bt::cast(prompt_embeds_mask, t, bt::Dtype::FP32); mask_f32 = t;
+    }
+    std::vector<float> mask_h = mask_f32.to(bt::Device::CPU).to_host_vector();
+    std::vector<int> valid;
+    valid.reserve(static_cast<std::size_t>(text_seq));
+    for (int i = 0; i < text_seq; ++i) {
+        if (mask_h[static_cast<std::size_t>(i)] > 0.5f) valid.push_back(i);
+    }
+    if (valid.empty()) fail("encode_text: mask has no valid tokens");
+    const int n_valid = static_cast<int>(valid.size());
+    if (n_valid < text_seq) {
+        bt::Tensor hs_c;
+        detail::resize_like(hs_c, n_valid * NL, TH, dt, bt::default_device());
+        for (int v = 0; v < n_valid; ++v) {
+            bt::copy_d2d(hs, valid[static_cast<std::size_t>(v)] * NL * TH,
+                         hs_c, v * NL * TH, NL * TH);
         }
-        return Y;
+        hs = hs_c;
+    }
+
+    // Attention scratch, reused across every attention call.
+    bt::Tensor Qr, Kr, Krep, Vrep;
+
+    // Refiner attention (nq == nkv, no RoPE; all compacted rows are valid so
+    // no mask either).
+    auto attn_apply = [&](const Attention& a, const bt::Tensor& x) -> bt::Tensor {
+        bt::Tensor q = linb(a.to_q, x);
+        bt::Tensor k = linb(a.to_k, x);
+        bt::Tensor v = linb(a.to_v, x);
+        bt::Tensor gate = linb(a.to_gate, x);
+        q = headnorm(q, a.norm_q, cfg_.norm_eps, nq_txt, hd_txt);
+        k = headnorm(k, a.norm_k, cfg_.norm_eps, nq_txt, hd_txt);
+        bt::Tensor attn;
+        gqa_attention_masked(q, k, v, nullptr, nullptr, hd_txt, nq_txt,
+                             nq_txt, nullptr, attn, Qr, Kr, Krep, Vrep);
+        bt::sigmoid_forward(gate, gate);
+        bt::mul_inplace(attn, gate);
+        return linb(a.to_out, attn);
     };
+
+    // FF sublayer (SwiGLU): down(silu(gate(x)) * up(x)).
+    auto ff_apply = [&](const SwiGLU& f, const bt::Tensor& x) -> bt::Tensor {
+        bt::Tensor g = linb(f.gate, x);
+        bt::silu_forward(g, g);
+        bt::Tensor u = linb(f.up, x);
+        bt::mul_inplace(g, u);
+        return linb(f.down, g);
+    };
+
+    // Layerwise blocks: attention over the NL-tap axis, batched per token.
+    std::vector<int32_t> cu(static_cast<std::size_t>(n_valid + 1));
+    for (int i = 0; i <= n_valid; ++i) cu[static_cast<std::size_t>(i)] = i * NL;
+    bt::Tensor cu_dev = make_idx_device(cu);
+    const int32_t* cu_ptr = static_cast<const int32_t*>(cu_dev.data);
+
+    auto layerwise_attn = [&](const Attention& a, const bt::Tensor& x) -> bt::Tensor {
+        bt::Tensor q = linb(a.to_q, x);
+        bt::Tensor k = linb(a.to_k, x);
+        bt::Tensor v = linb(a.to_v, x);
+        bt::Tensor gate = linb(a.to_gate, x);
+        q = headnorm(q, a.norm_q, cfg_.norm_eps, nq_txt, hd_txt);
+        k = headnorm(k, a.norm_k, cfg_.norm_eps, nq_txt, hd_txt);
+        bt::Tensor attn;
+        bt::flash_attention_varlen_forward(q, k, v, cu_ptr, cu_ptr, n_valid,
+                                           NL, NL, nq_txt, hd_txt,
+                                           /*causal=*/false, attn);
+        bt::sigmoid_forward(gate, gate);
+        bt::mul_inplace(attn, gate);
+        return linb(a.to_out, attn);
+    };
+
+    for (const FusionBlock& b : layerwise_blocks_) {
+        bt::Tensor n1 = rmsnorm(hs, b.norm1, cfg_.norm_eps);
+        bt::Tensor ao = layerwise_attn(b.attn, n1);
+        bt::add_inplace(hs, ao);
+        bt::Tensor n2 = rmsnorm(hs, b.norm2, cfg_.norm_eps);
+        bt::Tensor fo = ff_apply(b.ff, n2);
+        bt::add_inplace(hs, fo);
+    }
+
+    // Projector: collapse the NL-tap axis (Linear NL->1) into (n_valid, TH).
+    std::vector<float> pw;
+    {
+        bt::Tensor pf = projector_;
+        if (pf.dtype != bt::Dtype::FP32) { bt::Tensor t; bt::cast(projector_, t, bt::Dtype::FP32); pf = t; }
+        pw = pf.to(bt::Device::CPU).to_host_vector();
+    }
+    bt::Tensor fused = bt::Tensor::zeros_on(bt::default_device(), n_valid, TH, dt);
+    bt::Tensor gath;
+    detail::resize_like(gath, n_valid, TH, dt, bt::default_device());
+    for (int l = 0; l < NL; ++l) {
+        bt::copy_d2d_strided(hs, l * TH, NL * TH, gath, 0, TH, TH, n_valid);
+        bt::axpby_inplace(fused, gath, 1.0f, pw[static_cast<std::size_t>(l)]);
+    }
+
+    // Refiner blocks: attention over the (compacted) token sequence, no RoPE.
+    for (const FusionBlock& b : refiner_blocks_) {
+        bt::Tensor n1 = rmsnorm(fused, b.norm1, cfg_.norm_eps);
+        bt::Tensor ao = attn_apply(b.attn, n1);
+        bt::add_inplace(fused, ao);
+        bt::Tensor n2 = rmsnorm(fused, b.norm2, cfg_.norm_eps);
+        bt::Tensor fo = ff_apply(b.ff, n2);
+        bt::add_inplace(fused, fo);
+    }
+
+    // txt_in (Krea2TextProjection): norm -> linear_1 -> gelu(tanh) -> linear_2.
+    bt::Tensor txt = rmsnorm(fused, txt_in_norm_, cfg_.norm_eps);
+    txt = linb(txt_in_l1_, txt);
+    gelu_tanh_inplace(txt);
+    txt_out = linb(txt_in_l2_, txt);             // (n_valid, H)
+}
+
+void Krea2Transformer2DModel::forward_with_text(const bt::Tensor& packed_latent,
+                                                int hp, int wp,
+                                                const bt::Tensor& txt,
+                                                float timestep, bt::Tensor& out) {
+    if (!loaded_) fail("forward_with_text: weights not loaded");
+    const bt::Dtype dt = flux_compute_dtype();
+    const int H = cfg_.hidden_size();
+    const int hd_img = cfg_.attention_head_dim;
+    const int nq_img = cfg_.num_attention_heads;
+    const int nkv_img = cfg_.num_key_value_heads;
+    const int img_len = hp * wp;
+    if (txt.cols != H || txt.dtype != dt) {
+        fail("forward_with_text: txt must be (n_valid, hidden) at the "
+             "compute dtype (see encode_text)");
+    }
+    const int text_seq = txt.rows;
+
+    auto linb = [&](const Linear& l, const bt::Tensor& X) { return linb_(l, X); };
 
     // ── timestep embeddings ──────────────────────────────────────────────
     const float ts_val = timestep * 1000.0f;   // Krea 2 scales flow-time by 1000
@@ -374,21 +511,6 @@ void Krea2Transformer2DModel::forward(const bt::Tensor& packed_latent,
     bt::Tensor temb_gelu = temb.clone();
     gelu_tanh_inplace(temb_gelu);
     bt::Tensor temb_mod = linb(time_mod_proj_, temb_gelu);   // (1, 6H)
-
-    // ── masks ────────────────────────────────────────────────────────────
-    bt::Tensor mask_f32 = prompt_embeds_mask;
-    if (mask_f32.dtype != bt::Dtype::FP32) {
-        bt::Tensor t; bt::cast(prompt_embeds_mask, t, bt::Dtype::FP32); mask_f32 = t;
-    }
-    mask_f32 = mask_f32.to(bt::default_device());
-    std::vector<float> text_mask_h = mask_f32.to(bt::Device::CPU).to_host_vector();
-    std::vector<float> comb_h(static_cast<std::size_t>(text_seq + img_len), 1.0f);
-    for (int i = 0; i < text_seq; ++i) comb_h[static_cast<std::size_t>(i)] = text_mask_h[static_cast<std::size_t>(i)];
-    bt::Tensor comb_mask =
-        bt::Tensor::from_host(comb_h.data(), text_seq + img_len, 1)
-            .to(bt::default_device());
-    const float* text_dmask = static_cast<const float*>(mask_f32.data);
-    const float* comb_dmask = static_cast<const float*>(comb_mask.data);
 
     // Attention scratch, reused across every attention call.
     bt::Tensor Qr, Kr, Krep, Vrep;
@@ -421,75 +543,7 @@ void Krea2Transformer2DModel::forward(const bt::Tensor& packed_latent,
         return linb(f.down, g);
     };
 
-    // ── text fusion ──────────────────────────────────────────────────────
-    bt::Tensor hs;   // (text_seq*NL, TH)
-    if (prompt_embeds.dtype != dt) bt::cast(prompt_embeds, hs, dt);
-    else hs = prompt_embeds.to(bt::default_device());
-
-    // Layerwise blocks: attention over the NL-tap axis, batched per token.
-    std::vector<int32_t> cu(static_cast<std::size_t>(text_seq + 1));
-    for (int i = 0; i <= text_seq; ++i) cu[static_cast<std::size_t>(i)] = i * NL;
-    bt::Tensor cu_dev = make_idx_device(cu);
-    const int32_t* cu_ptr = static_cast<const int32_t*>(cu_dev.data);
-
-    auto layerwise_attn = [&](const Attention& a, const bt::Tensor& x) -> bt::Tensor {
-        bt::Tensor q = linb(a.to_q, x);
-        bt::Tensor k = linb(a.to_k, x);
-        bt::Tensor v = linb(a.to_v, x);
-        bt::Tensor gate = linb(a.to_gate, x);
-        q = headnorm(q, a.norm_q, cfg_.norm_eps, nq_txt, hd_txt);
-        k = headnorm(k, a.norm_k, cfg_.norm_eps, nq_txt, hd_txt);
-        bt::Tensor attn;
-        bt::flash_attention_varlen_forward(q, k, v, cu_ptr, cu_ptr, text_seq,
-                                           NL, NL, nq_txt, hd_txt,
-                                           /*causal=*/false, attn);
-        bt::sigmoid_forward(gate, gate);
-        bt::mul_inplace(attn, gate);
-        return linb(a.to_out, attn);
-    };
-
-    for (const FusionBlock& b : layerwise_blocks_) {
-        bt::Tensor n1 = rmsnorm(hs, b.norm1, cfg_.norm_eps);
-        bt::Tensor ao = layerwise_attn(b.attn, n1);
-        bt::add_inplace(hs, ao);
-        bt::Tensor n2 = rmsnorm(hs, b.norm2, cfg_.norm_eps);
-        bt::Tensor fo = ff_apply(b.ff, n2);
-        bt::add_inplace(hs, fo);
-    }
-
-    // Projector: collapse the NL-tap axis (Linear NL->1) into (text_seq, TH).
-    std::vector<float> pw;
-    {
-        bt::Tensor pf = projector_;
-        if (pf.dtype != bt::Dtype::FP32) { bt::Tensor t; bt::cast(projector_, t, bt::Dtype::FP32); pf = t; }
-        pw = pf.to(bt::Device::CPU).to_host_vector();
-    }
-    bt::Tensor fused = bt::Tensor::zeros_on(bt::default_device(), text_seq, TH, dt);
-    bt::Tensor gath;
-    detail::resize_like(gath, text_seq, TH, dt, bt::default_device());
-    for (int l = 0; l < NL; ++l) {
-        bt::copy_d2d_strided(hs, l * TH, NL * TH, gath, 0, TH, TH, text_seq);
-        bt::axpby_inplace(fused, gath, 1.0f, pw[static_cast<std::size_t>(l)]);
-    }
-
-    // Refiner blocks: attention over the token sequence, text-masked, no RoPE.
-    for (const FusionBlock& b : refiner_blocks_) {
-        bt::Tensor n1 = rmsnorm(fused, b.norm1, cfg_.norm_eps);
-        bt::Tensor ao = attn_apply(b.attn, n1, hd_txt, nq_txt, nq_txt,
-                                   nullptr, nullptr, text_dmask);
-        bt::add_inplace(fused, ao);
-        bt::Tensor n2 = rmsnorm(fused, b.norm2, cfg_.norm_eps);
-        bt::Tensor fo = ff_apply(b.ff, n2);
-        bt::add_inplace(fused, fo);
-    }
-
-    // txt_in (Krea2TextProjection): norm -> linear_1 -> gelu(tanh) -> linear_2.
-    bt::Tensor txt = rmsnorm(fused, txt_in_norm_, cfg_.norm_eps);
-    txt = linb(txt_in_l1_, txt);
-    gelu_tanh_inplace(txt);
-    txt = linb(txt_in_l2_, txt);                 // (text_seq, H)
-
-    // img_in and joint sequence.
+    // img_in and joint sequence (txt precomputed by encode_text).
     bt::Tensor lat = packed_latent;
     if (lat.dtype != dt) { bt::Tensor t; bt::cast(packed_latent, t, dt); lat = t; }
     else lat = packed_latent.to(bt::default_device());
@@ -524,8 +578,9 @@ void Krea2Transformer2DModel::forward(const bt::Tensor& packed_latent,
         bt::Tensor n1 = rmsnorm(x, b.norm1, cfg_.norm_eps);
         bt::Tensor n1m;
         bt::modulate(n1, prescale, preshift, n1m);
+        // No mask: the compacted joint sequence is fully valid.
         bt::Tensor ao = attn_apply(b.attn, n1m, hd_img, nq_img, nkv_img,
-                                   &rope.cos, &rope.sin, comb_dmask);
+                                   &rope.cos, &rope.sin, nullptr);
         bt::Tensor gated;
         bt::broadcast_mul(ao, pregate, gated);
         bt::add_inplace(x, gated);
@@ -558,6 +613,16 @@ void Krea2Transformer2DModel::forward(const bt::Tensor& packed_latent,
     bt::sync_all();
 }
 
+void Krea2Transformer2DModel::forward(const bt::Tensor& packed_latent,
+                                      int hp, int wp,
+                                      const bt::Tensor& prompt_embeds,
+                                      const bt::Tensor& prompt_embeds_mask,
+                                      float timestep, bt::Tensor& out) {
+    bt::Tensor txt;
+    encode_text(prompt_embeds, prompt_embeds_mask, txt);
+    forward_with_text(packed_latent, hp, wp, txt, timestep, out);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Krea2Denoiser — Denoiser-interface wrapper
 // ═══════════════════════════════════════════════════════════════════════
@@ -568,12 +633,13 @@ namespace {
     throw std::runtime_error("dit::Krea2Denoiser: " + msg);
 }
 
-// Per-model prepared payload: the (embeds, mask) pairs the transformer's
-// text_fusion consumes, one for each CFG branch. No heavy precompute —
-// Krea2Transformer2DModel::forward re-runs text_fusion itself every step.
+// Per-model prepared payload: the text_fusion output rows per CFG branch.
+// encode_text (compaction + the whole fusion stack + txt_in) is timestep-
+// independent, so it runs ONCE here instead of inside every denoise step —
+// the reference pipeline re-runs it per forward, which is pure waste.
 struct Krea2Prepared : PreparedConditioning::Impl {
-    bt::Tensor text_embeds, text_mask;
-    bt::Tensor uncond_embeds, uncond_mask;
+    bt::Tensor txt;          // (n_valid_pos, hidden)
+    bt::Tensor uncond_txt;   // (n_valid_neg, hidden)
     bool has_uncond = false;
 };
 
@@ -607,16 +673,16 @@ PreparedConditioning Krea2Denoiser::prepare(const Conditioning& cond) {
         cond.text_embeddings_mask.size() == 0) {
         fail_den("prepare: text_embeddings / text_embeddings_mask are empty");
     }
-    prep->text_embeds = cond.text_embeddings;
-    prep->text_mask   = cond.text_embeddings_mask;
-    prep->has_uncond  = cond.has_uncond;
+    model_.encode_text(cond.text_embeddings, cond.text_embeddings_mask,
+                       prep->txt);
+    prep->has_uncond = cond.has_uncond;
     if (cond.has_uncond) {
         if (cond.uncond_embeddings.size() == 0 ||
             cond.uncond_embeddings_mask.size() == 0) {
             fail_den("prepare: has_uncond but uncond embeddings/mask are empty");
         }
-        prep->uncond_embeds = cond.uncond_embeddings;
-        prep->uncond_mask   = cond.uncond_embeddings_mask;
+        model_.encode_text(cond.uncond_embeddings, cond.uncond_embeddings_mask,
+                           prep->uncond_txt);
     }
     return PreparedConditioning(std::move(prep));
 }
@@ -632,15 +698,13 @@ void Krea2Denoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
         fail_den("forward: H_lat and W_lat must be multiples of patch_size");
     }
 
-    const bt::Tensor* emb = &prep->text_embeds;
-    const bt::Tensor* msk = &prep->text_mask;
+    const bt::Tensor* txt = &prep->txt;
     if (branch == Branch::Uncond) {
         if (!prep->has_uncond) {
             fail_den("forward: Uncond branch requested but no uncond "
                      "conditioning was prepared");
         }
-        emb = &prep->uncond_embeds;
-        msk = &prep->uncond_mask;
+        txt = &prep->uncond_txt;
     }
 
     const int LC = model_.config().latent_channels();
@@ -658,7 +722,7 @@ void Krea2Denoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
     // Flux's embedded value). So divide by 1000 here to invert that.
     const float t_flow = timestep / 1000.0f;
 
-    model_.forward(packed, hp, wp, *emb, *msk, t_flow, tf_out_);
+    model_.forward_with_text(packed, hp, wp, *txt, t_flow, tf_out_);
     unpack_latents(tf_out_, LC, H_lat, W_lat, out);
 }
 
