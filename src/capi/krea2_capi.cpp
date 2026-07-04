@@ -226,6 +226,23 @@ int k2_set_gate_scale(k2_ctx* c, float txt_scale, float img_scale,
     });
 }
 
+int k2_set_gate_mask(k2_ctx* c, const float* mask, int64_t n, int block_lo,
+                     int block_hi) {
+    return guarded([&] {
+        if (!c->dit) {
+            throw std::runtime_error("k2_set_gate_mask: DiT not loaded "
+                                     "(open with K2_LOAD_DIT)");
+        }
+        if (!mask) {
+            c->dit->set_gate_mask(bt::Tensor(), 0, 0);
+            return;
+        }
+        bt::Tensor m = bt::Tensor::from_host(mask, (int)n, 1)
+                           .to(bt::default_device());
+        c->dit->set_gate_mask(m, block_lo, block_hi);
+    });
+}
+
 int k2_capture_gates(k2_ctx* c, int enable) {
     return guarded([&] {
         if (!c->dit) {

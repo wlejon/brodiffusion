@@ -104,6 +104,13 @@ K2_API int k2_time_mod(k2_ctx* c, float timestep, float* temb_out,
 K2_API int k2_set_gate_scale(k2_ctx* c, float txt_scale, float img_scale,
                              int block_lo, int block_hi);
 
+/* Per-token gate mask: multiply gate row r of body blocks
+ * [block_lo, block_hi) by mask[r] after the sigmoid (and after any
+ * k2_set_gate_scale). `n` must equal the forward's n_txt + hp*wp; a forward
+ * with a different sequence length skips the mask. NULL clears. */
+K2_API int k2_set_gate_mask(k2_ctx* c, const float* mask, int64_t n,
+                            int block_lo, int block_hi);
+
 /* Gate activity capture: enable, run k2_forward, then read the per-block
  * per-row mean sigmoid gate. Layout (28, n_txt + hp*wp) row-major from the
  * most recent forward; k2_gates_size gives the float count (0 if none).

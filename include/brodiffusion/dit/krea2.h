@@ -165,6 +165,14 @@ public:
     void set_gate_scale(float txt_scale, float img_scale, int block_lo,
                         int block_hi);
 
+    // Per-token gate mask: after the sigmoid (and any set_gate_scale), each
+    // gate row r of body blocks [block_lo, block_hi) is multiplied by
+    // mask[r]. `mask` holds text_seq + img_len values in forward order (any
+    // device/dtype); rows whose value is 1.0 are untouched. An empty tensor
+    // clears; a forward whose sequence length differs from the mask skips it.
+    void set_gate_mask(const brotensor::Tensor& mask, int block_lo,
+                       int block_hi);
+
     // Gate activity capture: when `sink` is non-null, every subsequent
     // forward_with_text overwrites it with the per-row mean sigmoid gate of
     // each body block, layout (num_blocks, text_seq + img_len) row-major.
@@ -253,6 +261,8 @@ private:
     int gate_lo_ = 0, gate_hi_ = 0;
     std::vector<float>* gate_sink_ = nullptr;
     brotensor::Tensor gate_ones_;   // (hidden, 1) scratch for row means
+    brotensor::Tensor gate_mask_;   // (seq, 1) compute dtype; empty = off
+    int gate_mask_lo_ = 0, gate_mask_hi_ = 0;
 };
 
 // Krea2Denoiser — Krea2Transformer2DModel behind brodiffusion's model-agnostic

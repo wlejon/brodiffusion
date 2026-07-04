@@ -522,6 +522,21 @@ void Krea2Transformer2DModel::set_gate_scale(float txt_scale,
     gate_hi_ = block_hi;
 }
 
+void Krea2Transformer2DModel::set_gate_mask(const bt::Tensor& mask,
+                                            int block_lo, int block_hi) {
+    if (mask.size() == 0) {
+        gate_mask_ = bt::Tensor();
+        gate_mask_lo_ = gate_mask_hi_ = 0;
+        return;
+    }
+    const bt::Dtype dt = flux_compute_dtype();
+    bt::Tensor m = mask.to(bt::default_device());
+    if (m.dtype != dt) { bt::Tensor t; bt::cast(m, t, dt); m = t; }
+    gate_mask_ = m;
+    gate_mask_lo_ = block_lo;
+    gate_mask_hi_ = block_hi;
+}
+
 void Krea2Transformer2DModel::capture_gates(std::vector<float>* sink) {
     gate_sink_ = sink;
 }
@@ -614,6 +629,20 @@ void Krea2Transformer2DModel::forward_with_text(const bt::Tensor& packed_latent,
                     gate.rows - text_seq, H, dt);
                 bt::scale_inplace(gi, gate_img_scale_);
             }
+        }
+        if (gate_mask_.size() == (size_t)gate.rows &&
+            block_idx >= gate_mask_lo_ && block_idx < gate_mask_hi_) {
+            if ((int)gate_ones_.rows != H || gate_ones_.dtype != dt) {
+                gate_ones_ = bt::Tensor::zeros_on(bt::default_device(), H, 1, dt);
+                bt::add_scalar_inplace(gate_ones_, 1.0f);
+            }
+            bt::Tensor mcol = bt::Tensor::view(
+                bt::default_device(), gate_mask_.data, gate.rows, 1, dt);
+            bt::Tensor ones_row = bt::Tensor::view(
+                bt::default_device(), gate_ones_.data, 1, H, dt);
+            bt::Tensor mfull;
+            bt::matmul(mcol, ones_row, mfull);   // (seq, hidden) rank-1
+            bt::mul_inplace(gate, mfull);
         }
         bt::mul_inplace(attn, gate);
         return linb(a.to_out, attn);
