@@ -95,15 +95,19 @@ else:
     model = Krea2Transformer2DModel.from_pretrained(
         tdir, torch_dtype=torch.float32).to("cpu").eval()
     cfg = model.config
-    hp, wp, text_seq = 8, 8, 512
+    # Small hp/wp/text_seq: REAL full 12.9B weights, but a short sequence so the
+    # CPU FP32 forward (dominated by weight loading, not L) finishes quickly.
+    hp, wp, text_seq = int(os.environ.get("KREA2_DIT_HP", 2)), \
+        int(os.environ.get("KREA2_DIT_WP", 2)), \
+        int(os.environ.get("KREA2_DIT_SEQ", 12))
     img_len = hp * wp
     g = torch.Generator().manual_seed(1234)
     hidden = torch.randn(1, img_len, cfg.in_channels, generator=g, dtype=torch.float32)
     ehs = torch.randn(1, text_seq, cfg.num_text_layers, cfg.text_hidden_dim,
                       generator=g, dtype=torch.float32)
     mask = torch.zeros(1, text_seq, dtype=torch.bool)
-    mask[0, :20] = True
-    mask[0, 507:512] = True
+    n_valid = max(1, text_seq // 2)
+    mask[0, :n_valid] = True
     timestep = torch.tensor([0.7], dtype=torch.float32)
     run(model, hidden, ehs, timestep, mask, hp, wp, "real")
     with open(os.path.join(out, "krea2_dit_dims.txt"), "w") as f:
