@@ -372,6 +372,7 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
         cfg.flux.quantize_weights = true;
         cfg.t5.quantize_weights   = true;
         cfg.krea2.transformer.quantize_weights = true;
+        cfg.krea2.text.text.quantize_weights   = true;
     }
 
     const fs::path root(model_dir);
@@ -1051,6 +1052,8 @@ PipelineState Pipeline::prime(std::string_view prompt,
         if (!qwen3vl_model_ || !qwen3vl_tokenizer_) {
             fail("prime: Krea2 pipeline missing Qwen3-VL model / tokenizer");
         }
+        const bool enc_time = std::getenv("BRODIFFUSION_TIME") != nullptr;
+        const auto enc_t0 = std::chrono::steady_clock::now();
         krea2::TextConditioning pos = krea2::encode_prompt(
             *qwen3vl_tokenizer_, *qwen3vl_model_, std::string(prompt));
         conditioning_.text_embeddings      = pos.prompt_embeds;
@@ -1066,6 +1069,14 @@ PipelineState Pipeline::prime(std::string_view prompt,
             conditioning_.has_uncond = false;
             conditioning_.uncond_embeddings      = bt::Tensor{};
             conditioning_.uncond_embeddings_mask = bt::Tensor{};
+        }
+        if (enc_time) {
+            brotensor::sync_all();
+            std::fprintf(stderr,
+                         "[time] Qwen3-VL encode (%d pass%s): %.3f s\n",
+                         do_cfg ? 2 : 1, do_cfg ? "es" : "",
+                         std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - enc_t0).count());
         }
         conditioning_.guidance = 0.0f;
     } else {
@@ -1738,9 +1749,19 @@ std::vector<float> Pipeline::generate(std::string_view prompt,
     // img2img priming sets state.step_index to a non-zero start (t_start);
     // txt2img leaves it at 0. Loop until the schedule is exhausted —
     // step_once increments step_index itself.
+    const bool loop_time = std::getenv("BRODIFFUSION_TIME") != nullptr;
+    const int steps_run = state.n_steps - state.step_index;
+    const auto loop_t0 = std::chrono::steady_clock::now();
     while (state.step_index < state.n_steps) {
         if (opts.should_cancel && opts.should_cancel()) throw GenerateCancelled();
         step_once(state, opts, /*trace_out=*/nullptr);
+    }
+    if (loop_time && steps_run > 0) {
+        bt::sync_all();
+        const double secs = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - loop_t0).count();
+        std::fprintf(stderr, "[time] denoise: %.3f s (%d steps, %.3f s/step)\n",
+                     secs, steps_run, secs / steps_run);
     }
     if (opts.should_cancel && opts.should_cancel()) throw GenerateCancelled();
     return decode(state);

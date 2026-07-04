@@ -337,9 +337,21 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     brotensor::init();
 
     std::printf("Loading model directory: %s%s\n", model_dir,
-                quantize ? " (INT8 W8A16 denoiser + T5)" : "");
+                quantize ? " (INT8 W8A16 denoiser + text encoder)" : "");
     pl::Pipeline::ModelDirOptions dir_opts;
     dir_opts.quantize = quantize;
+    // Device-memory report (BRODIFFUSION_TIME): used/total for the active
+    // GPU. "used" is device-wide, so it includes other processes on the card.
+    auto print_vram = [](const char* when) {
+        if (!std::getenv("BRODIFFUSION_TIME")) return;
+        std::size_t fb = 0, tb = 0;
+        if (brotensor::device_mem_info(brotensor::default_device(), fb, tb)) {
+            std::fprintf(stderr, "[mem] %s: %.2f / %.2f GiB used\n", when,
+                         static_cast<double>(tb - fb) / (1024.0 * 1024 * 1024),
+                         static_cast<double>(tb) / (1024.0 * 1024 * 1024));
+        }
+    };
+
     const auto t_load0 = std::chrono::steady_clock::now();
     pl::Pipeline pipeline = pl::Pipeline::from_model_dir(model_dir, dir_opts);
     if (std::getenv("BRODIFFUSION_TIME")) {
@@ -347,6 +359,7 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
                      std::chrono::duration<double>(
                          std::chrono::steady_clock::now() - t_load0).count());
     }
+    print_vram("after model load");
     const bool is_flux =
         pipeline.config().model_class == brodiffusion::ModelClass::Flux;
     const bool is_sana =
@@ -493,6 +506,7 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
                      std::chrono::duration<double>(
                          std::chrono::steady_clock::now() - t_gen0).count());
     }
+    print_vram("after generate");
     return write_png(out_path, img, opts.width, opts.height);
 }
 
