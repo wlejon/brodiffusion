@@ -1105,6 +1105,23 @@ PipelineState Pipeline::prime(std::string_view prompt,
     // across all branched states.
     prepared_ = denoiser_->prepare(conditioning_);
 
+    // Text encoding is over: return its cached allocator blocks to the
+    // driver before the denoise loop. On Windows (WDDM) a near-full commit
+    // makes the OS demote large resident allocations — the DiT's biggest
+    // weight tensors — to shared memory, silently turning their per-step
+    // reads into PCIe traffic (measured: the 100 MB FF GEMMs run 2.6x
+    // slower once that starts).
+    brotensor::device_mem_trim(brotensor::default_device());
+    if (std::getenv("BRODIFFUSION_TIME") != nullptr) {
+        std::size_t fb = 0, tb = 0;
+        if (brotensor::device_mem_info(brotensor::default_device(), fb, tb)) {
+            std::fprintf(stderr, "[mem] after prime (pool trimmed): "
+                         "%.2f / %.2f GiB used\n",
+                         double(tb - fb) / (1024.0 * 1024.0 * 1024.0),
+                         double(tb) / (1024.0 * 1024.0 * 1024.0));
+        }
+    }
+
     // 2. Build the initial state shell (latent assigned below).
     PipelineState state;
     state.H_lat = H_lat;

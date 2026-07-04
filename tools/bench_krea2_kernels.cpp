@@ -7,7 +7,10 @@
 // linears at hidden 6144 / intermediate 16384 / kv 1536; 48/12 GQA flash
 // attention at head_dim 128.
 //
-// Usage: bench_krea2_kernels [B]   (default 4126)
+// Usage: bench_krea2_kernels [B] [ballast_gib]   (default 4126, 0)
+// ballast_gib pins that much extra VRAM first, to reproduce the memory
+// pressure the kernels run under inside the full pipeline (WDDM starts
+// demoting resident allocations well before the card is nominally full).
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
@@ -82,6 +85,24 @@ int main(int argc, char** argv) {
     }
     std::mt19937 rng(0);
 
+    std::vector<bt::Tensor> ballast;
+    const double ballast_gib = (argc > 2) ? std::atof(argv[2]) : 0.0;
+    if (ballast_gib > 0.0) {
+        // 256 MiB FP16 chunks, touched once so they are actually resident.
+        const int rows = 128 * 1024 * 1024 / H;
+        const int chunks = static_cast<int>(ballast_gib * 4.0);
+        for (int i = 0; i < chunks; ++i) {
+            bt::Tensor t = bt::Tensor::zeros_on(bt::default_device(), rows, H,
+                                                bt::Dtype::FP16);
+            ballast.push_back(t);
+        }
+        std::size_t fb = 0, tb = 0;
+        bt::device_mem_info(bt::default_device(), fb, tb);
+        std::printf("ballast: %.1f GiB pinned, device %.2f/%.2f GiB used\n",
+                    ballast_gib, (tb - fb) / 1073741824.0,
+                    tb / 1073741824.0);
+    }
+
     bt::Tensor x = randn_fp16(B, H, rng);
     bt::Tensor xff = randn_fp16(B, FF, rng);
     bt::Tensor y;
@@ -115,6 +136,28 @@ int main(int argc, char** argv) {
         report("int8w  6144x16384 (ff down)",
                time_op([&] { bt::linear_forward_batched_int8w_fp16(
                                  q.w8, q.scales, nullptr, xff, y); }, iters),
+               2.0 * B * H * FF);
+    }
+
+    // ── INT8 W8A16 with BF16 activations (Krea 2 runs the DiT in BF16) ──
+    {
+        bt::Tensor xb, xffb;
+        bt::cast(x, xb, bt::Dtype::BF16);
+        bt::cast(xff, xffb, bt::Dtype::BF16);
+        QW q1 = quant_random(H, H, rng);
+        report("int8w  6144x6144  (bf16 act)",
+               time_op([&] { bt::linear_forward_batched_int8w_fp16(
+                                 q1.w8, q1.scales, nullptr, xb, y); }, iters),
+               2.0 * B * H * H);
+        QW q2 = quant_random(FF, H, rng);
+        report("int8w 16384x6144  (bf16 act)",
+               time_op([&] { bt::linear_forward_batched_int8w_fp16(
+                                 q2.w8, q2.scales, nullptr, xb, y); }, iters),
+               2.0 * B * FF * H);
+        QW q3 = quant_random(H, FF, rng);
+        report("int8w  6144x16384 (bf16 act)",
+               time_op([&] { bt::linear_forward_batched_int8w_fp16(
+                                 q3.w8, q3.scales, nullptr, xffb, y); }, iters),
                2.0 * B * H * FF);
     }
 
