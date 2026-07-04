@@ -23,8 +23,11 @@
 #include "brodiffusion/detail/safetensors_dir.h"
 #include "brodiffusion/detail/torch_rng.h"
 #include "brodiffusion/dit/sana.h"
+#include "brodiffusion/dit/krea2.h"
 #include "brodiffusion/sana_text.h"
+#include "brodiffusion/krea2_text.h"
 #include "brodiffusion/vae_dcae.h"
+#include "brodiffusion/vae_qwenimage.h"
 #include "brodiffusion/image_io.h"
 
 #include "brotensor/ops.h"
@@ -219,6 +222,10 @@ std::unique_ptr<Denoiser> make_denoiser(const PipelineConfig& cfg) {
     if (cfg.model_class == ModelClass::PixArt) {
         return std::make_unique<dit::PixArtDenoiser>(cfg.pixart);
     }
+    if (cfg.model_class == ModelClass::Krea2) {
+        return std::make_unique<dit::Krea2Denoiser>(cfg.krea2.transformer,
+                                                    cfg.krea2.patch_size);
+    }
     return std::make_unique<unet::UNet>(cfg.unet);
 }
 
@@ -316,6 +323,25 @@ Pipeline::Pipeline(const PipelineConfig& cfg, brolm::t5::Tokenizer t5_tok)
     }
 }
 
+Pipeline::Pipeline(const PipelineConfig& cfg,
+                   brolm::qwen3vl::Tokenizer qwen3vl_tok)
+    : cfg_(cfg),
+      model_class_(cfg.model_class),
+      tokenizer_(std::nullopt),           // no CLIP frontend for Krea 2
+      text_encoder_(cfg.text_encoder),    // CLIP unused for Krea 2
+      denoiser_(make_denoiser(cfg)),
+      vae_(cfg.vae),                       // KL-VAE unused for Krea 2
+      vae_encoder_(encoder_config_from_decoder(cfg.vae)),
+      scheduler_(make_scheduler(cfg.scheduler)),
+      vae_qwen_(std::in_place, cfg.krea2.vae),
+      qwen3vl_model_(std::in_place, cfg.krea2.text.text),
+      qwen3vl_tokenizer_(std::move(qwen3vl_tok)) {
+    if (cfg.model_class != ModelClass::Krea2) {
+        fail("Pipeline: the (cfg, qwen3vl_tok) constructor requires "
+             "model_class == Krea2");
+    }
+}
+
 const unet::UNet& Pipeline::unet() const {
     const unet::UNet* u = denoiser_->as_unet();
     if (u == nullptr) fail("unet(): the active denoiser is not a UNet");
@@ -339,6 +365,7 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
     cfg.t5_max_length = mc.t5_max_length;
     cfg.gemma         = mc.gemma;
     cfg.sana_max_seq_len = mc.sana_max_seq_len;
+    cfg.krea2         = mc.krea2;
     cfg.scheduler     = mc.scheduler;
     if (dir_opts.quantize) {
         cfg.unet.quantize_weights = true;
@@ -386,6 +413,54 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
         for (const auto& f : te_files) te_ptrs.push_back(&f);
         p.gemma_model_->load_weights(te_ptrs, "");
         t = stamp("Gemma weights", t);
+
+        return p;
+    }
+
+    if (mc.model_class == ModelClass::Krea2) {
+        // Krea 2: Qwen3-VL-4B text encoder (single-file), Qwen-Image VAE
+        // decoder, and the sharded (3-shard) single-stream flow DiT. The
+        // tokenizer's vocab.json / merges.txt live under tokenizer/.
+        brolm::qwen3vl::Tokenizer qwen_tok = brolm::qwen3vl::Tokenizer::load(
+            (root / "tokenizer" / "vocab.json").string(),
+            (root / "tokenizer" / "merges.txt").string());
+
+        Pipeline p(cfg, std::move(qwen_tok));
+
+        const bool time_load = std::getenv("BRODIFFUSION_TIME") != nullptr;
+        auto stamp = [&](const char* what, auto t0) {
+            if (time_load) {
+                std::fprintf(stderr, "[time]   %s: %.2f s\n", what,
+                             std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - t0).count());
+            }
+            return std::chrono::steady_clock::now();
+        };
+        auto t = std::chrono::steady_clock::now();
+        auto tf_files  = detail::open_component_files(
+            (root / "transformer").string());
+        auto vae_files = detail::open_component_files(
+            (root / "vae").string());
+        auto te_files  = detail::open_component_files(
+            (root / "text_encoder").string());
+        t = stamp("open files (mmap)", t);
+
+        std::vector<const brotensor::safetensors::File*> tf_ptrs;
+        for (const auto& f : tf_files) tf_ptrs.push_back(&f);
+        auto* krea2 = dynamic_cast<dit::Krea2Denoiser*>(p.denoiser_.get());
+        if (!krea2) fail("from_model_dir: Krea2 denoiser construction failed");
+        krea2->load_weights(tf_ptrs, "");
+        t = stamp("DiT weights", t);
+
+        p.vae_qwen_->load_weights(vae_files.front(), "");
+        t = stamp("Qwen-Image VAE weights", t);
+
+        // The Qwen3-VL-4B text encoder ships unsharded (text_encoder/
+        // model.safetensors); load its language-model subtree.
+        std::vector<const brotensor::safetensors::File*> te_ptrs;
+        for (const auto& f : te_files) te_ptrs.push_back(&f);
+        p.qwen3vl_model_->load_weights(te_ptrs, "language_model.");
+        t = stamp("Qwen3-VL weights", t);
 
         return p;
     }
@@ -967,6 +1042,31 @@ PipelineState Pipeline::prime(std::string_view prompt,
                              std::chrono::steady_clock::now() - t5_t0).count());
         }
         conditioning_.guidance = 0.0f;
+    } else if (model_class_ == ModelClass::Krea2) {
+        // Krea 2: Qwen3-VL tapped-hidden-states conditioning + validity mask.
+        // Runs true classifier-free guidance, so the negative prompt (empty by
+        // default, matching the reference pipeline) gets its own encode for the
+        // uncond branch. No CLIP pooled vector / distilled guidance embedding.
+        if (!qwen3vl_model_ || !qwen3vl_tokenizer_) {
+            fail("prime: Krea2 pipeline missing Qwen3-VL model / tokenizer");
+        }
+        krea2::TextConditioning pos = krea2::encode_prompt(
+            *qwen3vl_tokenizer_, *qwen3vl_model_, std::string(prompt));
+        conditioning_.text_embeddings      = pos.prompt_embeds;
+        conditioning_.text_embeddings_mask = pos.prompt_embeds_mask;
+        if (do_cfg) {
+            krea2::TextConditioning neg = krea2::encode_prompt(
+                *qwen3vl_tokenizer_, *qwen3vl_model_,
+                std::string(opts.negative_prompt));
+            conditioning_.uncond_embeddings      = neg.prompt_embeds;
+            conditioning_.uncond_embeddings_mask = neg.prompt_embeds_mask;
+            conditioning_.has_uncond = true;
+        } else {
+            conditioning_.has_uncond = false;
+            conditioning_.uncond_embeddings      = bt::Tensor{};
+            conditioning_.uncond_embeddings_mask = bt::Tensor{};
+        }
+        conditioning_.guidance = 0.0f;
     } else {
         int content_end = -1;
         encode_prompt_(prompt, conditioning_.text_embeddings, &content_end);
@@ -1544,6 +1644,14 @@ std::vector<float> Pipeline::decode(const PipelineState& state) {
         dcae_->decode(state.latent, state.H_lat, state.W_lat, decoded_);
         n_img = cfg_.dcae.image_channels *
                 (state.H_lat * 32) * (state.W_lat * 32);
+    } else if (model_class_ == ModelClass::Krea2) {
+        // Qwen-Image VAE: 8x upsample, 3-channel image. decode() applies the
+        // per-channel latents_mean/std denormalization internally (see
+        // vae_qwenimage.h), so the unpacked NCHW latent goes straight in.
+        if (!vae_qwen_) fail("decode: Krea2 Qwen-Image decoder not loaded");
+        vae_qwen_->decode(state.latent, state.H_lat, state.W_lat, decoded_);
+        n_img = cfg_.krea2.vae.input_channels *
+                (state.H_lat * 8) * (state.W_lat * 8);
     } else {
         vae_.decode(state.latent, state.H_lat, state.W_lat, decoded_);
         n_img = cfg_.vae.out_channels *

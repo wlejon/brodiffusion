@@ -16,6 +16,7 @@
 #include "brodiffusion/unet.h"
 #include "brodiffusion/vae.h"
 #include "brodiffusion/vae_dcae.h"
+#include "brodiffusion/vae_qwenimage.h"
 #include "brolm/clip.h"
 #include "brodiffusion/scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
@@ -25,15 +26,30 @@
 #include "brodiffusion/dit/flux.h"
 #include "brodiffusion/dit/sana.h"
 #include "brodiffusion/dit/pixart.h"
+#include "brodiffusion/dit/krea2.h"
 #include "brolm/t5.h"
 #include "brolm/gemma2_config.h"
+#include "brolm/qwen3vl_config.h"
 
 #include <string>
 #include <variant>
 
 namespace brodiffusion {
 
-enum class ModelClass { StableDiffusion, Flux, Sana, PixArt, Unknown };
+enum class ModelClass { StableDiffusion, Flux, Sana, PixArt, Krea2, Unknown };
+
+// Pipeline-level Krea 2 configuration — the trio of component configs the
+// Krea2 branch needs, plus the two model_index.json scalars. Distinct from
+// dit::Krea2Config (the transformer's own hyper-parameters, held in
+// `transformer` here), mirroring how Sana keeps its DiT / VAE / text-encoder
+// configs as separate ModelConfig fields.
+struct Krea2ModelConfig {
+    dit::Krea2Config              transformer;   // transformer/config.json
+    vae_qwenimage::Config         vae;           // vae/config.json
+    brolm::qwen3vl::Qwen3VLConfig text;          // text_encoder/config.json
+    bool is_distilled = false;   // model_index.json: false=Raw (CFG), true=Turbo
+    int  patch_size   = 2;       // model_index.json: 2x2 latent packing
+};
 
 // Architecture + hyper-parameters of a diffusers model directory, read from
 // its JSON config files. The Pipeline factory consumes this to build the
@@ -59,6 +75,8 @@ struct ModelConfig {
     // PixArt-Sigma shares Flux's T5-XXL text encoder (the `t5` field above) but
     // caps captions at 300 tokens. The encoder weights are NOT bundled in a
     // PixArt model dir — from_model_dir resolves them from a sibling t5-xxl dir.
+
+    Krea2ModelConfig krea2;            // populated for ModelClass::Krea2
 
     std::variant<scheduler::DDIMConfig,
                  scheduler::LCMConfig,

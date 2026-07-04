@@ -7,6 +7,7 @@
 
 #include "brodiffusion/detail/json.h"
 
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -330,6 +331,73 @@ void populate_gemma(const json::Value& cfg, brolm::gemma::Gemma2Config& out) {
         cfg.get_int("max_position_embeddings", out.max_position_embeddings);
 }
 
+// Parse a JSON float array (get_int_array has no float sibling).
+std::vector<float> get_float_array(const json::Value& cfg, const std::string& key,
+                                   std::vector<float> dflt) {
+    const json::Value* v = cfg.find(key);
+    if (!v || !v->is_array()) return dflt;
+    std::vector<float> out;
+    for (const auto& e : v->as_array()) {
+        out.push_back(static_cast<float>(e.as_number()));
+    }
+    return out;
+}
+
+// Parse a JSON bool array.
+std::vector<bool> get_bool_array(const json::Value& cfg, const std::string& key,
+                                 std::vector<bool> dflt) {
+    const json::Value* v = cfg.find(key);
+    if (!v || !v->is_array()) return dflt;
+    std::vector<bool> out;
+    for (const auto& e : v->as_array()) out.push_back(e.as_bool());
+    return out;
+}
+
+void populate_krea2_transformer(const json::Value& cfg, dit::Krea2Config& out) {
+    out.in_channels          = cfg.get_int("in_channels", out.in_channels);
+    out.num_layers           = cfg.get_int("num_layers", out.num_layers);
+    out.attention_head_dim   = cfg.get_int("attention_head_dim",
+                                           out.attention_head_dim);
+    out.num_attention_heads  = cfg.get_int("num_attention_heads",
+                                           out.num_attention_heads);
+    out.num_key_value_heads  = cfg.get_int("num_key_value_heads",
+                                           out.num_key_value_heads);
+    out.intermediate_size    = cfg.get_int("intermediate_size",
+                                           out.intermediate_size);
+    out.timestep_embed_dim   = cfg.get_int("timestep_embed_dim",
+                                           out.timestep_embed_dim);
+    out.text_hidden_dim      = cfg.get_int("text_hidden_dim", out.text_hidden_dim);
+    out.num_text_layers      = cfg.get_int("num_text_layers", out.num_text_layers);
+    out.text_num_attention_heads =
+        cfg.get_int("text_num_attention_heads", out.text_num_attention_heads);
+    out.text_num_key_value_heads =
+        cfg.get_int("text_num_key_value_heads", out.text_num_key_value_heads);
+    out.text_intermediate_size =
+        cfg.get_int("text_intermediate_size", out.text_intermediate_size);
+    out.num_layerwise_text_blocks =
+        cfg.get_int("num_layerwise_text_blocks", out.num_layerwise_text_blocks);
+    out.num_refiner_text_blocks =
+        cfg.get_int("num_refiner_text_blocks", out.num_refiner_text_blocks);
+    out.axes_dims_rope       = cfg.get_int_array("axes_dims_rope",
+                                                 out.axes_dims_rope);
+    out.rope_theta           = cfg.get_float("rope_theta", out.rope_theta);
+    out.norm_eps             = cfg.get_float("norm_eps", out.norm_eps);
+}
+
+void populate_krea2_vae(const json::Value& cfg, vae_qwenimage::Config& out) {
+    out.base_dim        = cfg.get_int("base_dim", out.base_dim);
+    out.z_dim           = cfg.get_int("z_dim", out.z_dim);
+    out.dim_mult        = cfg.get_int_array("dim_mult", out.dim_mult);
+    out.num_res_blocks  = cfg.get_int("num_res_blocks", out.num_res_blocks);
+    out.attn_scales     = get_float_array(cfg, "attn_scales", out.attn_scales);
+    out.temperal_downsample =
+        get_bool_array(cfg, "temperal_downsample", out.temperal_downsample);
+    out.dropout         = cfg.get_float("dropout", out.dropout);
+    out.input_channels  = cfg.get_int("input_channels", out.input_channels);
+    out.latents_mean    = get_float_array(cfg, "latents_mean", out.latents_mean);
+    out.latents_std     = get_float_array(cfg, "latents_std", out.latents_std);
+}
+
 }  // namespace
 
 ModelConfig load_model_config(const std::string& model_dir) {
@@ -354,6 +422,8 @@ ModelConfig load_model_config(const std::string& model_dir) {
         out.model_class = ModelClass::Sana;
     } else if (contains_ci(class_name, "PixArt")) {
         out.model_class = ModelClass::PixArt;
+    } else if (contains_ci(class_name, "Krea2")) {
+        out.model_class = ModelClass::Krea2;
     } else {
         out.model_class = ModelClass::Unknown;
     }
@@ -361,9 +431,27 @@ ModelConfig load_model_config(const std::string& model_dir) {
     const bool is_flux   = (out.model_class == ModelClass::Flux);
     const bool is_sana   = (out.model_class == ModelClass::Sana);
     const bool is_pixart = (out.model_class == ModelClass::PixArt);
+    const bool is_krea2  = (out.model_class == ModelClass::Krea2);
+
+    // --- Krea 2: transformer + VAE + Qwen3-VL text encoder configs ---
+    if (is_krea2) {
+        // Raw vs Turbo: both ship _class_name "Krea2Pipeline"; is_distilled
+        // separates them (false = Raw / real CFG, true = Turbo / no CFG).
+        out.krea2.is_distilled = index.get_bool("is_distilled", false);
+        out.krea2.patch_size   = index.get_int("patch_size", 2);
+
+        const fs::path tf_cfg = root / "transformer" / "config.json";
+        if (fs::exists(tf_cfg)) {
+            populate_krea2_transformer(parse_file(tf_cfg), out.krea2.transformer);
+        }
+        const fs::path te_cfg = root / "text_encoder" / "config.json";
+        if (fs::exists(te_cfg)) {
+            out.krea2.text = brolm::qwen3vl::Qwen3VLConfig::load(te_cfg.string());
+        }
+    }
 
     // --- unet/config.json (StableDiffusion only) ---
-    if (!is_flux && !is_sana && !is_pixart) {
+    if (!is_flux && !is_sana && !is_pixart && !is_krea2) {
         const fs::path unet_cfg = root / "unet" / "config.json";
         if (fs::exists(unet_cfg)) {
             populate_unet(parse_file(unet_cfg), out.unet);
@@ -419,20 +507,24 @@ ModelConfig load_model_config(const std::string& model_dir) {
         out.t5_max_length = 300;  // PixArt-Sigma caption cap (alpha was 120)
     }
 
-    // --- vae/config.json (always; AutoencoderDC for Sana, AutoencoderKL else) ---
+    // --- vae/config.json (AutoencoderDC for Sana, AutoencoderKLQwenImage for
+    //     Krea 2, AutoencoderKL otherwise) ---
     {
         const fs::path vae_cfg = root / "vae" / "config.json";
         if (fs::exists(vae_cfg)) {
             if (is_sana) {
                 populate_dcae(parse_file(vae_cfg), out.dcae);
+            } else if (is_krea2) {
+                populate_krea2_vae(parse_file(vae_cfg), out.krea2.vae);
             } else {
                 populate_vae(parse_file(vae_cfg), out.vae);
             }
         }
     }
 
-    // --- text_encoder/config.json (CLIP; Sana's Gemma-2 + PixArt's T5 above) ---
-    if (!is_sana && !is_pixart) {
+    // --- text_encoder/config.json (CLIP; Sana's Gemma-2, PixArt's T5, and
+    //     Krea 2's Qwen3-VL are handled above) ---
+    if (!is_sana && !is_pixart && !is_krea2) {
         const fs::path te_cfg = root / "text_encoder" / "config.json";
         if (fs::exists(te_cfg)) {
             populate_text_encoder(parse_file(te_cfg), out.text_encoder);
@@ -447,7 +539,18 @@ ModelConfig load_model_config(const std::string& model_dir) {
             const json::Value cfg = parse_file(sched_cfg);
             const std::string sched_class = cfg.get_string("_class_name", "");
             if (sched_class == "FlowMatchEulerDiscreteScheduler") {
-                out.scheduler = parse_flow_match(cfg);
+                scheduler::FlowMatchConfig fm = parse_flow_match(cfg);
+                // Krea 2 Turbo (distilled) uses a FIXED dynamic-shift mu = max_shift
+                // instead of the resolution-derived one. A dynamic shift with a
+                // fixed mu is algebraically identical to a static shift = exp(mu)
+                // (both give sigma' = e^mu·s / (1 + (e^mu-1)·s)), so realise it as
+                // a static shift and leave the scheduler's dynamic-shifting path —
+                // and every other model's behaviour — untouched.
+                if (is_krea2 && out.krea2.is_distilled) {
+                    fm.use_dynamic_shifting = false;
+                    fm.shift = std::exp(fm.max_shift);
+                }
+                out.scheduler = fm;
             } else if (sched_class == "DPMSolverMultistepScheduler") {
                 // Two flavours share this class name: PixArt-Sigma's epsilon
                 // DPM-Solver++ (a real discrete-time DPM) and Sana's
@@ -469,7 +572,7 @@ ModelConfig load_model_config(const std::string& model_dir) {
             }
         } else {
             // Missing scheduler config: default per model class.
-            if (is_flux || is_sana) {
+            if (is_flux || is_sana || is_krea2) {
                 out.scheduler = scheduler::FlowMatchConfig{};
             } else if (is_pixart) {
                 out.scheduler = scheduler::DPMSolverConfig{};

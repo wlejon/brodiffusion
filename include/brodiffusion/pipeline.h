@@ -34,6 +34,9 @@
 #include "brodiffusion/unet.h"
 #include "brodiffusion/vae.h"
 #include "brodiffusion/vae_dcae.h"
+#include "brodiffusion/vae_qwenimage.h"
+#include "brolm/qwen3vl_text.h"
+#include "brolm/qwen3vl_tokenizer.h"
 
 #include "brotensor/tensor.h"
 
@@ -65,6 +68,7 @@ struct PipelineConfig {
     int                      t5_max_length = 512;
     brolm::gemma::Gemma2Config gemma;       // Sana (Gemma-2 text encoder)
     int                      sana_max_seq_len = 300;  // Gemma caption length
+    Krea2ModelConfig         krea2;         // Krea 2 (transformer + VAE + Qwen3-VL)
     // DDIM (default, vanilla SD1.5) or LCM (latent-consistency, distilled
     // checkpoints with unet.time_cond_proj_dim > 0) or FlowMatch (Flux). The
     // pipeline branches on the active alternative; existing call sites that
@@ -232,6 +236,12 @@ public:
     // cfg.model_class == ModelClass::PixArt. There is no CLIP frontend (the
     // CLIP tokenizer/encoder members stay default-constructed and unused).
     Pipeline(const PipelineConfig& cfg, brolm::t5::Tokenizer t5_tok);
+
+    // Krea 2 constructor: builds a Krea2Denoiser (single-stream flow DiT) + the
+    // Qwen-Image VAE decoder + the Qwen3-VL-4B text encoder, and owns the
+    // Qwen3-VL tokenizer. Valid only when cfg.model_class == ModelClass::Krea2.
+    // No CLIP frontend / KL-VAE (those members stay default-constructed).
+    Pipeline(const PipelineConfig& cfg, brolm::qwen3vl::Tokenizer qwen3vl_tok);
 
     // Build a fully-loaded Pipeline from a diffusers model directory: reads the
     // JSON configs, constructs the right sub-modules, loads all component
@@ -467,6 +477,15 @@ private:
     std::optional<dcae::Decoder>             dcae_;
     std::optional<brolm::gemma::Gemma2Model> gemma_model_;
     std::optional<brolm::gemma::Tokenizer>   gemma_tokenizer_;
+
+    // ── Krea 2-only sub-modules ───────────────────────────────────────────
+    // The Krea2Denoiser lives in denoiser_; these have no SD / Flux analogue.
+    // decode() routes to vae_qwen_ for Krea 2; prime() Qwen3-VL-encodes the
+    // prompt (tapped hidden states + validity mask) via qwen3vl_model_ /
+    // qwen3vl_tokenizer_. All empty for non-Krea2 pipelines.
+    std::optional<vae_qwenimage::Decoder>    vae_qwen_;
+    std::optional<brolm::qwen3vl::TextModel> qwen3vl_model_;
+    std::optional<brolm::qwen3vl::Tokenizer> qwen3vl_tokenizer_;
 
     // Model-agnostic conditioning, rebuilt each prime(). `conditioning_` keeps
     // the raw text context around for trace-mode access; `prepared_` holds the

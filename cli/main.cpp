@@ -353,9 +353,16 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
         pipeline.config().model_class == brodiffusion::ModelClass::Sana;
     const bool is_pixart =
         pipeline.config().model_class == brodiffusion::ModelClass::PixArt;
+    const bool is_krea2 =
+        pipeline.config().model_class == brodiffusion::ModelClass::Krea2;
+    // Krea 2 ships two checkpoints under one _class_name: Raw (real CFG) and
+    // the distilled Turbo (no CFG, few steps).
+    const bool is_krea2_turbo = is_krea2 && pipeline.config().krea2.is_distilled;
     std::printf("Model class: %s\n",
                 is_flux ? "Flux" : (is_sana ? "Sana"
-                       : (is_pixart ? "PixArt-Sigma" : "StableDiffusion")));
+                       : (is_pixart ? "PixArt-Sigma"
+                       : (is_krea2 ? (is_krea2_turbo ? "Krea 2 Turbo" : "Krea 2 Raw")
+                       : "StableDiffusion"))));
 
     // Sana-Sprint is the guidance-distilled (guidance_embeds), SCM/TrigFlow
     // few-step variant — it defaults to 2 steps, vs base Sana's 20.
@@ -373,6 +380,12 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     if (is_pixart) { opts.width = 1024; opts.height = 1024;
                      opts.num_inference_steps = 20;
                      opts.guidance_scale = 4.5f; }
+    // Krea 2 native 1024px. The model card quotes guidance g under the
+    // convention standard_scale = 1 + g: Raw g=4.5 -> --guidance-scale 5.5
+    // (28 steps); Turbo g=0.0 -> --guidance-scale 1.0 (no CFG, 8 steps).
+    if (is_krea2) { opts.width = 1024; opts.height = 1024;
+                    opts.num_inference_steps = is_krea2_turbo ? 8 : 28;
+                    opts.guidance_scale = is_krea2_turbo ? 1.0f : 5.5f; }
     if (neg)      opts.negative_prompt = neg;
     if (steps_s)  opts.num_inference_steps = std::atoi(steps_s);
     else if (is_flux) opts.num_inference_steps = 4;  // flux-schnell default
