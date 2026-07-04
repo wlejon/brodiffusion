@@ -1,0 +1,492 @@
+#include "brodiffusion/dit/krea2.h"
+
+#include "brodiffusion/dit/common.h"
+#include "brodiffusion/detail/compute.h"
+#include "brodiffusion/detail/device.h"
+
+#include "brotensor/ops.h"
+#include "brotensor/runtime.h"
+#include "brotensor/safetensors.h"
+#include "brotensor/tensor.h"
+
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace brodiffusion::dit {
+
+namespace bt = ::brotensor;
+namespace st = ::brotensor::safetensors;
+
+namespace {
+
+[[noreturn]] void fail(const std::string& msg) {
+    throw std::runtime_error("dit::Krea2Transformer2DModel: " + msg);
+}
+
+const st::TensorView& need(const std::vector<const st::File*>& shards,
+                           const std::string& key) {
+    for (const st::File* f : shards) {
+        if (const auto* v = f->find(key)) return *v;
+    }
+    fail("missing tensor '" + key + "'");
+}
+
+// Download a checked view to host FP32 regardless of storage dtype.
+std::vector<float> view_to_fp32(const st::TensorView& v, int rows, int cols,
+                                const std::string& name) {
+    const std::int64_t expected =
+        static_cast<std::int64_t>(rows) * static_cast<std::int64_t>(cols);
+    if (v.numel() != expected) {
+        fail(name + " ('" + v.name + "'): shape mismatch (expected " +
+             std::to_string(rows) + "x" + std::to_string(cols) + ")");
+    }
+    const std::size_t n = static_cast<std::size_t>(expected);
+    std::vector<float> out(n);
+    if (v.dtype == st::Dtype::F32) {
+        std::memcpy(out.data(), v.data, n * 4);
+    } else if (v.dtype == st::Dtype::F16) {
+        const auto* b = reinterpret_cast<const std::uint16_t*>(v.data);
+        for (std::size_t i = 0; i < n; ++i) out[i] = bt::fp16_bits_to_fp32(b[i]);
+    } else if (v.dtype == st::Dtype::BF16) {
+        const auto* b = reinterpret_cast<const std::uint16_t*>(v.data);
+        for (std::size_t i = 0; i < n; ++i) out[i] = bt::bf16_bits_to_fp32(b[i]);
+    } else {
+        fail(name + " ('" + v.name + "'): expected F16/F32/BF16");
+    }
+    return out;
+}
+
+// Upload host FP32 values at the given dtype.
+bt::Tensor upload_as(const std::vector<float>& h, int rows, int cols,
+                     bt::Dtype dt) {
+    const std::size_t n = static_cast<std::size_t>(rows) * cols;
+    if (dt == bt::Dtype::BF16) {
+        std::vector<std::uint16_t> bits(n);
+        for (std::size_t i = 0; i < n; ++i) bits[i] = bt::fp32_to_bf16_bits(h[i]);
+        return bt::Tensor::from_host_bf16(bits.data(), rows, cols);
+    }
+    if (dt == bt::Dtype::FP16) {
+        std::vector<std::uint16_t> bits(n);
+        for (std::size_t i = 0; i < n; ++i) bits[i] = bt::fp32_to_fp16_bits(h[i]);
+        return bt::Tensor::from_host_fp16(bits.data(), rows, cols);
+    }
+    return bt::Tensor::from_host(h.data(), rows, cols);
+}
+
+// ── activation / norm helpers (see krea2.h: RMSNorm gain is 1+weight, FP32) ──
+
+// gelu with the tanh approximation (reference approximate="tanh").
+void gelu_tanh_inplace(bt::Tensor& t) { bt::gelu_forward(t, t); }
+
+// FP32 RMSNorm with a preloaded (1+weight) FP32 gain. Upcasts the activations
+// so the norm runs in FP32, then casts back to the input dtype.
+bt::Tensor rmsnorm(const bt::Tensor& X, const bt::Tensor& gain_fp32, float eps) {
+    bt::Tensor out;
+    if (X.dtype == bt::Dtype::FP32) {
+        bt::rms_norm_forward(X, gain_fp32, eps, out);
+        return out;
+    }
+    bt::Tensor xf, yf;
+    bt::cast(X, xf, bt::Dtype::FP32);
+    bt::rms_norm_forward(xf, gain_fp32, eps, yf);
+    bt::cast(yf, out, X.dtype);
+    return out;
+}
+
+// Per-head FP32 RMSNorm: view (L, nh*hd) as (L*nh, hd), norm, relabel (L, nh*hd).
+bt::Tensor headnorm(const bt::Tensor& X, const bt::Tensor& gain_fp32, float eps,
+                    int nh, int hd) {
+    const int L = X.rows;
+    bt::Tensor xv = bt::Tensor::view(X.device, X.data, L * nh, hd, X.dtype);
+    bt::Tensor normed = rmsnorm(xv, gain_fp32, eps);   // owns (L*nh, hd)
+    normed.rows = L;
+    normed.cols = nh * hd;
+    return normed;
+}
+
+// Build a device INT32 buffer from host values (varlen cu_seqlens).
+bt::Tensor make_idx_device(const std::vector<int32_t>& host) {
+    const int n = static_cast<int>(host.size());
+    bt::Tensor cpu = bt::Tensor::empty_on(bt::Device::CPU, n, 1, bt::Dtype::INT32);
+    std::memcpy(cpu.host_raw_mut(), host.data(),
+                static_cast<std::size_t>(n) * sizeof(int32_t));
+    return cpu.to(bt::default_device());
+}
+
+}  // namespace
+
+// ─── ctor / dtor ───────────────────────────────────────────────────────────
+
+Krea2Transformer2DModel::Krea2Transformer2DModel(const Krea2Config& cfg)
+    : cfg_(cfg) {
+    if (cfg_.num_attention_heads <= 0 || cfg_.attention_head_dim <= 0) {
+        fail("num_attention_heads / attention_head_dim must be positive");
+    }
+    if (cfg_.num_attention_heads % cfg_.num_key_value_heads != 0) {
+        fail("num_attention_heads must be a multiple of num_key_value_heads");
+    }
+    int sum = 0;
+    for (int d : cfg_.axes_dims_rope) sum += d;
+    if (sum != cfg_.attention_head_dim) {
+        fail("axes_dims_rope must sum to attention_head_dim");
+    }
+    if (cfg_.text_hidden_dim % cfg_.text_num_attention_heads != 0) {
+        fail("text_hidden_dim must be a multiple of text_num_attention_heads");
+    }
+    if (cfg_.text_num_attention_heads != cfg_.text_num_key_value_heads) {
+        fail("text fusion attention must be plain MHA (nq == nkv)");
+    }
+    layerwise_blocks_.resize(static_cast<std::size_t>(cfg_.num_layerwise_text_blocks));
+    refiner_blocks_.resize(static_cast<std::size_t>(cfg_.num_refiner_text_blocks));
+    blocks_.resize(static_cast<std::size_t>(cfg_.num_layers));
+}
+
+Krea2Transformer2DModel::~Krea2Transformer2DModel() = default;
+
+bt::Dtype Krea2Transformer2DModel::compute_dtype() const {
+    return flux_compute_dtype();
+}
+
+// ─── load_weights ──────────────────────────────────────────────────────────
+
+void Krea2Transformer2DModel::load_weights(const st::File& f,
+                                           const std::string& prefix) {
+    const std::vector<const st::File*> shards = {&f};
+    load_weights(shards, prefix);
+}
+
+void Krea2Transformer2DModel::load_weights(
+    const std::vector<const st::File*>& shards, const std::string& prefix) {
+    if (shards.empty()) fail("load_weights: no shards");
+    load_impl_(shards, prefix);
+    loaded_ = true;
+}
+
+void Krea2Transformer2DModel::load_impl_(
+    const std::vector<const st::File*>& shards, const std::string& prefix) {
+    const bt::Dtype dt = flux_compute_dtype();
+    const int H = cfg_.hidden_size();
+    const int IC = cfg_.in_channels;
+    const int TE = cfg_.timestep_embed_dim;
+    const int TH = cfg_.text_hidden_dim;
+    const int hd_img = cfg_.attention_head_dim;
+    const int nq_img = cfg_.num_attention_heads;
+    const int nkv_img = cfg_.num_key_value_heads;
+    const int hd_txt = TH / cfg_.text_num_attention_heads;
+    const int nq_txt = cfg_.text_num_attention_heads;
+
+    auto lin = [&](const std::string& key, int out, int in, bool bias,
+                   Linear& l) {
+        l.W = upload_as(view_to_fp32(need(shards, prefix + key + ".weight"),
+                                     out, in, key),
+                        out, in, dt);
+        if (bias) {
+            l.b = upload_as(view_to_fp32(need(shards, prefix + key + ".bias"),
+                                         out, 1, key),
+                            out, 1, dt);
+        }
+    };
+    // RMSNorm gain: store (1 + weight) in FP32 (see krea2.h).
+    auto norm = [&](const std::string& key, int dim, bt::Tensor& g) {
+        std::vector<float> h = view_to_fp32(need(shards, prefix + key + ".weight"),
+                                            dim, 1, key);
+        for (float& x : h) x += 1.0f;
+        g = bt::Tensor::from_host(h.data(), dim, 1).to(bt::default_device());
+    };
+    auto raw = [&](const std::string& key, int rows, int cols, bt::Tensor& t) {
+        t = upload_as(view_to_fp32(need(shards, prefix + key), rows, cols, key),
+                      rows, cols, dt);
+    };
+
+    auto load_attn = [&](const std::string& p, int dim, int hd, int nq, int nkv,
+                         Attention& a) {
+        lin(p + "to_q", hd * nq, dim, false, a.to_q);
+        lin(p + "to_k", hd * nkv, dim, false, a.to_k);
+        lin(p + "to_v", hd * nkv, dim, false, a.to_v);
+        lin(p + "to_gate", dim, dim, false, a.to_gate);
+        lin(p + "to_out.0", dim, dim, false, a.to_out);
+        norm(p + "norm_q", hd, a.norm_q);
+        norm(p + "norm_k", hd, a.norm_k);
+    };
+    auto load_ff = [&](const std::string& p, int dim, int inter, SwiGLU& f) {
+        lin(p + "gate", inter, dim, false, f.gate);
+        lin(p + "up", inter, dim, false, f.up);
+        lin(p + "down", dim, inter, false, f.down);
+    };
+    auto load_fusion = [&](const std::string& p, FusionBlock& b) {
+        norm(p + "norm1", TH, b.norm1);
+        norm(p + "norm2", TH, b.norm2);
+        load_attn(p + "attn.", TH, hd_txt, nq_txt, nq_txt, b.attn);
+        load_ff(p + "ff.", TH, cfg_.text_intermediate_size, b.ff);
+    };
+
+    lin("img_in", H, IC, true, img_in_);
+    lin("time_embed.linear_1", H, TE, true, time_l1_);
+    lin("time_embed.linear_2", H, H, true, time_l2_);
+    lin("time_mod_proj", 6 * H, H, true, time_mod_proj_);
+
+    for (int i = 0; i < cfg_.num_layerwise_text_blocks; ++i) {
+        load_fusion("text_fusion.layerwise_blocks." + std::to_string(i) + ".",
+                    layerwise_blocks_[static_cast<std::size_t>(i)]);
+    }
+    raw("text_fusion.projector.weight", 1, cfg_.num_text_layers, projector_);
+    for (int i = 0; i < cfg_.num_refiner_text_blocks; ++i) {
+        load_fusion("text_fusion.refiner_blocks." + std::to_string(i) + ".",
+                    refiner_blocks_[static_cast<std::size_t>(i)]);
+    }
+
+    norm("txt_in.norm", TH, txt_in_norm_);
+    lin("txt_in.linear_1", H, TH, true, txt_in_l1_);
+    lin("txt_in.linear_2", H, H, true, txt_in_l2_);
+
+    for (int i = 0; i < cfg_.num_layers; ++i) {
+        const std::string p = "transformer_blocks." + std::to_string(i) + ".";
+        TransformerBlock& b = blocks_[static_cast<std::size_t>(i)];
+        raw(p + "scale_shift_table", 6, H, b.scale_shift_table);
+        norm(p + "norm1", H, b.norm1);
+        norm(p + "norm2", H, b.norm2);
+        load_attn(p + "attn.", H, hd_img, nq_img, nkv_img, b.attn);
+        load_ff(p + "ff.", H, cfg_.intermediate_size, b.ff);
+    }
+
+    raw("final_layer.scale_shift_table", 2, H, final_scale_shift_table_);
+    norm("final_layer.norm", H, final_norm_);
+    lin("final_layer.linear", IC, H, true, final_linear_);
+}
+
+// ─── forward ───────────────────────────────────────────────────────────────
+
+void Krea2Transformer2DModel::forward(const bt::Tensor& packed_latent,
+                                      int hp, int wp,
+                                      const bt::Tensor& prompt_embeds,
+                                      const bt::Tensor& prompt_embeds_mask,
+                                      float timestep, bt::Tensor& out) {
+    if (!loaded_) fail("forward: weights not loaded");
+    const bt::Dtype dt = flux_compute_dtype();
+    const int H = cfg_.hidden_size();
+    const int NL = cfg_.num_text_layers;
+    const int TH = cfg_.text_hidden_dim;
+    const int hd_img = cfg_.attention_head_dim;
+    const int nq_img = cfg_.num_attention_heads;
+    const int nkv_img = cfg_.num_key_value_heads;
+    const int hd_txt = TH / cfg_.text_num_attention_heads;
+    const int nq_txt = cfg_.text_num_attention_heads;
+    const int img_len = hp * wp;
+    if (prompt_embeds.cols != TH || prompt_embeds.rows % NL != 0) {
+        fail("forward: prompt_embeds shape mismatch");
+    }
+    const int text_seq = prompt_embeds.rows / NL;
+    if (prompt_embeds_mask.rows != text_seq) {
+        fail("forward: prompt_embeds_mask length mismatch");
+    }
+
+    auto linb = [&](const Linear& l, const bt::Tensor& X) -> bt::Tensor {
+        bt::Tensor Y;
+        detail::linear_batched(l.W, l.has_bias() ? &l.b : nullptr, X, Y);
+        return Y;
+    };
+
+    // ── timestep embeddings ──────────────────────────────────────────────
+    const float ts_val = timestep * 1000.0f;   // Krea 2 scales flow-time by 1000
+    bt::Tensor ts = bt::Tensor::from_host_on(bt::Device::CPU, &ts_val, 1, 1);
+    bt::Tensor freq;
+    bt::timestep_embedding(ts, cfg_.timestep_embed_dim, 10000.0f, freq);  // (1,TE) FP32
+    bt::Tensor freq_dev = freq.to(bt::default_device());
+    bt::Tensor freq_cd = freq_dev;
+    if (dt != bt::Dtype::FP32) bt::cast(freq_dev, freq_cd, dt);
+    bt::Tensor temb = linb(time_l1_, freq_cd);
+    gelu_tanh_inplace(temb);
+    temb = linb(time_l2_, temb);                 // (1, H)  raw time embedding
+    bt::Tensor temb_gelu = temb.clone();
+    gelu_tanh_inplace(temb_gelu);
+    bt::Tensor temb_mod = linb(time_mod_proj_, temb_gelu);   // (1, 6H)
+
+    // ── masks ────────────────────────────────────────────────────────────
+    bt::Tensor mask_f32 = prompt_embeds_mask;
+    if (mask_f32.dtype != bt::Dtype::FP32) {
+        bt::Tensor t; bt::cast(prompt_embeds_mask, t, bt::Dtype::FP32); mask_f32 = t;
+    }
+    mask_f32 = mask_f32.to(bt::default_device());
+    std::vector<float> text_mask_h = mask_f32.to(bt::Device::CPU).to_host_vector();
+    std::vector<float> comb_h(static_cast<std::size_t>(text_seq + img_len), 1.0f);
+    for (int i = 0; i < text_seq; ++i) comb_h[static_cast<std::size_t>(i)] = text_mask_h[static_cast<std::size_t>(i)];
+    bt::Tensor comb_mask =
+        bt::Tensor::from_host(comb_h.data(), text_seq + img_len, 1)
+            .to(bt::default_device());
+    const float* text_dmask = static_cast<const float*>(mask_f32.data);
+    const float* comb_dmask = static_cast<const float*>(comb_mask.data);
+
+    // Attention scratch, reused across every attention call.
+    bt::Tensor Qr, Kr, Krep, Vrep;
+
+    // Attention sublayer (Krea2AttnProcessor): project q/k/v/gate, per-head
+    // qk-norm, optional RoPE, GQA masked attention, sigmoid gate, out proj.
+    auto attn_apply = [&](const Attention& a, const bt::Tensor& x,
+                          int hd, int nq, int nkv, const bt::Tensor* cos,
+                          const bt::Tensor* sin, const float* dmask) -> bt::Tensor {
+        bt::Tensor q = linb(a.to_q, x);
+        bt::Tensor k = linb(a.to_k, x);
+        bt::Tensor v = linb(a.to_v, x);
+        bt::Tensor gate = linb(a.to_gate, x);
+        q = headnorm(q, a.norm_q, cfg_.norm_eps, nq, hd);
+        k = headnorm(k, a.norm_k, cfg_.norm_eps, nkv, hd);
+        bt::Tensor attn;
+        gqa_attention_masked(q, k, v, cos, sin, hd, nq, nkv, dmask, attn,
+                             Qr, Kr, Krep, Vrep);
+        bt::sigmoid_forward(gate, gate);
+        bt::mul_inplace(attn, gate);
+        return linb(a.to_out, attn);
+    };
+
+    // FF sublayer (SwiGLU): down(silu(gate(x)) * up(x)).
+    auto ff_apply = [&](const SwiGLU& f, const bt::Tensor& x) -> bt::Tensor {
+        bt::Tensor g = linb(f.gate, x);
+        bt::silu_forward(g, g);
+        bt::Tensor u = linb(f.up, x);
+        bt::mul_inplace(g, u);
+        return linb(f.down, g);
+    };
+
+    // ── text fusion ──────────────────────────────────────────────────────
+    bt::Tensor hs;   // (text_seq*NL, TH)
+    if (prompt_embeds.dtype != dt) bt::cast(prompt_embeds, hs, dt);
+    else hs = prompt_embeds.to(bt::default_device());
+
+    // Layerwise blocks: attention over the NL-tap axis, batched per token.
+    std::vector<int32_t> cu(static_cast<std::size_t>(text_seq + 1));
+    for (int i = 0; i <= text_seq; ++i) cu[static_cast<std::size_t>(i)] = i * NL;
+    bt::Tensor cu_dev = make_idx_device(cu);
+    const int32_t* cu_ptr = static_cast<const int32_t*>(cu_dev.data);
+
+    auto layerwise_attn = [&](const Attention& a, const bt::Tensor& x) -> bt::Tensor {
+        bt::Tensor q = linb(a.to_q, x);
+        bt::Tensor k = linb(a.to_k, x);
+        bt::Tensor v = linb(a.to_v, x);
+        bt::Tensor gate = linb(a.to_gate, x);
+        q = headnorm(q, a.norm_q, cfg_.norm_eps, nq_txt, hd_txt);
+        k = headnorm(k, a.norm_k, cfg_.norm_eps, nq_txt, hd_txt);
+        bt::Tensor attn;
+        bt::flash_attention_varlen_forward(q, k, v, cu_ptr, cu_ptr, text_seq,
+                                           NL, NL, nq_txt, hd_txt,
+                                           /*causal=*/false, attn);
+        bt::sigmoid_forward(gate, gate);
+        bt::mul_inplace(attn, gate);
+        return linb(a.to_out, attn);
+    };
+
+    for (const FusionBlock& b : layerwise_blocks_) {
+        bt::Tensor n1 = rmsnorm(hs, b.norm1, cfg_.norm_eps);
+        bt::Tensor ao = layerwise_attn(b.attn, n1);
+        bt::add_inplace(hs, ao);
+        bt::Tensor n2 = rmsnorm(hs, b.norm2, cfg_.norm_eps);
+        bt::Tensor fo = ff_apply(b.ff, n2);
+        bt::add_inplace(hs, fo);
+    }
+
+    // Projector: collapse the NL-tap axis (Linear NL->1) into (text_seq, TH).
+    std::vector<float> pw;
+    {
+        bt::Tensor pf = projector_;
+        if (pf.dtype != bt::Dtype::FP32) { bt::Tensor t; bt::cast(projector_, t, bt::Dtype::FP32); pf = t; }
+        pw = pf.to(bt::Device::CPU).to_host_vector();
+    }
+    bt::Tensor fused = bt::Tensor::zeros_on(bt::default_device(), text_seq, TH, dt);
+    bt::Tensor gath;
+    detail::resize_like(gath, text_seq, TH, dt, bt::default_device());
+    for (int l = 0; l < NL; ++l) {
+        bt::copy_d2d_strided(hs, l * TH, NL * TH, gath, 0, TH, TH, text_seq);
+        bt::axpby_inplace(fused, gath, 1.0f, pw[static_cast<std::size_t>(l)]);
+    }
+
+    // Refiner blocks: attention over the token sequence, text-masked, no RoPE.
+    for (const FusionBlock& b : refiner_blocks_) {
+        bt::Tensor n1 = rmsnorm(fused, b.norm1, cfg_.norm_eps);
+        bt::Tensor ao = attn_apply(b.attn, n1, hd_txt, nq_txt, nq_txt,
+                                   nullptr, nullptr, text_dmask);
+        bt::add_inplace(fused, ao);
+        bt::Tensor n2 = rmsnorm(fused, b.norm2, cfg_.norm_eps);
+        bt::Tensor fo = ff_apply(b.ff, n2);
+        bt::add_inplace(fused, fo);
+    }
+
+    // txt_in (Krea2TextProjection): norm -> linear_1 -> gelu(tanh) -> linear_2.
+    bt::Tensor txt = rmsnorm(fused, txt_in_norm_, cfg_.norm_eps);
+    txt = linb(txt_in_l1_, txt);
+    gelu_tanh_inplace(txt);
+    txt = linb(txt_in_l2_, txt);                 // (text_seq, H)
+
+    // img_in and joint sequence.
+    bt::Tensor lat = packed_latent;
+    if (lat.dtype != dt) { bt::Tensor t; bt::cast(packed_latent, t, dt); lat = t; }
+    else lat = packed_latent.to(bt::default_device());
+    bt::Tensor img = linb(img_in_, lat);         // (img_len, H)
+
+    bt::Tensor x;
+    detail::resize_like(x, text_seq + img_len, H, dt, bt::default_device());
+    bt::copy_d2d(txt, 0, x, 0, text_seq * H);
+    bt::copy_d2d(img, 0, x, text_seq * H, img_len * H);
+
+    // RoPE tables for the joint [text ; image] sequence (theta = rope_theta).
+    RopeTables rope = build_axial_rope_tables(text_seq, hp, wp, hd_img,
+                                              cfg_.axes_dims_rope, cfg_.rope_theta);
+
+    // ── transformer blocks ───────────────────────────────────────────────
+    bt::Tensor table_flat;   // scratch: (1, 6H) view of a block's table
+    std::vector<bt::Tensor> chunks;
+    for (const TransformerBlock& b : blocks_) {
+        // modulation = temb_mod + scale_shift_table (flattened), sliced to 6.
+        bt::Tensor mod;
+        detail::resize_like(mod, 1, 6 * H, dt, bt::default_device());
+        bt::copy_d2d(b.scale_shift_table, 0, mod, 0, 6 * H);
+        bt::add_inplace(mod, temb_mod);
+        slice_modulation_chunks(mod, H, 6, chunks);
+        const bt::Tensor& prescale = chunks[0];
+        const bt::Tensor& preshift = chunks[1];
+        const bt::Tensor& pregate = chunks[2];
+        const bt::Tensor& postscale = chunks[3];
+        const bt::Tensor& postshift = chunks[4];
+        const bt::Tensor& postgate = chunks[5];
+
+        bt::Tensor n1 = rmsnorm(x, b.norm1, cfg_.norm_eps);
+        bt::Tensor n1m;
+        bt::modulate(n1, prescale, preshift, n1m);
+        bt::Tensor ao = attn_apply(b.attn, n1m, hd_img, nq_img, nkv_img,
+                                   &rope.cos, &rope.sin, comb_dmask);
+        bt::Tensor gated;
+        bt::broadcast_mul(ao, pregate, gated);
+        bt::add_inplace(x, gated);
+
+        bt::Tensor n2 = rmsnorm(x, b.norm2, cfg_.norm_eps);
+        bt::Tensor n2m;
+        bt::modulate(n2, postscale, postshift, n2m);
+        bt::Tensor fo = ff_apply(b.ff, n2m);
+        bt::broadcast_mul(fo, postgate, gated);
+        bt::add_inplace(x, gated);
+    }
+
+    // ── final layer over image rows (uses the RAW temb) ──────────────────
+    bt::Tensor img_x;
+    detail::resize_like(img_x, img_len, H, dt, bt::default_device());
+    bt::copy_d2d(x, text_seq * H, img_x, 0, img_len * H);
+
+    bt::Tensor scale, shift;
+    detail::resize_like(scale, 1, H, dt, bt::default_device());
+    detail::resize_like(shift, 1, H, dt, bt::default_device());
+    bt::copy_d2d(final_scale_shift_table_, 0, scale, 0, H);
+    bt::copy_d2d(final_scale_shift_table_, H, shift, 0, H);
+    bt::add_inplace(scale, temb);
+    bt::add_inplace(shift, temb);
+
+    bt::Tensor fn = rmsnorm(img_x, final_norm_, cfg_.norm_eps);
+    bt::Tensor fnm;
+    bt::modulate(fn, scale, shift, fnm);
+    out = linb(final_linear_, fnm);              // (img_len, in_channels)
+    bt::sync_all();
+}
+
+}  // namespace brodiffusion::dit

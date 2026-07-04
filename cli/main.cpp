@@ -1,6 +1,8 @@
 #include "brodiffusion/pipeline.h"
 #include "brodiffusion/vae_qwenimage.h"
 #include "brodiffusion/krea2_text.h"
+#include "brodiffusion/dit/krea2.h"
+#include "brodiffusion/detail/json.h"
 #include "brolm/qwen3vl_config.h"
 #include "brolm/qwen3vl_text.h"
 #include "brolm/qwen3vl_tokenizer.h"
@@ -17,6 +19,7 @@
 #include "broimage/encode.h"
 #include "broimage/preproc.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -910,6 +913,118 @@ int run_krea2_text_fwd(int argc, char** argv) {
     return 0;
 }
 
+// Parse a Krea2Transformer2DModel config.json into a Krea2Config.
+brodiffusion::dit::Krea2Config load_krea2_config(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open config: " + path);
+    std::string text((std::istreambuf_iterator<char>(f)),
+                     std::istreambuf_iterator<char>());
+    namespace j = brodiffusion::detail::json;
+    j::Value v = j::parse(text);
+    brodiffusion::dit::Krea2Config c;
+    c.in_channels = v.get_int("in_channels", c.in_channels);
+    c.num_layers = v.get_int("num_layers", c.num_layers);
+    c.attention_head_dim = v.get_int("attention_head_dim", c.attention_head_dim);
+    c.num_attention_heads = v.get_int("num_attention_heads", c.num_attention_heads);
+    c.num_key_value_heads = v.get_int("num_key_value_heads", c.num_key_value_heads);
+    c.intermediate_size = v.get_int("intermediate_size", c.intermediate_size);
+    c.timestep_embed_dim = v.get_int("timestep_embed_dim", c.timestep_embed_dim);
+    c.text_hidden_dim = v.get_int("text_hidden_dim", c.text_hidden_dim);
+    c.num_text_layers = v.get_int("num_text_layers", c.num_text_layers);
+    c.text_num_attention_heads =
+        v.get_int("text_num_attention_heads", c.text_num_attention_heads);
+    c.text_num_key_value_heads =
+        v.get_int("text_num_key_value_heads", c.text_num_key_value_heads);
+    c.text_intermediate_size =
+        v.get_int("text_intermediate_size", c.text_intermediate_size);
+    c.num_layerwise_text_blocks =
+        v.get_int("num_layerwise_text_blocks", c.num_layerwise_text_blocks);
+    c.num_refiner_text_blocks =
+        v.get_int("num_refiner_text_blocks", c.num_refiner_text_blocks);
+    c.axes_dims_rope = v.get_int_array("axes_dims_rope", c.axes_dims_rope);
+    c.rope_theta = v.get_float("rope_theta", c.rope_theta);
+    c.norm_eps = v.get_float("norm_eps", c.norm_eps);
+    return c;
+}
+
+// Hidden debug subcommand: run ONE Krea2 DiT forward on fixed inputs (packed
+// latent, stage-1 conditioning, timestep, packed grid) read from raw float32
+// files, dump the velocity. Diffed against scripts/krea2_dit_ref.py. Sharded
+// checkpoint (--weights-dir holds config.json + the diffusion_pytorch_model
+// shards). Not in usage().
+int run_krea2_fwd(int argc, char** argv) {
+    const char* wdir = arg_after(argc, argv, "--weights-dir");
+    const char* lp = arg_after(argc, argv, "--latent");
+    const char* ep = arg_after(argc, argv, "--embeds");
+    const char* mp = arg_after(argc, argv, "--mask");
+    const char* op = arg_after(argc, argv, "--out");
+    const char* ts = arg_after(argc, argv, "--t");
+    const char* hps = arg_after(argc, argv, "--hp");
+    const char* wps = arg_after(argc, argv, "--wp");
+    const char* seqs = arg_after(argc, argv, "--seq");
+    if (!wdir || !lp || !ep || !mp || !op || !ts || !hps || !wps) {
+        std::fprintf(stderr, "krea2-fwd: need --weights-dir --latent --embeds "
+                             "--mask --out --t --hp --wp [--seq]\n");
+        return 2;
+    }
+    const int hp = std::atoi(hps), wp = std::atoi(wps);
+    const int text_seq = seqs ? std::atoi(seqs) : 512;
+    const float t = static_cast<float>(std::atof(ts));
+    brotensor::init();
+
+    const std::string wd = wdir;
+    auto cfg = load_krea2_config(wd + "/config.json");
+    brodiffusion::dit::Krea2Transformer2DModel model(cfg);
+
+    // Open every shard listed in the index (or the single-file checkpoint).
+    std::vector<st::File> files;
+    std::vector<const st::File*> shards;
+    const std::string index = wd + "/diffusion_pytorch_model.safetensors.index.json";
+    std::ifstream idxf(index, std::ios::binary);
+    if (idxf) {
+        std::string text((std::istreambuf_iterator<char>(idxf)),
+                         std::istreambuf_iterator<char>());
+        namespace j = brodiffusion::detail::json;
+        j::Value v = j::parse(text);
+        const auto& wm = v.at("weight_map");
+        std::vector<std::string> names;
+        for (const auto& m : wm.as_object()) {
+            const std::string s = m.second.as_string();
+            if (std::find(names.begin(), names.end(), s) == names.end())
+                names.push_back(s);
+        }
+        files.reserve(names.size());
+        for (const std::string& n : names) files.push_back(st::File::open(wd + "/" + n));
+    } else {
+        files.push_back(st::File::open(wd + "/diffusion_pytorch_model.safetensors"));
+    }
+    for (const st::File& f : files) shards.push_back(&f);
+    model.load_weights(shards, "");
+
+    const int img_len = hp * wp;
+    auto lat_h = load_latent_f32(lp, img_len * cfg.in_channels);
+    auto emb_h = load_latent_f32(ep, text_seq * cfg.num_text_layers * cfg.text_hidden_dim);
+    auto msk_h = load_latent_f32(mp, text_seq);
+    brotensor::Tensor lat =
+        brotensor::Tensor::from_host(lat_h.data(), img_len, cfg.in_channels)
+            .to(brotensor::default_device());
+    brotensor::Tensor emb =
+        brotensor::Tensor::from_host(emb_h.data(),
+                                     text_seq * cfg.num_text_layers,
+                                     cfg.text_hidden_dim)
+            .to(brotensor::default_device());
+    brotensor::Tensor msk =
+        brotensor::Tensor::from_host(msk_h.data(), text_seq, 1)
+            .to(brotensor::default_device());
+
+    brotensor::Tensor out;
+    model.forward(lat, hp, wp, emb, msk, t, out);
+    brotensor::sync_all();
+    dump_latent_f32(op, out);
+    std::printf("krea2-fwd: wrote velocity (%d,%d) to %s\n", out.rows, out.cols, op);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -930,6 +1045,12 @@ int main(int argc, char** argv) {
         try { return run_krea2_text_fwd(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "krea2-text-fwd: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "krea2-fwd") == 0) {
+        try { return run_krea2_fwd(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "krea2-fwd: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-v") == 0) {

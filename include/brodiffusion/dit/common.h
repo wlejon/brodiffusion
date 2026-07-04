@@ -65,8 +65,11 @@ struct RopeTables {
     brotensor::Tensor cos;  // (L, head_dim/2) FP32
     brotensor::Tensor sin;  // (L, head_dim/2) FP32
 };
+// `theta` is the per-axis frequency base (diffusers' rope_theta). Flux uses the
+// default 10000; Krea 2 passes 1000.
 RopeTables build_axial_rope_tables(int txt_len, int hp, int wp, int head_dim,
-                                   const std::vector<int>& axes_dims_rope);
+                                   const std::vector<int>& axes_dims_rope,
+                                   float theta = 10000.0f);
 
 // ─── joint attention ───────────────────────────────────────────────────────
 
@@ -124,6 +127,30 @@ void joint_attention_traced(const brotensor::Tensor& Q,
                             // optional pre-softmax image→text steering bias
                             int txt_len = 0,
                             const brotensor::Tensor* image_text_bias = nullptr);
+
+// ─── grouped-query masked attention (Krea 2) ───────────────────────────────
+
+// Bidirectional attention with grouped-query heads, optional RoPE, and an
+// optional key-padding mask. Q is (L, num_q_heads*head_dim); K, V are
+// (L, num_kv_heads*head_dim) with num_kv_heads dividing num_q_heads (equal =
+// plain MHA). When `cos`/`sin` are non-null the caller's RoPE tables are
+// applied to Q (num_q_heads) and K (num_kv_heads) first; pass null to skip
+// (text-fusion attention has no RoPE). `d_mask`, if non-null, is a device
+// length-L FP32 key mask (1 valid / 0 invalid) applied to every query.
+// The KV heads are widened to num_q_heads (each serves num_q_heads/num_kv_heads
+// consecutive query heads) so the fused kernel sees matched shapes. Writes
+// (L, num_q_heads*head_dim) into `out`. Caller has already applied the per-head
+// RMSNorm to Q and K. `Qr`/`Kr`/`Krep`/`Vrep` are reused scratch.
+void gqa_attention_masked(const brotensor::Tensor& Q,
+                          const brotensor::Tensor& K,
+                          const brotensor::Tensor& V,
+                          const brotensor::Tensor* cos,
+                          const brotensor::Tensor* sin,
+                          int head_dim, int num_q_heads, int num_kv_heads,
+                          const float* d_mask,
+                          brotensor::Tensor& out,
+                          brotensor::Tensor& Qr, brotensor::Tensor& Kr,
+                          brotensor::Tensor& Krep, brotensor::Tensor& Vrep);
 
 // ─── AdaLN modulation chunks ───────────────────────────────────────────────
 

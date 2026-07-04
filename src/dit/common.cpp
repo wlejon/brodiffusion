@@ -151,7 +151,8 @@ void unpack_latents(const bt::Tensor& packed, int latent_channels,
 // ─── 2D axial RoPE tables ──────────────────────────────────────────────────
 
 RopeTables build_axial_rope_tables(int txt_len, int hp, int wp, int head_dim,
-                                   const std::vector<int>& axes_dims_rope) {
+                                   const std::vector<int>& axes_dims_rope,
+                                   float theta) {
     if (head_dim % 2 != 0) fail("build_axial_rope_tables: head_dim must be even");
     int sum = 0;
     for (int d : axes_dims_rope) sum += d;
@@ -186,7 +187,8 @@ RopeTables build_axial_rope_tables(int txt_len, int hp, int wp, int head_dim,
         const int cnt = pair_cnt[static_cast<std::size_t>(a)];
         for (int p = 0; p < cnt; ++p) {
             const double omega =
-                1.0 / std::pow(10000.0, (2.0 * p) / static_cast<double>(D_a));
+                1.0 / std::pow(static_cast<double>(theta),
+                               (2.0 * p) / static_cast<double>(D_a));
             const double angle = static_cast<double>(pos) * omega;
             const std::size_t idx =
                 row * half + static_cast<std::size_t>(off + p);
@@ -361,6 +363,55 @@ void joint_attention_traced(const bt::Tensor& Q, const bt::Tensor& K,
         out = detail::upload_host(o.data(), L, D);
     }
     attn_avg = detail::upload_host(avg_f.data(), L, L);
+}
+
+// ─── grouped-query masked attention (Krea 2) ───────────────────────────────
+
+void gqa_attention_masked(const bt::Tensor& Q, const bt::Tensor& K,
+                          const bt::Tensor& V, const bt::Tensor* cos,
+                          const bt::Tensor* sin, int head_dim,
+                          int num_q_heads, int num_kv_heads,
+                          const float* d_mask, bt::Tensor& out,
+                          bt::Tensor& Qr, bt::Tensor& Kr,
+                          bt::Tensor& Krep, bt::Tensor& Vrep) {
+    if (num_q_heads <= 0 || num_kv_heads <= 0 ||
+        num_q_heads % num_kv_heads != 0) {
+        fail("gqa_attention_masked: num_kv_heads must divide num_q_heads");
+    }
+    const int L = Q.rows;
+
+    const bt::Tensor* Qp = &Q;
+    const bt::Tensor* Kp = &K;
+    if (cos != nullptr && sin != nullptr) {
+        bt::rope_apply(Q, *cos, *sin, head_dim, num_q_heads, Qr);
+        bt::rope_apply(K, *cos, *sin, head_dim, num_kv_heads, Kr);
+        Qp = &Qr;
+        Kp = &Kr;
+    }
+
+    if (num_q_heads == num_kv_heads) {
+        bt::flash_attention_forward(*Qp, *Kp, V, d_mask, num_q_heads,
+                                    /*causal=*/false, out);
+        return;
+    }
+
+    // Widen K/V heads to the query-head count (repeat_interleave): query head qh
+    // reads KV head qh/group. flash_attention_forward is not GQA-aware, so we
+    // materialise the widened K/V once per call via strided column copies.
+    const int group = num_q_heads / num_kv_heads;
+    const int qcols = num_q_heads * head_dim;
+    const int kvcols = num_kv_heads * head_dim;
+    detail::resize_like(Krep, L, qcols, Kp->dtype, Kp->device);
+    detail::resize_like(Vrep, L, qcols, V.dtype, V.device);
+    for (int qh = 0; qh < num_q_heads; ++qh) {
+        const int kvh = qh / group;
+        bt::copy_d2d_strided(*Kp, kvh * head_dim, kvcols,
+                             Krep, qh * head_dim, qcols, head_dim, L);
+        bt::copy_d2d_strided(V, kvh * head_dim, kvcols,
+                             Vrep, qh * head_dim, qcols, head_dim, L);
+    }
+    bt::flash_attention_forward(*Qp, Krep, Vrep, d_mask, num_q_heads,
+                                /*causal=*/false, out);
 }
 
 // ─── AdaLN modulation chunks ───────────────────────────────────────────────

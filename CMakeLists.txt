@@ -170,6 +170,7 @@ target_sources(brodiffusion PRIVATE
     src/optim.cpp
     src/dit/common.cpp
     src/dit/flux.cpp
+    src/dit/krea2.cpp
     src/dit/sana.cpp
     src/dit/pixart.cpp
     src/triposplat/vae_encoder.cpp
