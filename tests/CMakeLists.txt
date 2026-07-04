@@ -50,6 +50,13 @@ brodiffusion_add_test(brodiffusion_test_krea2_vae test_krea2_vae.cpp)
 target_compile_definitions(brodiffusion_test_krea2_vae PRIVATE
     BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
 
+# Krea 2 text conditioning (prompt -> tapped Qwen3-VL hidden states + mask).
+# Template-invariant checks always run; the end-to-end path is gated on the
+# real Qwen3-VL-4B text encoder + tokenizer under weights/krea-2-raw.
+brodiffusion_add_test(brodiffusion_test_krea2_text test_krea2_text.cpp)
+target_compile_definitions(brodiffusion_test_krea2_text PRIVATE
+    BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
+
 # Sana Linear DiT (SanaTransformer2DModel) denoiser smoke test. Gated entirely
 # on the real Sana 0.6B transformer checkpoint under weights/sana-600m/transformer
 # (skips cleanly when absent — no compact synthetic fixture for this DiT).

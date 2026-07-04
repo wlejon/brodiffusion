@@ -160,6 +160,7 @@ target_sources(brodiffusion PRIVATE
     src/dpm_solver.cpp
     src/model_config.cpp
     src/sana_text.cpp
+    src/krea2_text.cpp
     src/cond_control.cpp
     src/detail/safetensors_dir.cpp
     src/lora.cpp

@@ -1,5 +1,9 @@
 #include "brodiffusion/pipeline.h"
 #include "brodiffusion/vae_qwenimage.h"
+#include "brodiffusion/krea2_text.h"
+#include "brolm/qwen3vl_config.h"
+#include "brolm/qwen3vl_text.h"
+#include "brolm/qwen3vl_tokenizer.h"
 #include "brotensor/safetensors.h"
 #include "brolm/tokenizer.h"
 #include "brolm/t5.h"
@@ -866,6 +870,46 @@ int run_krea2_vae_fwd(int argc, char** argv) {
     return 0;
 }
 
+// Hidden debug subcommand: run the Krea 2 text-conditioning pathway (Qwen3-VL
+// tapped hidden states → fused-fusion input tensors) for one prompt and dump
+// prompt_embeds (and optionally the validity mask) as raw float32. Diffed
+// against scripts/krea2_text_ref.py. Not in usage().
+int run_krea2_text_fwd(int argc, char** argv) {
+    const char* wdir = arg_after(argc, argv, "--weights-dir");
+    const char* tdir = arg_after(argc, argv, "--tokenizer-dir");
+    const char* prompt = arg_after(argc, argv, "--prompt");
+    const char* op = arg_after(argc, argv, "--out");
+    const char* mp = arg_after(argc, argv, "--mask-out");
+    if (!wdir || !tdir || !prompt || !op) {
+        std::fprintf(stderr,
+            "krea2-text-fwd: need --weights-dir --tokenizer-dir --prompt --out "
+            "[--mask-out]\n");
+        return 2;
+    }
+    brotensor::init();
+
+    const std::string wd = wdir, td = tdir;
+    auto tok = brolm::qwen3vl::Tokenizer::load(td + "/vocab.json",
+                                               td + "/merges.txt");
+    auto cfg = brolm::qwen3vl::Qwen3VLConfig::load(wd + "/text_encoder/config.json");
+    brolm::qwen3vl::TextModel model(cfg.text);
+    auto f = st::File::open(wd + "/text_encoder/model.safetensors");
+    model.load_weights(f, "language_model.");
+
+    auto cond = brodiffusion::krea2::encode_prompt(tok, model, prompt);
+    brotensor::sync_all();
+
+    dump_latent_f32(op, cond.prompt_embeds);
+    std::printf("krea2-text-fwd: wrote prompt_embeds (%d,%d) to %s\n",
+                cond.prompt_embeds.rows, cond.prompt_embeds.cols, op);
+    if (mp) {
+        dump_latent_f32(mp, cond.prompt_embeds_mask);
+        std::printf("krea2-text-fwd: wrote mask (%d,%d) to %s\n",
+                    cond.prompt_embeds_mask.rows, cond.prompt_embeds_mask.cols, mp);
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -880,6 +924,12 @@ int main(int argc, char** argv) {
         try { return run_krea2_vae_fwd(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "krea2-vae-fwd: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "krea2-text-fwd") == 0) {
+        try { return run_krea2_text_fwd(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "krea2-text-fwd: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-v") == 0) {
