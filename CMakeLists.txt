@@ -225,6 +225,10 @@ if(BRODIFFUSION_CLI)
     # DiT-only nondeterminism harness (no T5/VAE) — compute-sanitizer target.
     add_executable(dit_race tools/dit_race.cpp)
     target_link_libraries(dit_race PRIVATE brodiffusion)
+
+    # Krea 2 kernel-shape microbenchmark (GEMM / flash-attention attribution).
+    add_executable(bench_krea2_kernels tools/bench_krea2_kernels.cpp)
+    target_link_libraries(bench_krea2_kernels PRIVATE brodiffusion)
 endif()
 
 # --- Install / export ---
