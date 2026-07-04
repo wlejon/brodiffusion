@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -203,20 +204,74 @@ void Krea2Transformer2DModel::load_impl_(
                       rows, cols, dt);
     };
 
+    bool quant = cfg_.quantize_weights;
+    if (quant && bt::default_device() != bt::Device::CUDA) {
+        std::fprintf(stderr,
+            "Krea2Transformer2DModel: quantize_weights requested but the "
+            "default device is not CUDA — loading dense weights instead (the "
+            "fused INT8 dequant matmuls are GPU-only)\n");
+        quant = false;
+    }
+
+    // Quantizing loader for the big per-block linears: converts the on-disk
+    // weight (F16/F32/BF16) to FP16 bits host-side, quantizes to INT8 with
+    // per-output-row symmetric FP32 scales, and uploads only the INT8 copy —
+    // the dense weight never lands on the device, so peak VRAM during load is
+    // the INT8 footprint (~12 GB), not the BF16 one (~24.6 GB). The bias (if
+    // any) uploads dense at the compute dtype, exactly as the dense path does.
+    auto lin_q = [&](const std::string& key, int out, int in, bool bias,
+                     Linear& l) {
+        if (!quant) { lin(key, out, in, bias, l); return; }
+        const st::TensorView& wv = need(shards, prefix + key + ".weight");
+        const std::int64_t expected =
+            static_cast<std::int64_t>(out) * static_cast<std::int64_t>(in);
+        if (wv.numel() != expected) {
+            fail(key + ".weight: shape mismatch (expected " +
+                 std::to_string(out) + "x" + std::to_string(in) + ")");
+        }
+        const std::size_t n = static_cast<std::size_t>(expected);
+        std::vector<std::uint16_t> w16(n);
+        if (wv.dtype == st::Dtype::F16) {
+            std::memcpy(w16.data(), wv.data, n * 2);
+        } else if (wv.dtype == st::Dtype::BF16) {
+            const auto* src = reinterpret_cast<const std::uint16_t*>(wv.data);
+            for (std::size_t i = 0; i < n; ++i) {
+                w16[i] = bt::fp32_to_fp16_bits(bt::bf16_bits_to_fp32(src[i]));
+            }
+        } else if (wv.dtype == st::Dtype::F32) {
+            const auto* src = reinterpret_cast<const float*>(wv.data);
+            for (std::size_t i = 0; i < n; ++i) {
+                w16[i] = bt::fp32_to_fp16_bits(src[i]);
+            }
+        } else {
+            fail(key + ".weight: expected F16/F32/BF16");
+        }
+        std::vector<std::int8_t> q(n);
+        std::vector<float> sc(static_cast<std::size_t>(out));
+        bt::quantize_int8_per_row_host(w16.data(), out, in, q.data(), sc.data());
+        l.W_int8 = bt::Tensor::from_host_int8(q.data(), out, in);
+        l.scales = bt::Tensor::from_host(sc.data(), out, 1);
+        if (bias) {
+            l.b = upload_as(view_to_fp32(need(shards, prefix + key + ".bias"),
+                                         out, 1, key),
+                            out, 1, dt);
+        }
+    };
+
     auto load_attn = [&](const std::string& p, int dim, int hd, int nq, int nkv,
                          Attention& a) {
-        lin(p + "to_q", hd * nq, dim, false, a.to_q);
-        lin(p + "to_k", hd * nkv, dim, false, a.to_k);
-        lin(p + "to_v", hd * nkv, dim, false, a.to_v);
-        lin(p + "to_gate", dim, dim, false, a.to_gate);
-        lin(p + "to_out.0", dim, dim, false, a.to_out);
+        lin_q(p + "to_q", hd * nq, dim, false, a.to_q);
+        lin_q(p + "to_k", hd * nkv, dim, false, a.to_k);
+        lin_q(p + "to_v", hd * nkv, dim, false, a.to_v);
+        lin_q(p + "to_gate", dim, dim, false, a.to_gate);
+        lin_q(p + "to_out.0", dim, dim, false, a.to_out);
         norm(p + "norm_q", hd, a.norm_q);
         norm(p + "norm_k", hd, a.norm_k);
     };
     auto load_ff = [&](const std::string& p, int dim, int inter, SwiGLU& f) {
-        lin(p + "gate", inter, dim, false, f.gate);
-        lin(p + "up", inter, dim, false, f.up);
-        lin(p + "down", dim, inter, false, f.down);
+        lin_q(p + "gate", inter, dim, false, f.gate);
+        lin_q(p + "up", inter, dim, false, f.up);
+        lin_q(p + "down", dim, inter, false, f.down);
     };
     auto load_fusion = [&](const std::string& p, FusionBlock& b) {
         norm(p + "norm1", TH, b.norm1);
@@ -287,7 +342,12 @@ void Krea2Transformer2DModel::forward(const bt::Tensor& packed_latent,
 
     auto linb = [&](const Linear& l, const bt::Tensor& X) -> bt::Tensor {
         bt::Tensor Y;
-        detail::linear_batched(l.W, l.has_bias() ? &l.b : nullptr, X, Y);
+        if (l.quantized()) {
+            bt::linear_forward_batched_int8w_fp16(
+                l.W_int8, l.scales, l.has_bias() ? &l.b : nullptr, X, Y);
+        } else {
+            detail::linear_batched(l.W, l.has_bias() ? &l.b : nullptr, X, Y);
+        }
         return Y;
     };
 

@@ -371,6 +371,7 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
         cfg.unet.quantize_weights = true;
         cfg.flux.quantize_weights = true;
         cfg.t5.quantize_weights   = true;
+        cfg.krea2.transformer.quantize_weights = true;
     }
 
     const fs::path root(model_dir);

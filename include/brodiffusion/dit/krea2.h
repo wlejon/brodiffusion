@@ -76,6 +76,19 @@ struct Krea2Config {
     float rope_theta            = 1000.0f;
     float norm_eps              = 1e-5f;
 
+    // When true (and the default device is CUDA), load_weights() quantizes
+    // every per-block linear — all Attention (to_q/to_k/to_v/to_gate/to_out)
+    // and SwiGLU (gate/up/down) weights in the 28 main TransformerBlocks and
+    // the 4 text-fusion FusionBlocks — to INT8 weight-only (W8A16, per-output-
+    // row symmetric FP32 scales) as the weights stream in, so the FP16/BF16
+    // copy never materialises on the device. That matters: the BF16 Krea 2
+    // transformer is ~24.6 GB — beyond a 24 GB card — while INT8 is ~12 GB.
+    // The small in/out layers (img_in, time/txt_in projections, final_layer,
+    // the projector) keep the compute dtype, as do all RMSNorm gains and the
+    // scale/shift tables. On a non-CUDA backend the flag is ignored with a
+    // warning (the fused dequant matmuls are GPU-only).
+    bool quantize_weights = false;
+
     int hidden_size() const { return num_attention_heads * attention_head_dim; }
     int latent_channels() const { return in_channels / 4; }
 };
@@ -114,10 +127,17 @@ public:
     brotensor::Dtype compute_dtype() const;
 
 private:
+    // A biased-or-bias-free linear (weight (out,in), bias (out,1) or empty).
+    // When the layer was quantized at load (cfg.quantize_weights), W is empty
+    // and W_int8 (out,in) + scales (out,1 FP32 per-row) carry the weight
+    // instead; the bias, if any, always stays at the compute dtype.
     struct Linear {
-        brotensor::Tensor W;   // (out, in) at compute dtype
+        brotensor::Tensor W;   // (out, in) at compute dtype; empty if quantized
         brotensor::Tensor b;   // (out, 1) at compute dtype; empty if bias-free
+        brotensor::Tensor W_int8;  // (out, in) INT8 when quantized
+        brotensor::Tensor scales;  // (out, 1) FP32 per-row scales when quantized
         bool has_bias() const { return b.size() > 0; }
+        bool quantized() const { return W_int8.size() > 0; }
     };
 
     // Self-attention with GQA, q/k RMSNorm, sigmoid output gate. RoPE is applied

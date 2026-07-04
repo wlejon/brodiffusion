@@ -975,9 +975,13 @@ int run_krea2_fwd(int argc, char** argv) {
     const char* hps = arg_after(argc, argv, "--hp");
     const char* wps = arg_after(argc, argv, "--wp");
     const char* seqs = arg_after(argc, argv, "--seq");
+    bool quantize = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--quantize") == 0) quantize = true;
+    }
     if (!wdir || !lp || !ep || !mp || !op || !ts || !hps || !wps) {
         std::fprintf(stderr, "krea2-fwd: need --weights-dir --latent --embeds "
-                             "--mask --out --t --hp --wp [--seq]\n");
+                             "--mask --out --t --hp --wp [--seq] [--quantize]\n");
         return 2;
     }
     const int hp = std::atoi(hps), wp = std::atoi(wps);
@@ -987,6 +991,7 @@ int run_krea2_fwd(int argc, char** argv) {
 
     const std::string wd = wdir;
     auto cfg = load_krea2_config(wd + "/config.json");
+    cfg.quantize_weights = quantize;
     brodiffusion::dit::Krea2Transformer2DModel model(cfg);
 
     // Open every shard listed in the index (or the single-file checkpoint).
@@ -1033,6 +1038,14 @@ int run_krea2_fwd(int argc, char** argv) {
     brotensor::Tensor out;
     model.forward(lat, hp, wp, emb, msk, t, out);
     brotensor::sync_all();
+    // dump_latent_f32 only special-cases FP16; the compute dtype is BF16 on a
+    // CUDA backend, so normalize to FP32 before dumping.
+    if (out.dtype != brotensor::Dtype::FP32) {
+        brotensor::Tensor out_f32;
+        brotensor::cast(out, out_f32, brotensor::Dtype::FP32);
+        brotensor::sync_all();
+        out = std::move(out_f32);
+    }
     dump_latent_f32(op, out);
     std::printf("krea2-fwd: wrote velocity (%d,%d) to %s\n", out.rows, out.cols, op);
     return 0;
