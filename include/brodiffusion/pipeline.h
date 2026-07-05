@@ -37,6 +37,9 @@
 #include "brodiffusion/vae_qwenimage.h"
 #include "brolm/qwen3vl_text.h"
 #include "brolm/qwen3vl_tokenizer.h"
+#include "brolm/qwen3vl_vision.h"
+#include "brolm/qwen3vl_prompt.h"
+#include "brodiffusion/krea2_text.h"
 
 #include "brotensor/tensor.h"
 
@@ -431,6 +434,94 @@ public:
     // Drop the cached anchor and zero the weight (frees the summary cache).
     void  clear_identity_anchor();
 
+    // ── Krea 2 research hooks (the krea2_capi / krea-research seam) ─────────
+    //
+    // Direct forwarding to dit::Krea2Transformer2DModel's research hooks (see
+    // dit/krea2.h for full semantics of each). Krea2-only; every method below
+    // throws if model_class_ != Krea2. These mirror the Sana identity-anchor
+    // methods above in spirit (denoiser-specific research plumbing exposed at
+    // the Pipeline level) but are independent of that seam.
+
+    // AdaLN mod-delta: add `delta` (1, 6*krea_hidden_size()) to the shared
+    // per-step modulation for body blocks [block_lo, block_hi) on every
+    // subsequent step_once(). Empty tensor clears.
+    void krea_set_mod_delta(const brotensor::Tensor& delta,
+                            int block_lo, int block_hi);
+
+    // Timestep-embedding readout at `timestep` (the SAME 0..1000-scale value
+    // krea_step_timestep() returns / step_once() consumes internally — this
+    // method does the flow-time (/1000) conversion itself). No forward pass.
+    // temb_out: (1, krea_hidden_size()); mod_out: (1, 6*krea_hidden_size()).
+    void krea_time_mod(float timestep, brotensor::Tensor& temb_out,
+                       brotensor::Tensor& mod_out);
+
+    // The active scheduler's timestep for `state.step_index` — the same
+    // 0..1000-scale value step_once() feeds the denoiser internally. Lets a
+    // caller build a krea_time_mod() query / mod-delta for the step about to
+    // run. Krea2 pairs exclusively with the FlowMatch scheduler.
+    float krea_step_timestep(const PipelineState& state) const;
+
+    // Attention-gate scale: scale the sigmoid output gate of body-block
+    // attention, text rows and image rows separately, for blocks
+    // [block_lo, block_hi). (1, 1) clears.
+    void krea_set_gate_scale(float txt_scale, float img_scale,
+                             int block_lo, int block_hi);
+
+    // Per-token gate mask over blocks [block_lo, block_hi); mask holds
+    // text_seq + img_len values in forward order. Empty tensor clears.
+    void krea_set_gate_mask(const brotensor::Tensor& mask,
+                            int block_lo, int block_hi);
+
+    // Gate activity capture. When enabled, every subsequent step_once()
+    // overwrites the internal sink; krea_gates() reads it back, row-major
+    // (krea_num_layers(), text_seq + img_len).
+    void krea_capture_gates(bool enable);
+    std::vector<float> krea_gates() const;
+
+    // Sizing accessors so a caller can allocate buffers without hardcoding
+    // Krea 2's constants (6144 / 28).
+    int krea_hidden_size() const;
+    int krea_num_layers() const;
+
+    // ── Krea 2 raw-taps entry points (band dial / image-as-prompt seam) ────
+    //
+    // Krea2's conditioning pipeline exposes two independently-callable
+    // stages: raw per-layer Qwen3-VL taps (krea_encode_prompt_taps) and the
+    // fusion stack that collapses them into the (n_valid, krea_hidden_size())
+    // conditioning the DiT cross-attends to (krea_encode_text — the same
+    // space cond_control axes are applied in, see cond_control()). Between
+    // the two, a caller can edit specific tap rows (e.g. scale layers 7-10
+    // for the "deep-band" literal<->stylized dial) or substitute an entirely
+    // different tap source (e.g. image tokens through the same Qwen3-VL
+    // backbone — see krea_encode_image_prompt). krea_prime_from_taps() then
+    // primes a step-wise generation from the (possibly edited) raw taps,
+    // exactly as prime() does internally for a plain text prompt.
+    krea2::TextConditioning krea_encode_prompt_taps(std::string_view prompt);
+
+    brotensor::Tensor krea_encode_text(
+        const brotensor::Tensor& prompt_embeds,
+        const brotensor::Tensor& prompt_embeds_mask);
+
+    // Prime a step-wise generation from caller-supplied raw taps (as
+    // returned by krea_encode_prompt_taps(), optionally edited) instead of
+    // encoding `prompt` internally. uncond_embeds/uncond_mask may be null —
+    // when guidance_scale != 1.0 (do_cfg) the uncond branch then falls back
+    // to encoding opts.negative_prompt normally.
+    PipelineState krea_prime_from_taps(const brotensor::Tensor& embeds,
+                                       const brotensor::Tensor& mask,
+                                       const brotensor::Tensor* uncond_embeds,
+                                       const brotensor::Tensor* uncond_mask,
+                                       const GenerateOptions& opts);
+
+    // Krea 2 image-as-prompt: encode `pixels` (FP32 CHW, [0,1] range, shape
+    // (3, H, W)) through Krea 2's own Qwen3-VL-4B vision tower into the SAME
+    // raw-taps shape krea_encode_prompt_taps() produces for text — feed the
+    // result straight into krea_encode_text()/krea_prime_from_taps(). No
+    // separate model — the checkpoint's text encoder ships its vision tower
+    // too (unused for plain text prompting).
+    krea2::TextConditioning krea_encode_image_prompt(const float* pixels,
+                                                     int H, int W);
+
 private:
     // Encode a prompt to the CLIP (77, hidden) conditioning. If content_end is
     // non-null, it receives the EOS index (first eos_id) = end of the content
@@ -486,6 +577,13 @@ private:
     std::optional<vae_qwenimage::Decoder>    vae_qwen_;
     std::optional<brolm::qwen3vl::TextModel> qwen3vl_model_;
     std::optional<brolm::qwen3vl::Tokenizer> qwen3vl_tokenizer_;
+    // Krea 2's vision tower + image preprocessor config — unused by plain
+    // text prompting, loaded (from the SAME text_encoder shard(s)
+    // qwen3vl_model_ loads) only so krea_encode_image_prompt() can work.
+    // Empty for non-Krea2 pipelines and left unconstructed until
+    // from_model_dir() loads its weights.
+    std::optional<brolm::qwen3vl::VisionTower> qwen3vl_vision_;
+    brolm::qwen3vl::PreprocessConfig           qwen3vl_pp_;
 
     // Model-agnostic conditioning, rebuilt each prime(). `conditioning_` keeps
     // the raw text context around for trace-mode access; `prepared_` holds the
@@ -506,6 +604,19 @@ private:
     bool  identity_anchor_   = false;
     bool  capturing_anchor_  = false;
     float identity_weight_   = 0.0f;
+
+    // Backing store for krea_capture_gates()/krea_gates() — owned here so its
+    // lifetime outlives the Krea2Transformer2DModel::capture_gates() pointer
+    // registration across step_once() calls.
+    std::vector<float> krea_gate_sink_;
+
+    // Set by krea_prime_from_taps() immediately before delegating to prime();
+    // prime()'s Krea2 branch consumes (moves out of) these instead of calling
+    // krea2::encode_prompt() when present, then clears them. Lets the two
+    // prime paths share every non-text-encode step (latent alloc, RNG,
+    // scheduler setup, CUDA graph keying) with zero duplication.
+    std::optional<krea2::TextConditioning> krea_taps_override_;
+    std::optional<krea2::TextConditioning> krea_uncond_taps_override_;
 
     // Working buffers reused across step_once() calls. The current latent
     // lives on PipelineState, not here.

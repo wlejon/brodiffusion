@@ -6,9 +6,9 @@
 // embedding space (unit vectors of width = the encoder's hidden dim), each with
 // a natural-unit `scale`. The Pipeline applies the weighted sum of the active
 // axes additively to the POSITIVE conditioning, on every token row except BOS
-// (row 0), just before the denoiser projects it — i.e.
+// (row 0) for models with one, just before the denoiser projects it — i.e.
 //
-//     text_embeddings[r] += Σ_k  weight_k * scale_k * dir_k     for r in [1, L)
+//     text_embeddings[r] += Σ_k  weight_k * scale_k * dir_k   for r in [row_start, L)
 //
 // This is encoder-agnostic: the directions are facts about the encoder's
 // geometry (Gemma-2 for Sana, T5 / CLIP for Flux / SD), discovered offline; the
@@ -63,17 +63,23 @@ public:
     // True iff any axis has a nonzero weight (apply() is a no-op otherwise).
     bool active() const;
 
-    // Add the active weighted control vector to rows [1, end) of `emb` in place
-    // (BOS row 0 untouched), where end = row_end if 0 < row_end <= emb.rows, else
-    // emb.rows. No-op when inactive or fewer than 2 steerable rows. `emb` is
-    // (L, dim) on any device/dtype (FP32 / FP16 / BF16). Throws if emb.cols !=
-    // dim(). The injection is built in FP32 and cast to emb.dtype.
+    // Add the active weighted control vector to rows [row_start, end) of `emb`
+    // in place, where end = row_end if 0 < row_end <= emb.rows, else emb.rows.
+    // No-op when inactive or fewer than 2 steerable rows. `emb` is (L, dim) on
+    // any device/dtype (FP32 / FP16 / BF16). Throws if emb.cols != dim(). The
+    // injection is built in FP32 and cast to emb.dtype.
     //
     // row_end exists for the CLIP fixed-77 path: pass the EOS index so only the
-    // CONTENT rows [1, eos) are steered, not the live EOS/padding tail (clip-
-    // research found injecting the padding rows over-drives generation). Sana's
-    // conditioning carries no padding, so it leaves row_end at the default.
-    void apply(brotensor::Tensor& emb, int row_end = -1) const;
+    // CONTENT rows [row_start, eos) are steered, not the live EOS/padding tail
+    // (clip-research found injecting the padding rows over-drives generation).
+    // Sana's conditioning carries no padding, so it leaves row_end at the
+    // default.
+    //
+    // row_start defaults to 1 (BOS row 0 untouched — SD/Flux/Sana/CLIP all
+    // prepend a BOS-equivalent row). Krea 2's fused conditioning has no BOS
+    // row, so its Pipeline passes row_start=0 to steer every valid token.
+    void apply(brotensor::Tensor& emb, int row_end = -1,
+              int row_start = 1) const;
 
 private:
     int dim_ = 0;

@@ -56,8 +56,11 @@
 // — identical between brolm and HF). Encoding the prompt alone is byte-identical
 // to the reference's `tokenize(prefix+prompt)[34:]` (verified across prompts).
 
+#include "brolm/qwen3vl_prompt.h"
 #include "brolm/qwen3vl_text.h"
 #include "brolm/qwen3vl_tokenizer.h"
+#include "brolm/qwen3vl_vision.h"
+#include "brolm/qwen3vl_vl.h"  // ImageInput
 #include "brotensor/tensor.h"
 
 #include <string>
@@ -97,6 +100,32 @@ TextConditioning encode_prompt(
     const brolm::qwen3vl::Tokenizer& tokenizer,
     brolm::qwen3vl::TextModel& model,
     const std::string& prompt,
+    int max_sequence_length = kMaxSequenceLength);
+
+// Encode an image into the SAME tapped-hidden-states conditioning shape
+// encode_prompt() produces for text — interchangeable with it (both flow
+// into Krea2TextFusion / Pipeline::krea_prime_from_taps() unchanged). Mirrors
+// krea-research's s7_extract.py: the checkpoint's Qwen3-VL-4B text backbone
+// ships its full vision tower too (unused by plain text prompting), so an
+// image can be run through the exact same fixed system-prompt template as
+// text — substituting a `<|vision_start|><|image_pad|>...<|image_pad|>
+// <|vision_end|>` run (expanded to the image's post-merger token count) for
+// the prompt's content tokens — and tapped at the identical 12 decoder
+// layers. No separate training or fine-tuning: a VLM's hidden space is
+// modality-shared, so the text-trained fusion stack consumes image taps
+// exactly as it does text taps.
+//
+// `vision` is the Qwen3-VL-4B vision tower paired with `model` (same
+// checkpoint); `pp` its preprocessor config. Throws std::runtime_error if
+// the image's post-merger token count doesn't fit the content budget
+// (max_sequence_length - 5, i.e. 507 by default) — unlike text, image
+// tokens can't be truncated mid-splice.
+TextConditioning encode_image_prompt(
+    const brolm::qwen3vl::Tokenizer& tokenizer,
+    brolm::qwen3vl::TextModel& model,
+    brolm::qwen3vl::VisionTower& vision,
+    const brolm::qwen3vl::PreprocessConfig& pp,
+    const brolm::qwen3vl::ImageInput& image,
     int max_sequence_length = kMaxSequenceLength);
 
 }  // namespace brodiffusion::krea2

@@ -132,7 +132,8 @@ bool CondControl::active() const {
     return false;
 }
 
-void CondControl::apply(brotensor::Tensor& emb, int row_end) const {
+void CondControl::apply(brotensor::Tensor& emb, int row_end,
+                        int row_start) const {
     if (!active()) return;
     const int rows = emb.rows;
     const int D    = emb.cols;
@@ -142,10 +143,11 @@ void CondControl::apply(brotensor::Tensor& emb, int row_end) const {
             " != dictionary dim " + std::to_string(dim_) +
             " (dictionary built for a different text encoder)");
     }
-    // Steer rows [1, end): clamp the caller's row_end (CLIP EOS index) into range;
-    // <0 means "all rows" (Sana, whose conditioning has no padding tail).
+    // Steer rows [row_start, end): clamp the caller's row_end (CLIP EOS index)
+    // into range; <0 means "all rows" (Sana, whose conditioning has no
+    // padding tail).
     const int end = (row_end >= 0 && row_end <= rows) ? row_end : rows;
-    if (end < 2) return;  // only BOS (or empty): nothing to steer
+    if (end - row_start < 1) return;  // nothing to steer
 
     // Combined injection vector v = Σ weight_k * scale_k * dir_k.
     std::vector<float> v(static_cast<std::size_t>(D), 0.0f);
@@ -157,11 +159,11 @@ void CondControl::apply(brotensor::Tensor& emb, int row_end) const {
         for (int j = 0; j < D; ++j) v[j] += s * d[j];
     }
 
-    // Injection matrix: rows [1, end) = v, all others (BOS + EOS/padding tail when
-    // row_end clips it) zero. Built FP32, cast to the embedding dtype, added on
-    // the embedding's own device.
+    // Injection matrix: rows [row_start, end) = v, all others (BOS + EOS/
+    // padding tail when row_end clips it) zero. Built FP32, cast to the
+    // embedding dtype, added on the embedding's own device.
     std::vector<float> M(static_cast<std::size_t>(rows) * D, 0.0f);
-    for (int r = 1; r < end; ++r) {
+    for (int r = row_start; r < end; ++r) {
         std::memcpy(&M[static_cast<std::size_t>(r) * D], v.data(), sizeof(float) * D);
     }
     brotensor::Tensor inj =

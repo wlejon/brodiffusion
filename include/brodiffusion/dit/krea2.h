@@ -316,6 +316,23 @@ public:
 
     const Krea2Config& config() const { return model_.config(); }
 
+    // Mutable access to a prepared conditioning's fused (n_valid, hidden_size)
+    // text tensor — the space CondControl's axis system operates in for
+    // Krea 2 (unlike Sana/SD/Flux, where CondControl applies to the raw
+    // per-token conditioning BEFORE prepare() runs; Krea 2's raw taps are
+    // pre-fusion and have incompatible row semantics — see cond_control()'s
+    // Pipeline-level doc comment). `prepared` must be a PreparedConditioning
+    // this Krea2Denoiser produced via prepare(). Throws if `uncond` is true
+    // but no uncond branch was prepared.
+    brotensor::Tensor& fused_text(PreparedConditioning& prepared, bool uncond);
+
+    // Research-hook access (AdaLN mod-delta, gate scale/mask/capture, time-mod
+    // readout — see Krea2Transformer2DModel's own doc comments). Exposed so
+    // Pipeline can forward these Krea2-only hooks to callers; there is no
+    // Flux/SD/Sana/PixArt analogue.
+    Krea2Transformer2DModel&       model()       { return model_; }
+    const Krea2Transformer2DModel& model() const { return model_; }
+
 private:
     Krea2Transformer2DModel model_;
     int patch_size_;

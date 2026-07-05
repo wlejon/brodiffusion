@@ -335,7 +335,10 @@ Pipeline::Pipeline(const PipelineConfig& cfg,
       scheduler_(make_scheduler(cfg.scheduler)),
       vae_qwen_(std::in_place, cfg.krea2.vae),
       qwen3vl_model_(std::in_place, cfg.krea2.text.text),
-      qwen3vl_tokenizer_(std::move(qwen3vl_tok)) {
+      qwen3vl_tokenizer_(std::move(qwen3vl_tok)),
+      qwen3vl_vision_(std::in_place, cfg.krea2.text.vision,
+                      cfg.krea2.text.text.hidden_size),
+      qwen3vl_pp_() {
     if (cfg.model_class != ModelClass::Krea2) {
         fail("Pipeline: the (cfg, qwen3vl_tok) constructor requires "
              "model_class == Krea2");
@@ -463,6 +466,18 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
         for (const auto& f : te_files) te_ptrs.push_back(&f);
         p.qwen3vl_model_->load_weights(te_ptrs, "language_model.");
         t = stamp("Qwen3-VL weights", t);
+
+        // The checkpoint's Qwen3-VL-4B text encoder ships its vision tower
+        // too (unused by plain text prompting) — load it from the same
+        // shard(s) so krea_encode_image_prompt() can work. Unlike a standalone
+        // Qwen3-VL checkpoint (which nests everything under "model.*", the
+        // default prefix VLM::load_from_directory relies on), this diffusers-
+        // packaged text_encoder strips that wrapper: tensors are top-level
+        // "visual.*" / "language_model.*" (confirmed by reading the actual
+        // safetensors header), matching the explicit "language_model." prefix
+        // already used just above.
+        p.qwen3vl_vision_->load_weights(te_ptrs, "visual.");
+        t = stamp("Qwen3-VL vision tower weights", t);
 
         return p;
     }
@@ -718,6 +733,13 @@ bt::Tensor Pipeline::encode_conditioning(std::string_view prompt) {
             *gemma_model_, *gemma_tokenizer_, std::string(prompt),
             cfg_.sana_max_seq_len,
             brodiffusion::sana::default_complex_human_instruction());
+    }
+    if (model_class_ == ModelClass::Krea2) {
+        // Krea 2: the FUSED (n_valid, hidden_size) conditioning — the same
+        // space cond_control() axes are minted in and applied to (see
+        // prime()'s Krea2 branch), not the raw pre-fusion taps.
+        krea2::TextConditioning tc = krea_encode_prompt_taps(prompt);
+        return krea_encode_text(tc.prompt_embeds, tc.prompt_embeds_mask);
     }
     // CLIP-based models (SD / Flux): reuse the fixed-length CLIP encode path.
     bt::Tensor out;
@@ -1054,18 +1076,38 @@ PipelineState Pipeline::prime(std::string_view prompt,
         }
         const bool enc_time = std::getenv("BRODIFFUSION_TIME") != nullptr;
         const auto enc_t0 = std::chrono::steady_clock::now();
-        krea2::TextConditioning pos = krea2::encode_prompt(
-            *qwen3vl_tokenizer_, *qwen3vl_model_, std::string(prompt));
+        // krea_prime_from_taps() stashes caller-supplied raw taps here just
+        // before calling prime(); consume (move out) them instead of
+        // encoding `prompt` when present. This is the shared entry point for
+        // the band dial (scaled taps) and image-as-prompt (taps from an
+        // image instead of text) — everything below (fusion, cond_control,
+        // prepare(), latent alloc, scheduler, CUDA graph keying) runs
+        // identically either way.
+        krea2::TextConditioning pos;
+        if (krea_taps_override_) {
+            pos = std::move(*krea_taps_override_);
+            krea_taps_override_.reset();
+        } else {
+            pos = krea2::encode_prompt(
+                *qwen3vl_tokenizer_, *qwen3vl_model_, std::string(prompt));
+        }
         conditioning_.text_embeddings      = pos.prompt_embeds;
         conditioning_.text_embeddings_mask = pos.prompt_embeds_mask;
         if (do_cfg) {
-            krea2::TextConditioning neg = krea2::encode_prompt(
-                *qwen3vl_tokenizer_, *qwen3vl_model_,
-                std::string(opts.negative_prompt));
+            krea2::TextConditioning neg;
+            if (krea_uncond_taps_override_) {
+                neg = std::move(*krea_uncond_taps_override_);
+                krea_uncond_taps_override_.reset();
+            } else {
+                neg = krea2::encode_prompt(
+                    *qwen3vl_tokenizer_, *qwen3vl_model_,
+                    std::string(opts.negative_prompt));
+            }
             conditioning_.uncond_embeddings      = neg.prompt_embeds;
             conditioning_.uncond_embeddings_mask = neg.prompt_embeds_mask;
             conditioning_.has_uncond = true;
         } else {
+            krea_uncond_taps_override_.reset();
             conditioning_.has_uncond = false;
             conditioning_.uncond_embeddings      = bt::Tensor{};
             conditioning_.uncond_embeddings_mask = bt::Tensor{};
@@ -1104,6 +1146,20 @@ PipelineState Pipeline::prime(std::string_view prompt,
     // projection for the UNet; pre-projected T5 context for Flux). Shared
     // across all branched states.
     prepared_ = denoiser_->prepare(conditioning_);
+
+    // Conditioning-space control seam for Krea 2: unlike Sana/CLIP (steered
+    // BEFORE prepare(), on the raw per-token conditioning), Krea 2's raw
+    // conditioning is pre-fusion taps (token-major/layer-minor — wrong row
+    // semantics for CondControl's per-token model). Its axis vectors live in
+    // the FUSED (n_valid, hidden_size) space prepare()'s text_fusion just
+    // produced, so steer that instead, with no BOS row to protect
+    // (row_start=0) — see cond_control()'s doc comment and
+    // Krea2Denoiser::fused_text().
+    if (model_class_ == ModelClass::Krea2 && cond_control_.active()) {
+        auto* krea2d = static_cast<dit::Krea2Denoiser*>(denoiser_.get());
+        cond_control_.apply(krea2d->fused_text(prepared_, /*uncond=*/false),
+                            /*row_end=*/-1, /*row_start=*/0);
+    }
 
     // Text encoding is over: return its cached allocator blocks to the
     // driver before the denoise loop. On Windows (WDDM) a near-full commit
@@ -1758,6 +1814,139 @@ void Pipeline::clear_identity_anchor() {
     if (model_class_ == ModelClass::Sana) {
         static_cast<dit::SanaDenoiser*>(denoiser_.get())->ref_clear();
     }
+}
+
+// ── Krea 2 research hooks ───────────────────────────────────────────────────
+
+namespace {
+dit::Krea2Transformer2DModel& krea_model(ModelClass model_class,
+                                         const std::unique_ptr<Denoiser>& d,
+                                         const char* who) {
+    if (model_class != ModelClass::Krea2) {
+        fail(std::string(who) + ": Krea 2 only");
+    }
+    return static_cast<dit::Krea2Denoiser*>(d.get())->model();
+}
+}  // namespace
+
+void Pipeline::krea_set_mod_delta(const brotensor::Tensor& delta,
+                                  int block_lo, int block_hi) {
+    krea_model(model_class_, denoiser_, "krea_set_mod_delta")
+        .set_mod_delta(delta, block_lo, block_hi);
+}
+
+void Pipeline::krea_time_mod(float timestep, brotensor::Tensor& temb_out,
+                             brotensor::Tensor& mod_out) {
+    // Callers work in the same 0..1000-scale timestep krea_step_timestep()
+    // returns / step_once() consumes; Krea2Denoiser::forward() divides by
+    // 1000 before reaching the model's own flow-time convention, so mirror
+    // that here rather than leaking the internal scale to JS.
+    krea_model(model_class_, denoiser_, "krea_time_mod")
+        .compute_time_mod(timestep / 1000.0f, temb_out, mod_out);
+}
+
+float Pipeline::krea_step_timestep(const PipelineState& state) const {
+    if (model_class_ != ModelClass::Krea2) {
+        fail("krea_step_timestep: Krea 2 only");
+    }
+    return std::get<scheduler::FlowMatch>(scheduler_).timesteps()
+        .at(static_cast<std::size_t>(state.step_index));
+}
+
+void Pipeline::krea_set_gate_scale(float txt_scale, float img_scale,
+                                   int block_lo, int block_hi) {
+    krea_model(model_class_, denoiser_, "krea_set_gate_scale")
+        .set_gate_scale(txt_scale, img_scale, block_lo, block_hi);
+}
+
+void Pipeline::krea_set_gate_mask(const brotensor::Tensor& mask,
+                                  int block_lo, int block_hi) {
+    krea_model(model_class_, denoiser_, "krea_set_gate_mask")
+        .set_gate_mask(mask, block_lo, block_hi);
+}
+
+void Pipeline::krea_capture_gates(bool enable) {
+    auto& model = krea_model(model_class_, denoiser_, "krea_capture_gates");
+    if (enable) {
+        model.capture_gates(&krea_gate_sink_);
+    } else {
+        model.capture_gates(nullptr);
+        krea_gate_sink_.clear();
+    }
+}
+
+std::vector<float> Pipeline::krea_gates() const {
+    if (model_class_ != ModelClass::Krea2) fail("krea_gates: Krea 2 only");
+    return krea_gate_sink_;
+}
+
+int Pipeline::krea_hidden_size() const {
+    return krea_model(model_class_, denoiser_, "krea_hidden_size")
+        .config().hidden_size();
+}
+
+int Pipeline::krea_num_layers() const {
+    return krea_model(model_class_, denoiser_, "krea_num_layers")
+        .config().num_layers;
+}
+
+krea2::TextConditioning Pipeline::krea_encode_prompt_taps(
+    std::string_view prompt) {
+    if (model_class_ != ModelClass::Krea2) {
+        fail("krea_encode_prompt_taps: Krea 2 only");
+    }
+    if (!qwen3vl_model_ || !qwen3vl_tokenizer_) {
+        fail("krea_encode_prompt_taps: missing Qwen3-VL model / tokenizer");
+    }
+    return krea2::encode_prompt(*qwen3vl_tokenizer_, *qwen3vl_model_,
+                               std::string(prompt));
+}
+
+brotensor::Tensor Pipeline::krea_encode_text(
+    const brotensor::Tensor& prompt_embeds,
+    const brotensor::Tensor& prompt_embeds_mask) {
+    auto& model = krea_model(model_class_, denoiser_, "krea_encode_text");
+    brotensor::Tensor out;
+    model.encode_text(prompt_embeds, prompt_embeds_mask, out);
+    return out;
+}
+
+krea2::TextConditioning Pipeline::krea_encode_image_prompt(const float* pixels,
+                                                           int H, int W) {
+    if (model_class_ != ModelClass::Krea2) {
+        fail("krea_encode_image_prompt: Krea 2 only");
+    }
+    if (!qwen3vl_model_ || !qwen3vl_tokenizer_ || !qwen3vl_vision_) {
+        fail("krea_encode_image_prompt: missing Qwen3-VL model / tokenizer / "
+             "vision tower");
+    }
+    brolm::qwen3vl::ImageInput img;
+    img.pixels = pixels;
+    img.H = H;
+    img.W = W;
+    return krea2::encode_image_prompt(*qwen3vl_tokenizer_, *qwen3vl_model_,
+                                      *qwen3vl_vision_, qwen3vl_pp_, img);
+}
+
+PipelineState Pipeline::krea_prime_from_taps(
+    const brotensor::Tensor& embeds, const brotensor::Tensor& mask,
+    const brotensor::Tensor* uncond_embeds,
+    const brotensor::Tensor* uncond_mask, const GenerateOptions& opts) {
+    if (model_class_ != ModelClass::Krea2) {
+        fail("krea_prime_from_taps: Krea 2 only");
+    }
+    krea_taps_override_ = krea2::TextConditioning{embeds, mask};
+    if (uncond_embeds != nullptr && uncond_mask != nullptr) {
+        krea_uncond_taps_override_ =
+            krea2::TextConditioning{*uncond_embeds, *uncond_mask};
+    } else {
+        krea_uncond_taps_override_.reset();
+    }
+    // prime()'s `prompt` argument is only used by the fallback (non-override)
+    // path, which the override above bypasses for the positive branch; a
+    // missing uncond override still falls back to encoding
+    // opts.negative_prompt normally when do_cfg is true.
+    return prime(std::string_view{}, opts);
 }
 
 std::vector<float> Pipeline::generate(std::string_view prompt,

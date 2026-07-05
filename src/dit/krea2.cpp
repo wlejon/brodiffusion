@@ -811,6 +811,20 @@ PreparedConditioning Krea2Denoiser::prepare(const Conditioning& cond) {
     return PreparedConditioning(std::move(prep));
 }
 
+brotensor::Tensor& Krea2Denoiser::fused_text(PreparedConditioning& prepared,
+                                             bool uncond) {
+    auto* prep = dynamic_cast<Krea2Prepared*>(prepared.get());
+    if (!prep) fail_den("fused_text: prepared conditioning has the wrong type");
+    if (uncond) {
+        if (!prep->has_uncond) {
+            fail_den("fused_text: uncond requested but no uncond conditioning "
+                     "was prepared");
+        }
+        return prep->uncond_txt;
+    }
+    return prep->txt;
+}
+
 void Krea2Denoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
                             float timestep,
                             const PreparedConditioning& prepared,
