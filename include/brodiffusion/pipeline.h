@@ -217,6 +217,10 @@ struct GenerateCancelled : std::exception {
     const char* what() const noexcept override { return "pipeline: generate cancelled"; }
 };
 
+// LoadCancelled (thrown by from_model_dir when ModelDirOptions::should_cancel
+// fires) lives in denoiser.h — the sharded DiT loaders that throw it sit below
+// this header and only include denoiser.h.
+
 class Pipeline {
 public:
     // StableDiffusion constructor: builds a UNet denoiser. Valid only when
@@ -257,6 +261,15 @@ public:
         // Flux.1 FP16 (~24 GB) does not fit a 24 GB card next to T5: INT8
         // (~12 GB) is how Flux runs there at all.
         bool quantize = false;
+
+        // Optional cooperative cancellation for the load itself. from_model_dir
+        // polls it between components — and, for the big sharded DiTs (Krea 2),
+        // once per transformer block — so a caller (e.g. an app shutting down
+        // mid-load) can abort a multi-GB read promptly instead of blocking a
+        // join until all ~26 GB finish. When it returns true, from_model_dir
+        // throws LoadCancelled. Empty by default (no cancellation). Same
+        // convention as GenerateOptions::should_cancel.
+        std::function<bool()> should_cancel;
     };
     static Pipeline from_model_dir(const std::string& model_dir,
                                    const ModelDirOptions& opts);

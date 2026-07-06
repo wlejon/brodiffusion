@@ -21,6 +21,15 @@ namespace brodiffusion {
 
 namespace unet { class UNet; }
 
+// Thrown by from_model_dir() when ModelDirOptions::should_cancel() returns true
+// (e.g. the app is shutting down mid-load) — and by the sharded DiT loaders it
+// forwards the hook to, which poll once per transformer block. Distinct type so
+// a caller can tell a cooperative cancel apart from a real load failure. Lives
+// here (not pipeline.h) because those low-level loaders only see denoiser.h.
+struct LoadCancelled : std::exception {
+    const char* what() const noexcept override { return "pipeline: model load cancelled"; }
+};
+
 // What the denoiser's forward output represents.
 //   Epsilon  — predicted noise epsilon (SD1.5 UNet; DDIM / LCM schedulers).
 //   Velocity — rectified-flow velocity v (Flux DiT; flow-match scheduler).

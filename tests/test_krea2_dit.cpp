@@ -219,6 +219,48 @@ static void test_synthetic() {
     std::filesystem::remove(path, ec);
 }
 
+// Cooperative-cancel wiring: the sharded load_weights polls should_cancel once
+// per transformer block and throws LoadCancelled when it fires. Verifies both
+// that a cancel is honored (and stops the load) and that a never-firing hook
+// runs to completion — polled exactly num_layers times. Uses the synthetic
+// fixture, so it needs no real weights.
+static void test_load_cancel() {
+    kd::Krea2Config cfg = synth_cfg();   // num_layers == 2
+    Builder b;
+    build_fixture(b, cfg);
+    auto path = std::filesystem::temp_directory_path() / "brodiffusion_krea2_cancel_test.safetensors";
+    b.write(path);
+    auto file = st::File::open(path.string());
+    std::vector<const st::File*> shards{ &file };
+
+    // Cancel immediately: throws before the first block loads (poll #1).
+    {
+        int polls = 0;
+        kd::Krea2Transformer2DModel model(cfg);
+        bool threw = false;
+        try {
+            model.load_weights(shards, "", [&]() { ++polls; return true; });
+        } catch (const brodiffusion::LoadCancelled&) { threw = true; }
+        CHECK(threw);
+        CHECK(polls == 1);
+    }
+
+    // Never cancel: completes, and the hook is polled once per block.
+    {
+        int polls = 0;
+        kd::Krea2Transformer2DModel model(cfg);
+        bool threw = false;
+        try {
+            model.load_weights(shards, "", [&]() { ++polls; return false; });
+        } catch (const brodiffusion::LoadCancelled&) { threw = true; }
+        CHECK(!threw);
+        CHECK(polls == cfg.num_layers);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
 #ifndef BRODIFFUSION_WEIGHTS_DIR
 #define BRODIFFUSION_WEIGHTS_DIR ""
 #endif
@@ -292,6 +334,10 @@ int main() {
     try { test_synthetic(); }
     catch (const std::exception& e) {
         std::fprintf(stderr, "krea2_dit: synthetic exception: %s\n", e.what()); return 1;
+    }
+    try { test_load_cancel(); }
+    catch (const std::exception& e) {
+        std::fprintf(stderr, "krea2_dit: load-cancel exception: %s\n", e.what()); return 1;
     }
     try { test_real_weights(); }
     catch (const std::exception& e) {

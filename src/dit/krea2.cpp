@@ -159,14 +159,16 @@ void Krea2Transformer2DModel::load_weights(const st::File& f,
 }
 
 void Krea2Transformer2DModel::load_weights(
-    const std::vector<const st::File*>& shards, const std::string& prefix) {
+    const std::vector<const st::File*>& shards, const std::string& prefix,
+    const std::function<bool()>& should_cancel) {
     if (shards.empty()) fail("load_weights: no shards");
-    load_impl_(shards, prefix);
+    load_impl_(shards, prefix, should_cancel);
     loaded_ = true;
 }
 
 void Krea2Transformer2DModel::load_impl_(
-    const std::vector<const st::File*>& shards, const std::string& prefix) {
+    const std::vector<const st::File*>& shards, const std::string& prefix,
+    const std::function<bool()>& should_cancel) {
     const bt::Dtype dt = flux_compute_dtype();
     const int H = cfg_.hidden_size();
     const int IC = cfg_.in_channels;
@@ -308,6 +310,11 @@ void Krea2Transformer2DModel::load_impl_(
     lin("txt_in.linear_2", H, H, true, txt_in_l2_);
 
     for (int i = 0; i < cfg_.num_layers; ++i) {
+        // Cooperative cancellation: this loop is the bulk of the ~25 GB load, so
+        // poll once per block. Abandoning here leaves the model half-loaded, but
+        // the only caller that passes a hook (from_model_dir) discards the whole
+        // Pipeline on LoadCancelled, so a partial model is never observed.
+        if (should_cancel && should_cancel()) throw LoadCancelled{};
         const std::string p = "transformer_blocks." + std::to_string(i) + ".";
         TransformerBlock& b = blocks_[static_cast<std::size_t>(i)];
         raw(p + "scale_shift_table", 6, H, b.scale_shift_table);
@@ -787,8 +794,9 @@ void Krea2Denoiser::load_weights(const st::File& f, const std::string& prefix) {
 }
 
 void Krea2Denoiser::load_weights(const std::vector<const st::File*>& shards,
-                                 const std::string& prefix) {
-    model_.load_weights(shards, prefix);
+                                 const std::string& prefix,
+                                 const std::function<bool()>& should_cancel) {
+    model_.load_weights(shards, prefix, should_cancel);
 }
 
 PreparedConditioning Krea2Denoiser::prepare(const Conditioning& cond) {

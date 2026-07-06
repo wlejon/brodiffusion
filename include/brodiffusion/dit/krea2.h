@@ -50,6 +50,7 @@
 #include "brodiffusion/denoiser.h"
 #include "brotensor/tensor.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -105,9 +106,13 @@ public:
     // a name missing everywhere throws). Krea 2 ships the transformer sharded.
     void load_weights(const brotensor::safetensors::File& f,
                       const std::string& prefix = "");
+    // should_cancel: optional cooperative-cancel hook, polled once per
+    // transformer block during the load (the ~25 GB dominant phase). Throws
+    // LoadCancelled when it returns true. Empty = no cancellation.
     void load_weights(
         const std::vector<const brotensor::safetensors::File*>& shards,
-        const std::string& prefix = "");
+        const std::string& prefix = "",
+        const std::function<bool()>& should_cancel = {});
 
     // Run the timestep-independent half of the model once per prompt: compact
     // the padded text block to its valid tokens (every text row shares the
@@ -220,7 +225,8 @@ private:
     };
 
     void load_impl_(const std::vector<const brotensor::safetensors::File*>& shards,
-                    const std::string& prefix);
+                    const std::string& prefix,
+                    const std::function<bool()>& should_cancel);
 
     // One linear at the compute dtype, dispatching dense vs INT8 (W8A16).
     brotensor::Tensor linb_(const Linear& l, const brotensor::Tensor& X);
@@ -296,10 +302,12 @@ public:
     // ── Denoiser interface ────────────────────────────────────────────────
     void load_weights(const brotensor::safetensors::File& f,
                       const std::string& prefix = "") override;
-    // Sharded overload — the Krea 2 transformer ships in 3 shards.
+    // Sharded overload — the Krea 2 transformer ships in 3 shards. should_cancel
+    // is a cooperative-cancel hook forwarded to the model (polled per block).
     void load_weights(
         const std::vector<const brotensor::safetensors::File*>& shards,
-        const std::string& prefix = "");
+        const std::string& prefix = "",
+        const std::function<bool()>& should_cancel = {});
     void finalize_weights() override {}   // no quantisation for Krea 2
     PreparedConditioning prepare(const Conditioning& cond) override;
     void forward(const brotensor::Tensor& latent, int H_lat, int W_lat,

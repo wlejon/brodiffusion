@@ -450,18 +450,25 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
             (root / "text_encoder").string());
         t = stamp("open files (mmap)", t);
 
+        const auto& cancel = dir_opts.should_cancel;
+        auto check_cancel = [&]() { if (cancel && cancel()) throw LoadCancelled{}; };
+
         std::vector<const brotensor::safetensors::File*> tf_ptrs;
         for (const auto& f : tf_files) tf_ptrs.push_back(&f);
         auto* krea2 = dynamic_cast<dit::Krea2Denoiser*>(p.denoiser_.get());
         if (!krea2) fail("from_model_dir: Krea2 denoiser construction failed");
-        krea2->load_weights(tf_ptrs, "");
+        check_cancel();
+        // The DiT is ~25 of the ~26 GB, so it polls `cancel` per block itself.
+        krea2->load_weights(tf_ptrs, "", cancel);
         t = stamp("DiT weights", t);
 
+        check_cancel();
         p.vae_qwen_->load_weights(vae_files.front(), "");
         t = stamp("Qwen-Image VAE weights", t);
 
         // The Qwen3-VL-4B text encoder ships unsharded (text_encoder/
         // model.safetensors); load its language-model subtree.
+        check_cancel();
         std::vector<const brotensor::safetensors::File*> te_ptrs;
         for (const auto& f : te_files) te_ptrs.push_back(&f);
         p.qwen3vl_model_->load_weights(te_ptrs, "language_model.");
@@ -476,6 +483,7 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
         // "visual.*" / "language_model.*" (confirmed by reading the actual
         // safetensors header), matching the explicit "language_model." prefix
         // already used just above.
+        check_cancel();
         p.qwen3vl_vision_->load_weights(te_ptrs, "visual.");
         t = stamp("Qwen3-VL vision tower weights", t);
 
