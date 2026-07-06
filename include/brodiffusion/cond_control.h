@@ -46,6 +46,13 @@ public:
     // Set axis `name`'s weight (alpha, in natural units). Throws if unknown.
     void set(const std::string& name, float alpha);
 
+    // The stored direction of axis `name` (a dim()-length copy) and its baked
+    // scale. Introspection of the axes themselves — e.g. decomposing a
+    // freshly minted runtime axis against the dictionary's named directions
+    // to explain WHAT it moves. Throws if unknown.
+    std::vector<float> direction(const std::string& name) const;
+    float axis_scale(const std::string& name) const;
+
     // Register (or replace) a runtime axis with an explicit direction + scale,
     // and set its weight. Unlike load()'s dictionary axes these are built live —
     // e.g. a diff-of-means search from user phrases. `dir` is taken as-is (the

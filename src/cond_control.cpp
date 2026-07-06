@@ -79,6 +79,24 @@ void CondControl::set(const std::string& name, float alpha) {
     weight_[static_cast<std::size_t>(it->second)] = alpha;
 }
 
+std::vector<float> CondControl::direction(const std::string& name) const {
+    auto it = index_.find(name);
+    if (it == index_.end()) {
+        throw std::runtime_error("CondControl::direction: no such axis '" + name + "'");
+    }
+    const std::size_t k = static_cast<std::size_t>(it->second);
+    return std::vector<float>(dirs_.begin() + k * dim_,
+                              dirs_.begin() + (k + 1) * dim_);
+}
+
+float CondControl::axis_scale(const std::string& name) const {
+    auto it = index_.find(name);
+    if (it == index_.end()) {
+        throw std::runtime_error("CondControl::axis_scale: no such axis '" + name + "'");
+    }
+    return scale_[static_cast<std::size_t>(it->second)];
+}
+
 void CondControl::set_vector(const std::string& name, float alpha,
                              const std::vector<float>& dir, float scale) {
     if (dir.empty()) {
