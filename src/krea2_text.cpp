@@ -141,11 +141,26 @@ TextConditioning encode_image_prompt(const brolm::qwen3vl::Tokenizer& tokenizer,
     const int suffix_len = static_cast<int>(kSuffixIds.size());   // 5
     const int content_budget = max_sequence_length - suffix_len;  // 507
 
+    // Cap the vision tower's max_pixels so the post-merger token count can't
+    // overflow the DiT content budget. num_image_tokens == resized_pixels /
+    // factor² (factor = patch*merge), and smart_resize *floors* each side to a
+    // factor multiple when it shrinks — so max_pixels = budget·factor²
+    // guarantees n_img ≤ budget. Without this the caller would have to know the
+    // exact budget and patch stride to pre-size the image; instead any image is
+    // downscaled to fit here and the throw below stays a defensive backstop.
+    const int tok_budget = content_budget - 2;   // minus <vision_start>/<vision_end>
+    brolm::qwen3vl::PreprocessConfig pp_fit = pp;
+    const long long budget_px =
+        static_cast<long long>(tok_budget) * pp.factor() * pp.factor();
+    if (pp_fit.max_pixels > budget_px) {
+        pp_fit.max_pixels = static_cast<int>(budget_px);
+    }
+
     // Run the vision tower: post-merger tokens + the DeepStack feature list.
     brolm::qwen3vl::PreprocessedImage pp_out;
     std::vector<bt::Tensor> deepstack_one;
     bt::Tensor vis_tokens =
-        brolm::qwen3vl::run_vision_one(vision, pp, image, pp_out, deepstack_one);
+        brolm::qwen3vl::run_vision_one(vision, pp_fit, image, pp_out, deepstack_one);
     const int n_img = pp_out.num_image_tokens();
 
     // Content = <|vision_start|> + N image tokens + <|vision_end|>, mirroring
