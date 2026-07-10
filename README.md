@@ -30,7 +30,7 @@ against a downloaded diffusers model directory — the loader reads
 | Flux.1 | CLIP-pooled + T5-XXL | DiT, double/single-stream joint attention | flow-match Euler | `schnell` defaults to 4 steps |
 | Sana / Sana-Sprint | Gemma-2 | linear-attention DiT | flow-match Euler / SCM (TrigFlow) | native 1024px; Sprint is the 2-step guidance-distilled variant |
 | PixArt-Sigma | T5-XXL | DiT (ada-norm-single) | DPM-Solver++ (2M) | native 1024px |
-| Krea 2 (Raw / Turbo) | Qwen3-VL, 12 tapped decoder layers | single-stream flow-matching DiT | flow-match Euler | Turbo is the distilled, no-CFG, 8-step checkpoint |
+| Krea 2 (Raw / Turbo) | Qwen3-VL, 12 tapped decoder layers | single-stream flow-matching DiT | flow-match Euler | Turbo is the distilled, no-CFG, 8-step checkpoint; LoRA as runtime adapters (INT8-safe, live rescale), optional INT8 DiT |
 
 **TripoSplat** (single-image → 3D Gaussian splats, the generative core of
 [VAST-AI/TripoSplat](https://huggingface.co/VAST-AI/TripoSplat)) is a separate
