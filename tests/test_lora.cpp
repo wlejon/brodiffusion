@@ -331,6 +331,11 @@ void test_krea2_key_grammar() {
     const std::string p_diff = "transformer.transformer_blocks.0.attn.to_q";
     const std::string p_comfy = "diffusion_model.transformer_blocks.5.ff.gate";
     const std::string p_bare = "text_fusion.refiner_blocks.0.ff.up";
+    // Standalone projections the official Krea LoRAs adapt (rank-32 PEFT
+    // exports cover every linear, incl. time_embed and the text-fusion
+    // projector row).
+    const std::string p_time = "transformer.time_embed.linear_1";
+    const std::string p_proj = "transformer.text_fusion.projector";
     std::vector<Entry> dit = {
         {p_diff + ".lora_A.weight",     {R, IN},  fp16_bytes(down), "F16"},
         {p_diff + ".lora_B.weight",     {OUT, R}, fp16_bytes(up),   "F16"},
@@ -339,22 +344,28 @@ void test_krea2_key_grammar() {
         {p_comfy + ".lora_up.weight",   {OUT, R}, fp16_bytes(up),   "F16"},
         {p_bare + ".lora_A.weight",     {R, IN},  fp16_bytes(down), "F16"},
         {p_bare + ".lora_B.weight",     {OUT, R}, fp16_bytes(up),   "F16"},
+        {p_time + ".lora_A.weight",     {R, IN},  fp16_bytes(down), "F16"},
+        {p_time + ".lora_B.weight",     {OUT, R}, fp16_bytes(up),   "F16"},
+        {p_proj + ".lora_A.weight",     {R, IN},  fp16_bytes(down), "F16"},
+        {p_proj + ".lora_B.weight",     {OUT, R}, fp16_bytes(up),   "F16"},
     };
     auto dpath = write_fixture("krea2_diff", dit);
     {
         auto f = st::File::open(dpath.string());
         CHECK(lora::detect_format(f) == lora::Format::Diffusers);
         auto trips = lora::enumerate(f);
-        CHECK(trips.size() == 3);
+        CHECK(trips.size() == 5);
         for (const auto& t : trips) CHECK(t.domain == "transformer");
         // Deterministic order: sorted by target_path.
-        if (trips.size() == 3) {
-            CHECK(trips[0].target_path == "text_fusion.refiner_blocks.0.ff.up");
-            CHECK(trips[0].alpha == static_cast<float>(R));   // defaulted
-            CHECK(trips[1].target_path == "transformer_blocks.0.attn.to_q");
-            CHECK(trips[1].alpha == 4.0f);
-            CHECK(trips[2].target_path == "transformer_blocks.5.ff.gate");
-            CHECK(trips[2].rank == R);
+        if (trips.size() == 5) {
+            CHECK(trips[0].target_path == "text_fusion.projector");
+            CHECK(trips[1].target_path == "text_fusion.refiner_blocks.0.ff.up");
+            CHECK(trips[1].alpha == static_cast<float>(R));   // defaulted
+            CHECK(trips[2].target_path == "time_embed.linear_1");
+            CHECK(trips[3].target_path == "transformer_blocks.0.attn.to_q");
+            CHECK(trips[3].alpha == 4.0f);
+            CHECK(trips[4].target_path == "transformer_blocks.5.ff.gate");
+            CHECK(trips[4].rank == R);
         }
     }
 
@@ -394,6 +405,16 @@ void test_krea2_key_grammar() {
     // Unknown DiT tails must NOT parse.
     CHECK(!lora::kohya_to_diffusers("lora_unet_transformer_blocks_3_attn_add_q_proj",
                                     dom, tail));
+    // Standalone projections round-trip through their mangled spellings.
+    CHECK(lora::diffusers_to_kohya_prefix("transformer", "time_embed.linear_1") ==
+          "lora_unet_time_embed_linear_1");
+    CHECK(lora::kohya_to_diffusers("lora_unet_time_embed_linear_1", dom, tail));
+    CHECK(dom == "transformer");
+    CHECK(tail == "time_embed.linear_1");
+    CHECK(lora::kohya_to_diffusers("lora_transformer_text_fusion_projector",
+                                   dom, tail));
+    CHECK(dom == "transformer");
+    CHECK(tail == "text_fusion.projector");
 
     std::error_code ec;
     std::filesystem::remove(dpath, ec);
@@ -403,8 +424,9 @@ void test_krea2_key_grammar() {
 // ─── unit 5: Krea2 runtime-adapter math ────────────────────────────────────
 //
 // Build a tiny Krea2Transformer2DModel checkpoint fixture, run one forward as
-// the base, attach a two-target LoRA via the same enumerate() -> add_lora()
-// path Pipeline::apply_lora uses, and check:
+// the base, attach a four-target LoRA (body attn, fusion ff, time_embed, and
+// the non-Linear text_fusion.projector row) via the same enumerate() ->
+// add_lora() path Pipeline::apply_lora uses, and check:
 //   - the adapted output matches a second model loaded from PRE-MERGED
 //     weights (W' = W + eff * up @ down) to within compute-dtype tolerance,
 //   - set_lora_scale(0) and clear_loras() reproduce the base output.
@@ -583,20 +605,27 @@ void test_krea2_runtime_adapter() {
     const int H = cfg.hidden_size();
     const int TH = cfg.text_hidden_dim;
 
-    // Two LoRA targets, chosen to cover a body block AND a text-fusion block:
+    // Four LoRA targets, covering a body block, a text-fusion block, a
+    // standalone projection, and the non-Linear projector row:
     //   transformer_blocks.0.attn.to_q       (out 16, in 16), alpha 4, rank 2
     //   text_fusion.refiner_blocks.0.ff.up   (out 16, in 8),  alpha absent
+    //   time_embed.linear_2                  (out 16, in 16), alpha absent
+    //   text_fusion.projector                (out 1,  in 2),  alpha absent
     const int R = 2;
+    const int NL = cfg.num_text_layers;
     const float user_scale = 0.5f;
     k2::Rng lrng(7);
     std::vector<float> toq_down = lrng.vec(R * H), toq_up = lrng.vec(H * R);
     std::vector<float> ffup_down = lrng.vec(R * TH);
     std::vector<float> ffup_up = lrng.vec(cfg.text_intermediate_size * R);
+    std::vector<float> te_down = lrng.vec(R * H), te_up = lrng.vec(H * R);
+    std::vector<float> proj_down = lrng.vec(R * NL), proj_up = lrng.vec(1 * R);
     // Make the low-rank delta LARGE relative to the tiny random base weights
     // (~10x), so the forward output visibly moves — with same-scale factors
     // the rank-2 delta on a random tiny model shifts the velocity by less
     // than measurement noise and the equivalence check would be vacuous.
-    for (auto* v : {&toq_down, &toq_up, &ffup_down, &ffup_up}) {
+    for (auto* v : {&toq_down, &toq_up, &ffup_down, &ffup_up,
+                    &te_down, &te_up, &proj_down, &proj_up}) {
         for (float& x : *v) x *= 10.0f;
     }
     const float toq_eff = (4.0f / R) * user_scale;   // explicit alpha 4
@@ -616,6 +645,14 @@ void test_krea2_runtime_adapter() {
          {R, TH}, fp32_bytes(ffup_down), "F32"},
         {"transformer.text_fusion.refiner_blocks.0.ff.up.lora_B.weight",
          {cfg.text_intermediate_size, R}, fp32_bytes(ffup_up), "F32"},
+        {"transformer.time_embed.linear_2.lora_A.weight",
+         {R, H}, fp32_bytes(te_down), "F32"},
+        {"transformer.time_embed.linear_2.lora_B.weight",
+         {H, R}, fp32_bytes(te_up), "F32"},
+        {"transformer.text_fusion.projector.lora_A.weight",
+         {R, NL}, fp32_bytes(proj_down), "F32"},
+        {"transformer.text_fusion.projector.lora_B.weight",
+         {1, R}, fp32_bytes(proj_up), "F32"},
     };
     auto lora_path = write_fixture("krea2_lora", lora_entries);
 
@@ -640,6 +677,10 @@ void test_krea2_runtime_adapter() {
           toq_eff);
     merge("text_fusion.refiner_blocks.0.ff.up.weight", ffup_up, ffup_down,
           cfg.text_intermediate_size, TH, ffup_eff);
+    // Both alpha-less: eff = (rank/rank) * user_scale.
+    merge("time_embed.linear_2.weight", te_up, te_down, H, H, user_scale);
+    merge("text_fusion.projector.weight", proj_up, proj_down, 1, NL,
+          user_scale);
     auto merged_path = k2::write_checkpoint("krea2_merged", merged);
 
     {
@@ -652,7 +693,7 @@ void test_krea2_runtime_adapter() {
         // Pipeline::apply_lora uses.
         auto lf = st::File::open(lora_path.string());
         auto trips = lora::enumerate(lf);
-        CHECK(trips.size() == 2);
+        CHECK(trips.size() == 4);
         std::vector<dit::Krea2Transformer2DModel::LoraTarget> targets;
         for (const auto& t : trips) {
             CHECK(t.domain == "transformer");

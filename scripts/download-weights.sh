@@ -12,7 +12,7 @@
 #   model            sd15 (default) | lcm-dreamshaper | clip-vit-l-14 |
 #                    flux-schnell | sana-600m | sana-1.6b |
 #                    sana-sprint-0.6b | sana-sprint-1.6b | pixart-sigma |
-#                    krea-2-raw | krea-2-turbo
+#                    krea-2-raw | krea-2-turbo | krea-2-loras
 #   --repo R         override the Hugging Face repo id
 #   --out-dir D      override the output directory
 #   --force          re-download even if the file already exists
@@ -93,6 +93,12 @@
 #                    (`guidance_scale=0.0`), fixed timestep shift `mu=1.15`.
 #                    Same component layout/sizes as krea-2-raw.
 #
+#   krea-2-loras     The nine official Krea-2-Turbo style LoRAs
+#                    (krea/Krea-2-LoRA-*): rank-32 F32 PEFT exports,
+#                    ~470 MB each (~4.2 GB total), one flat
+#                    <style>.safetensors per file — loadable directly by
+#                    Pipeline::apply_lora / the --lora CLI flag.
+#
 # Auth: the SD1.5 mirror is public and needs no token. For rate-limited repos,
 # export HF_TOKEN=hf_... and it will be sent as a bearer token.
 #
@@ -116,12 +122,12 @@ while [ $# -gt 0 ]; do
         sd15|lcm-dreamshaper|clip-vit-l-14|flux-schnell|t5-xxl|controlnet-canny|controlnet-depth|controlnet-openpose) MODEL="$1"; shift ;;
         sana-600m|sana-1.6b|sana-sprint-0.6b|sana-sprint-1.6b) MODEL="$1"; shift ;;
         pixart-sigma) MODEL="$1"; shift ;;
-        krea-2-raw|krea-2-turbo) MODEL="$1"; shift ;;
+        krea-2-raw|krea-2-turbo|krea-2-loras) MODEL="$1"; shift ;;
         --repo)    REPO="${2:?--repo needs a value}"; shift 2 ;;
         --out-dir) OUT_DIR="${2:?--out-dir needs a value}"; shift 2 ;;
         --force)   FORCE=1; shift ;;
         -h|--help)
-            sed -n '2,96p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,102p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) echo "error: unknown argument '$1' (try --help)" >&2; exit 2 ;;
     esac
@@ -361,6 +367,17 @@ case "$MODEL" in
         # qwen3vl_tokenizer needs them by name — pulled separately below since
         # they live at the base repo's root, not under a tokenizer/ subfolder.
         KREA2_QWEN3VL_REPO="Qwen/Qwen3-VL-4B-Instruct"
+        ;;
+    krea-2-loras)
+        # Nine single-file repos; every FILES entry names its own repo, so
+        # $REPO is display-only here.
+        [ -n "$REPO" ]    || REPO="krea/Krea-2-LoRA-*"
+        [ -n "$OUT_DIR" ] || OUT_DIR="$REPO_ROOT/weights/$MODEL"
+        FILES=()
+        for s in retroanime darkbrush sunsetblur neondrip kidsdrawing \
+                 vintagetarot dotmatrix rainywindow softwatercolor; do
+            FILES+=("krea/Krea-2-LoRA-$s|$s.safetensors")
+        done
         ;;
 esac
 

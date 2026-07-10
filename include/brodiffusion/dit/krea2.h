@@ -232,6 +232,16 @@ private:
         int   group = 0;          // index into lora_group_scales_
     };
 
+    // Adapter on `text_fusion.projector` — the one LoRA-addressable weight
+    // that isn't a Linear. It's a (1, num_text_layers) row read to host each
+    // encode_text, so the adapter is the pre-multiplied dense delta up@down
+    // (num_text_layers floats) added there under the live group scale.
+    struct ProjLoraAdapter {
+        std::vector<float> delta;  // (num_text_layers) FP32, up @ down
+        float base_scale = 1.0f;   // alpha / rank
+        int   group = 0;           // index into lora_group_scales_
+    };
+
     // A biased-or-bias-free linear (weight (out,in), bias (out,1) or empty).
     // When the layer was quantized at load (cfg.quantize_weights), W is empty
     // and W_int8 (out,in) + scales (out,1 FP32 per-row) carry the weight
@@ -315,6 +325,7 @@ private:
     // sized at construction, so the pointers are stable across a load).
     std::unordered_map<std::string, Linear*> lora_targets_;
     std::vector<float> lora_group_scales_;   // user multiplier per group
+    std::vector<ProjLoraAdapter> proj_loras_;  // adapters on text_fusion.projector
 
     // Gate research hook state (set_gate_scale / capture_gates).
     float gate_txt_scale_ = 1.0f, gate_img_scale_ = 1.0f;

@@ -652,7 +652,7 @@ void Pipeline::load_weights(const brotensor::safetensors::File& text_file,
     vae_encoder_.load_weights(vae_file, "encoder.");
 }
 
-void Pipeline::apply_lora(const brotensor::safetensors::File& f, float scale) {
+int Pipeline::apply_lora(const brotensor::safetensors::File& f, float scale) {
     const std::vector<lora::Triple> triples = lora::enumerate(f);
     if (triples.empty()) {
         fail("apply_lora: no LoRA triples found in file");
@@ -673,10 +673,9 @@ void Pipeline::apply_lora(const brotensor::safetensors::File& f, float scale) {
                                &f.get(t.up_key),
                                t.alpha / static_cast<float>(t.rank)});
         }
-        static_cast<dit::Krea2Denoiser*>(denoiser_.get())
+        return static_cast<dit::Krea2Denoiser*>(denoiser_.get())
             ->model()
             .add_lora(targets, scale);
-        return;
     }
     for (const lora::Triple& t : triples) {
         if (t.domain == "transformer") {
@@ -702,6 +701,7 @@ void Pipeline::apply_lora(const brotensor::safetensors::File& f, float scale) {
             fail("apply_lora: unknown domain '" + t.domain + "'");
         }
     }
+    return -1;   // merged in place — no adapter group to address
 }
 
 int Pipeline::add_controlnet(const brotensor::safetensors::File& f) {

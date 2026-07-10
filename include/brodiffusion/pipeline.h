@@ -334,7 +334,10 @@ public:
     // kohya-mangled transformer_blocks) — see lora.h. The format is
     // auto-detected from the key prefixes. Throws if the file contains LoRA
     // tensors that don't map to a target of the ACTIVE model family.
-    void apply_lora(const brotensor::safetensors::File& f, float scale = 1.0f);
+    //
+    // Returns the runtime-adapter group index (Krea 2; pass it to
+    // set_lora_scale), or -1 when the LoRA was merged in place (SD1.5).
+    int apply_lora(const brotensor::safetensors::File& f, float scale = 1.0f);
 
     // Runtime-adapter LoRA controls — Krea 2 only (SD1.5 LoRAs are merged
     // irreversibly; these throw for other model classes). `index` is the

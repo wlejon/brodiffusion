@@ -161,6 +161,31 @@ bool parse_kohya_dit_blocks(const std::string& rest,
     return true;
 }
 
+// Kohya-mangled spellings of the standalone DiT projections (the mangling is
+// lossy — dots became underscores — so map them back explicitly).
+bool parse_kohya_dit_exact(const std::string& rest,
+                           std::string& domain,
+                           std::string& target_path) {
+    static const std::pair<const char*, const char*> exact[] = {
+        {"img_in", "img_in"},
+        {"txt_in_linear_1", "txt_in.linear_1"},
+        {"txt_in_linear_2", "txt_in.linear_2"},
+        {"final_layer_linear", "final_layer.linear"},
+        {"time_embed_linear_1", "time_embed.linear_1"},
+        {"time_embed_linear_2", "time_embed.linear_2"},
+        {"time_mod_proj", "time_mod_proj"},
+        {"text_fusion_projector", "text_fusion.projector"},
+    };
+    for (const auto& [k, v] : exact) {
+        if (rest == k) {
+            domain = "transformer";
+            target_path = v;
+            return true;
+        }
+    }
+    return false;
+}
+
 // CLIP self-attn projection names are identical in kohya and diffusers.
 bool is_clip_proj_name(const std::string& proj) {
     return proj == "q_proj" || proj == "k_proj" ||
@@ -234,6 +259,7 @@ bool parse_kohya_prefix(const std::string& p,
         // Krea2-style DiT body block (musubi/kohya trainers keep the
         // lora_unet_ head even for transformer checkpoints).
         if (parse_kohya_dit_blocks(rest, domain, target_path)) return true;
+        if (parse_kohya_dit_exact(rest, domain, target_path)) return true;
         for (const char* side : {"down", "up"}) {
             std::string head = std::string(side) + "_blocks_";
             if (starts_with(rest, head)) {
@@ -268,7 +294,8 @@ bool parse_kohya_prefix(const std::string& p,
     // Some DiT trainers use a lora_transformer_ head instead of lora_unet_.
     if (starts_with(p, "lora_transformer_")) {
         std::string rest = p.substr(17);
-        return parse_kohya_dit_blocks(rest, domain, target_path);
+        return parse_kohya_dit_blocks(rest, domain, target_path) ||
+               parse_kohya_dit_exact(rest, domain, target_path);
     }
     if (starts_with(p, "lora_te_")) {
         std::string rest = p.substr(8);
@@ -353,7 +380,9 @@ bool parse_diffusers_prefix(const std::string& p,
     sv = strip_domain("transformer");
     if (sv.empty()) sv = strip_domain("diffusion_model");
     if (sv.empty() && (starts_with(p, "transformer_blocks.") ||
-                       starts_with(p, "text_fusion."))) {
+                       starts_with(p, "text_fusion.") ||
+                       starts_with(p, "time_embed.") ||
+                       p == "time_mod_proj")) {
         sv = p;
     }
     if (!sv.empty()) {
@@ -376,6 +405,8 @@ bool parse_diffusers_prefix(const std::string& p,
         static const char* dit_exact[] = {
             "img_in", "txt_in.linear_1", "txt_in.linear_2",
             "final_layer.linear",
+            "time_embed.linear_1", "time_embed.linear_2", "time_mod_proj",
+            "text_fusion.projector",
         };
         for (const char* exact : dit_exact) {
             if (sv == exact) {

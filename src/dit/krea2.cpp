@@ -376,14 +376,34 @@ int Krea2Transformer2DModel::add_lora(const std::vector<LoraTarget>& targets,
         int out, in, rank;
     };
     std::vector<Resolved> rs;
+    std::vector<const LoraTarget*> proj_ts;
     rs.reserve(targets.size());
     for (const LoraTarget& t : targets) {
+        if (!t.down || !t.up) {
+            fail("add_lora: '" + t.path + "': missing lora_down/lora_up view");
+        }
+        // text_fusion.projector is a raw (1, num_text_layers) row, not a
+        // Linear — validated here, committed below as a host-side delta.
+        if (t.path == "text_fusion.projector") {
+            const int NL = cfg_.num_text_layers;
+            if (t.down->shape.empty() || t.down->shape[0] <= 0) {
+                fail("add_lora: '" + t.path + "': lora_down has no rank dimension");
+            }
+            const int rank = static_cast<int>(t.down->shape[0]);
+            if (t.down->numel() != static_cast<std::int64_t>(rank) * NL) {
+                fail("add_lora: '" + t.path + "': lora_down must be (" +
+                     std::to_string(rank) + ", " + std::to_string(NL) + ")");
+            }
+            if (t.up->numel() != rank) {
+                fail("add_lora: '" + t.path + "': lora_up must be (1, " +
+                     std::to_string(rank) + ")");
+            }
+            proj_ts.push_back(&t);
+            continue;
+        }
         auto it = lora_targets_.find(t.path);
         if (it == lora_targets_.end()) {
             fail("add_lora: unknown target '" + t.path + "'");
-        }
-        if (!t.down || !t.up) {
-            fail("add_lora: '" + t.path + "': missing lora_down/lora_up view");
         }
         Linear* l = it->second;
         const int out = l->out_dim();
@@ -417,6 +437,26 @@ int Krea2Transformer2DModel::add_lora(const std::vector<LoraTarget>& targets,
         a.group = group;
         r.l->loras.push_back(std::move(a));
     }
+    for (const LoraTarget* t : proj_ts) {
+        const int NL = cfg_.num_text_layers;
+        const int rank = static_cast<int>(t->down->shape[0]);
+        std::vector<float> down = view_to_fp32(*t->down, rank, NL,
+                                               t->path + " lora_down");
+        std::vector<float> up = view_to_fp32(*t->up, 1, rank,
+                                             t->path + " lora_up");
+        ProjLoraAdapter a;
+        a.delta.assign(static_cast<std::size_t>(NL), 0.0f);
+        for (int r = 0; r < rank; ++r) {
+            for (int j = 0; j < NL; ++j) {
+                a.delta[static_cast<std::size_t>(j)] +=
+                    up[static_cast<std::size_t>(r)] *
+                    down[static_cast<std::size_t>(r * NL + j)];
+            }
+        }
+        a.base_scale = t->base_scale;
+        a.group = group;
+        proj_loras_.push_back(std::move(a));
+    }
     return group;
 }
 
@@ -431,6 +471,7 @@ void Krea2Transformer2DModel::set_lora_scale(int group, float scale) {
 void Krea2Transformer2DModel::clear_loras() {
     lora_group_scales_.clear();
     for (auto& kv : lora_targets_) kv.second->loras.clear();
+    proj_loras_.clear();
 }
 
 int Krea2Transformer2DModel::num_loras() const {
@@ -553,6 +594,15 @@ void Krea2Transformer2DModel::encode_text(const bt::Tensor& prompt_embeds,
         bt::Tensor pf = projector_;
         if (pf.dtype != bt::Dtype::FP32) { bt::Tensor t; bt::cast(projector_, t, bt::Dtype::FP32); pf = t; }
         pw = pf.to(bt::Device::CPU).to_host_vector();
+    }
+    for (const ProjLoraAdapter& a : proj_loras_) {
+        const float eff =
+            a.base_scale * lora_group_scales_[static_cast<std::size_t>(a.group)];
+        if (eff == 0.0f) continue;
+        for (int l = 0; l < NL; ++l) {
+            pw[static_cast<std::size_t>(l)] +=
+                eff * a.delta[static_cast<std::size_t>(l)];
+        }
     }
     bt::Tensor fused = bt::Tensor::zeros_on(bt::default_device(), n_valid, TH, dt);
     bt::Tensor gath;
