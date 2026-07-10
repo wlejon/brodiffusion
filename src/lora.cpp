@@ -122,6 +122,45 @@ std::string match_resnet_tail_kohya(const std::string& tail) {
     return {};
 }
 
+// Tails inside a Krea2-style DiT transformer_blocks.<i> scope (the attention
+// projections + SwiGLU FF — see brodiffusion/dit/krea2.h).
+std::string match_dit_block_tail_kohya(const std::string& tail) {
+    static const std::pair<const char*, const char*> map[] = {
+        {"attn_to_q",      "attn.to_q"},
+        {"attn_to_k",      "attn.to_k"},
+        {"attn_to_v",      "attn.to_v"},
+        {"attn_to_gate",   "attn.to_gate"},
+        {"attn_to_out_0",  "attn.to_out.0"},
+        {"ff_gate",        "ff.gate"},
+        {"ff_up",          "ff.up"},
+        {"ff_down",        "ff.down"},
+    };
+    for (const auto& kv : map) {
+        if (tail == kv.first) return kv.second;
+    }
+    return {};
+}
+
+// Parse a kohya-mangled DiT body-block path:
+//   transformer_blocks_<i>_<tail>  ->  transformer_blocks.<i>.<dtail>
+// Returns true and fills (domain, target_path) on a recognized target.
+bool parse_kohya_dit_blocks(const std::string& rest,
+                            std::string& domain,
+                            std::string& target_path) {
+    static const std::string tb = "transformer_blocks_";
+    if (!starts_with(rest, tb)) return false;
+    std::size_t pos = tb.size();
+    int i = 0;
+    if (!parse_uint(rest, pos, i)) return false;
+    if (pos >= rest.size() || rest[pos] != '_') return false;
+    ++pos;
+    std::string dtail = match_dit_block_tail_kohya(rest.substr(pos));
+    if (dtail.empty()) return false;
+    domain = "transformer";
+    target_path = "transformer_blocks." + std::to_string(i) + "." + dtail;
+    return true;
+}
+
 // CLIP self-attn projection names are identical in kohya and diffusers.
 bool is_clip_proj_name(const std::string& proj) {
     return proj == "q_proj" || proj == "k_proj" ||
@@ -192,6 +231,9 @@ bool parse_kohya_prefix(const std::string& p,
                         std::string& target_path) {
     if (starts_with(p, "lora_unet_")) {
         std::string rest = p.substr(10);
+        // Krea2-style DiT body block (musubi/kohya trainers keep the
+        // lora_unet_ head even for transformer checkpoints).
+        if (parse_kohya_dit_blocks(rest, domain, target_path)) return true;
         for (const char* side : {"down", "up"}) {
             std::string head = std::string(side) + "_blocks_";
             if (starts_with(rest, head)) {
@@ -222,6 +264,11 @@ bool parse_kohya_prefix(const std::string& p,
             return true;
         }
         return false;
+    }
+    // Some DiT trainers use a lora_transformer_ head instead of lora_unet_.
+    if (starts_with(p, "lora_transformer_")) {
+        std::string rest = p.substr(17);
+        return parse_kohya_dit_blocks(rest, domain, target_path);
     }
     if (starts_with(p, "lora_te_")) {
         std::string rest = p.substr(8);
@@ -300,6 +347,45 @@ bool parse_diffusers_prefix(const std::string& p,
         }
         return false;
     }
+    // Krea2-style DiT transformer domain. Diffusers/PEFT exports prefix with
+    // `transformer.`, ComfyUI-style exports with `diffusion_model.`, and some
+    // trainers emit the bare checkpoint path with no domain prefix at all.
+    sv = strip_domain("transformer");
+    if (sv.empty()) sv = strip_domain("diffusion_model");
+    if (sv.empty() && (starts_with(p, "transformer_blocks.") ||
+                       starts_with(p, "text_fusion."))) {
+        sv = p;
+    }
+    if (!sv.empty()) {
+        // Attention/FF tails inside a body or text-fusion block, plus the
+        // small standalone projections a trainer could still target.
+        static const char* dit_tails[] = {
+            ".attn.to_q", ".attn.to_k", ".attn.to_v", ".attn.to_gate",
+            ".attn.to_out.0",
+            ".ff.gate", ".ff.up", ".ff.down",
+        };
+        for (const char* tail : dit_tails) {
+            std::string_view k(tail);
+            if (sv.size() >= k.size() &&
+                sv.compare(sv.size() - k.size(), k.size(), k) == 0) {
+                domain = "transformer";
+                target_path = std::string(sv);
+                return true;
+            }
+        }
+        static const char* dit_exact[] = {
+            "img_in", "txt_in.linear_1", "txt_in.linear_2",
+            "final_layer.linear",
+        };
+        for (const char* exact : dit_exact) {
+            if (sv == exact) {
+                domain = "transformer";
+                target_path = std::string(sv);
+                return true;
+            }
+        }
+        return false;
+    }
     return false;
 }
 
@@ -318,12 +404,21 @@ Format detect_format(const st::File& f) {
     int kohya = 0, diffusers = 0;
     for (const st::TensorView& tv : f.tensors()) {
         const std::string& k = tv.name;
-        if (starts_with(k, "lora_unet_") || starts_with(k, "lora_te_")) ++kohya;
-        else if (starts_with(k, "unet.") || starts_with(k, "text_encoder.")) ++diffusers;
+        if (starts_with(k, "lora_unet_") || starts_with(k, "lora_te_") ||
+            starts_with(k, "lora_transformer_")) {
+            ++kohya;
+        } else if (starts_with(k, "unet.") || starts_with(k, "text_encoder.") ||
+                   starts_with(k, "transformer.") ||
+                   starts_with(k, "diffusion_model.") ||
+                   starts_with(k, "transformer_blocks.") ||
+                   starts_with(k, "text_fusion.")) {
+            ++diffusers;
+        }
     }
     if (kohya == 0 && diffusers == 0) {
-        fail("file contains no recognizable LoRA keys (need 'lora_unet_'/'lora_te_' "
-             "or 'unet.'/'text_encoder.' prefixes)");
+        fail("file contains no recognizable LoRA keys (need 'lora_unet_'/'lora_te_'/"
+             "'lora_transformer_' or 'unet.'/'text_encoder.'/'transformer.'/"
+             "'diffusion_model.' prefixes)");
     }
     return (kohya >= diffusers) ? Format::Kohya : Format::Diffusers;
 }
@@ -333,6 +428,8 @@ std::string diffusers_to_kohya_prefix(const std::string& domain,
     std::string head;
     if (domain == "unet")              head = "lora_unet_";
     else if (domain == "text_encoder") head = "lora_te_";
+    // DiT checkpoints: musubi/kohya trainers keep the lora_unet_ head.
+    else if (domain == "transformer")  head = "lora_unet_";
     else fail("diffusers_to_kohya_prefix: unknown domain '" + domain + "'");
 
     std::string body = target_path;

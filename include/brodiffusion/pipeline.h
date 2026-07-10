@@ -309,22 +309,39 @@ public:
                       const brotensor::safetensors::File& unet_file,
                       const brotensor::safetensors::File& vae_file);
 
-    // Merge a LoRA file's deltas into the base UNet and CLIP weights.
+    // Apply a LoRA file.
+    //
+    // SD1.5: merges the deltas into the base UNet and CLIP weights.
+    // Krea 2: attaches the file as ONE runtime-adapter group on the DiT (the
+    // base linears may be INT8-quantized, so nothing is merged; each adapted
+    // linear adds scale * (x @ down^T) @ up^T per forward). Runtime groups
+    // are indexed in apply order — see set_lora_scale() / clear_loras().
     //
     // Must be called *after* load_weights() and *before* generate(). The
     // cross-attention K/V cache is re-primed inside every generate() call,
     // so calling apply_lora() between generates is safe — the next generate
-    // will rebuild the cache against the updated K/V projections.
+    // will rebuild the cache against the updated K/V projections. For Krea 2
+    // the fused text conditioning is rebuilt at every prime(), so a LoRA on
+    // the text-fusion blocks likewise lands on the next generation.
     //
     // `scale` is a user multiplier applied on top of the per-LoRA alpha/rank
     // factor (default 1.0 = use as-shipped). Negative values are allowed
     // (subtract / undo). May be called more than once to stack multiple
     // LoRAs.
     //
-    // Accepts both kohya-ss/A1111 and diffusers/PEFT key conventions; the
-    // format is auto-detected from the key prefixes. Throws if the file
-    // contains LoRA tensors that don't map to a known SD1.5 target.
+    // Accepts kohya-ss/A1111 and diffusers/PEFT key conventions for SD1.5,
+    // plus the Krea2-style DiT conventions (transformer. / diffusion_model. /
+    // kohya-mangled transformer_blocks) — see lora.h. The format is
+    // auto-detected from the key prefixes. Throws if the file contains LoRA
+    // tensors that don't map to a target of the ACTIVE model family.
     void apply_lora(const brotensor::safetensors::File& f, float scale = 1.0f);
+
+    // Runtime-adapter LoRA controls — Krea 2 only (SD1.5 LoRAs are merged
+    // irreversibly; these throw for other model classes). `index` is the
+    // apply_lora() call order, 0-based.
+    void set_lora_scale(int index, float scale);
+    void clear_loras();
+    int  num_loras() const;
 
     // Register a ControlNet safetensors file. The returned index is the
     // addressing key used elsewhere (remove_controlnet, plus the position

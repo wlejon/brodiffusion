@@ -657,6 +657,33 @@ void Pipeline::apply_lora(const brotensor::safetensors::File& f, float scale) {
     if (triples.empty()) {
         fail("apply_lora: no LoRA triples found in file");
     }
+    // Krea 2: transformer-domain triples become ONE runtime-adapter group on
+    // the DiT (never merged — the base linears may be INT8; see
+    // Krea2Transformer2DModel::add_lora). set_lora_scale()/clear_loras()
+    // address the group afterwards.
+    if (model_class_ == ModelClass::Krea2) {
+        std::vector<dit::Krea2Transformer2DModel::LoraTarget> targets;
+        targets.reserve(triples.size());
+        for (const lora::Triple& t : triples) {
+            if (t.domain != "transformer") {
+                fail("apply_lora: '" + t.domain + "' LoRA target in a Krea 2 "
+                     "pipeline (need transformer-domain keys)");
+            }
+            targets.push_back({t.target_path, &f.get(t.down_key),
+                               &f.get(t.up_key),
+                               t.alpha / static_cast<float>(t.rank)});
+        }
+        static_cast<dit::Krea2Denoiser*>(denoiser_.get())
+            ->model()
+            .add_lora(targets, scale);
+        return;
+    }
+    for (const lora::Triple& t : triples) {
+        if (t.domain == "transformer") {
+            fail("apply_lora: transformer-domain (DiT) LoRA but the active "
+                 "model is not Krea 2");
+        }
+    }
     for (const lora::Triple& t : triples) {
         const float scale_total = (static_cast<float>(t.alpha) /
                                    static_cast<float>(t.rank)) * scale;
@@ -1886,6 +1913,21 @@ void Pipeline::krea_capture_gates(bool enable) {
 std::vector<float> Pipeline::krea_gates() const {
     if (model_class_ != ModelClass::Krea2) fail("krea_gates: Krea 2 only");
     return krea_gate_sink_;
+}
+
+void Pipeline::set_lora_scale(int index, float scale) {
+    // Only runtime-adapter LoRAs (Krea 2) can rescale after apply_lora();
+    // the SD1.5 path merges deltas into the base weights irreversibly.
+    krea_model(model_class_, denoiser_, "set_lora_scale")
+        .set_lora_scale(index, scale);
+}
+
+void Pipeline::clear_loras() {
+    krea_model(model_class_, denoiser_, "clear_loras").clear_loras();
+}
+
+int Pipeline::num_loras() const {
+    return krea_model(model_class_, denoiser_, "num_loras").num_loras();
 }
 
 int Pipeline::krea_hidden_size() const {

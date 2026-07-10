@@ -180,8 +180,14 @@ void Krea2Transformer2DModel::load_impl_(
     const int hd_txt = TH / cfg_.text_num_attention_heads;
     const int nq_txt = cfg_.text_num_attention_heads;
 
+    // A reload invalidates any attached LoRA adapters (they patched the OLD
+    // weights) and rebuilds the target map from scratch.
+    clear_loras();
+    lora_targets_.clear();
+
     auto lin = [&](const std::string& key, int out, int in, bool bias,
                    Linear& l) {
+        lora_targets_[key] = &l;
         l.W = upload_as(view_to_fp32(need(shards, prefix + key + ".weight"),
                                      out, in, key),
                         out, in, dt);
@@ -224,6 +230,7 @@ void Krea2Transformer2DModel::load_impl_(
     auto lin_q = [&](const std::string& key, int out, int in, bool bias,
                      Linear& l) {
         if (!quant) { lin(key, out, in, bias, l); return; }
+        lora_targets_[key] = &l;
         const st::TensorView& wv = need(shards, prefix + key + ".weight");
         const std::int64_t expected =
             static_cast<std::int64_t>(out) * static_cast<std::int64_t>(in);
@@ -339,7 +346,95 @@ bt::Tensor Krea2Transformer2DModel::linb_(const Linear& l, const bt::Tensor& X) 
     } else {
         detail::linear_batched(l.W, l.has_bias() ? &l.b : nullptr, X, Y);
     }
+    // Runtime LoRA adapters (see add_lora): Y += eff * (X @ down^T) @ up^T.
+    // Two rank-r matmuls per adapter — negligible next to the base linear.
+    for (const LoraAdapter& a : l.loras) {
+        const float eff =
+            a.base_scale * lora_group_scales_[static_cast<std::size_t>(a.group)];
+        if (eff == 0.0f) continue;
+        bt::Tensor t, d;
+        detail::linear_batched(a.down, nullptr, X, t);
+        detail::linear_batched(a.up, nullptr, t, d);
+        bt::axpby_inplace(Y, d, 1.0f, eff);
+    }
     return Y;
+}
+
+// ─── LoRA (runtime adapters) ────────────────────────────────────────────────
+
+int Krea2Transformer2DModel::add_lora(const std::vector<LoraTarget>& targets,
+                                      float scale) {
+    if (!loaded_) fail("add_lora: weights not loaded");
+    if (targets.empty()) fail("add_lora: no targets");
+    const bt::Dtype dt = flux_compute_dtype();
+
+    // Resolve + shape-check every target BEFORE touching any state, so a bad
+    // file never leaves a partially-applied adapter group behind.
+    struct Resolved {
+        Linear* l;
+        const LoraTarget* t;
+        int out, in, rank;
+    };
+    std::vector<Resolved> rs;
+    rs.reserve(targets.size());
+    for (const LoraTarget& t : targets) {
+        auto it = lora_targets_.find(t.path);
+        if (it == lora_targets_.end()) {
+            fail("add_lora: unknown target '" + t.path + "'");
+        }
+        if (!t.down || !t.up) {
+            fail("add_lora: '" + t.path + "': missing lora_down/lora_up view");
+        }
+        Linear* l = it->second;
+        const int out = l->out_dim();
+        const int in = l->in_dim();
+        if (t.down->shape.empty() || t.down->shape[0] <= 0) {
+            fail("add_lora: '" + t.path + "': lora_down has no rank dimension");
+        }
+        const int rank = static_cast<int>(t.down->shape[0]);
+        if (t.down->numel() != static_cast<std::int64_t>(rank) * in) {
+            fail("add_lora: '" + t.path + "': lora_down must be (" +
+                 std::to_string(rank) + ", " + std::to_string(in) + ")");
+        }
+        if (t.up->numel() != static_cast<std::int64_t>(out) * rank) {
+            fail("add_lora: '" + t.path + "': lora_up must be (" +
+                 std::to_string(out) + ", " + std::to_string(rank) + ")");
+        }
+        rs.push_back(Resolved{l, &t, out, in, rank});
+    }
+
+    const int group = static_cast<int>(lora_group_scales_.size());
+    lora_group_scales_.push_back(scale);
+    for (const Resolved& r : rs) {
+        LoraAdapter a;
+        a.down = upload_as(view_to_fp32(*r.t->down, r.rank, r.in,
+                                        r.t->path + " lora_down"),
+                           r.rank, r.in, dt);
+        a.up = upload_as(view_to_fp32(*r.t->up, r.out, r.rank,
+                                      r.t->path + " lora_up"),
+                         r.out, r.rank, dt);
+        a.base_scale = r.t->base_scale;
+        a.group = group;
+        r.l->loras.push_back(std::move(a));
+    }
+    return group;
+}
+
+void Krea2Transformer2DModel::set_lora_scale(int group, float scale) {
+    if (group < 0 ||
+        group >= static_cast<int>(lora_group_scales_.size())) {
+        fail("set_lora_scale: no LoRA group " + std::to_string(group));
+    }
+    lora_group_scales_[static_cast<std::size_t>(group)] = scale;
+}
+
+void Krea2Transformer2DModel::clear_loras() {
+    lora_group_scales_.clear();
+    for (auto& kv : lora_targets_) kv.second->loras.clear();
+}
+
+int Krea2Transformer2DModel::num_loras() const {
+    return static_cast<int>(lora_group_scales_.size());
 }
 
 void Krea2Transformer2DModel::encode_text(const bt::Tensor& prompt_embeds,

@@ -52,9 +52,10 @@
 
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
-namespace brotensor::safetensors { class File; }
+namespace brotensor::safetensors { class File; struct TensorView; }
 
 namespace brodiffusion::dit {
 
@@ -184,10 +185,53 @@ public:
     // nullptr disables. The pointer must outlive captures.
     void capture_gates(std::vector<float>* sink);
 
+    // ── LoRA (runtime adapters) ──────────────────────────────────────────
+    // Krea 2 LoRAs are NOT merged into the base weights (the SD1.5 path):
+    // under quantize_weights the base linears stream to INT8 during load, so
+    // there is no dense weight left to fold a delta into. Instead each target
+    // keeps its low-rank factors resident and every linb_ adds
+    //   scale * (X @ down^T) @ up^T
+    // on top of the base result. That also buys live rescale (set_lora_scale)
+    // and removal (clear_loras) without reloading the ~25 GB checkpoint.
+
+    // One resolved LoRA target: the canonical checkpoint path of the base
+    // linear (the same name load_weights read it under, e.g.
+    // "transformer_blocks.0.attn.to_q") plus file views of the two factors
+    // and the resolved alpha/rank factor. Views must stay valid for the
+    // duration of the add_lora() call only (factors are uploaded inside).
+    struct LoraTarget {
+        std::string path;
+        const brotensor::safetensors::TensorView* down = nullptr;  // (rank, in)
+        const brotensor::safetensors::TensorView* up   = nullptr;  // (out, rank)
+        float base_scale = 1.0f;   // alpha / rank
+    };
+
+    // Register one LoRA file's targets as a runtime-adapter group at user
+    // multiplier `scale`; returns the group index (dense, starting at 0).
+    // Every target is resolved and shape-checked BEFORE any state changes,
+    // so a bad file leaves no partial adapters behind. Stackable — each call
+    // is an independent group.
+    int  add_lora(const std::vector<LoraTarget>& targets, float scale);
+    // Change a group's user multiplier; 0 disables it (adapters are skipped).
+    void set_lora_scale(int group, float scale);
+    // Drop every adapter group (frees the factor tensors).
+    void clear_loras();
+    int  num_loras() const;
+
     const Krea2Config& config() const { return cfg_; }
     brotensor::Dtype compute_dtype() const;
 
 private:
+    // One attached runtime LoRA adapter (see add_lora): resident low-rank
+    // factors at the compute dtype plus the alpha/rank factor and the group
+    // whose user multiplier scales it.
+    struct LoraAdapter {
+        brotensor::Tensor down;   // (rank, in) at compute dtype
+        brotensor::Tensor up;     // (out, rank) at compute dtype
+        float base_scale = 1.0f;  // alpha / rank
+        int   group = 0;          // index into lora_group_scales_
+    };
+
     // A biased-or-bias-free linear (weight (out,in), bias (out,1) or empty).
     // When the layer was quantized at load (cfg.quantize_weights), W is empty
     // and W_int8 (out,in) + scales (out,1 FP32 per-row) carry the weight
@@ -197,8 +241,11 @@ private:
         brotensor::Tensor b;   // (out, 1) at compute dtype; empty if bias-free
         brotensor::Tensor W_int8;  // (out, in) INT8 when quantized
         brotensor::Tensor scales;  // (out, 1) FP32 per-row scales when quantized
+        std::vector<LoraAdapter> loras;  // runtime adapters (usually empty)
         bool has_bias() const { return b.size() > 0; }
         bool quantized() const { return W_int8.size() > 0; }
+        int out_dim() const { return quantized() ? W_int8.rows : W.rows; }
+        int in_dim()  const { return quantized() ? W_int8.cols : W.cols; }
     };
 
     // Self-attention with GQA, q/k RMSNorm, sigmoid output gate. RoPE is applied
@@ -261,6 +308,13 @@ private:
     // AdaLN research hook state (set_mod_delta).
     brotensor::Tensor mod_delta_;   // (1, 6*hidden) compute dtype; empty = off
     int mod_delta_lo_ = 0, mod_delta_hi_ = 0;
+
+    // LoRA runtime-adapter state (add_lora / set_lora_scale / clear_loras).
+    // lora_targets_ maps every LoRA-addressable base linear's checkpoint path
+    // to its Linear, rebuilt on each load (the Linear objects live in vectors
+    // sized at construction, so the pointers are stable across a load).
+    std::unordered_map<std::string, Linear*> lora_targets_;
+    std::vector<float> lora_group_scales_;   // user multiplier per group
 
     // Gate research hook state (set_gate_scale / capture_gates).
     float gate_txt_scale_ = 1.0f, gate_img_scale_ = 1.0f;

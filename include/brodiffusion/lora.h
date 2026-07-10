@@ -26,6 +26,16 @@
 // `latent-consistency/lcm-lora-sdv1-5` checkpoint, which patches only the
 // four UNet attention projections per Transformer2D block (attn1.{q,k,v,
 // to_out.0} and attn2.{q,k,v,to_out.0}).
+//
+// A third target family covers Krea2-style DiT checkpoints (domain
+// "transformer"): diffusers/PEFT keys under `transformer.`, ComfyUI-style
+// keys under `diffusion_model.`, bare `transformer_blocks.` / `text_fusion.`
+// paths, and kohya-mangled `lora_unet_transformer_blocks_*` /
+// `lora_transformer_transformer_blocks_*` names. Recognized tails are the
+// block attention projections (attn.to_{q,k,v,gate}, attn.to_out.0) and the
+// SwiGLU FF (ff.{gate,up,down}), plus img_in / txt_in.linear_{1,2} /
+// final_layer.linear. These are applied as RUNTIME adapters, not merged —
+// see Krea2Transformer2DModel::add_lora.
 
 #include <string>
 #include <vector>
@@ -48,10 +58,11 @@ Format detect_format(const brotensor::safetensors::File& f);
 // resolved (alpha, rank). The caller looks up the views and dispatches to
 // UNet::apply_lora_delta / TextEncoder::apply_lora_delta.
 struct Triple {
-    std::string domain;       // "unet" or "text_encoder"
+    std::string domain;       // "unet", "text_encoder", or "transformer" (DiT)
     std::string target_path;  // diffusers path *within* the domain, e.g.
                               //   "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q"
                               //   "encoder.layers.0.self_attn.q_proj"
+                              //   "transformer_blocks.0.attn.to_q"
     std::string down_key;     // raw key for lora_down / lora_A in `f`
     std::string up_key;       // raw key for lora_up   / lora_B in `f`
     float       alpha = 0.0f; // resolved (= rank if .alpha absent)
