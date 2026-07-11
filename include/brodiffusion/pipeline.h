@@ -82,12 +82,16 @@ struct PipelineConfig {
 };
 
 // Snapshot of mid-generation state. Cheap to fork — only the latent
-// carries device memory; the rest is host-side scalars / RNG state.
+// carries device memory; the rest is host-side scalars / RNG state plus a
+// shared handle to the prepared conditioning.
 //
-// The cross-attention K/V cache (which holds the projected text context) is
-// NOT part of this snapshot — it lives on Pipeline, is rebuilt at every
-// prime(), and stays constant across all branched states within a generation.
-// Forking a state therefore costs one latent clone, not a full UNet replay.
+// The prepared conditioning (cross-attention K/V cache / projected text
+// context) rides the state as a shared_ptr: prime() builds one per call and
+// every clone() of that state shares it, so forking still costs one latent
+// clone, not a re-encode. Because each prime() owns its conditioning, states
+// from DIFFERENT prime() calls can be stepped interleaved — the spatial-paint
+// dual-state loop primes once plain and once axis-steered, then steps both in
+// lockstep, and each denoises under its own conditioning.
 //
 // Used by cross-attention tree search: at any step, .clone() the current
 // state, advance the clone differently from the original (different RNG, a
@@ -103,8 +107,13 @@ struct PipelineState {
     int H_lat      = 0;
     int W_lat      = 0;
 
-    // Deep clone: copies the latent on the active device. RNG and ints are
-    // trivial copies.
+    // The conditioning this state denoises under. Set by prime(); shared
+    // (not copied) by clone(). step_once()/decode() read the state's own
+    // conditioning, never a pipeline-global one.
+    std::shared_ptr<PreparedConditioning> prepared;
+
+    // Deep clone: copies the latent on the active device; shares `prepared`.
+    // RNG and ints are trivial copies.
     PipelineState clone() const;
 };
 
@@ -387,9 +396,11 @@ public:
     // decode():       VAE-decode a state's latent to an FP32 host buffer
     //                 (same shape and units as generate()).
     //
-    // The xattn cache lives on `this` and is shared across all branched
-    // states from the same prime() call. Calling apply_lora() between
-    // prime() and step_once() leaves the cache stale — re-prime() to refresh.
+    // The xattn cache rides the returned state (state.prepared) and is shared
+    // across all branched states cloned from it; states from separate prime()
+    // calls each keep their own, so they can be stepped interleaved (the
+    // spatial-paint dual-state loop). Calling apply_lora() between prime()
+    // and step_once() leaves the cache stale — re-prime() to refresh.
     PipelineState prime(std::string_view prompt, const GenerateOptions& opts);
     // If `attn_logit_biases` is non-null, trace mode is used and the bias
     // vector is forwarded to the active denoiser's forward_traced (length must
@@ -618,12 +629,13 @@ private:
     std::optional<brolm::qwen3vl::VisionTower> qwen3vl_vision_;
     brolm::qwen3vl::PreprocessConfig           qwen3vl_pp_;
 
-    // Model-agnostic conditioning, rebuilt each prime(). `conditioning_` keeps
-    // the raw text context around for trace-mode access; `prepared_` holds the
-    // per-denoiser prepared payload (K/V caches), shared across all branched
-    // states from the same prime().
+    // Model-agnostic raw conditioning, rebuilt each prime(). Kept around for
+    // trace-mode / ControlNet access to the raw text context (those paths
+    // reflect the LATEST prime()). The per-denoiser prepared payload (K/V
+    // caches) is NOT held here — prime() moves it onto the returned
+    // PipelineState (state.prepared), so states from different prime() calls
+    // each step under their own conditioning.
     Conditioning          conditioning_;
-    PreparedConditioning  prepared_;
 
     // Conditioning-space control axes, applied to the positive text embeddings
     // in every prime() (no-op until a dictionary is loaded + a weight set).

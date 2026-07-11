@@ -244,7 +244,7 @@ struct Pipeline::StepGraphSession {
     bt::CudaGraph graph_uncond;   // uncond branch — a SEPARATE graph under CFG
 #endif
     const void* latent_ptr  = nullptr;  // state.latent.data
-    const void* prepared_id = nullptr;  // prepared_.get()
+    const void* prepared_id = nullptr;  // state.prepared->get()
     int  H = 0, W = 0;
     bool do_cfg = false;
     int  eager_steps = 0;
@@ -790,6 +790,7 @@ PipelineState PipelineState::clone() const {
     out.n_steps    = n_steps;
     out.H_lat      = H_lat;
     out.W_lat      = W_lat;
+    out.prepared   = prepared;   // shared, not copied — one encode per prime()
     return out;
 }
 
@@ -862,8 +863,9 @@ PipelineState Pipeline::prime_sana_(std::string_view prompt,
     conditioning_.guidance = is_scm ? opts.guidance_scale : 0.0f;
 
     // 1b. Project the caption context once per generation (caption_projection
-    //     + caption_norm), shared across all branched states.
-    prepared_ = denoiser_->prepare(conditioning_);
+    //     + caption_norm), shared across all states branched from this prime.
+    auto prepared = std::make_shared<PreparedConditioning>(
+        denoiser_->prepare(conditioning_));
 
     // Reference-attention identity seam (Sana linear-attention only). When
     // capture_identity_anchor() is driving this run the denoiser is already in
@@ -883,9 +885,10 @@ PipelineState Pipeline::prime_sana_(std::string_view prompt,
 
     // 2. State shell + timestep schedule (rectified-flow FlowMatch, shift=3).
     PipelineState state;
-    state.H_lat   = H_lat;
-    state.W_lat   = W_lat;
-    state.rng_key = opts.seed;
+    state.H_lat    = H_lat;
+    state.W_lat    = W_lat;
+    state.rng_key  = opts.seed;
+    state.prepared = std::move(prepared);
     std::visit([&](auto& s) { s.set_timesteps(opts.num_inference_steps); },
                scheduler_);
     state.n_steps = std::visit(
@@ -1178,9 +1181,10 @@ PipelineState Pipeline::prime(std::string_view prompt,
     }
 
     // 1b. Pre-process conditioning once per generation (cross-attention K/V
-    // projection for the UNet; pre-projected T5 context for Flux). Shared
-    // across all branched states.
-    prepared_ = denoiser_->prepare(conditioning_);
+    // projection for the UNet; pre-projected T5 context for Flux). Rides the
+    // returned state, shared across all states branched from this prime.
+    auto prepared = std::make_shared<PreparedConditioning>(
+        denoiser_->prepare(conditioning_));
 
     // Conditioning-space control seam for Krea 2: unlike Sana/CLIP (steered
     // BEFORE prepare(), on the raw per-token conditioning), Krea 2's raw
@@ -1192,7 +1196,7 @@ PipelineState Pipeline::prime(std::string_view prompt,
     // Krea2Denoiser::fused_text().
     if (model_class_ == ModelClass::Krea2 && cond_control_.active()) {
         auto* krea2d = static_cast<dit::Krea2Denoiser*>(denoiser_.get());
-        cond_control_.apply(krea2d->fused_text(prepared_, /*uncond=*/false),
+        cond_control_.apply(krea2d->fused_text(*prepared, /*uncond=*/false),
                             /*row_end=*/-1, /*row_start=*/0);
     }
 
@@ -1217,6 +1221,7 @@ PipelineState Pipeline::prime(std::string_view prompt,
     PipelineState state;
     state.H_lat = H_lat;
     state.W_lat = W_lat;
+    state.prepared = std::move(prepared);
     // Stash the seed: LCM resamples per-step noise from this same Philox key,
     // and branched states diverge by mutating rng_key on the clone.
     state.rng_key = opts.seed;
@@ -1383,14 +1388,14 @@ void Pipeline::step_denoise_captured_(PipelineState& state, float t,
     const bool key_match =
         s != nullptr &&
         s->latent_ptr  == state.latent.data &&
-        s->prepared_id == prepared_.get() &&
+        s->prepared_id == state.prepared->get() &&
         s->H == state.H_lat && s->W == state.W_lat &&
         s->do_cfg == do_cfg;
     if (!key_match) {
         step_graph_ = std::make_unique<StepGraphSession>();
         s = step_graph_.get();
         s->latent_ptr  = state.latent.data;
-        s->prepared_id = prepared_.get();
+        s->prepared_id = state.prepared->get();
         s->H      = state.H_lat;
         s->W      = state.W_lat;
         s->do_cfg = do_cfg;
@@ -1398,7 +1403,7 @@ void Pipeline::step_denoise_captured_(PipelineState& state, float t,
 
     // Host-dependent per-step inputs (time-embedding chain) — always eager,
     // writes the persistent temb buffers the captured body reads.
-    denoiser_->prepare_step(t, prepared_);
+    denoiser_->prepare_step(t, *state.prepared);
 
     if (s->captured) {
         s->graph.launch();                       // cond branch
@@ -1409,10 +1414,11 @@ void Pipeline::step_denoise_captured_(PipelineState& state, float t,
     // Eager warm-up step through the capture seam: computes this step's real
     // outputs and settles every body buffer at its high-water capacity.
     denoiser_->forward_body(state.latent, state.H_lat, state.W_lat,
-                            prepared_, Branch::Cond, noise_pred_cond_);
+                            *state.prepared, Branch::Cond, noise_pred_cond_);
     if (do_cfg) {
         denoiser_->forward_body(state.latent, state.H_lat, state.W_lat,
-                                prepared_, Branch::Uncond, noise_pred_uncond_);
+                                *state.prepared, Branch::Uncond,
+                                noise_pred_uncond_);
     }
     ++s->eager_steps;
 
@@ -1435,31 +1441,34 @@ void Pipeline::step_denoise_captured_(PipelineState& state, float t,
         bt::sync_all();
         bt::CudaGraphCapture cap;
         denoiser_->forward_body(state.latent, state.H_lat, state.W_lat,
-                                prepared_, Branch::Cond, noise_pred_cond_);
+                                *state.prepared, Branch::Cond,
+                                noise_pred_cond_);
         s->graph = cap.finish();
     }
     if (do_cfg) {
         bt::sync_all();
         bt::CudaGraphCapture cap;
         denoiser_->forward_body(state.latent, state.H_lat, state.W_lat,
-                                prepared_, Branch::Uncond, noise_pred_uncond_);
+                                *state.prepared, Branch::Uncond,
+                                noise_pred_uncond_);
         s->graph_uncond = cap.finish();
     }
     s->captured = true;
 #else
     // No CUDA backend in this build: plain eager forwards.
     denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
-                       prepared_, Branch::Cond, noise_pred_cond_);
+                       *state.prepared, Branch::Cond, noise_pred_cond_);
     if (do_cfg) {
         denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
-                           prepared_, Branch::Uncond, noise_pred_uncond_);
+                           *state.prepared, Branch::Uncond,
+                           noise_pred_uncond_);
     }
 #endif
 }
 
 void Pipeline::step_once_scm_(PipelineState& state,
                               const GenerateOptions& opts) {
-    (void)opts;  // guidance is baked into prepared_; steps/seed live elsewhere
+    (void)opts;  // guidance is baked into the prepared conditioning
     auto& sched = std::get<scheduler::SCM>(scheduler_);
     const int i      = state.step_index;
     const int n_lat  = denoiser_->latent_channels() *
@@ -1486,8 +1495,8 @@ void Pipeline::step_once_scm_(PipelineState& state,
 
     // One DiT forward at the sCM input timestep. Guidance (already embedded via
     // the prepared conditioning) makes this a single, CFG-free pass.
-    denoiser_->forward(scratch_, state.H_lat, state.W_lat, scm_t, prepared_,
-                       Branch::Cond, noise_pred_cond_);
+    denoiser_->forward(scratch_, state.H_lat, state.W_lat, scm_t,
+                       *state.prepared, Branch::Cond, noise_pred_cond_);
 
     // Reconstruct the scheduler's model_output from the network output:
     //   np = ((1 - 2t)·lmi + (1 - 2t + 2t²)·np) / scale · sigma_data
@@ -1522,6 +1531,10 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
     if (state.step_index >= state.n_steps) {
         fail("step_once: step_index (" + std::to_string(state.step_index) +
              ") >= n_steps (" + std::to_string(state.n_steps) + ")");
+    }
+    if (!state.prepared) {
+        fail("step_once: state has no prepared conditioning — prime() builds "
+             "it; a default-constructed PipelineState cannot be stepped");
     }
     // Sana-Sprint (SCMScheduler / TrigFlow): a dedicated few-step, no-CFG,
     // no-trace path with model-specific input/output parameterisation.
@@ -1627,7 +1640,7 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
                              noise_pred_cond_);
             if (do_cfg) {
                 const auto& cache_uncond =
-                    u->kv_cache_for(prepared_, Branch::Uncond);
+                    u->kv_cache_for(*state.prepared, Branch::Uncond);
                 const bt::Tensor& ctx_uncond =
                     conditioning_.uncond_embeddings;
                 u->forward(state.latent, state.H_lat, state.W_lat, t,
@@ -1636,7 +1649,7 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
             }
         } else {
             const auto& cache_cond =
-                u->kv_cache_for(prepared_, Branch::Cond);
+                u->kv_cache_for(*state.prepared, Branch::Cond);
             if (is_lcm) {
                 // LCM-distilled UNet: cond_proj path adds the guidance
                 // embedding to the time embedding. No CFG branch under LCM.
@@ -1649,7 +1662,7 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
                            noise_pred_cond_);
                 if (do_cfg) {
                     const auto& cache_uncond =
-                        u->kv_cache_for(prepared_, Branch::Uncond);
+                        u->kv_cache_for(*state.prepared, Branch::Uncond);
                     const bt::Tensor& ctx_uncond =
                         conditioning_.uncond_embeddings;
                     u->forward(state.latent, state.H_lat, state.W_lat, t,
@@ -1663,7 +1676,7 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
         // captures the conditional pass only; a CFG uncond branch (if any)
         // still uses the fast prepared path. A scratch trace absorbs the maps
         // when the caller wants biases but not the trace itself. The denoiser
-        // pulls the raw context (and any LCM guidance) from prepared_.
+        // pulls the raw context (and any LCM guidance) from the state's prepared.
         if (denoiser_->num_xattn_blocks() == 0) {
             fail("step_once: trace mode requires a denoiser with traceable "
                  "attention blocks");
@@ -1671,11 +1684,13 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
         AttentionTrace scratch_trace;
         AttentionTrace* trace_dst = trace_out ? trace_out : &scratch_trace;
         denoiser_->forward_traced(state.latent, state.H_lat, state.W_lat, t,
-                                  prepared_, Branch::Cond, attn_logit_biases,
-                                  trace_dst, noise_pred_cond_);
+                                  *state.prepared, Branch::Cond,
+                                  attn_logit_biases, trace_dst,
+                                  noise_pred_cond_);
         if (do_cfg) {
             denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
-                               prepared_, Branch::Uncond, noise_pred_uncond_);
+                               *state.prepared, Branch::Uncond,
+                               noise_pred_uncond_);
         }
     } else {
         // Plain fast path. When the denoiser exposes the step-capture seam
@@ -1690,10 +1705,11 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
             step_denoise_captured_(state, t, do_cfg);
         } else {
             denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
-                               prepared_, Branch::Cond, noise_pred_cond_);
+                               *state.prepared, Branch::Cond,
+                               noise_pred_cond_);
             if (do_cfg) {
                 denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
-                                   prepared_, Branch::Uncond,
+                                   *state.prepared, Branch::Uncond,
                                    noise_pred_uncond_);
             }
         }
