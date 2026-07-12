@@ -1767,6 +1767,13 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
     }
 }
 
+std::vector<float> Pipeline::schedule_sigmas() const {
+    if (const auto* fm = std::get_if<scheduler::FlowMatch>(&scheduler_)) {
+        return fm->sigmas();
+    }
+    return {};
+}
+
 std::vector<float> Pipeline::decode(const PipelineState& state) {
     const bool vae_time = std::getenv("BRODIFFUSION_TIME") != nullptr;
     if (vae_time) brotensor::sync_all();

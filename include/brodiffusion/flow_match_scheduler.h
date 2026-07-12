@@ -62,6 +62,13 @@ public:
     // NOTE: continuous (vector<float>), unlike DDIM / LCM which return
     // vector<int>.
     const std::vector<float>& timesteps() const { return timesteps_; }
+
+    // The sigma schedule set_timesteps() built: length num_inference_steps+1
+    // with a trailing 0.0. sigmas()[i] is the noise level entering step i, so
+    // a caller holding x_i and x_{i+1} can recover the velocity
+    // v = (x_{i+1} - x_i) / (sigmas[i+1] - sigmas[i]) and the x0 preview
+    // x0 = x_i - sigmas[i] * v without re-running the model.
+    const std::vector<float>& sigmas() const { return sigmas_; }
     int num_inference_steps() const { return static_cast<int>(timesteps_.size()); }
 
     // Run one rectified-flow Euler step. All tensors carry the pipeline

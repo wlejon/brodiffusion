@@ -414,6 +414,14 @@ public:
                        attn_logit_biases = nullptr);
     std::vector<float> decode(const PipelineState& state);
 
+    // The sigma schedule of the most recent prime()/generate() when the
+    // active scheduler is FlowMatch: length num_inference_steps + 1 with a
+    // trailing 0.0 (see FlowMatch::sigmas()). Empty for non-flow-match
+    // schedulers or before any schedule has been set. Lets a step-wise
+    // caller compute the x0 preview x_i - sigmas[i]*v from consecutive
+    // latents without re-running the model.
+    std::vector<float> schedule_sigmas() const;
+
     // Accessors for research callers (e.g. tree search needs xattn block count
     // to size the bias vector). Throws if the active denoiser is not a UNet.
     const unet::UNet& unet() const;
