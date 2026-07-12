@@ -739,4 +739,16 @@ private:
     void step_denoise_captured_(PipelineState& state, float t, bool do_cfg);
 };
 
+// Expand an init-noise tensor (NCHW, c×h×w, raw N(0,1)) by an integer spatial
+// factor k, preserving its low-frequency structure: the result is exactly
+// i.i.d. N(0,1), but each k×k block's mean is tied to the source value
+// (H = E − mean_k(E) + src/k, with E a fresh Philox stream keyed by `seed`).
+// Because a generation's identity/composition is decided by the coarse
+// structure of the init noise, this transports an identity found at one
+// resolution to a k× larger render — a seed cannot do that (the same seed at
+// a different latent shape is an unrelated noise field). Deterministic for a
+// given (src, seed). Output length = c * h*k * w*k.
+std::vector<float> expand_init_noise(const float* src, int c, int h, int w,
+                                     int k, std::uint64_t seed);
+
 }  // namespace brodiffusion::pipeline

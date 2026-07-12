@@ -46,6 +46,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -2044,6 +2045,60 @@ std::vector<float> Pipeline::generate(std::string_view prompt,
     }
     if (opts.should_cancel && opts.should_cancel()) throw GenerateCancelled();
     return decode(state);
+}
+
+std::vector<float> expand_init_noise(const float* src, int c, int h, int w,
+                                     int k, std::uint64_t seed) {
+    if (!src || c < 1 || h < 1 || w < 1 || k < 1) {
+        throw std::invalid_argument("expand_init_noise: bad dimensions");
+    }
+    const int H = h * k, W = w * k;
+    const std::size_t n = static_cast<std::size_t>(c) * H * W;
+
+    // Fine-level complement E: brotensor's Philox stream, same generator as
+    // the pipeline's Internal noise source.
+    std::vector<float> E(n);
+    {
+        bt::init();
+        bt::Tensor t = bt::Tensor::empty(1, static_cast<int>(n), bt::Dtype::FP32);
+        bt::randn(seed, 0, t);
+        bt::sync_all();
+        bt::Tensor host = t.to(bt::Device::CPU);
+        std::memcpy(E.data(), host.data, sizeof(float) * n);
+    }
+
+    // Conditional Gaussian: within each k×k block, subtract E's block mean
+    // (leaving a zero-mean residual) and add src/k. Block means of the result
+    // are then src/k — exactly the distribution of a fresh field's block
+    // means when src ~ N(0,1) — and every element stays i.i.d. N(0,1).
+    std::vector<float> out(n);
+    const float inv_kk = 1.0f / static_cast<float>(k * k);
+    const float inv_k = 1.0f / static_cast<float>(k);
+    for (int ch = 0; ch < c; ++ch) {
+        const std::size_t srcBase = static_cast<std::size_t>(ch) * h * w;
+        const std::size_t dstBase = static_cast<std::size_t>(ch) * H * W;
+        for (int by = 0; by < h; ++by) {
+            for (int bx = 0; bx < w; ++bx) {
+                float mean = 0.0f;
+                for (int dy = 0; dy < k; ++dy) {
+                    const std::size_t row = dstBase +
+                        static_cast<std::size_t>(by * k + dy) * W + bx * k;
+                    for (int dx = 0; dx < k; ++dx) mean += E[row + dx];
+                }
+                mean *= inv_kk;
+                const float lv =
+                    src[srcBase + static_cast<std::size_t>(by) * w + bx] * inv_k;
+                for (int dy = 0; dy < k; ++dy) {
+                    const std::size_t row = dstBase +
+                        static_cast<std::size_t>(by * k + dy) * W + bx * k;
+                    for (int dx = 0; dx < k; ++dx) {
+                        out[row + dx] = E[row + dx] - mean + lv;
+                    }
+                }
+            }
+        }
+    }
+    return out;
 }
 
 }  // namespace brodiffusion::pipeline
