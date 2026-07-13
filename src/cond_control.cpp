@@ -5,6 +5,7 @@
 #include "brotensor/ops/elementwise.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -150,6 +151,39 @@ bool CondControl::active() const {
     return false;
 }
 
+std::vector<float> CondControl::combined(float& alpha_norm) const {
+    alpha_norm = 0.0f;
+    if (dim_ == 0) return {};
+
+    std::vector<float> v(static_cast<std::size_t>(dim_), 0.0f);
+    double scale_sum = 0.0;
+    int n_active = 0;
+    for (std::size_t k = 0; k < names_.size(); ++k) {
+        const float w = weight_[k];
+        if (w == 0.0f) continue;
+        const float s = w * scale_[k];
+        const float* d = &dirs_[k * static_cast<std::size_t>(dim_)];
+        for (int j = 0; j < dim_; ++j) v[j] += s * d[j];
+        scale_sum += scale_[k];
+        ++n_active;
+    }
+    if (n_active == 0) return {};
+
+    double sq = 0.0;
+    for (float x : v) sq += static_cast<double>(x) * x;
+    // Alpha units: the axes' own natural injection scale. With one dictionary
+    // they share a scale, so this is exactly "how many sliders' worth".
+    const double unit = scale_sum / n_active;
+    alpha_norm = unit > 0.0 ? static_cast<float>(std::sqrt(sq) / unit) : 0.0f;
+    return v;
+}
+
+float CondControl::active_norm() const {
+    float alpha = 0.0f;
+    combined(alpha);
+    return alpha;
+}
+
 void CondControl::apply(brotensor::Tensor& emb, int row_end,
                         int row_start) const {
     if (!active()) return;
@@ -167,14 +201,14 @@ void CondControl::apply(brotensor::Tensor& emb, int row_end,
     const int end = (row_end >= 0 && row_end <= rows) ? row_end : rows;
     if (end - row_start < 1) return;  // nothing to steer
 
-    // Combined injection vector v = Σ weight_k * scale_k * dir_k.
-    std::vector<float> v(static_cast<std::size_t>(D), 0.0f);
-    for (std::size_t k = 0; k < names_.size(); ++k) {
-        const float w = weight_[k];
-        if (w == 0.0f) continue;
-        const float s = w * scale_[k];
-        const float* d = &dirs_[k * static_cast<std::size_t>(D)];
-        for (int j = 0; j < D; ++j) v[j] += s * d[j];
+    // Combined injection vector v = Σ weight_k * scale_k * dir_k, held to the
+    // stack budget: a stack that overspends is scaled down by one common factor,
+    // which keeps the caller's mix and only sheds the overdrive.
+    float alpha = 0.0f;
+    std::vector<float> v = combined(alpha);
+    if (budget_ > 0.0f && alpha > budget_) {
+        const float f = budget_ / alpha;
+        for (float& x : v) x *= f;
     }
 
     // Injection matrix: rows [row_start, end) = v, all others (BOS + EOS/

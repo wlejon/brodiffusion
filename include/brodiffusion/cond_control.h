@@ -70,6 +70,27 @@ public:
     // True iff any axis has a nonzero weight (apply() is a no-op otherwise).
     bool active() const;
 
+    // ── stack budget ────────────────────────────────────────────────────────
+    // Each axis weight is bounded by whatever range a UI gives its slider, but
+    // the SUM of a stack is not — and what reaches the denoiser is the sum. Once
+    // that combined vector grows comparable to the conditioning's own token norm,
+    // the prompt stops being the thing that gets rendered: the model draws the
+    // injection's semantics instead (on Krea 2 a ten-axis stack past ~12 alpha
+    // reliably turns any scene into dramatic crowds, whatever the prompt said).
+    //
+    // set_budget() caps the injection's LENGTH, measured in the same alpha units
+    // the weights use (a length of `budget * mean scale of the active axes`).
+    // When a stack exceeds it, apply() scales every active axis by ONE common
+    // factor — the dialled-in mix is preserved exactly, only the overdrive is
+    // shed. 0 (the default) leaves the stack uncapped.
+    void  set_budget(float alpha) { budget_ = alpha > 0.0f ? alpha : 0.0f; }
+    float budget() const { return budget_; }
+
+    // The current stack's length in those same alpha units — i.e. a lone axis at
+    // this weight would inject the same magnitude. What a UI puts on a stack
+    // meter, and what apply() compares against the budget. 0 when inactive.
+    float active_norm() const;
+
     // Add the active weighted control vector to rows [row_start, end) of `emb`
     // in place, where end = row_end if 0 < row_end <= emb.rows, else emb.rows.
     // No-op when inactive or fewer than 2 steerable rows. `emb` is (L, dim) on
@@ -89,7 +110,12 @@ public:
               int row_start = 1) const;
 
 private:
+    // The weighted sum Σ weight_k * scale_k * dir_k, plus its length in alpha
+    // units (see active_norm()). Empty when no axis is active.
+    std::vector<float> combined(float& alpha_norm) const;
+
     int dim_ = 0;
+    float budget_ = 0.0f;                          // 0 = uncapped
     std::vector<std::string>             names_;
     std::vector<float>                   scale_;   // [n_axes]
     std::vector<float>                   dirs_;    // [n_axes * dim] row-major
