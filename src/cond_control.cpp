@@ -25,7 +25,7 @@ T read_pod(std::ifstream& f, const char* what) {
 
 }  // namespace
 
-void CondControl::load(const std::string& path) {
+void CondControl::load(const std::string& path, bool merge) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("CondControl::load: cannot open " + path);
 
@@ -64,12 +64,40 @@ void CondControl::load(const std::string& path) {
         scale.push_back(s);
     }
 
-    dim_    = dim;
-    names_  = std::move(names);
-    scale_  = std::move(scale);
-    dirs_   = std::move(dirs);
-    index_  = std::move(index);
-    weight_.assign(names_.size(), 0.0f);
+    if (!merge || !loaded()) {
+        dim_    = dim;
+        names_  = std::move(names);
+        scale_  = std::move(scale);
+        dirs_   = std::move(dirs);
+        index_  = std::move(index);
+        weight_.assign(names_.size(), 0.0f);
+        return;
+    }
+
+    if (dim != dim_) {
+        throw std::runtime_error(
+            "CondControl::load: cannot merge " + path + " — dim " + std::to_string(dim) +
+            " does not match the loaded dim " + std::to_string(dim_));
+    }
+
+    // Merge: overwrite same-named axes in place (weight reset — the direction it
+    // referred to is gone), append the rest.
+    for (int k = 0; k < n_axes; ++k) {
+        const float* src = &dirs[static_cast<std::size_t>(k) * dim];
+        auto it = index_.find(names[static_cast<std::size_t>(k)]);
+        if (it != index_.end()) {
+            const std::size_t j = static_cast<std::size_t>(it->second);
+            std::copy(src, src + dim, dirs_.begin() + static_cast<std::ptrdiff_t>(j * dim));
+            scale_[j]  = scale[static_cast<std::size_t>(k)];
+            weight_[j] = 0.0f;
+            continue;
+        }
+        index_[names[static_cast<std::size_t>(k)]] = static_cast<int>(names_.size());
+        names_.push_back(names[static_cast<std::size_t>(k)]);
+        scale_.push_back(scale[static_cast<std::size_t>(k)]);
+        dirs_.insert(dirs_.end(), src, src + dim);
+        weight_.push_back(0.0f);
+    }
 }
 
 void CondControl::set(const std::string& name, float alpha) {

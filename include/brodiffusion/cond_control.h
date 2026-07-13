@@ -35,9 +35,21 @@ namespace brodiffusion {
 
 class CondControl {
 public:
-    // Load a dictionary file, replacing any currently-loaded axes (and resetting
-    // all weights to zero). Throws std::runtime_error on a malformed file.
-    void load(const std::string& path);
+    // Load a dictionary file. By default this REPLACES any currently-loaded axes
+    // (and resets all weights to zero).
+    //
+    // With `merge`, the file's axes are added to the ones already loaded instead,
+    // and an axis whose name already exists is overwritten (its weight reset to
+    // zero). Banks come from different discoveries — a word-derived bank, an
+    // SAE-discovered one, a baked spectrum — and a tool that wants a slider for
+    // each should not have to concatenate them into one blob offline, losing
+    // track of which axis came from where. Runtime axes registered via
+    // set_vector() already coexist with dictionary axes; this makes dictionaries
+    // coexist with each other on the same footing.
+    //
+    // A merged file must agree on `dim` with what is already loaded. Throws
+    // std::runtime_error on a malformed file or a dim mismatch.
+    void load(const std::string& path, bool merge = false);
 
     bool loaded() const { return dim_ > 0; }
     int  dim() const { return dim_; }
