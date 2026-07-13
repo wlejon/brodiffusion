@@ -93,11 +93,33 @@ struct PipelineConfig {
 // dual-state loop primes once plain and once axis-steered, then steps both in
 // lockstep, and each denoises under its own conditioning.
 //
+// Hands out a fresh identity for every PipelineState ever constructed. Process
+// -wide and monotonic: unlike a heap or device address, a value from here is
+// never handed out twice, so two different states can never compare equal.
+std::uint64_t next_state_id();
+
 // Used by cross-attention tree search: at any step, .clone() the current
 // state, advance the clone differently from the original (different RNG, a
 // different attn_logit_bias, etc.), score, and pick a winner.
 struct PipelineState {
     brotensor::Tensor latent;  // (1, C_lat * H_lat * W_lat) at compute dtype
+
+    // Unique, never-reused identity for this state's buffer set. The CUDA-graph
+    // step session keys on this.
+    //
+    // It used to key on the raw addresses of `latent.data` and `prepared`, and
+    // that is unsound: both are freed and re-allocated at the same size on every
+    // generate(), so a pooled allocator hands the next generation the SAME
+    // addresses, the key compares equal, and a graph captured against the
+    // PREVIOUS generation's buffers gets replayed against this one's. It survives
+    // on the accident that the rest of the buffers usually land at their old
+    // addresses too; perturb the allocator (encode an image with another model
+    // between generations, say) and one of them moves, and the replay reads a
+    // freed pointer — an illegal access if the block is unmapped, and, worse, a
+    // silently mis-conditioned image if it is not. An address that can be recycled
+    // is not an identity. A counter cannot be recycled.
+    std::uint64_t id = next_state_id();
+
     // Philox key for initial-noise + per-step LCM noise. Initialised from
     // opts.seed in prime(); branched states should mutate this on the clone
     // (e.g. XOR a branch id) to diverge their noise streams.

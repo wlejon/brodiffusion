@@ -40,6 +40,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -232,8 +233,18 @@ std::unique_ptr<Denoiser> make_denoiser(const PipelineConfig& cfg) {
 
 }  // namespace
 
-// CUDA-graph denoising-step session. One per (latent buffer, prepared
-// payload, H, W, CFG mode) identity — see the member doc in pipeline.h.
+// CUDA-graph denoising-step session. One per (state identity, H, W, CFG mode).
+//
+// The identity is PipelineState::id — a counter, NOT the address of the latent
+// or of the prepared payload. Both of those are freed and re-allocated at the
+// same size by the next generate(), so the allocator hands back the same address
+// and an address-keyed session silently matches ACROSS generations: the graph
+// captured for one image is replayed for the next, with the previous
+// generation's buffer pointers baked into it. It works right up until the
+// allocator state shifts (another model allocating between generations is
+// enough), one buffer lands somewhere new, and the replay reads a freed pointer.
+// The loud version of that is CUDA error 700; the quiet version is an image
+// denoised against a stale conditioning buffer, with no error at all.
 // `eager_steps` counts the warm-up steps run through the capture seam for
 // this key; the second one settles every U-Net scratch buffer at its
 // high-water capacity (the x_/y_ ping-pong roles permute per body call, so
@@ -244,8 +255,7 @@ struct Pipeline::StepGraphSession {
     bt::CudaGraph graph;          // cond branch (also the single graph when no CFG)
     bt::CudaGraph graph_uncond;   // uncond branch — a SEPARATE graph under CFG
 #endif
-    const void* latent_ptr  = nullptr;  // state.latent.data
-    const void* prepared_id = nullptr;  // state.prepared->get()
+    std::uint64_t state_id = 0;   // PipelineState::id — never a recycled address
     int  H = 0, W = 0;
     bool do_cfg = false;
     int  eager_steps = 0;
@@ -781,6 +791,11 @@ bt::Tensor Pipeline::encode_conditioning(std::string_view prompt) {
     bt::Tensor out;
     encode_prompt_(prompt, out);
     return out;
+}
+
+std::uint64_t next_state_id() {
+    static std::atomic<std::uint64_t> counter{1};
+    return counter.fetch_add(1, std::memory_order_relaxed);
 }
 
 PipelineState PipelineState::clone() const {
@@ -1388,18 +1403,16 @@ void Pipeline::step_denoise_captured_(PipelineState& state, float t,
     StepGraphSession* s = step_graph_.get();
     const bool key_match =
         s != nullptr &&
-        s->latent_ptr  == state.latent.data &&
-        s->prepared_id == state.prepared->get() &&
+        s->state_id == state.id &&
         s->H == state.H_lat && s->W == state.W_lat &&
         s->do_cfg == do_cfg;
     if (!key_match) {
         step_graph_ = std::make_unique<StepGraphSession>();
         s = step_graph_.get();
-        s->latent_ptr  = state.latent.data;
-        s->prepared_id = state.prepared->get();
-        s->H      = state.H_lat;
-        s->W      = state.W_lat;
-        s->do_cfg = do_cfg;
+        s->state_id = state.id;
+        s->H        = state.H_lat;
+        s->W        = state.W_lat;
+        s->do_cfg   = do_cfg;
     }
 
     // Host-dependent per-step inputs (time-embedding chain) — always eager,

@@ -258,8 +258,8 @@ int main() {
 
     // 16x16 image -> 2x2 latent (8x VAE), the smallest legal input for the
     // 2-block UNet. 8 steps: 2 eager warm-ups + capture, 6 graph replays.
-    auto run_generate = [&](float guidance, bool disable_graph)
-            -> std::vector<float> {
+    auto run_generate_prompt = [&](const char* prompt, float guidance,
+                                   bool disable_graph) -> std::vector<float> {
         set_env("BRODIFFUSION_DISABLE_STEP_GRAPH", disable_graph ? "1" : "0");
         auto p = make_loaded_pipeline();
         pl::GenerateOptions opts;
@@ -268,7 +268,11 @@ int main() {
         opts.num_inference_steps = 8;
         opts.guidance_scale = guidance;
         opts.seed = 1234;
-        return p.generate("hi", opts);
+        return p.generate(prompt, opts);
+    };
+    auto run_generate = [&](float guidance, bool disable_graph)
+            -> std::vector<float> {
+        return run_generate_prompt("hi", guidance, disable_graph);
     };
 
     // ── 1. CFG on: cond + uncond bodies in one graph ──────────────────────
@@ -313,6 +317,108 @@ int main() {
             }
             std::fprintf(stderr, "  CFG-off graph vs eager max |diff| = %g\n",
                          max_diff);
+        }
+    }
+
+    // ── 3. Many generations on ONE pipeline ───────────────────────────────
+    //
+    // Everything above builds a fresh Pipeline per image, so the graph session is
+    // always new and the interesting case never runs. A real caller generates over
+    // and over on one pipeline, and that is where the session key mattered: it
+    // used to be the ADDRESS of the latent and of the prepared conditioning, both
+    // of which are freed and re-allocated at the same size by the next generate().
+    // A pooled allocator hands back the same address, so the key compared equal
+    // across two different generations and the graph captured for the first was
+    // replayed for the second — carrying the first one's baked buffer pointers.
+    //
+    // It survives on the accident that everything else lands back at its old
+    // address too. So this perturbs the allocator between generations, the way any
+    // real workload does (the sweep that found this ran a CLIP encode between
+    // renders): churn some device memory, then generate again and demand the same
+    // image the eager path produces. A stale replay shows up either as CUDA error
+    // 700 or as a quietly wrong image, and both fail this check.
+    {
+        auto p = make_loaded_pipeline();
+        set_env("BRODIFFUSION_DISABLE_STEP_GRAPH", "0");
+
+        const char* prompts[] = {"hi", "hello there", "hi"};
+        for (int i = 0; i < 3; ++i) {
+            // Churn the device allocator between generations, the way a real
+            // workload does. This has to be BIG and ragged to matter: the sweep
+            // that found the bug ran a CLIP image encode between renders, which
+            // allocates and frees megabytes and leaves the pool's free lists
+            // rearranged. Kilobyte-sized churn is not enough — the pool hands
+            // everything straight back to its old address and the stale graph
+            // replays harmlessly.
+
+            // Churn the device allocator between generations, the way a real
+            // workload does: the sweep that found this ran a CLIP image encode
+            // between renders, which allocates and frees megabytes and leaves the
+            // pool's free lists rearranged. This is what forces the session key to
+            // be re-examined, and with it the recapture path that never ran when
+            // every image got a fresh Pipeline.
+            for (int k = 1; k <= 6; ++k) {
+                bt::Tensor big = bt::Tensor::zeros_on(
+                    bt::default_device(), 1, 997 * 1024 * k, bt::Dtype::FP32);
+                bt::Tensor odd = bt::Tensor::zeros_on(
+                    bt::default_device(), 1, 65537 * k, bt::Dtype::FP16);
+                (void)big.size();
+                (void)odd.size();
+            }
+
+            pl::GenerateOptions opts;
+            opts.width  = 16;
+            opts.height = 16;
+            opts.num_inference_steps = 8;
+            opts.guidance_scale = 1.0f;
+            opts.seed = 1234;
+            std::vector<float> got = p.generate(prompts[i], opts);
+
+            std::vector<float> want = run_generate_prompt(prompts[i], 1.0f,
+                                                          /*disable=*/true);
+            set_env("BRODIFFUSION_DISABLE_STEP_GRAPH", "0");
+
+            CHECK(got.size() == want.size());
+            bool identical = got.size() == want.size() &&
+                             std::memcmp(got.data(), want.data(),
+                                         got.size() * sizeof(float)) == 0;
+            CHECK(identical);
+            if (!identical) {
+                float max_diff = 0.0f;
+                for (std::size_t j = 0; j < got.size() && j < want.size(); ++j)
+                    max_diff = std::max(max_diff, std::fabs(got[j] - want[j]));
+                std::fprintf(stderr,
+                             "  generation %d (\"%s\") on a reused pipeline "
+                             "differs from eager: max |diff| = %g\n",
+                             i, prompts[i], max_diff);
+            }
+        }
+    }
+
+    // ── 4. State identity is never recycled ───────────────────────────────
+    //
+    // The invariant the graph key now rests on. An address can be handed out
+    // twice; a counter cannot.
+    {
+        auto p = make_loaded_pipeline();
+        pl::GenerateOptions opts;
+        opts.width  = 16;
+        opts.height = 16;
+        opts.num_inference_steps = 8;
+        opts.seed = 1234;
+
+        pl::PipelineState a = p.prime("hi", opts);
+        const std::uint64_t a_id = a.id;
+        pl::PipelineState b = p.prime("hi", opts);   // same prompt, same size
+        CHECK(a.id != b.id);
+        CHECK(a.clone().id != a_id);
+
+        // And the states really can land on the same addresses — which is what
+        // made the old address key unsound. Not a requirement, just the reason.
+        if (a.latent.data == b.latent.data) {
+            std::fprintf(stderr,
+                         "  (note: two live states share a latent address — "
+                         "exactly the collision the id key now prevents)\n");
         }
     }
 
