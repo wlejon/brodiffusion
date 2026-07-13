@@ -1,5 +1,9 @@
 # brodiffusion
 
+[![CI](https://github.com/wlejon/brodiffusion/actions/workflows/ci.yml/badge.svg)](https://github.com/wlejon/brodiffusion/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/wlejon/brodiffusion/actions/workflows/codeql.yml/badge.svg)](https://github.com/wlejon/brodiffusion/actions/workflows/codeql.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Diffusion-model (text-to-image) inference, written from scratch in C++20.
 Part of the [bro](https://github.com/wlejon/bro) stack, and usable
 standalone as a CLI or library — built on [brotensor](https://github.com/wlejon/brotensor)

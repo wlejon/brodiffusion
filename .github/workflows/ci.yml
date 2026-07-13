@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# brodiffusion composes brotensor ops and uses brolm for its text frontend.
+# The dependency closure is bromath (header-only) + brotensor (Tensor + CPU op
+# backend) + brolm (text encoders/tokenizers) + broimage (brolm pulls it in).
+# CI builds the default CPU-only configuration (GPU backends OFF), so all four
+# siblings are reconstructed beside this repo:
+#
+#   $GITHUB_WORKSPACE/
+#     brodiffusion/  <- this repo, checked out into a named path
+#     bromath/
+#     brotensor/
+#     brolm/
+#     broimage/
+#
+# Ninja on Linux/macOS bounds parallelism once brotensor's op TUs are in the
+# build; Windows keeps the VS generator (MSBuild /m is bounded).
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-gcc,    os: ubuntu-24.04, cc: gcc,   cxx: g++ }
+          - { name: linux-clang,  os: ubuntu-24.04, cc: clang, cxx: clang++ }
+          - { name: windows-msvc, os: windows-2022 }
+          - { name: macos-arm64,  os: macos-14 }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: brodiffusion
+      - uses: actions/checkout@v7
+        with: { repository: wlejon/bromath, path: bromath }
+      - uses: actions/checkout@v7
+        with: { repository: wlejon/brotensor, path: brotensor }
+      - uses: actions/checkout@v7
+        with: { repository: wlejon/brolm, path: brolm }
+      - uses: actions/checkout@v7
+        with: { repository: wlejon/broimage, path: broimage }
+
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cmake -S brodiffusion -B build -DCMAKE_BUILD_TYPE=Release
+          else
+            cmake -S brodiffusion -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          fi
+        shell: bash
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # ── Coverage ──────────────────────────────────────────────────────────────
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: brodiffusion
+      - uses: actions/checkout@v7
+        with: { repository: wlejon/bromath, path: bromath }
+      - uses: actions/checkout@v7
+        with: { repository: wlejon/brotensor, path: brotensor }
+      - uses: actions/checkout@v7
+        with: { repository: wlejon/brolm, path: brolm }
+      - uses: actions/checkout@v7
+        with: { repository: wlejon/broimage, path: broimage }
+
+      - name: Install gcovr + Ninja
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gcovr ninja-build
+
+      - name: Configure (instrumented)
+        run: |
+          cmake -S brodiffusion -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="--coverage" \
+            -DCMAKE_EXE_LINKER_FLAGS="--coverage"
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Report
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p coverage-html
+          gcovr --root . \
+            --filter 'brodiffusion/include/brodiffusion/' --filter 'brodiffusion/src/' \
+            --exclude-unreachable-branches \
+            --gcov-ignore-errors=no_working_dir_found \
+            --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
+            --print-summary \
+            --html-details coverage-html/index.html \
+            | tee coverage-summary.txt
+          test -s coverage-html/index.html
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo '## Coverage — `include/brodiffusion/` + `src/`'
+            echo
+            echo 'The bromath / brotensor / brolm / broimage siblings are filtered out.'
+            echo
+            echo '```'
+            cat coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-html
+          path: coverage-html/
+          retention-days: 14

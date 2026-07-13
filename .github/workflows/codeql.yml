@@ -1,0 +1,71 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+# brodiffusion runs the diffusion sampling loop: latent tensors, scheduler
+# stepping, and fused UNet/VAE op compositions over the brotensor surface, with
+# text conditioning from brolm. Shape and stride arithmetic across those tensors
+# is where an out-of-bounds slip hides, so that is where the analysis pays off.
+jobs:
+  analyze:
+    name: Analyze C++
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: brodiffusion
+      - uses: actions/checkout@v7
+        with: { repository: wlejon/bromath, path: bromath }
+      - uses: actions/checkout@v7
+        with: { repository: wlejon/brotensor, path: brotensor }
+      - uses: actions/checkout@v7
+        with: { repository: wlejon/brolm, path: brolm }
+      - uses: actions/checkout@v7
+        with: { repository: wlejon/broimage, path: broimage }
+
+      - name: Install Ninja
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
+
+      - name: Configure
+        run: cmake -S brodiffusion -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+
+      # The sibling libraries (brotensor core + CPU backend, brolm, broimage) are
+      # compiled here, ahead of `init`. For a compiled language CodeQL only
+      # extracts what it observes the compiler build while tracing, so anything
+      # already built when `init` runs is never analysed. That is the exclusion
+      # mechanism — paths-ignore does not filter compiled sources — and it keeps
+      # the siblings out of brodiffusion's Security tab, where they have their own
+      # analysis. bromath is header-only.
+      - name: Pre-build the siblings (outside the traced build)
+        run: cmake --build build --parallel 4 --target brotensor_core brotensor_cpu brolm broimage
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: c-cpp
+          build-mode: manual
+          queries: security-extended
+          config-file: brodiffusion/.github/codeql/codeql-config.yml
+
+      - name: Build brodiffusion (traced)
+        run: cmake --build build --parallel 4 --target brodiffusion
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:c-cpp
