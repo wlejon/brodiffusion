@@ -5,6 +5,15 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# This project ships a shared library (krea2_capi) that whole-archives
+# libbrodiffusion.a and the vendored sibling static libs. On Linux/ELF, a
+# static archive linked into a shared object must be position-independent, or
+# ld rejects its R_X86_64_PC32/TPOFF32 relocations ("recompile with -fPIC").
+# Set this before the add_subdirectory() calls below so it propagates into
+# every vendored sibling's scope (bromath / brotensor / brolm / broimage) as
+# well as this project's own targets.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 if(MSVC)
     add_compile_options(
         $<$<COMPILE_LANGUAGE:CXX>:/MP>
