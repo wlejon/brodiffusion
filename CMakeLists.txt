@@ -200,7 +200,9 @@ if(BROTENSOR_WITH_CUDA)
         src/triposplat/flow_rope.cu
     )
     find_package(CUDAToolkit REQUIRED)
-    target_link_libraries(brodiffusion PUBLIC CUDA::cudart)
+    # Static CUDA runtime so the shipped binary carries no cudart DLL dependency
+    # and launches on machines without the CUDA toolkit (falls back to CPU).
+    target_link_libraries(brodiffusion PUBLIC CUDA::cudart_static)
 endif()
 
 if(BROTENSOR_WITH_METAL)
