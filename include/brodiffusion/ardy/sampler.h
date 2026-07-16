@@ -126,6 +126,14 @@ public:
                          float cfg_weight, const float* gen_noise,
                          std::vector<float>& out_hybrid, int& out_T_tok);
 
+    // Detokenize a world-frame hybrid sequence into explicit ARDY motion
+    // features: (F frames x motion_rep_dim, 414 = [global_root 5, body 409]),
+    // F = T_tok * fpt. Runs the FSQ decoder on the body latents conditioned on
+    // the local root derived from the hybrid's global root, then concatenates
+    // the global root with the decoded body (get_explicit_motion_from_hybrid).
+    void detokenize_to_motion(const float* hybrid, int T_tok,
+                              std::vector<float>& out_motion);
+
 private:
     ArdyWindowSampler sampler_;
     ArdyDenoiser& denoiser_;

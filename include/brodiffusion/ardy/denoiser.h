@@ -113,12 +113,16 @@ public:
     void translate_global_root(float* groot_norm, int F,
                                const float translation[3]) const;
 
+    // Convert a normalized global root (F frames x motion_root_dim, 5) into the
+    // normalized local root (F x local_root_dim, 4): heading-rate + planar
+    // velocity + height, matching motion_rep.global_root_to_local_root over the
+    // full (no-padding) length. Used to build the FSQ decoder's external-root
+    // condition at detokenize time.
+    void global_root_to_local_root(const float* groot_norm, int F,
+                                   float* lroot_norm) const;
+
 private:
     struct Linear { brotensor::Tensor W, b; };
-
-    // global root (T_frames, 5) normalized -> local root (T_frames, 4) normalized.
-    void global_root_to_local_root(const float* groot_norm, int T_frames,
-                                   float* lroot_norm) const;
 
     Config cfg_;
     ArdyDenoiserBackbone root_model_;

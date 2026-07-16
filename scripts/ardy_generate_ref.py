@@ -179,9 +179,48 @@ try:
 finally:
     torch.randn = _orig_randn
 
-hybrid = captured["hybrid"].squeeze(0)          # (T_tok, 148)
+hybrid_b = captured["hybrid"]                   # (1, T_tok, 148)
+hybrid = hybrid_b.squeeze(0)                     # (T_tok, 148)
 noise = torch.cat(window_noise, dim=0)          # (num_windows, 13, 148)
 num_windows = noise.shape[0]
+
+# ── explicit-motion detokenize (get_explicit_motion_from_hybrid, no crop) via the
+#    REAL decoder transformer + REAL motion_rep. vqp-free: FSQVAETransformer.
+#    detokenize's requantize is the same scalar round (half 32); the decoder is
+#    the real DoubleCondDecoderTransformer loaded from tokenizer.safetensors. ──
+import importlib.util  # noqa: E402
+
+_spec = importlib.util.spec_from_file_location(
+    "ardy_dec_transformer",
+    ARDY / "ardy" / "model" / "autoencoder" / "transformer.py",
+)
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+decoder = _mod.DoubleCondDecoderTransformer(
+    input_dim=128, output_dim=413, num_frames_per_token=4, latent_dim=512,
+    num_heads=4, ff_size=1024, dropout=0.0, activation="gelu", norm_first=False,
+    num_layers=8, pe_dropout=0.0, is_causal=True, target_cond_dim=409,
+    external_cond_dim=4,
+)
+_tok = load_file(str(CKPT / "tokenizer.safetensors"))
+_dpref = "pose_net.decoder."
+_dsd = {k[len(_dpref):]: v for k, v in _tok.items() if k.startswith(_dpref)}
+_missing, _ = decoder.load_state_dict(_dsd, strict=False)
+assert not _missing, f"missing decoder params: {_missing}"
+decoder.eval()
+
+with torch.no_grad():
+    g_root, latent = ardy_model.hybrid.get_root_and_latent_body_motion_from_hybrid(hybrid_b)
+    F = g_root.shape[1]
+    local_root = motion_rep.global_root_to_local_root(
+        g_root, normalized=True, lengths=torch.tensor([F])
+    )
+    tq = post_quant_stats.unnormalize(latent)
+    tq = torch.round(tq.clamp(-1, 1) * 32) / 32
+    decoded = decoder(tq, external_cond=local_root)          # (1, F, 413)
+    body = decoded[..., motion_rep.local_root_dim:]          # (1, F, 409)
+    motion = motion_rep.concat_root_body(g_root, body)       # (1, F, 414)
+motion = motion.squeeze(0)
 
 
 def dump(name, t):
@@ -193,8 +232,11 @@ def dump(name, t):
 dump("ardy_gen_text.f32", text_feat.squeeze(0).squeeze(0))  # (4096,)
 dump("ardy_gen_noise.f32", noise)                           # (W, 13, 148)
 ref_out = dump("ardy_gen_ref_hyb.f32", hybrid)              # (T_tok, 148)
+ref_motion = dump("ardy_gen_ref_motion.f32", motion)        # (F, 414)
 
 print(f"frames={NUM_FRAMES} windows={num_windows} T_tok={hybrid.shape[0]} "
       f"steps={NUM_DENOISING_STEPS} cfg={CFG_WEIGHT} heading={FIRST_HEADING}")
 print(f"world-frame hybrid mean {ref_out.mean():.6f} std {ref_out.std():.6f}")
-print("dumped text/noise + ref hybrid to .parity/")
+print(f"explicit motion ({motion.shape[0]},{motion.shape[1]}) "
+      f"mean {ref_motion.mean():.6f} std {ref_motion.std():.6f}")
+print("dumped text/noise + ref hybrid + ref motion to .parity/")

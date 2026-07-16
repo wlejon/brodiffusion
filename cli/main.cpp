@@ -1287,7 +1287,8 @@ int run_ardy_generate(int argc, char** argv) {
     const char* ss  = arg_after(argc, argv, "--steps");
     const char* cs  = arg_after(argc, argv, "--cfg");
     const char* hs  = arg_after(argc, argv, "--heading");
-    const char* op  = arg_after(argc, argv, "--out");
+    const char* op  = arg_after(argc, argv, "--out");        // hybrid (T_tok,148)
+    const char* omp = arg_after(argc, argv, "--out-motion"); // optional explicit (F,414)
     if (!dw || !tw || !mp || !sp || !qmp || !qsp || !tp || !np_ || !Fs || !ss ||
         !cs || !hs || !op) {
         std::fprintf(stderr, "ardy-generate: need --denoiser --tokenizer --mean "
@@ -1341,6 +1342,71 @@ int run_ardy_generate(int argc, char** argv) {
              static_cast<std::streamsize>(out.size() * sizeof(float)));
     std::printf("ardy-generate: frames=%d windows=%d T_tok=%d out(%d,%d)\n",
                 frames, W, T_tok, T_tok, hyb);
+
+    if (omp) {
+        std::vector<float> motion;
+        gen.detokenize_to_motion(out.data(), T_tok, motion);
+        const int mrd = dn.config().motion_rep_dim;  // 414
+        const int F = T_tok * fpt;
+        std::ofstream mf(omp, std::ios::binary | std::ios::trunc);
+        if (!mf) { std::fprintf(stderr, "ardy-generate: cannot write %s\n", omp); return 1; }
+        mf.write(reinterpret_cast<const char*>(motion.data()),
+                 static_cast<std::streamsize>(motion.size() * sizeof(float)));
+        std::printf("ardy-generate: motion(%d,%d)\n", F, mrd);
+    }
+    return 0;
+}
+
+// Detokenize an explicit hybrid sequence into ARDY motion features (F,414). Used
+// to isolate the FSQ-decode + local-root conditioning (get_explicit_motion_from_
+// hybrid) from the autoregressive rollout: feeding a fixed hybrid tests the
+// detokenize path alone.
+int run_ardy_detok_motion(int argc, char** argv) {
+    const char* dw  = arg_after(argc, argv, "--denoiser");
+    const char* tw  = arg_after(argc, argv, "--tokenizer");
+    const char* mp  = arg_after(argc, argv, "--mean");
+    const char* sp  = arg_after(argc, argv, "--std");
+    const char* qmp = arg_after(argc, argv, "--pq-mean");
+    const char* qsp = arg_after(argc, argv, "--pq-std");
+    const char* xp  = arg_after(argc, argv, "--hybrid");   // (T_tok,148) raw f32
+    const char* Ts  = arg_after(argc, argv, "--T-tok");
+    const char* op  = arg_after(argc, argv, "--out");
+    if (!dw || !tw || !mp || !sp || !qmp || !qsp || !xp || !Ts || !op) {
+        std::fprintf(stderr, "ardy-detok-motion: need --denoiser --tokenizer "
+                             "--mean --std --pq-mean --pq-std --hybrid --T-tok "
+                             "--out\n");
+        return 2;
+    }
+    const int T_tok = std::atoi(Ts);
+
+    brotensor::init();
+    brodiffusion::ardy::ArdyDenoiser dn;
+    { auto f = st::File::open(dw); dn.load_weights(f); }
+    const int sdim = dn.stats_dim();
+    auto mean = load_npy_f64_as_f32(mp, sdim);
+    auto std_ = load_npy_f64_as_f32(sp, sdim);
+    dn.set_motion_stats(mean.data(), std_.data(), sdim);
+
+    brodiffusion::ardy::FsqMotionDecoder fsq;
+    { auto f = st::File::open(tw); fsq.load_weights(f); }
+    const int td = fsq.config().token_dim;
+    auto qmean = load_npy_f32(qmp, td);
+    auto qstd  = load_npy_f32(qsp, td);
+    fsq.set_post_quant_stats(qmean.data(), qstd.data(), td);
+
+    auto hyb = load_raw_f32(xp, static_cast<size_t>(T_tok) * dn.hybrid_dim());
+
+    brodiffusion::ardy::ArdyMotionGenerator gen(dn, fsq);
+    std::vector<float> motion;
+    gen.detokenize_to_motion(hyb.data(), T_tok, motion);
+
+    std::ofstream of(op, std::ios::binary | std::ios::trunc);
+    if (!of) { std::fprintf(stderr, "ardy-detok-motion: cannot write %s\n", op); return 1; }
+    of.write(reinterpret_cast<const char*>(motion.data()),
+             static_cast<std::streamsize>(motion.size() * sizeof(float)));
+    const int F = T_tok * dn.config().num_frames_per_token;
+    std::printf("ardy-detok-motion: T_tok=%d motion(%d,%d)\n", T_tok, F,
+                dn.config().motion_rep_dim);
     return 0;
 }
 
@@ -1485,6 +1551,12 @@ int main(int argc, char** argv) {
         try { return run_ardy_generate(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "ardy-generate: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "ardy-detok-motion") == 0) {
+        try { return run_ardy_detok_motion(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "ardy-detok-motion: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-v") == 0) {

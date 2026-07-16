@@ -300,4 +300,46 @@ void ArdyMotionGenerator::generate_hybrid(const float* text_feat, int num_frames
     out_T_tok = total_tok;
 }
 
+void ArdyMotionGenerator::detokenize_to_motion(const float* hybrid, int T_tok,
+                                               std::vector<float>& out_motion) {
+    const int fpt = denoiser_.config().num_frames_per_token;   // 4
+    const int NR  = denoiser_.config().nframe_root_dim;        // 20
+    const int LB  = denoiser_.config().latent_embedding_dim;   // 128
+    const int hyb = denoiser_.hybrid_dim();                    // 148
+    const int GR  = denoiser_.config().motion_root_dim;        // 5
+    const int LR  = denoiser_.config().local_root_dim;         // 4
+    const int MRD = denoiser_.config().motion_rep_dim;         // 414
+    const int BD  = denoiser_.config().body_dim;               // 409
+    const int F   = T_tok * fpt;
+    const int pose_dim = fsq_.config().output_dim;             // 413 = local_root4 + body409
+    const int fsq_lr   = fsq_.config().local_root_dim;         // 4
+
+    // split: per token [global_root 20 == (fpt,5)] ++ [body latent 128].
+    std::vector<float> groot(static_cast<size_t>(F) * GR);      // (F,5) flat
+    std::vector<float> latent(static_cast<size_t>(T_tok) * LB);
+    for (int t = 0; t < T_tok; ++t) {
+        const float* xt = hybrid + static_cast<size_t>(t) * hyb;
+        for (int i = 0; i < NR; ++i) groot[static_cast<size_t>(t) * NR + i] = xt[i];
+        for (int i = 0; i < LB; ++i) latent[static_cast<size_t>(t) * LB + i] = xt[NR + i];
+    }
+    // external-root condition: local root (F,4) == (T_tok, fpt*4) row-major.
+    std::vector<float> lroot(static_cast<size_t>(F) * LR);
+    denoiser_.global_root_to_local_root(groot.data(), F, lroot.data());
+
+    bt::Tensor decoded_T;
+    fsq_.detokenize(latent.data(), lroot.data(), T_tok, decoded_T);
+    bt::sync_all();
+    const std::vector<float> decoded = read_host(decoded_T);   // (F, 413)
+
+    // explicit motion (F,414) = [global_root 5, decoded body 409].
+    out_motion.resize(static_cast<size_t>(F) * MRD);
+    for (int f = 0; f < F; ++f) {
+        float* o = out_motion.data() + static_cast<size_t>(f) * MRD;
+        const float* g = groot.data() + static_cast<size_t>(f) * GR;
+        const float* d = decoded.data() + static_cast<size_t>(f) * pose_dim;
+        for (int i = 0; i < GR; ++i) o[i] = g[i];
+        for (int i = 0; i < BD; ++i) o[GR + i] = d[fsq_lr + i];
+    }
+}
+
 }  // namespace brodiffusion::ardy

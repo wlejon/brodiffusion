@@ -30,19 +30,57 @@ echo "== C++ ($BIN) =="
   --text  .parity/ardy_gen_text.f32 \
   --noise .parity/ardy_gen_noise.f32 \
   --frames "$FRAMES" --steps 10 --cfg 2.5 --heading 0.6 \
-  --out .parity/ardy_gen_mine_hyb.f32
+  --out .parity/ardy_gen_mine_hyb.f32 \
+  --out-motion .parity/ardy_gen_mine_motion.f32
+
+# Strict detokenize check on the REFERENCE hybrid: isolates the FSQ-decode +
+# local-root conditioning from the rollout (both sides detokenize identical
+# tokens), so it is not perturbed by an FSQ-grid boundary flip in the rollout.
+echo "== C++ detok (ref hybrid) =="
+"$BIN" ardy-detok-motion \
+  --denoiser  "$CKPT/denoiser.safetensors" \
+  --tokenizer "$CKPT/tokenizer.safetensors" \
+  --mean "$CKPT/stats/motion/mean.npy" \
+  --std  "$CKPT/stats/motion/std.npy" \
+  --pq-mean "$CKPT/stats/post_quantization/mean.npy" \
+  --pq-std  "$CKPT/stats/post_quantization/std.npy" \
+  --hybrid .parity/ardy_gen_ref_hyb.f32 \
+  --T-tok $(( (FRAMES + 51) / 52 * 13 )) \
+  --out .parity/ardy_gen_detok_motion.f32
 
 python - <<'PY'
 import numpy as np
-ref  = np.fromfile('.parity/ardy_gen_ref_hyb.f32',  dtype='<f4')
-mine = np.fromfile('.parity/ardy_gen_mine_hyb.f32', dtype='<f4')
-assert ref.shape == mine.shape, (ref.shape, mine.shape)
-cos = float(np.dot(ref, mine) / (np.linalg.norm(ref) * np.linalg.norm(mine)))
-rel = float(np.linalg.norm(ref - mine) / (np.linalg.norm(ref) + 1e-30))
-mad = float(np.max(np.abs(ref - mine)))
-print("world-hybrid  cosine %.8f  relL2 %.3e  maxabsdiff %.3e" % (cos, rel, mad))
-print("ref std %.5f  mine std %.5f" % (ref.std(), mine.std()))
-ok = cos > 0.99999 and rel < 2e-3
+import sys
+
+
+def stats(ref_path, mine_path):
+    ref = np.fromfile(ref_path, dtype='<f4')
+    mine = np.fromfile(mine_path, dtype='<f4')
+    assert ref.shape == mine.shape, (ref.shape, mine.shape)
+    cos = float(np.dot(ref, mine) / (np.linalg.norm(ref) * np.linalg.norm(mine)))
+    rel = float(np.linalg.norm(ref - mine) / (np.linalg.norm(ref) + 1e-30))
+    mad = float(np.max(np.abs(ref - mine)))
+    return cos, rel, mad, ref.std(), mine.std()
+
+
+def report(label, tup):
+    cos, rel, mad, rs, ms = tup
+    print("%-16s cosine %.8f  relL2 %.3e  maxabsdiff %.3e  (ref std %.5f mine %.5f)"
+          % (label, cos, rel, mad, rs, ms))
+
+
+# Gate 1: the autoregressive rollout, at the hybrid level (strict).
+h = stats('.parity/ardy_gen_ref_hyb.f32', '.parity/ardy_gen_mine_hyb.f32')
+report("world-hybrid", h)
+# Gate 2: the FSQ detokenize -> explicit motion on identical (ref) tokens (strict).
+d = stats('.parity/ardy_gen_ref_motion.f32', '.parity/ardy_gen_detok_motion.f32')
+report("explicit(detok)", d)
+# Informational: full text->motion (mine rollout + mine detok). Inherits any
+# FSQ-grid boundary flip from the rollout, amplified through the causal decoder.
+e = stats('.parity/ardy_gen_ref_motion.f32', '.parity/ardy_gen_mine_motion.f32')
+report("explicit(e2e)", e)
+
+ok = (h[0] > 0.99999 and h[1] < 2e-3) and (d[0] > 0.99999 and d[1] < 2e-3)
 print("PARITY OK" if ok else "PARITY FAILED")
-import sys; sys.exit(0 if ok else 1)
+sys.exit(0 if ok else 1)
 PY
