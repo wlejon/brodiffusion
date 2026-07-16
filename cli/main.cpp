@@ -14,6 +14,7 @@
 #include "brodiffusion/ardy/motion_rep.h"
 #include "brodiffusion/ardy/fsq_decoder.h"
 #include "brodiffusion/ardy/denoiser_backbone.h"
+#include "brodiffusion/ardy/denoiser.h"
 #include "brodiffusion/detail/compute.h"
 
 #include "brotensor/ops.h"
@@ -1108,6 +1109,24 @@ std::vector<float> load_npy_f32(const char* path, int n) {
     if (!in) throw std::runtime_error(std::string("short read from ") + path);
     return v;
 }
+// Read a 1-D float64 numpy .npy array (n elements) into host floats.
+std::vector<float> load_npy_f64_as_f32(const char* path, int n) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error(std::string("cannot open ") + path);
+    char magic[8];
+    in.read(magic, 8);
+    unsigned char hl[2];
+    in.read(reinterpret_cast<char*>(hl), 2);
+    const int hlen = hl[0] | (hl[1] << 8);
+    in.seekg(10 + hlen, std::ios::beg);
+    std::vector<double> d(n);
+    in.read(reinterpret_cast<char*>(d.data()),
+            static_cast<std::streamsize>(n * sizeof(double)));
+    if (!in) throw std::runtime_error(std::string("short read from ") + path);
+    std::vector<float> v(n);
+    for (int i = 0; i < n; ++i) v[i] = static_cast<float>(d[i]);
+    return v;
+}
 std::vector<float> load_raw_f32(const char* path, size_t n) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error(std::string("cannot open ") + path);
@@ -1154,6 +1173,47 @@ int run_ardy_fsq_detok(int argc, char** argv) {
     std::printf("ardy-fsq-detok: T_tok=%d out(%d,%d) -> %d frames x %d\n",
                 T_tok, out.rows, out.cols, T_tok * cfg.num_frames_per_token,
                 cfg.output_dim);
+    return 0;
+}
+
+int run_ardy_denoiser_fwd(int argc, char** argv) {
+    const char* w  = arg_after(argc, argv, "--weights");
+    const char* mp = arg_after(argc, argv, "--mean");     // motion mean.npy (414)
+    const char* sp = arg_after(argc, argv, "--std");      // motion std.npy (414)
+    const char* xp = arg_after(argc, argv, "--hybrid");   // (T_tok, 148) raw f32
+    const char* tp = arg_after(argc, argv, "--text");     // (1, 4096) raw f32
+    const char* Ts = arg_after(argc, argv, "--T-tok");
+    const char* ts = arg_after(argc, argv, "--timestep");
+    const char* hs = arg_after(argc, argv, "--heading");
+    const char* op = arg_after(argc, argv, "--out");
+    if (!w || !mp || !sp || !xp || !tp || !Ts || !ts || !hs || !op) {
+        std::fprintf(stderr, "ardy-denoiser-fwd: need --weights --mean --std "
+                             "--hybrid --text --T-tok --timestep --heading --out\n");
+        return 2;
+    }
+    const int T_tok = std::atoi(Ts);
+    const int timestep = std::atoi(ts);
+    const float heading = static_cast<float>(std::atof(hs));
+
+    brotensor::init();
+    brodiffusion::ardy::ArdyDenoiser dn;
+    const auto& cfg = dn.config();
+
+    auto f = st::File::open(w);
+    dn.load_weights(f);
+    const int sdim = dn.stats_dim();  // 418 (float64 stats)
+    auto mean = load_npy_f64_as_f32(mp, sdim);
+    auto std_ = load_npy_f64_as_f32(sp, sdim);
+    dn.set_motion_stats(mean.data(), std_.data(), sdim);
+
+    auto hyb  = load_raw_f32(xp, static_cast<size_t>(T_tok) * dn.hybrid_dim());
+    auto text = load_raw_f32(tp, 4096);
+
+    brotensor::Tensor out;
+    dn.forward(hyb.data(), text.data(), timestep, heading, T_tok, out);
+    brotensor::sync_all();
+    dump_latent_f32(op, out);
+    std::printf("ardy-denoiser-fwd: T_tok=%d out(%d,%d)\n", T_tok, out.rows, out.cols);
     return 0;
 }
 
@@ -1280,6 +1340,12 @@ int main(int argc, char** argv) {
         try { return run_ardy_backbone_fwd(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "ardy-backbone-fwd: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "ardy-denoiser-fwd") == 0) {
+        try { return run_ardy_denoiser_fwd(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "ardy-denoiser-fwd: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-v") == 0) {

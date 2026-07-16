@@ -185,6 +185,7 @@ target_sources(brodiffusion PRIVATE
     src/ardy/motion_rep.cpp
     src/ardy/fsq_decoder.cpp
     src/ardy/denoiser_backbone.cpp
+    src/ardy/denoiser.cpp
     src/triposplat/vae_encoder.cpp
     src/triposplat/flow_model.cpp
     src/triposplat/flow_sobol_pe.cpp
