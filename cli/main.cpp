@@ -13,6 +13,8 @@
 #include "brodiffusion/version.h"
 #include "brodiffusion/ardy/motion_rep.h"
 #include "brodiffusion/ardy/fsq_decoder.h"
+#include "brodiffusion/ardy/denoiser_backbone.h"
+#include "brodiffusion/detail/compute.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -1155,6 +1157,52 @@ int run_ardy_fsq_detok(int argc, char** argv) {
     return 0;
 }
 
+int run_ardy_backbone_fwd(int argc, char** argv) {
+    const char* w  = arg_after(argc, argv, "--weights");
+    const char* st_ = arg_after(argc, argv, "--stage");     // root | body
+    const char* xp = arg_after(argc, argv, "--x");          // (T, latent) raw f32
+    const char* tp = arg_after(argc, argv, "--text");       // (num_text_tokens, llm) raw f32
+    const char* Ts = arg_after(argc, argv, "--T");
+    const char* ts = arg_after(argc, argv, "--timestep");
+    const char* hs = arg_after(argc, argv, "--heading");
+    const char* op = arg_after(argc, argv, "--out");
+    if (!w || !st_ || !xp || !tp || !Ts || !ts || !hs || !op) {
+        std::fprintf(stderr, "ardy-backbone-fwd: need --weights --stage --x "
+                             "--text --T --timestep --heading --out\n");
+        return 2;
+    }
+    const int T = std::atoi(Ts);
+    const int timestep = std::atoi(ts);
+    const float heading = static_cast<float>(std::atof(hs));
+    const bool is_body = std::strcmp(st_, "body") == 0;
+
+    brotensor::init();
+    brodiffusion::ardy::ArdyDenoiserBackbone::Config cfg;
+    cfg.output_dim = is_body ? 128 : 20;
+    brodiffusion::ardy::ArdyDenoiserBackbone bb(cfg);
+
+    auto f = st::File::open(w);
+    bb.load_weights(f, std::string("denoiser.backbone.") +
+                       (is_body ? "body_model." : "root_model."));
+
+    auto xh = load_raw_f32(xp, static_cast<size_t>(T) * cfg.latent_dim);
+    auto th = load_raw_f32(tp, static_cast<size_t>(cfg.num_text_tokens) * cfg.llm_dim);
+    brotensor::Tensor x = brodiffusion::detail::upload_host(xh.data(), T, cfg.latent_dim);
+
+    // First-generation window: token_index = arange(T) (origin at frame 0).
+    std::vector<int> tok_idx(T);
+    for (int i = 0; i < T; ++i) tok_idx[i] = i;
+
+    brotensor::Tensor out;
+    bb.forward(x, th.data(), timestep, heading, tok_idx.data(), T,
+               /*key_mask=*/nullptr, out);
+    brotensor::sync_all();
+    dump_latent_f32(op, out);
+    std::printf("ardy-backbone-fwd: stage=%s T=%d out(%d,%d)\n",
+                is_body ? "body" : "root", T, out.rows, out.cols);
+    return 0;
+}
+
 int run_ardy_motionrep_fwd(int argc, char** argv) {
     const char* lr = arg_after(argc, argv, "--local-rots");
     const char* rp = arg_after(argc, argv, "--root-pos");
@@ -1226,6 +1274,12 @@ int main(int argc, char** argv) {
         try { return run_ardy_fsq_detok(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "ardy-fsq-detok: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "ardy-backbone-fwd") == 0) {
+        try { return run_ardy_backbone_fwd(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "ardy-backbone-fwd: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-v") == 0) {
