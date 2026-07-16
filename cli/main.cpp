@@ -15,6 +15,7 @@
 #include "brodiffusion/ardy/fsq_decoder.h"
 #include "brodiffusion/ardy/denoiser_backbone.h"
 #include "brodiffusion/ardy/denoiser.h"
+#include "brodiffusion/ardy/sampler.h"
 #include "brodiffusion/detail/compute.h"
 
 #include "brotensor/ops.h"
@@ -1217,6 +1218,54 @@ int run_ardy_denoiser_fwd(int argc, char** argv) {
     return 0;
 }
 
+// Full spaced-DDIM text-to-motion window: denoise a fresh generation window from
+// initial noise with text-only CFG. Matches the reference generation loop.
+int run_ardy_sample(int argc, char** argv) {
+    const char* w  = arg_after(argc, argv, "--weights");
+    const char* mp = arg_after(argc, argv, "--mean");     // motion mean.npy (418, f64)
+    const char* sp = arg_after(argc, argv, "--std");      // motion std.npy  (418, f64)
+    const char* xp = arg_after(argc, argv, "--x-init");   // (T_tok,148) raw f32 noise
+    const char* tp = arg_after(argc, argv, "--text");     // (1,4096) raw f32
+    const char* Ts = arg_after(argc, argv, "--T-tok");
+    const char* Ss = arg_after(argc, argv, "--steps");
+    const char* cs = arg_after(argc, argv, "--cfg");
+    const char* hs = arg_after(argc, argv, "--heading");
+    const char* op = arg_after(argc, argv, "--out");
+    if (!w || !mp || !sp || !xp || !tp || !Ts || !Ss || !cs || !hs || !op) {
+        std::fprintf(stderr, "ardy-sample: need --weights --mean --std --x-init "
+                             "--text --T-tok --steps --cfg --heading --out\n");
+        return 2;
+    }
+    const int T_tok = std::atoi(Ts);
+    const int steps = std::atoi(Ss);
+    const float cfg_w = static_cast<float>(std::atof(cs));
+    const float heading = static_cast<float>(std::atof(hs));
+
+    brotensor::init();
+    brodiffusion::ardy::ArdyDenoiser dn;
+    auto f = st::File::open(w);
+    dn.load_weights(f);
+    const int sdim = dn.stats_dim();  // 418 (float64 stats)
+    auto mean = load_npy_f64_as_f32(mp, sdim);
+    auto std_ = load_npy_f64_as_f32(sp, sdim);
+    dn.set_motion_stats(mean.data(), std_.data(), sdim);
+
+    auto x_init = load_raw_f32(xp, static_cast<size_t>(T_tok) * dn.hybrid_dim());
+    auto text   = load_raw_f32(tp, 4096);
+
+    brodiffusion::ardy::ArdyWindowSampler sampler(dn);
+    std::vector<float> out;
+    sampler.sample(x_init.data(), text.data(), T_tok, heading, steps, cfg_w, out);
+
+    std::ofstream of(op, std::ios::binary | std::ios::trunc);
+    if (!of) { std::fprintf(stderr, "ardy-sample: cannot write %s\n", op); return 1; }
+    of.write(reinterpret_cast<const char*>(out.data()),
+             static_cast<std::streamsize>(out.size() * sizeof(float)));
+    std::printf("ardy-sample: T_tok=%d steps=%d cfg=%.3f out(%d,%d)\n",
+                T_tok, steps, cfg_w, T_tok, dn.hybrid_dim());
+    return 0;
+}
+
 int run_ardy_backbone_fwd(int argc, char** argv) {
     const char* w  = arg_after(argc, argv, "--weights");
     const char* st_ = arg_after(argc, argv, "--stage");     // root | body
@@ -1346,6 +1395,12 @@ int main(int argc, char** argv) {
         try { return run_ardy_denoiser_fwd(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "ardy-denoiser-fwd: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "ardy-sample") == 0) {
+        try { return run_ardy_sample(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "ardy-sample: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-v") == 0) {
