@@ -12,6 +12,7 @@
 #include "brolm/tokenizer_t5.h"
 #include "brodiffusion/version.h"
 #include "brodiffusion/ardy/motion_rep.h"
+#include "brodiffusion/ardy/fsq_decoder.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -1088,6 +1089,72 @@ void dump_f64(const char* path, const std::vector<double>& v) {
 }
 }  // namespace
 
+// Read a 1-D float32 numpy .npy array (n elements) into host floats.
+namespace {
+std::vector<float> load_npy_f32(const char* path, int n) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error(std::string("cannot open ") + path);
+    char magic[8];
+    in.read(magic, 8);  // \x93NUMPY + version(2)
+    unsigned char hl[2];
+    in.read(reinterpret_cast<char*>(hl), 2);
+    const int hlen = hl[0] | (hl[1] << 8);
+    in.seekg(10 + hlen, std::ios::beg);  // data starts after the header
+    std::vector<float> v(n);
+    in.read(reinterpret_cast<char*>(v.data()),
+            static_cast<std::streamsize>(n * sizeof(float)));
+    if (!in) throw std::runtime_error(std::string("short read from ") + path);
+    return v;
+}
+std::vector<float> load_raw_f32(const char* path, size_t n) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error(std::string("cannot open ") + path);
+    std::vector<float> v(n);
+    in.read(reinterpret_cast<char*>(v.data()),
+            static_cast<std::streamsize>(n * sizeof(float)));
+    if (!in) throw std::runtime_error(std::string("short read from ") + path);
+    return v;
+}
+}  // namespace
+
+int run_ardy_fsq_detok(int argc, char** argv) {
+    const char* w  = arg_after(argc, argv, "--weights");
+    const char* mp = arg_after(argc, argv, "--pq-mean");
+    const char* sp = arg_after(argc, argv, "--pq-std");
+    const char* tp = arg_after(argc, argv, "--tokens");
+    const char* rp = arg_after(argc, argv, "--local-root");
+    const char* Ts = arg_after(argc, argv, "--T-tok");
+    const char* op = arg_after(argc, argv, "--out");
+    if (!w || !mp || !sp || !tp || !rp || !Ts || !op) {
+        std::fprintf(stderr, "ardy-fsq-detok: need --weights --pq-mean --pq-std "
+                             "--tokens --local-root --T-tok --out\n");
+        return 2;
+    }
+    const int T_tok = std::atoi(Ts);
+    brotensor::init();
+    brodiffusion::ardy::FsqMotionDecoder dec;
+    const auto& cfg = dec.config();
+
+    auto f = st::File::open(w);
+    dec.load_weights(f);
+    auto mean = load_npy_f32(mp, cfg.token_dim);
+    auto std_ = load_npy_f32(sp, cfg.token_dim);
+    dec.set_post_quant_stats(mean.data(), std_.data(), cfg.token_dim);
+
+    auto tokens = load_raw_f32(tp, static_cast<size_t>(T_tok) * cfg.token_dim);
+    auto lroot  = load_raw_f32(rp, static_cast<size_t>(T_tok) *
+                                       cfg.num_frames_per_token * cfg.external_cond_dim);
+
+    brotensor::Tensor out;
+    dec.detokenize(tokens.data(), lroot.data(), T_tok, out);
+    brotensor::sync_all();
+    dump_latent_f32(op, out);
+    std::printf("ardy-fsq-detok: T_tok=%d out(%d,%d) -> %d frames x %d\n",
+                T_tok, out.rows, out.cols, T_tok * cfg.num_frames_per_token,
+                cfg.output_dim);
+    return 0;
+}
+
 int run_ardy_motionrep_fwd(int argc, char** argv) {
     const char* lr = arg_after(argc, argv, "--local-rots");
     const char* rp = arg_after(argc, argv, "--root-pos");
@@ -1153,6 +1220,12 @@ int main(int argc, char** argv) {
         try { return run_ardy_motionrep_fwd(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "ardy-motionrep-fwd: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "ardy-fsq-detok") == 0) {
+        try { return run_ardy_fsq_detok(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "ardy-fsq-detok: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-v") == 0) {
