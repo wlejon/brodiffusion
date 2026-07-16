@@ -51,7 +51,12 @@ public:
         bool input_first_heading_angle = true;
     };
 
-    explicit ArdyDenoiserBackbone(const Config& cfg = Config{});
+    // NB: a delegating default ctor rather than a `= Config{}` default arg —
+    // GCC 12 rejects value-initializing a nested type in a default argument
+    // (the enclosing class is still incomplete there). The member-init below
+    // runs in complete-class context, where Config's NSDMIs are available.
+    ArdyDenoiserBackbone() : ArdyDenoiserBackbone(Config{}) {}
+    explicit ArdyDenoiserBackbone(const Config& cfg);
     ~ArdyDenoiserBackbone();
 
     ArdyDenoiserBackbone(const ArdyDenoiserBackbone&) = delete;

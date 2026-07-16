@@ -48,7 +48,10 @@ public:
         float fps                = 25.0f;
     };
 
-    explicit ArdyDenoiser(const Config& cfg = Config{});
+    // Delegating default ctor (not a `= Config{}` default arg): GCC 12 rejects
+    // value-initializing a nested type in a default argument. See denoiser_backbone.h.
+    ArdyDenoiser() : ArdyDenoiser(Config{}) {}
+    explicit ArdyDenoiser(const Config& cfg);
     ~ArdyDenoiser();
 
     ArdyDenoiser(const ArdyDenoiser&) = delete;

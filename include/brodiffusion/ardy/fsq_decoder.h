@@ -45,7 +45,10 @@ public:
         bool causal              = true;
     };
 
-    explicit FsqMotionDecoder(const Config& cfg = Config{});
+    // Delegating default ctor (not a `= Config{}` default arg): GCC 12 rejects
+    // value-initializing a nested type in a default argument. See denoiser_backbone.h.
+    FsqMotionDecoder() : FsqMotionDecoder(Config{}) {}
+    explicit FsqMotionDecoder(const Config& cfg);
     ~FsqMotionDecoder();
 
     FsqMotionDecoder(const FsqMotionDecoder&) = delete;
