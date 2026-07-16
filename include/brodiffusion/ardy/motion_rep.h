@@ -88,6 +88,17 @@ public:
 
     double fps() const { return fps_; }
 
+    // Motion normalization stats for inverse(is_normalized=true). ARDY bundles
+    // the motion stats as [global_root 5, local_root 4, body 409] = 418 entries,
+    // but the explicit 414-dim feature is [global_root 5, body 409]; so
+    // unnormalization uses the stats sliced to indices [0:5] ++ [9:418] (exactly
+    // all_stats.sliced(...) in the ardy motionrep base). Pass the full 418-entry
+    // mean/std; eps matches the ardy Stats default (1e-5). Without stats set,
+    // inverse(is_normalized=true) throws.
+    void set_motion_stats(const float* mean, const float* std, int n_full,
+                          float eps = 1e-5f);
+    bool has_motion_stats() const { return !feat_mean_.empty(); }
+
     // Encode local rotations + root positions into ARDY features (unnormalized).
     //   local_rot_mats: (T, J, 3, 3), root_positions: (T, 3)
     //   out_features:   (T, kFeatureDim), resized if needed.
@@ -105,9 +116,14 @@ public:
         std::vector<double> global_root_heading;  // (T, 2)
         int T = 0;
     };
-    // posed_joints_from_rotations: re-run FK from the decoded rotations (true,
-    // the ARDY default) vs. lift the stored local_joints_positions (false).
+    // is_normalized: the features are in normalized space (the detokenize /
+    // hybrid output) and must be unnormalized with the motion stats first,
+    // matching motion_rep.inverse(motion, is_normalized=True). Requires
+    // set_motion_stats(). posed_joints_from_rotations: re-run FK from the decoded
+    // rotations (true, the ARDY default) vs. lift the stored
+    // local_joints_positions (false).
     Decoded inverse(const double* features, int T,
+                    bool is_normalized = false,
                     bool posed_joints_from_rotations = true) const;
 
     // Foot-contact heuristic thresholds (ArdyMotionRep uses 0.15 / 0.10).
@@ -116,6 +132,9 @@ public:
 
 private:
     double fps_;
+    // 414-dim sliced motion stats (double), eps-folded denom. Empty until set.
+    std::vector<double> feat_mean_;    // [kFeatureDim]
+    std::vector<double> feat_stdeps_;  // [kFeatureDim] = sqrt(std^2 + eps)
 };
 
 }  // namespace brodiffusion::ardy

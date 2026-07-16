@@ -46,7 +46,8 @@ echo "== C++ detok (ref hybrid) =="
   --pq-std  "$CKPT/stats/post_quantization/std.npy" \
   --hybrid .parity/ardy_gen_ref_hyb.f32 \
   --T-tok $(( (FRAMES + 51) / 52 * 13 )) \
-  --out .parity/ardy_gen_detok_motion.f32
+  --out .parity/ardy_gen_detok_motion.f32 \
+  --out-posed .parity/ardy_gen_detok_posed.f32
 
 python - <<'PY'
 import numpy as np
@@ -75,12 +76,18 @@ report("world-hybrid", h)
 # Gate 2: the FSQ detokenize -> explicit motion on identical (ref) tokens (strict).
 d = stats('.parity/ardy_gen_ref_motion.f32', '.parity/ardy_gen_detok_motion.f32')
 report("explicit(detok)", d)
+# Gate 3: unnormalize + FK -> world joint positions (the render input). Exercises
+# ArdyMotionRep.inverse(is_normalized=True): stats.unnormalize over the full 414-d
+# feature then FK. This is the channel the scale bug lived in.
+p = stats('.parity/ardy_gen_ref_posed.f32', '.parity/ardy_gen_detok_posed.f32')
+report("posed(detok)", p)
 # Informational: full text->motion (mine rollout + mine detok). Inherits any
 # FSQ-grid boundary flip from the rollout, amplified through the causal decoder.
 e = stats('.parity/ardy_gen_ref_motion.f32', '.parity/ardy_gen_mine_motion.f32')
 report("explicit(e2e)", e)
 
-ok = (h[0] > 0.99999 and h[1] < 2e-3) and (d[0] > 0.99999 and d[1] < 2e-3)
+ok = ((h[0] > 0.99999 and h[1] < 2e-3) and (d[0] > 0.99999 and d[1] < 2e-3)
+      and (p[0] > 0.99999 and p[1] < 2e-3))
 print("PARITY OK" if ok else "PARITY FAILED")
 sys.exit(0 if ok else 1)
 PY

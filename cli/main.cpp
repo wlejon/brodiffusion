@@ -1374,6 +1374,7 @@ int run_ardy_detok_motion(int argc, char** argv) {
     const char* xp  = arg_after(argc, argv, "--hybrid");   // (T_tok,148) raw f32
     const char* Ts  = arg_after(argc, argv, "--T-tok");
     const char* op  = arg_after(argc, argv, "--out");
+    const char* pp  = arg_after(argc, argv, "--out-posed");  // optional (F,J,3) f32
     if (!dw || !tw || !mp || !sp || !qmp || !qsp || !xp || !Ts || !op) {
         std::fprintf(stderr, "ardy-detok-motion: need --denoiser --tokenizer "
                              "--mean --std --pq-mean --pq-std --hybrid --T-tok "
@@ -1408,8 +1409,26 @@ int run_ardy_detok_motion(int argc, char** argv) {
     of.write(reinterpret_cast<const char*>(motion.data()),
              static_cast<std::streamsize>(motion.size() * sizeof(float)));
     const int F = T_tok * dn.config().num_frames_per_token;
-    std::printf("ardy-detok-motion: T_tok=%d motion(%d,%d)\n", T_tok, F,
-                dn.config().motion_rep_dim);
+
+    // Optional: unnormalize + FK to world joint positions, exercising
+    // ArdyMotionRep::inverse(is_normalized=true) (== motion_rep.inverse with
+    // is_normalized=True in the reference).
+    if (pp) {
+        brodiffusion::ardy::ArdyMotionRep rep(/*fps=*/dn.config().fps);
+        rep.set_motion_stats(mean.data(), std_.data(), sdim);
+        std::vector<double> mdbl(motion.begin(), motion.end());
+        auto dec = rep.inverse(mdbl.data(), F, /*is_normalized=*/true);
+        std::vector<float> posed(dec.posed_joints.size());
+        for (size_t i = 0; i < posed.size(); ++i)
+            posed[i] = static_cast<float>(dec.posed_joints[i]);
+        std::ofstream pf(pp, std::ios::binary | std::ios::trunc);
+        if (!pf) { std::fprintf(stderr, "ardy-detok-motion: cannot write %s\n", pp); return 1; }
+        pf.write(reinterpret_cast<const char*>(posed.data()),
+                 static_cast<std::streamsize>(posed.size() * sizeof(float)));
+    }
+
+    std::printf("ardy-detok-motion: T_tok=%d motion(%d,%d)%s\n", T_tok, F,
+                dn.config().motion_rep_dim, pp ? " +posed" : "");
     return 0;
 }
 
@@ -1549,7 +1568,8 @@ int run_ardy_motionrep_fwd(int argc, char** argv) {
     std::vector<double> feats;
     rep.forward(local.data(), root.data(), T, feats);
 
-    auto dec = rep.inverse(feats.data(), T, /*posed_from_rot=*/true);
+    auto dec = rep.inverse(feats.data(), T, /*is_normalized=*/false,
+                           /*posed_from_rot=*/true);
 
     dump_f64(of, feats);
     dump_f64(op, dec.posed_joints);

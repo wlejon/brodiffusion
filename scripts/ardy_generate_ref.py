@@ -222,6 +222,16 @@ with torch.no_grad():
     motion = motion_rep.concat_root_body(g_root, body)       # (1, F, 414)
 motion = motion.squeeze(0)
 
+# Unnormalize + FK to world joint positions, the actual render input. This is
+# where the normalized explicit feature (normalized global root + normalized
+# decoded body) becomes real-world meters: inverse(is_normalized=True) runs
+# stats.unnormalize over the full 414-d feature before unpacking / FK.
+with torch.no_grad():
+    inv = motion_rep.inverse(
+        motion.unsqueeze(0), is_normalized=True, posed_joints_from="rotations"
+    )
+posed = inv["posed_joints"].squeeze(0)                     # (F, 34, 3)
+
 
 def dump(name, t):
     a = t.detach().cpu().numpy().astype("<f4").ravel()
@@ -233,10 +243,16 @@ dump("ardy_gen_text.f32", text_feat.squeeze(0).squeeze(0))  # (4096,)
 dump("ardy_gen_noise.f32", noise)                           # (W, 13, 148)
 ref_out = dump("ardy_gen_ref_hyb.f32", hybrid)              # (T_tok, 148)
 ref_motion = dump("ardy_gen_ref_motion.f32", motion)        # (F, 414)
+ref_posed = dump("ardy_gen_ref_posed.f32", posed)           # (F, 34, 3)
 
 print(f"frames={NUM_FRAMES} windows={num_windows} T_tok={hybrid.shape[0]} "
       f"steps={NUM_DENOISING_STEPS} cfg={CFG_WEIGHT} heading={FIRST_HEADING}")
 print(f"world-frame hybrid mean {ref_out.mean():.6f} std {ref_out.std():.6f}")
 print(f"explicit motion ({motion.shape[0]},{motion.shape[1]}) "
       f"mean {ref_motion.mean():.6f} std {ref_motion.std():.6f}")
-print("dumped text/noise + ref hybrid + ref motion to .parity/")
+_p = posed.reshape(-1, 3)
+print(f"posed joints ({posed.shape[0]},{posed.shape[1]},3) "
+      f"root-y range [{posed[:, 0, 1].min():.3f}, {posed[:, 0, 1].max():.3f}] "
+      f"xz-span [{_p[:, 0].min():.3f},{_p[:, 0].max():.3f}]x"
+      f"[{_p[:, 2].min():.3f},{_p[:, 2].max():.3f}]")
+print("dumped text/noise + ref hybrid + ref motion + ref posed to .parity/")

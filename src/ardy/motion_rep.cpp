@@ -288,10 +288,55 @@ void ArdyMotionRep::forward(const double* local_rot_mats,
     }
 }
 
+void ArdyMotionRep::set_motion_stats(const float* mean, const float* std,
+                                     int n_full, float eps) {
+    // ARDY motion stats: [global_root 5, local_root 4, body 409] = 418.
+    constexpr int kGlobalRoot = 5;
+    constexpr int kLocalRoot  = 4;
+    constexpr int kBody       = 409;
+    if (n_full != kGlobalRoot + kLocalRoot + kBody)
+        throw std::runtime_error("ArdyMotionRep::set_motion_stats expects 418 entries, got " +
+                                 std::to_string(n_full));
+
+    feat_mean_.assign(kFeatureDim, 0.0);
+    feat_stdeps_.assign(kFeatureDim, 0.0);
+    const double e = static_cast<double>(eps);
+    // Slice to the 414-dim explicit feature: indices [0:5] ++ [9:418].
+    auto put = [&](int dst, int src) {
+        const double s = static_cast<double>(std[src]);
+        feat_mean_[dst]   = static_cast<double>(mean[src]);
+        feat_stdeps_[dst] = std::sqrt(s * s + e);
+    };
+    int dst = 0;
+    for (int i = 0; i < kGlobalRoot; ++i) put(dst++, i);
+    for (int i = 0; i < kBody; ++i)       put(dst++, kGlobalRoot + kLocalRoot + i);
+}
+
 ArdyMotionRep::Decoded ArdyMotionRep::inverse(const double* features, int T,
+                                              bool is_normalized,
                                               bool posed_from_rot) const {
     Decoded d;
     d.T = T;
+
+    // Unnormalize the full 414-dim feature first when the caller passes
+    // normalized features (the detokenize / hybrid output), matching
+    // motion_rep.inverse(features, is_normalized=True) -> stats.unnormalize.
+    std::vector<double> unnorm;
+    const double* src = features;
+    if (is_normalized) {
+        if (feat_mean_.empty())
+            throw std::runtime_error(
+                "ArdyMotionRep::inverse(is_normalized=true) needs set_motion_stats()");
+        unnorm.resize(static_cast<size_t>(T) * kFeatureDim);
+        for (int t = 0; t < T; ++t) {
+            const double* fi = features + static_cast<size_t>(t) * kFeatureDim;
+            double* fo = unnorm.data() + static_cast<size_t>(t) * kFeatureDim;
+            for (int i = 0; i < kFeatureDim; ++i)
+                fo[i] = fi[i] * feat_stdeps_[i] + feat_mean_[i];
+        }
+        src = unnorm.data();
+    }
+    features = src;  // the rest of inverse reads from `features`
 
     // Slice offsets within a 414-d feature row.
     constexpr int kRootPos   = 0;                         // 3
