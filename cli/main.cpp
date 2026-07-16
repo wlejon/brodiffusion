@@ -11,6 +11,7 @@
 #include "brolm/t5.h"
 #include "brolm/tokenizer_t5.h"
 #include "brodiffusion/version.h"
+#include "brodiffusion/ardy/motion_rep.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -1065,6 +1066,61 @@ int run_krea2_fwd(int argc, char** argv) {
     return 0;
 }
 
+// ── ARDY motion-rep parity (scripts/ardy_motionrep_ref.py) ──────────────────
+// Reads float64 local rotation matrices + root positions, runs the ARDY motion
+// codec forward (features) and inverse (posed joints + recovered local rots),
+// and dumps all three as raw float64 to diff against the PyTorch reference.
+namespace {
+std::vector<double> load_f64(const char* path, size_t n) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error(std::string("cannot open ") + path);
+    std::vector<double> v(n);
+    in.read(reinterpret_cast<char*>(v.data()),
+            static_cast<std::streamsize>(n * sizeof(double)));
+    if (!in) throw std::runtime_error(std::string("short read from ") + path);
+    return v;
+}
+void dump_f64(const char* path, const std::vector<double>& v) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) throw std::runtime_error(std::string("cannot write ") + path);
+    out.write(reinterpret_cast<const char*>(v.data()),
+              static_cast<std::streamsize>(v.size() * sizeof(double)));
+}
+}  // namespace
+
+int run_ardy_motionrep_fwd(int argc, char** argv) {
+    const char* lr = arg_after(argc, argv, "--local-rots");
+    const char* rp = arg_after(argc, argv, "--root-pos");
+    const char* Ts = arg_after(argc, argv, "--T");
+    const char* of = arg_after(argc, argv, "--out-features");
+    const char* op = arg_after(argc, argv, "--out-posed");
+    const char* ol = arg_after(argc, argv, "--out-local");
+    if (!lr || !rp || !Ts || !of || !op || !ol) {
+        std::fprintf(stderr, "ardy-motionrep-fwd: need --local-rots --root-pos "
+                             "--T --out-features --out-posed --out-local\n");
+        return 2;
+    }
+    const int T = std::atoi(Ts);
+    constexpr int Jn = brodiffusion::ardy::ArdyMotionRep::kNumJoints;   // 34
+    constexpr int Fd = brodiffusion::ardy::ArdyMotionRep::kFeatureDim;  // 414
+
+    auto local = load_f64(lr, static_cast<size_t>(T) * Jn * 9);
+    auto root  = load_f64(rp, static_cast<size_t>(T) * 3);
+
+    brodiffusion::ardy::ArdyMotionRep rep(/*fps=*/25.0);
+    std::vector<double> feats;
+    rep.forward(local.data(), root.data(), T, feats);
+
+    auto dec = rep.inverse(feats.data(), T, /*posed_from_rot=*/true);
+
+    dump_f64(of, feats);
+    dump_f64(op, dec.posed_joints);
+    dump_f64(ol, dec.local_rot_mats);
+    std::printf("ardy-motionrep-fwd: T=%d features(%d,%d) posed(%d,%d,3) "
+                "local(%d,%d,3,3)\n", T, T, Fd, T, Jn, T, Jn);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1091,6 +1147,12 @@ int main(int argc, char** argv) {
         try { return run_krea2_fwd(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "krea2-fwd: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "ardy-motionrep-fwd") == 0) {
+        try { return run_ardy_motionrep_fwd(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "ardy-motionrep-fwd: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-v") == 0) {
