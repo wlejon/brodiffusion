@@ -1270,6 +1270,80 @@ int run_ardy_sample(int argc, char** argv) {
     return 0;
 }
 
+// Autoregressive text-to-motion rollout: chain windows into a full-length hybrid
+// sequence (recenter + requantize + global-translation tracking). Emits the world-
+// frame hybrid before FSQ detokenization. Matches ardy_model.py Ardy.__call__
+// (text-only, no history/constraints/crop).
+int run_ardy_generate(int argc, char** argv) {
+    const char* dw  = arg_after(argc, argv, "--denoiser");   // denoiser.safetensors
+    const char* tw  = arg_after(argc, argv, "--tokenizer");  // tokenizer.safetensors
+    const char* mp  = arg_after(argc, argv, "--mean");       // motion mean.npy (418, f64)
+    const char* sp  = arg_after(argc, argv, "--std");        // motion std.npy  (418, f64)
+    const char* qmp = arg_after(argc, argv, "--pq-mean");    // post-quant mean (128, f32)
+    const char* qsp = arg_after(argc, argv, "--pq-std");     // post-quant std  (128, f32)
+    const char* tp  = arg_after(argc, argv, "--text");       // (4096) raw f32
+    const char* np_ = arg_after(argc, argv, "--noise");      // (W*13*148) raw f32
+    const char* Fs  = arg_after(argc, argv, "--frames");
+    const char* ss  = arg_after(argc, argv, "--steps");
+    const char* cs  = arg_after(argc, argv, "--cfg");
+    const char* hs  = arg_after(argc, argv, "--heading");
+    const char* op  = arg_after(argc, argv, "--out");
+    if (!dw || !tw || !mp || !sp || !qmp || !qsp || !tp || !np_ || !Fs || !ss ||
+        !cs || !hs || !op) {
+        std::fprintf(stderr, "ardy-generate: need --denoiser --tokenizer --mean "
+                             "--std --pq-mean --pq-std --text --noise --frames "
+                             "--steps --cfg --heading --out\n");
+        return 2;
+    }
+    const int frames = std::atoi(Fs);
+    const int steps  = std::atoi(ss);
+    const float cfg_w = static_cast<float>(std::atof(cs));
+    const float heading = static_cast<float>(std::atof(hs));
+
+    brotensor::init();
+    brodiffusion::ardy::ArdyDenoiser dn;
+    {
+        auto f = st::File::open(dw);
+        dn.load_weights(f);
+    }
+    const int sdim = dn.stats_dim();  // 418 (f64 stats)
+    auto mean = load_npy_f64_as_f32(mp, sdim);
+    auto std_ = load_npy_f64_as_f32(sp, sdim);
+    dn.set_motion_stats(mean.data(), std_.data(), sdim);
+
+    brodiffusion::ardy::FsqMotionDecoder fsq;
+    {
+        auto f = st::File::open(tw);
+        fsq.load_weights(f);
+    }
+    const int td = fsq.config().token_dim;  // 128
+    auto qmean = load_npy_f32(qmp, td);
+    auto qstd  = load_npy_f32(qsp, td);
+    fsq.set_post_quant_stats(qmean.data(), qstd.data(), td);
+
+    brodiffusion::ardy::ArdyMotionGenerator gen(dn, fsq);
+    const int W = gen.num_windows(frames);
+    const int hyb = dn.hybrid_dim();
+    const int fpt = dn.config().num_frames_per_token;
+    const int G = 52 / fpt;  // tokens per window
+
+    auto text  = load_raw_f32(tp, 4096);
+    auto noise = load_raw_f32(np_, static_cast<size_t>(W) * G * hyb);
+
+    std::vector<float> out;
+    int T_tok = 0;
+    gen.generate_hybrid(text.data(), frames, heading, steps, cfg_w, noise.data(),
+                        out, T_tok);
+
+    std::ofstream of(op, std::ios::binary | std::ios::trunc);
+    if (!of) { std::fprintf(stderr, "ardy-generate: cannot write %s\n", op); return 1; }
+    of.write(reinterpret_cast<const char*>(out.data()),
+             static_cast<std::streamsize>(out.size() * sizeof(float)));
+    std::printf("ardy-generate: frames=%d windows=%d T_tok=%d out(%d,%d)\n",
+                frames, W, T_tok, T_tok, hyb);
+    return 0;
+}
+
 int run_ardy_backbone_fwd(int argc, char** argv) {
     const char* w  = arg_after(argc, argv, "--weights");
     const char* st_ = arg_after(argc, argv, "--stage");     // root | body
@@ -1405,6 +1479,12 @@ int main(int argc, char** argv) {
         try { return run_ardy_sample(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "ardy-sample: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "ardy-generate") == 0) {
+        try { return run_ardy_generate(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "ardy-generate: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-v") == 0) {

@@ -154,6 +154,40 @@ void ArdyDenoiser::global_root_to_local_root(const float* groot_norm,
     }
 }
 
+void ArdyDenoiser::recenter_global_root(float* groot_norm, int F,
+                                        int center_frame, float center_pos[3]) const {
+    if (gr_mean_.empty()) fail("recenter_global_root: motion stats not set");
+    const int GR = cfg_.motion_root_dim;  // 5
+    // Center frame's unnormalized planar position (y forced to 0).
+    const float* c = groot_norm + static_cast<size_t>(center_frame) * GR;
+    const float cx = c[0] * gr_stdeps_[0] + gr_mean_[0];
+    const float cz = c[2] * gr_stdeps_[2] + gr_mean_[2];
+    center_pos[0] = cx;
+    center_pos[1] = 0.0f;
+    center_pos[2] = cz;
+    // Subtracting cx/cz in meters == subtracting cx/std, cz/std in normalized space.
+    const float dx = cx / gr_stdeps_[0];
+    const float dz = cz / gr_stdeps_[2];
+    for (int f = 0; f < F; ++f) {
+        float* g = groot_norm + static_cast<size_t>(f) * GR;
+        g[0] -= dx;
+        g[2] -= dz;
+    }
+}
+
+void ArdyDenoiser::translate_global_root(float* groot_norm, int F,
+                                         const float translation[3]) const {
+    if (gr_mean_.empty()) fail("translate_global_root: motion stats not set");
+    const int GR = cfg_.motion_root_dim;  // 5
+    const float dx = translation[0] / gr_stdeps_[0];
+    const float dz = translation[2] / gr_stdeps_[2];  // translation[1] == 0
+    for (int f = 0; f < F; ++f) {
+        float* g = groot_norm + static_cast<size_t>(f) * GR;
+        g[0] += dx;
+        g[2] += dz;
+    }
+}
+
 void ArdyDenoiser::forward(const float* hybrid, const float* text_feat,
                            int timestep, float first_heading_angle, int T_tok,
                            bt::Tensor& out, int num_history_tokens) {

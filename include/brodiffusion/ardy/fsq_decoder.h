@@ -68,6 +68,14 @@ public:
     void set_post_quant_stats(const float* mean, const float* std, int n,
                               float eps = 1e-5f);
 
+    // Requantize normalized FSQ token embeddings onto the discrete grid, in
+    // place. Matches FSQVAETransformer.requantize: unnormalize with the
+    // post-quant stats, round(clamp(x,-1,1)*half)/half (half = fsq_level/2), then
+    // renormalize. Used by the autoregressive rollout to snap freshly generated
+    // (continuous) body latents to the codebook before they become history.
+    //   tokens_norm: (T_tok, token_dim) host, modified in place.
+    void requantize(float* tokens_norm, int T_tok) const;
+
     // Decode body tokens into pose features.
     //   tokens_norm: (T_tok, token_dim) normalized FSQ token embeddings (host).
     //   local_root:  (T_tok * num_frames_per_token, local_root_dim) local-root

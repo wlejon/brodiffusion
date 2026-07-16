@@ -96,6 +96,22 @@ void FsqMotionDecoder::set_post_quant_stats(const float* mean, const float* std,
     for (int i = 0; i < n; ++i) pq_std_[i] = std::sqrt(std[i] * std[i] + eps);
 }
 
+void FsqMotionDecoder::requantize(float* tokens_norm, int T_tok) const {
+    if (pq_mean_.empty()) fail("requantize: post-quant stats not set");
+    const int Cd = cfg_.token_dim;  // 128
+    const float half = static_cast<float>(cfg_.fsq_level) / 2.0f;  // 32
+    for (int t = 0; t < T_tok; ++t) {
+        for (int c = 0; c < Cd; ++c) {
+            const size_t i = static_cast<size_t>(t) * Cd + c;
+            float x = tokens_norm[i] * pq_std_[c] + pq_mean_[c];  // unnormalize
+            if (x > 1.0f) x = 1.0f;
+            if (x < -1.0f) x = -1.0f;
+            const float q = std::nearbyint(x * half) / half;      // snap to grid
+            tokens_norm[i] = (q - pq_mean_[c]) / pq_std_[c];       // renormalize
+        }
+    }
+}
+
 void FsqMotionDecoder::detokenize(const float* tokens_norm,
                                   const float* local_root, int T_tok,
                                   bt::Tensor& out) {

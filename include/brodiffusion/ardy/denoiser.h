@@ -96,6 +96,23 @@ public:
                  float first_heading_angle, int T_tok, brotensor::Tensor& out,
                  int num_history_tokens = 0);
 
+    // Autoregressive-rollout helpers on the normalized global root (F frames x
+    // motion_root_dim, row-major — the per-token 20-dim root slice reshaped to
+    // (F,5)). Both use the global-root normalization stats set above.
+
+    // Recenter so frame `center_frame` sits at the planar origin: subtract that
+    // frame's x/z from every frame (y and heading untouched), in place. Writes
+    // the applied shift (x, 0, z, unnormalized meters) to center_pos —
+    // accumulate it into the running global translation. Matches
+    // ArdyMotionRep.recenter_root_motion (transl_center_mode "last_history").
+    void recenter_global_root(float* groot_norm, int F, int center_frame,
+                              float center_pos[3]) const;
+
+    // Add a global translation (x, 0, z meters) back onto the root position, in
+    // place. Matches translate_normalized_root_motion.
+    void translate_global_root(float* groot_norm, int F,
+                               const float translation[3]) const;
+
 private:
     struct Linear { brotensor::Tensor W, b; };
 

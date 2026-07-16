@@ -19,6 +19,7 @@
 // (real text, zero text) combined as uncond + w * (text - uncond).
 
 #include "brodiffusion/ardy/denoiser.h"
+#include "brodiffusion/ardy/fsq_decoder.h"
 
 #include <vector>
 
@@ -75,11 +76,61 @@ public:
                 float first_heading_angle, int num_denoising_steps,
                 float cfg_weight, std::vector<float>& out);
 
+    // Denoise one autoregressive window: fixed clean history tokens conditioning
+    // a fresh block of generation noise. Only the generation tokens are stepped
+    // (history is held), producing the newly generated hybrid tokens.
+    //   history:    (num_history_tokens, 148) clean history (host); may be null
+    //               when num_history_tokens == 0.
+    //   gen_noise:  (num_gen_tokens, 148) initial noise for the generation block.
+    //   out_gen:    (num_gen_tokens * 148) the denoised generation tokens (host).
+    void sample_ar_window(const float* history, int num_history_tokens,
+                          const float* gen_noise, int num_gen_tokens,
+                          const float* text_feat, float first_heading_angle,
+                          int num_denoising_steps, float cfg_weight,
+                          std::vector<float>& out_gen);
+
     const ArdyDiffusion& diffusion() const { return diffusion_; }
 
 private:
     ArdyDiffusion diffusion_;
     ArdyDenoiser& denoiser_;
+};
+
+// Autoregressive text-to-motion generator: chains ArdyWindowSampler windows into
+// an arbitrary-length hybrid motion sequence, recentering + requantizing the
+// history between windows and tracking the global translation, exactly as
+// ardy_model.py Ardy.__call__ does for the text-only (no history, no constraint,
+// no crop) path. Produces the full hybrid sequence in the original world frame
+// (before FSQ detokenization to explicit motion).
+class ArdyMotionGenerator {
+public:
+    ArdyMotionGenerator(ArdyDenoiser& denoiser, FsqMotionDecoder& fsq,
+                        int gen_horizon_len = 52, int num_base_steps = 10);
+
+    // Number of hybrid tokens produced for a requested frame count: one window is
+    // gen_horizon_len frames == gen_horizon_len/fpt tokens, and num_frames is
+    // rounded up to a whole number of windows.
+    int num_windows(int num_frames) const;
+    int num_tokens(int num_frames) const;
+
+    // Generate the full hybrid motion sequence for a text embedding.
+    //   text_feat:  (4096) host text embedding.
+    //   num_frames: requested length (rounded up to a whole window).
+    //   first_heading_angle: frame-0 heading (radians).
+    //   gen_noise:  (num_windows * (gen_horizon_len/fpt) * 148) per-window noise,
+    //               window-major — one fresh generation-block noise per window.
+    //   out_hybrid: (num_tokens * 148) hybrid tokens in the world frame.
+    //   out_T_tok:  num_tokens(num_frames).
+    void generate_hybrid(const float* text_feat, int num_frames,
+                         float first_heading_angle, int num_denoising_steps,
+                         float cfg_weight, const float* gen_noise,
+                         std::vector<float>& out_hybrid, int& out_T_tok);
+
+private:
+    ArdyWindowSampler sampler_;
+    ArdyDenoiser& denoiser_;
+    FsqMotionDecoder& fsq_;
+    int gen_horizon_len_;
 };
 
 }  // namespace brodiffusion::ardy

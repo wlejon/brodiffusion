@@ -151,4 +151,153 @@ void ArdyWindowSampler::sample(const float* x_init, const float* text_feat,
     out = std::move(x);
 }
 
+void ArdyWindowSampler::sample_ar_window(const float* history,
+                                         int num_history_tokens,
+                                         const float* gen_noise, int num_gen_tokens,
+                                         const float* text_feat,
+                                         float first_heading_angle,
+                                         int num_denoising_steps, float cfg_weight,
+                                         std::vector<float>& out_gen) {
+    const int hyb = denoiser_.hybrid_dim();  // 148
+    const int H = num_history_tokens;
+    const int G = num_gen_tokens;
+    const int T_tok = H + G;
+    const int n = T_tok * hyb;         // full window element count
+    const int gn = G * hyb;            // generation-block element count
+    const ArdyDiffusion::Schedule sch = diffusion_.make_schedule(num_denoising_steps);
+
+    // x = [history | generation noise]; only the generation block is stepped.
+    std::vector<float> x(static_cast<size_t>(n));
+    if (H > 0) std::copy(history, history + static_cast<size_t>(H) * hyb, x.begin());
+    std::copy(gen_noise, gen_noise + gn, x.begin() + static_cast<size_t>(H) * hyb);
+
+    const std::vector<float> zero_text(kTextFeatDim, 0.0f);
+    std::vector<float> x0_gen(gn), x_next_gen(gn);
+    float* gen_ptr = x.data() + static_cast<size_t>(H) * hyb;
+
+    for (int i = num_denoising_steps - 1; i >= 0; --i) {
+        const int t = i;
+        const int t_map = sch.base_timestep[i];
+
+        bt::Tensor out_text_T, out_uncond_T;
+        denoiser_.forward(x.data(), text_feat, t_map, first_heading_angle, T_tok,
+                          out_text_T, H);
+        denoiser_.forward(x.data(), zero_text.data(), t_map, first_heading_angle,
+                          T_tok, out_uncond_T, H);
+        bt::sync_all();
+        const std::vector<float> ot = read_host(out_text_T);
+        const std::vector<float> ou = read_host(out_uncond_T);
+
+        // CFG combine + DDIM on the generation tokens only (history is held).
+        const int base = H * hyb;
+        for (int k = 0; k < gn; ++k)
+            x0_gen[k] = ou[base + k] + cfg_weight * (ot[base + k] - ou[base + k]);
+        ArdyDiffusion::ddim_step(sch, t, gen_ptr, x0_gen.data(), gn, x_next_gen.data());
+        std::copy(x_next_gen.begin(), x_next_gen.end(), gen_ptr);
+    }
+
+    out_gen.assign(gen_ptr, gen_ptr + gn);
+}
+
+ArdyMotionGenerator::ArdyMotionGenerator(ArdyDenoiser& denoiser,
+                                         FsqMotionDecoder& fsq,
+                                         int gen_horizon_len, int num_base_steps)
+    : sampler_(denoiser, num_base_steps),
+      denoiser_(denoiser),
+      fsq_(fsq),
+      gen_horizon_len_(gen_horizon_len) {}
+
+int ArdyMotionGenerator::num_windows(int num_frames) const {
+    if (num_frames <= 0) return 0;
+    return (num_frames + gen_horizon_len_ - 1) / gen_horizon_len_;  // ceil
+}
+
+int ArdyMotionGenerator::num_tokens(int num_frames) const {
+    const int fpt = denoiser_.config().num_frames_per_token;
+    return num_windows(num_frames) * (gen_horizon_len_ / fpt);
+}
+
+void ArdyMotionGenerator::generate_hybrid(const float* text_feat, int num_frames,
+                                          float first_heading_angle,
+                                          int num_denoising_steps, float cfg_weight,
+                                          const float* gen_noise,
+                                          std::vector<float>& out_hybrid,
+                                          int& out_T_tok) {
+    const int fpt = denoiser_.config().num_frames_per_token;   // 4
+    const int NR  = denoiser_.config().nframe_root_dim;        // 20
+    const int LB  = denoiser_.config().latent_embedding_dim;   // 128
+    const int hyb = denoiser_.hybrid_dim();                    // 148
+    const int G   = gen_horizon_len_ / fpt;                    // 13 tokens / window
+    const int W   = num_windows(num_frames);
+
+    std::vector<float> history;  // grows by one window (G tokens) each step
+    history.reserve(static_cast<size_t>(W) * G * hyb);
+    float global_transl[3] = {0.0f, 0.0f, 0.0f};
+
+    // Scratch for the per-window recenter/requantize on the growing history.
+    std::vector<float> groot, latent;
+
+    for (int step = 0; step < W; ++step) {
+        const int H = step * G;  // all prior tokens are history (no crop)
+        const float* noise = gen_noise + static_cast<size_t>(step) * G * hyb;
+
+        std::vector<float> gen;
+        sampler_.sample_ar_window(H > 0 ? history.data() : nullptr, H, noise, G,
+                                  text_feat, first_heading_angle,
+                                  num_denoising_steps, cfg_weight, gen);
+        history.insert(history.end(), gen.begin(), gen.end());
+
+        // Recenter the whole history around the last generated frame, requantize
+        // the body latents, both in place (requantize=True in _recenter_history).
+        const int total_tok = H + G;
+        const int F = total_tok * fpt;
+        const int center_frame = step * gen_horizon_len_ + gen_horizon_len_ - 1;
+
+        // extract global root (F,5) == per-token [0:20], recenter, write back.
+        groot.resize(static_cast<size_t>(total_tok) * NR);
+        for (int tk = 0; tk < total_tok; ++tk)
+            std::copy(history.data() + static_cast<size_t>(tk) * hyb,
+                      history.data() + static_cast<size_t>(tk) * hyb + NR,
+                      groot.data() + static_cast<size_t>(tk) * NR);
+        float center_pos[3];
+        denoiser_.recenter_global_root(groot.data(), F, center_frame, center_pos);
+        for (int tk = 0; tk < total_tok; ++tk)
+            std::copy(groot.data() + static_cast<size_t>(tk) * NR,
+                      groot.data() + static_cast<size_t>(tk) * NR + NR,
+                      history.data() + static_cast<size_t>(tk) * hyb);
+
+        // extract body latent (total_tok,128) == per-token [20:148], requantize.
+        latent.resize(static_cast<size_t>(total_tok) * LB);
+        for (int tk = 0; tk < total_tok; ++tk)
+            std::copy(history.data() + static_cast<size_t>(tk) * hyb + NR,
+                      history.data() + static_cast<size_t>(tk) * hyb + hyb,
+                      latent.data() + static_cast<size_t>(tk) * LB);
+        fsq_.requantize(latent.data(), total_tok);
+        for (int tk = 0; tk < total_tok; ++tk)
+            std::copy(latent.data() + static_cast<size_t>(tk) * LB,
+                      latent.data() + static_cast<size_t>(tk) * LB + LB,
+                      history.data() + static_cast<size_t>(tk) * hyb + NR);
+
+        global_transl[0] += center_pos[0];
+        global_transl[2] += center_pos[2];
+    }
+
+    // Apply the accumulated global translation back onto the root (world frame).
+    const int total_tok = W * G;
+    const int F = total_tok * fpt;
+    groot.resize(static_cast<size_t>(total_tok) * NR);
+    for (int tk = 0; tk < total_tok; ++tk)
+        std::copy(history.data() + static_cast<size_t>(tk) * hyb,
+                  history.data() + static_cast<size_t>(tk) * hyb + NR,
+                  groot.data() + static_cast<size_t>(tk) * NR);
+    denoiser_.translate_global_root(groot.data(), F, global_transl);
+    for (int tk = 0; tk < total_tok; ++tk)
+        std::copy(groot.data() + static_cast<size_t>(tk) * NR,
+                  groot.data() + static_cast<size_t>(tk) * NR + NR,
+                  history.data() + static_cast<size_t>(tk) * hyb);
+
+    out_hybrid = std::move(history);
+    out_T_tok = total_tok;
+}
+
 }  // namespace brodiffusion::ardy
