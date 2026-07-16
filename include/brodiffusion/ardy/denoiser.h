@@ -78,16 +78,23 @@ public:
     void set_motion_stats(const float* mean, const float* std, int n,
                           float eps = 1e-5f);
 
-    // One x0-prediction forward over a generation window.
-    //   hybrid:    (T_tok, 148) noisy hybrid tokens (host, row-major).
+    // One x0-prediction forward over a window of history + generation tokens.
+    //   hybrid:    (T_tok, 148) noisy hybrid tokens (host, row-major). The first
+    //              num_history_tokens are clean conditioning history; the rest are
+    //              the generation tokens being denoised.
     //   text_feat: (1, 4096) host text embedding (zero it for the uncond pass).
     //   timestep:  diffusion step index.
     //   first_heading_angle: frame-0 heading (radians).
-    //   T_tok:     number of tokens (num_frames = T_tok * fpt).
+    //   T_tok:     total number of tokens (num_frames = T_tok * fpt).
+    //   num_history_tokens: leading history tokens (0 for a fresh generation
+    //              window). History tokens use the plain hybrid projections and a
+    //              negative token index (origin = history_len // fpt); they are
+    //              carried through unchanged (the denoiser is a no-op on them).
     //   out:       (T_tok, 148) predicted clean hybrid at compute dtype. Caller
     //              syncs before reading.
     void forward(const float* hybrid, const float* text_feat, int timestep,
-                 float first_heading_angle, int T_tok, brotensor::Tensor& out);
+                 float first_heading_angle, int T_tok, brotensor::Tensor& out,
+                 int num_history_tokens = 0);
 
 private:
     struct Linear { brotensor::Tensor W, b; };
@@ -99,8 +106,10 @@ private:
     Config cfg_;
     ArdyDenoiserBackbone root_model_;
     ArdyDenoiserBackbone body_model_;
-    Linear global_root_hybrid_constraints_proj_;  // 3440 -> 1024
-    Linear local_root_hybrid_constraints_proj_;   // 3436 -> 1024
+    Linear global_root_hybrid_proj_;              // 148  -> 1024 (history tokens)
+    Linear local_root_hybrid_proj_;               // 144  -> 1024 (history tokens)
+    Linear global_root_hybrid_constraints_proj_;  // 3440 -> 1024 (generation tokens)
+    Linear local_root_hybrid_constraints_proj_;   // 3436 -> 1024 (generation tokens)
     // Global/local root normalization stats (eps-folded denom), sliced from motion.
     std::vector<float> gr_mean_, gr_stdeps_;  // [motion_root_dim]
     std::vector<float> lr_mean_, lr_stdeps_;  // [local_root_dim]

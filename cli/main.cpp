@@ -1186,15 +1186,18 @@ int run_ardy_denoiser_fwd(int argc, char** argv) {
     const char* Ts = arg_after(argc, argv, "--T-tok");
     const char* ts = arg_after(argc, argv, "--timestep");
     const char* hs = arg_after(argc, argv, "--heading");
+    const char* hts = arg_after(argc, argv, "--history-tok");  // optional, default 0
     const char* op = arg_after(argc, argv, "--out");
     if (!w || !mp || !sp || !xp || !tp || !Ts || !ts || !hs || !op) {
         std::fprintf(stderr, "ardy-denoiser-fwd: need --weights --mean --std "
-                             "--hybrid --text --T-tok --timestep --heading --out\n");
+                             "--hybrid --text --T-tok --timestep --heading --out "
+                             "[--history-tok N]\n");
         return 2;
     }
     const int T_tok = std::atoi(Ts);
     const int timestep = std::atoi(ts);
     const float heading = static_cast<float>(std::atof(hs));
+    const int history_tok = hts ? std::atoi(hts) : 0;
 
     brotensor::init();
     brodiffusion::ardy::ArdyDenoiser dn;
@@ -1211,10 +1214,11 @@ int run_ardy_denoiser_fwd(int argc, char** argv) {
     auto text = load_raw_f32(tp, 4096);
 
     brotensor::Tensor out;
-    dn.forward(hyb.data(), text.data(), timestep, heading, T_tok, out);
+    dn.forward(hyb.data(), text.data(), timestep, heading, T_tok, out, history_tok);
     brotensor::sync_all();
     dump_latent_f32(op, out);
-    std::printf("ardy-denoiser-fwd: T_tok=%d out(%d,%d)\n", T_tok, out.rows, out.cols);
+    std::printf("ardy-denoiser-fwd: T_tok=%d hist=%d out(%d,%d)\n", T_tok,
+                history_tok, out.rows, out.cols);
     return 0;
 }
 
