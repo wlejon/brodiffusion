@@ -48,7 +48,7 @@ public:
         float fps                = 25.0f;
     };
 
-    explicit ArdyDenoiser(const Config& cfg = {});
+    explicit ArdyDenoiser(const Config& cfg = Config{});
     ~ArdyDenoiser();
 
     ArdyDenoiser(const ArdyDenoiser&) = delete;

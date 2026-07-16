@@ -51,7 +51,7 @@ public:
         bool input_first_heading_angle = true;
     };
 
-    explicit ArdyDenoiserBackbone(const Config& cfg = {});
+    explicit ArdyDenoiserBackbone(const Config& cfg = Config{});
     ~ArdyDenoiserBackbone();
 
     ArdyDenoiserBackbone(const ArdyDenoiserBackbone&) = delete;

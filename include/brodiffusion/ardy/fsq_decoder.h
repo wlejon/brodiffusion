@@ -45,7 +45,7 @@ public:
         bool causal              = true;
     };
 
-    explicit FsqMotionDecoder(const Config& cfg = {});
+    explicit FsqMotionDecoder(const Config& cfg = Config{});
     ~FsqMotionDecoder();
 
     FsqMotionDecoder(const FsqMotionDecoder&) = delete;
