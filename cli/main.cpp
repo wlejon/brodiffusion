@@ -16,6 +16,9 @@
 #include "brodiffusion/ardy/denoiser_backbone.h"
 #include "brodiffusion/ardy/denoiser.h"
 #include "brodiffusion/ardy/sampler.h"
+#include "brodiffusion/ardy/text_conditioner.h"
+#include "brolm/llm2vec.h"
+#include "brolm/llama3_tokenizer.h"
 #include "brodiffusion/detail/compute.h"
 
 #include "brotensor/ops.h"
@@ -1410,6 +1413,73 @@ int run_ardy_detok_motion(int argc, char** argv) {
     return 0;
 }
 
+// ARDY text conditioning: prompt -> the (4096) pooled LLM2Vec feature the
+// denoiser cross-attends to. Reproduces ardy's prepare_for_tokenization +
+// tokenize + skip-instruction mean pooling (see text_conditioner.h). With
+// --dump-ids / --dump-mask it also writes the built token sequence + pool mask,
+// so the tokenization can be diffed against ardy without the 8B forward.
+int run_ardy_text_feat(int argc, char** argv) {
+    const char* ew  = arg_after(argc, argv, "--encoder");       // model.safetensors
+    const char* cp  = arg_after(argc, argv, "--config");        // llama config.json
+    const char* tj  = arg_after(argc, argv, "--tokenizer-json"); // tokenizer.json
+    const char* txt = arg_after(argc, argv, "--text");          // prompt string
+    const char* op  = arg_after(argc, argv, "--out");           // (4096) f32
+    const char* di  = arg_after(argc, argv, "--dump-ids");      // optional (L) i32
+    const char* dm  = arg_after(argc, argv, "--dump-mask");     // optional (L) f32
+    if (!tj || !txt) {
+        std::fprintf(stderr, "ardy-text-feat: need --tokenizer-json --text "
+                             "[--encoder <st> --config <json> --out <f32>] "
+                             "[--dump-ids <i32>] [--dump-mask <f32>]\n");
+        return 2;
+    }
+
+    brolm::llama3::Tokenizer tok = brolm::llama3::Tokenizer::load(tj);
+
+    // Token-only path (no encoder): build ids + pool mask and dump them.
+    if (di || dm) {
+        std::vector<std::int32_t> ids;
+        std::vector<float> mask;
+        brodiffusion::ardy::build_ardy_text_tokens(tok, txt, ids, mask);
+        if (di) {
+            std::ofstream f(di, std::ios::binary | std::ios::trunc);
+            f.write(reinterpret_cast<const char*>(ids.data()),
+                    static_cast<std::streamsize>(ids.size() * sizeof(std::int32_t)));
+        }
+        if (dm) {
+            std::ofstream f(dm, std::ios::binary | std::ios::trunc);
+            f.write(reinterpret_cast<const char*>(mask.data()),
+                    static_cast<std::streamsize>(mask.size() * sizeof(float)));
+        }
+        std::printf("ardy-text-feat: L=%zu pooled=%d\n", ids.size(),
+                    static_cast<int>(std::count(mask.begin(), mask.end(), 1.0f)));
+        if (!op) return 0;   // tokens-only run
+    }
+
+    if (!ew || !cp || !op) {
+        std::fprintf(stderr, "ardy-text-feat: --encoder --config --out required "
+                             "for the pooled embedding\n");
+        return 2;
+    }
+
+    brotensor::init();
+    brolm::llm2vec::Config cfg = brolm::llm2vec::Config::load(cp);
+    brolm::llm2vec::Encoder enc(cfg);
+    { auto f = st::File::open(ew); enc.load_weights(f); }
+
+    std::vector<float> feat;
+    brodiffusion::ardy::ardy_text_feat(tok, enc, txt, feat);
+
+    std::ofstream of(op, std::ios::binary | std::ios::trunc);
+    if (!of) { std::fprintf(stderr, "ardy-text-feat: cannot write %s\n", op); return 1; }
+    of.write(reinterpret_cast<const char*>(feat.data()),
+             static_cast<std::streamsize>(feat.size() * sizeof(float)));
+    double mean = 0.0;
+    for (float v : feat) mean += v;
+    mean /= (feat.empty() ? 1.0 : static_cast<double>(feat.size()));
+    std::printf("ardy-text-feat: text_feat(%zu) mean %.6f\n", feat.size(), mean);
+    return 0;
+}
+
 int run_ardy_backbone_fwd(int argc, char** argv) {
     const char* w  = arg_after(argc, argv, "--weights");
     const char* st_ = arg_after(argc, argv, "--stage");     // root | body
@@ -1557,6 +1627,12 @@ int main(int argc, char** argv) {
         try { return run_ardy_detok_motion(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "ardy-detok-motion: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "ardy-text-feat") == 0) {
+        try { return run_ardy_text_feat(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "ardy-text-feat: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-v") == 0) {
