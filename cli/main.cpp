@@ -20,6 +20,7 @@
 #include "brodiffusion/terrain/mp_unet.h"
 #include "brodiffusion/terrain/portable_rng.h"
 #include "brodiffusion/terrain/sampler.h"
+#include "brodiffusion/terrain/synthetic_map.h"
 #include "brolm/llm2vec.h"
 #include "brolm/llama3_tokenizer.h"
 #include "brodiffusion/detail/compute.h"
@@ -1681,6 +1682,66 @@ int run_terrain_rng(int argc, char** argv) {
     return 0;
 }
 
+// Sample a window of the five-channel synthetic climate map that conditions the
+// coarse stage. See brodiffusion/terrain/synthetic_map.h.
+int run_terrain_synth(int argc, char** argv) {
+    namespace td = brodiffusion::terrain;
+    const char* sp = arg_after(argc, argv, "--stats");
+    const char* op = arg_after(argc, argv, "--out");
+    const char* sd = arg_after(argc, argv, "--seed");
+    const char* a1 = arg_after(argc, argv, "--i1");
+    const char* b1 = arg_after(argc, argv, "--j1");
+    const char* a2 = arg_after(argc, argv, "--i2");
+    const char* b2 = arg_after(argc, argv, "--j2");
+    bool raw = false;
+    for (int i = 2; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--raw") == 0) raw = true;
+    }
+    if (!sp) throw std::runtime_error("terrain-synth: --stats is required");
+
+    const std::int64_t I1 = a1 ? std::strtoll(a1, nullptr, 10) : 0;
+    const std::int64_t J1 = b1 ? std::strtoll(b1, nullptr, 10) : 0;
+    const std::int64_t I2 = a2 ? std::strtoll(a2, nullptr, 10) : 64;
+    const std::int64_t J2 = b2 ? std::strtoll(b2, nullptr, 10) : 64;
+    if (I2 <= I1 || J2 <= J1) throw std::runtime_error("terrain-synth: empty window");
+
+    td::SyntheticMapConfig cfg;
+    cfg.seed = sd ? static_cast<std::uint32_t>(std::strtoul(sd, nullptr, 10)) : 0u;
+
+    td::SyntheticMap map(td::SyntheticMapStats::load(sp), cfg);
+
+    const std::size_t plane = static_cast<std::size_t>(I2 - I1) * static_cast<std::size_t>(J2 - J1);
+    std::vector<float> out(plane * td::kSyntheticChannels);
+    if (raw) map.sample_raw(I1, J1, I2, J2, out.data());
+    else     map.sample(I1, J1, I2, J2, out.data());
+
+    if (op) {
+        std::FILE* f = std::fopen(op, "wb");
+        if (!f) throw std::runtime_error("terrain-synth: cannot open --out");
+        std::fwrite(out.data(), sizeof(float), out.size(), f);
+        std::fclose(f);
+    }
+
+    static const char* kNames[td::kSyntheticChannels] = {
+        "elev", "temp", "temp_std", "precip", "precip_std"};
+    std::printf("terrain-synth: seed=%u (%lld,%lld)-(%lld,%lld)%s\n",
+                cfg.seed, static_cast<long long>(I1), static_cast<long long>(J1),
+                static_cast<long long>(I2), static_cast<long long>(J2),
+                raw ? " raw" : "");
+    for (int c = 0; c < td::kSyntheticChannels; ++c) {
+        const float* p = out.data() + static_cast<std::size_t>(c) * plane;
+        double mean = 0.0, lo = p[0], hi = p[0];
+        for (std::size_t i = 0; i < plane; ++i) {
+            mean += p[i];
+            if (p[i] < lo) lo = p[i];
+            if (p[i] > hi) hi = p[i];
+        }
+        std::printf("  %-11s mean %+12.4f  range [%+12.4f, %+12.4f]\n",
+                    kNames[c], mean / static_cast<double>(plane), lo, hi);
+    }
+    return 0;
+}
+
 // Full denoise for one terrain-diffusion stage: DPM-Solver++ for `coarse`,
 // TrigFlow consistency for `base` / `decoder`. Inputs are supplied as raw LE
 // f32 so scripts/terrain_sampler_parity.sh can drive the same noise through the
@@ -1850,6 +1911,12 @@ int main(int argc, char** argv) {
         try { return run_terrain_rng(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "terrain-rng: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "terrain-synth") == 0) {
+        try { return run_terrain_synth(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "terrain-synth: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "ardy-motionrep-fwd") == 0) {

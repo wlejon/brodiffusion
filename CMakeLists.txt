@@ -139,6 +139,11 @@ target_include_directories(brodiffusion PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 target_compile_features(brodiffusion PUBLIC cxx_std_20)
+# FastNoiseLite is vendored as a single header and used only by the terrain
+# synthetic map. PRIVATE: it stays out of our public headers (SyntheticMap hides
+# it behind a pimpl), so consumers do not inherit 100 KB of it.
+target_include_directories(brodiffusion PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fastnoiselite)
 target_link_libraries(brodiffusion PUBLIC
     bromath::bromath
     brotensor::brotensor
@@ -190,6 +195,7 @@ target_sources(brodiffusion PRIVATE
     src/ardy/text_conditioner.cpp
     src/terrain/mp_unet.cpp
     src/terrain/sampler.cpp
+    src/terrain/synthetic_map.cpp
     src/triposplat/vae_encoder.cpp
     src/triposplat/flow_model.cpp
     src/triposplat/flow_sobol_pe.cpp
