@@ -40,6 +40,7 @@ def main() -> int:
     # discrepancy accumulates per step or arrives from the coarse input.
     ap.add_argument("--latent-init", action="store_true")
     ap.add_argument("--residual", action="store_true")
+    ap.add_argument("--elev", action="store_true", help="elevation in metres")
     # CUDA by default, because that is the path that ships. The reference's own
     # CPU-vs-CUDA spread on this stage is 1.5e-4 relative, well under the gate's
     # bar, so running on GPU costs no discrimination — and CPU costs about three
@@ -81,6 +82,14 @@ def main() -> int:
         weights, seed=int(args.seed), caching_strategy="direct", dtype=args.dtype)
     pipe.to(args.device)
     pipe.bind()
+
+    if args.elev:
+        e = pipe.get(args.i1, args.j1, args.i2, args.j2, with_climate=False)["elev"]
+        arr = e.cpu().numpy()[None]
+        np.asarray(arr, dtype="<f4").tofile(out_path)
+        print(f"elev {arr.shape} sum {float(arr.sum()):.4f} "
+              f"range [{float(arr.min()):.3f}, {float(arr.max()):.3f}]")
+        return 0
 
     ch = 2 if args.residual else (6 if (args.latent or args.latent_init) else 7)
     tensor = pipe.residual if args.residual else (pipe.latents if args.latent else pipe.coarse)

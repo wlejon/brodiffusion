@@ -135,6 +135,19 @@ public:
     TileBuffer residual_normalized(std::int64_t i1, std::int64_t j1,
                                    std::int64_t i2, std::int64_t j2);
 
+    // ELEVATION IN METRES over [i1, i2) x [j1, j2), at native_resolution metres
+    // per cell. Shape (1, i2-i1, j2-j1). This is the pipeline's actual product.
+    //
+    // Reconstructed from two bands: the decoder's high-pass residual at this
+    // resolution and the latent map's channel 4 as the low-frequency band. The
+    // request is padded outward before reconstruction and cropped afterwards,
+    // because the blur and the resampling both reach beyond the requested edge —
+    // without the pad, the boundary cells would be reconstructed from truncated
+    // support and a region would not match the same region read as part of a
+    // larger one.
+    TileBuffer elevation(std::int64_t i1, std::int64_t j1,
+                         std::int64_t i2, std::int64_t j2);
+
     // The FIRST of the latent stage's two TrigFlow steps, weighted form.
     // Exposed for the parity gate: reading it alone halves the composition
     // depth, which is what distinguishes error accumulating per step from

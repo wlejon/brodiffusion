@@ -2,6 +2,7 @@
 
 #include "brodiffusion/detail/compute.h"
 #include "brodiffusion/detail/json.h"
+#include "brodiffusion/terrain/laplacian.h"
 #include "brodiffusion/terrain/portable_rng.h"
 #include "brotensor/safetensors.h"
 
@@ -639,6 +640,85 @@ TileBuffer WorldPipeline::residual_normalized(std::int64_t i1, std::int64_t j1,
     out.data.resize(plane);
     const float* w = raw.data.data() + plane;
     for (std::size_t k = 0; k < plane; ++k) out.data[k] = raw.data[k] / w[k];
+    return out;
+}
+
+TileBuffer WorldPipeline::elevation(std::int64_t i1, std::int64_t j1,
+                                    std::int64_t i2, std::int64_t j2) {
+    // Upstream's constants. The low band is stored standardised, so it comes
+    // back as metres through these; the residual through the config's pair.
+    constexpr double kLowfreqMean = -31.4;
+    constexpr double kLowfreqStd  = 38.6;
+    constexpr double kSigma       = 5.0;
+
+    const std::int64_t scale = cfg_.latent_compression;
+
+    // Pad by the blur's reach, then round OUTWARD to whole latent cells so the
+    // padded region maps to an exact latent slice. floor/ceil rather than
+    // truncating division: these coordinates go negative and truncation would
+    // pull the low end toward the origin, silently shifting the low band by a
+    // cell relative to the residual.
+    const int kernel_size = (static_cast<int>(kSigma * 2) / 2) * 2 + 1;
+    const std::int64_t pad_lr = kernel_size / 2 + 1;
+    const std::int64_t pad_hr = pad_lr * scale;
+
+    const std::int64_t pi1 = floor_div(i1 - pad_hr, scale) * scale;
+    const std::int64_t pj1 = floor_div(j1 - pad_hr, scale) * scale;
+    const std::int64_t pi2 = ceil_div(i2 + pad_hr, scale) * scale;
+    const std::int64_t pj2 = ceil_div(j2 + pad_hr, scale) * scale;
+
+    const int ph = static_cast<int>(pi2 - pi1);
+    const int pw = static_cast<int>(pj2 - pj1);
+    const int lh = static_cast<int>((pi2 - pi1) / scale);
+    const int lw = static_cast<int>((pj2 - pj1) / scale);
+
+    // High band: the decoder residual, weight-normalised and rescaled.
+    TileBuffer res = residual(pi1, pj1, pi2, pj2);
+    const std::size_t rplane = static_cast<std::size_t>(ph) * pw;
+    std::vector<double> residual_p(rplane);
+    {
+        const float* w = res.data.data() + rplane;
+        for (std::size_t k = 0; k < rplane; ++k) {
+            residual_p[k] = static_cast<double>(res.data[k] / w[k]) * cfg_.residual_std +
+                            cfg_.residual_mean;
+        }
+    }
+
+    // Low band: latent channel 4, the one the decoder was NOT given.
+    TileBuffer lat = latent(pi1 / scale, pj1 / scale, pi2 / scale, pj2 / scale);
+    const std::size_t lplane = static_cast<std::size_t>(lh) * lw;
+    std::vector<double> lowfreq_p(lplane);
+    {
+        const float* w = lat.data.data() +
+                         static_cast<std::size_t>(kLatentChannels - 1) * lplane;
+        const float* src = lat.data.data() + 4 * lplane;
+        for (std::size_t k = 0; k < lplane; ++k) {
+            lowfreq_p[k] = static_cast<double>(src[k] / w[k]) * kLowfreqStd + kLowfreqMean;
+        }
+    }
+
+    std::vector<double> new_low, elev_p;
+    laplacian_denoise(residual_p.data(), ph, pw, lowfreq_p.data(), lh, lw,
+                      kSigma, new_low);
+    laplacian_decode(residual_p.data(), ph, pw, new_low.data(), lh, lw,
+                     /*extrapolate=*/false, elev_p);
+
+    // Crop back to the request and undo the signed square root the whole
+    // pipeline works in. That transform is why the models can represent both
+    // ocean trenches and mountains without the deep end dominating the loss.
+    const int oi = static_cast<int>(i1 - pi1), oj = static_cast<int>(j1 - pj1);
+    const int h  = static_cast<int>(i2 - i1),  w  = static_cast<int>(j2 - j1);
+
+    TileBuffer out;
+    out.shape = {1, h, w};
+    out.data.resize(static_cast<std::size_t>(h) * w);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const double v = elev_p[static_cast<std::size_t>(y + oi) * pw + (x + oj)];
+            out.data[static_cast<std::size_t>(y) * w + x] =
+                static_cast<float>(std::copysign(v * v, v));
+        }
+    }
     return out;
 }
 

@@ -22,6 +22,7 @@
 #include "brodiffusion/terrain/sampler.h"
 #include "brodiffusion/terrain/infinite_tensor.h"
 #include "brodiffusion/terrain/synthetic_map.h"
+#include "brodiffusion/terrain/laplacian.h"
 #include "brodiffusion/terrain/world_pipeline.h"
 #include "brolm/llm2vec.h"
 #include "brolm/llama3_tokenizer.h"
@@ -1854,6 +1855,74 @@ int run_terrain_synth(int argc, char** argv) {
     return 0;
 }
 
+// Exercise the Laplacian primitives on a deterministic input so
+// scripts/terrain_laplacian_parity.sh can drive the same data through
+// torchvision. These need a gate of their own: the composed elevation output is
+// nearly insensitive to them, because the sigma=5 blur that follows removes most
+// of what the resampling choice affects. A wrong resampler shows up here at 1e-1
+// and in the elevation at 1e-3, under its bar.
+int run_terrain_laplacian(int argc, char** argv) {
+    namespace td = brodiffusion::terrain;
+    const char* op = arg_after(argc, argv, "--out");
+    const char* wh = arg_after(argc, argv, "--op");
+    if (!op || !wh) {
+        std::fprintf(stderr, "terrain-laplacian: need --op <resize|blur|extrap|denoise> --out F "
+                             "[--ih N --iw N --oh N --ow N]\n");
+        return 2;
+    }
+    auto opt = [&](const char* k, int d) { const char* v = arg_after(argc, argv, k);
+                                          return v ? std::atoi(v) : d; };
+    const int ih = opt("--ih", 64), iw = opt("--iw", 64);
+    const int oh = opt("--oh", 8),  ow = opt("--ow", 8);
+
+    // A deterministic, non-separable, non-symmetric input: anything symmetric
+    // would hide an axis swap, and anything separable would hide a mixed-up
+    // horizontal/vertical pass.
+    std::vector<double> src(static_cast<std::size_t>(ih) * iw);
+    for (int y = 0; y < ih; ++y) {
+        for (int x = 0; x < iw; ++x) {
+            src[static_cast<std::size_t>(y) * iw + x] =
+                std::sin(0.13 * x + 0.29 * y) + 0.4 * std::cos(0.07 * x * y + 1.0) +
+                0.001 * (x * x - y);
+        }
+    }
+
+    std::vector<double> out;
+    const std::string what = wh;
+    if (what == "resize") {
+        td::resize_bilinear(src.data(), ih, iw, oh, ow, out);
+    } else if (what == "blur") {
+        td::gaussian_blur(src.data(), ih, iw, 11, 5.0, out);
+    } else if (what == "extrap") {
+        td::resize_extrapolated(src.data(), ih, iw, oh, ow, out);
+    } else if (what == "denoise") {
+        // residual at (ih, iw), low band at (oh, ow)
+        std::vector<double> low(static_cast<std::size_t>(oh) * ow);
+        for (int y = 0; y < oh; ++y) {
+            for (int x = 0; x < ow; ++x) {
+                low[static_cast<std::size_t>(y) * ow + x] =
+                    std::cos(0.31 * x - 0.17 * y) + 0.2 * x;
+            }
+        }
+        std::vector<double> nl;
+        td::laplacian_denoise(src.data(), ih, iw, low.data(), oh, ow, 5.0, nl);
+        std::vector<double> dec;
+        td::laplacian_decode(src.data(), ih, iw, nl.data(), oh, ow, false, dec);
+        out = dec;
+    } else {
+        std::fprintf(stderr, "terrain-laplacian: unknown --op %s\n", wh);
+        return 2;
+    }
+
+    std::vector<float> f(out.begin(), out.end());
+    std::ofstream o(op, std::ios::binary);
+    if (!o) { std::fprintf(stderr, "terrain-laplacian: cannot write output\n"); return 1; }
+    o.write(reinterpret_cast<const char*>(f.data()),
+            static_cast<std::streamsize>(f.size() * sizeof(float)));
+    std::printf("terrain-laplacian: %s -> %zu values\n", wh, f.size());
+    return 0;
+}
+
 // The coarse world map over a requested cell range, as raw LE f32. Emits the
 // weight-normalized 6-channel form by default (what you would look at); --raw
 // emits the 7-channel weighted form the next stage consumes. Drives
@@ -1885,11 +1954,23 @@ int run_terrain_coarse(int argc, char** argv) {
 
     brotensor::init();
     td::WorldPipeline pipe(w, std::strtoull(sd, nullptr, 10));
-    bool latent = false, latent_init = false, residual = false;
+    bool latent = false, latent_init = false, residual = false, elev = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--latent") == 0) latent = true;
         if (std::strcmp(argv[i], "--latent-init") == 0) latent_init = true;
         if (std::strcmp(argv[i], "--residual") == 0) residual = true;
+        if (std::strcmp(argv[i], "--elev") == 0) elev = true;
+    }
+    if (elev) {
+        td::TileBuffer e = pipe.elevation(i1, j1, i2, j2);
+        std::ofstream ef(op, std::ios::binary);
+        if (!ef) { std::fprintf(stderr, "terrain-coarse: cannot write file\n"); return 1; }
+        ef.write(reinterpret_cast<const char*>(e.data.data()),
+                 static_cast<std::streamsize>(e.data.size() * sizeof(float)));
+        std::printf("terrain-coarse: elev (%lld, %lld) -> %s\n",
+                    static_cast<long long>(e.shape[1]),
+                    static_cast<long long>(e.shape[2]), op);
+        return 0;
     }
     if (latent_init) {
         td::TileBuffer li = pipe.latent_init(i1, j1, i2, j2);
@@ -2097,6 +2178,12 @@ int main(int argc, char** argv) {
         try { return run_terrain_unet_fwd(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "terrain-unet-fwd: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "terrain-laplacian") == 0) {
+        try { return run_terrain_laplacian(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "terrain-laplacian: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "terrain-coarse") == 0) {

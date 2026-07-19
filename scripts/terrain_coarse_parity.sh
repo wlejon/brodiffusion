@@ -63,6 +63,13 @@ BAR_COARSE="2e-3"
 # upstream's own half-precision path is the degraded one and the port tracks its
 # fp32 path closely. brotensor must be accumulating in fp32.
 BAR_LATENT="2e-2"
+#
+# Elevation: 1.0e-3 to 3.1e-3 across ocean floor, coastline and low-relief land,
+# which is TIGHTER than the residual it is built from. That is not luck — the
+# low-frequency band carries most of the magnitude and comes from the latent
+# map, so the residual's larger relative error is diluted. Worst observed
+# absolute error is 18 m on a region with 3 km of relief.
+BAR_ELEV="1e-2"
 
 status=0
 # Fed by the heredoc at the bottom of the loop rather than a pipe: a pipe would
@@ -85,6 +92,7 @@ while read -r SEED I1 J1 I2 J2 MODE; do
     latent-init) FLAGS="--latent-init";       CH=5; BAR="$BAR_LATENT" ;;
     residual)     FLAGS="--residual";          CH=1; BAR="$BAR_LATENT" ;;
     residual-raw) FLAGS="--residual --raw";    CH=2; BAR="$BAR_LATENT" ;;
+    elev)         FLAGS="--elev";              CH=1; BAR="$BAR_ELEV" ;;
     *) echo "   UNKNOWN MODE $MODE"; status=1; continue ;;
   esac
 
@@ -125,6 +133,8 @@ if stage.startswith("latent"):
     names = [f"lat{i}" for i in range(5)] + ["weight"]
 elif stage.startswith("residual"):
     names = ["residual", "weight"]
+elif stage == "elev":
+    names = ["elev_m"]
 ref  = ref.reshape(ch, -1)
 mine = mine.reshape(ch, -1)
 
@@ -162,6 +172,10 @@ done <<'CASES'
 1234 0 0 512 512 residual
 1234 0 0 512 512 residual-raw
 77 -768 -768 -256 -256 residual
+1234 0 0 512 512 elev
+7 0 0 512 512 elev
+7 -2048 3072 -1536 3584 elev
+7 5120 -4096 5632 -3584 elev
 CASES
 
 [ "$status" -eq 0 ] && echo "ALL COARSE PARITY OK" || echo "COARSE PARITY FAILED"
