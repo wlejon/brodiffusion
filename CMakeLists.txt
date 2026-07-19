@@ -238,7 +238,15 @@ option(BRODIFFUSION_CLI "Build the brodiffusion CLI" ${PROJECT_IS_TOP_LEVEL})
 if(BRODIFFUSION_CLI)
     add_executable(brodiffusion_cli cli/main.cpp)
     target_link_libraries(brodiffusion_cli PRIVATE brodiffusion)
-    set_target_properties(brodiffusion_cli PROPERTIES OUTPUT_NAME brodiffusion)
+    # OUTPUT_NAME collides with the static lib's basename: on MSVC, an
+    # executable that exports any symbol also emits an import library, and
+    # `brodiffusion.exe` would emit `brodiffusion.lib` straight over the
+    # `brodiffusion.lib` it is linking against (LNK1149). Only bites on a full
+    # relink — an incremental build that skips the exe link hides it. Give the
+    # exe's import lib its own basename; the .exe name is unaffected.
+    set_target_properties(brodiffusion_cli PROPERTIES
+        OUTPUT_NAME brodiffusion
+        ARCHIVE_OUTPUT_NAME brodiffusion_cli)
 
     # DiT-only nondeterminism harness (no T5/VAE) — compute-sanitizer target.
     add_executable(dit_race tools/dit_race.cpp)
