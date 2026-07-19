@@ -18,6 +18,7 @@
 #include "brodiffusion/ardy/sampler.h"
 #include "brodiffusion/ardy/text_conditioner.h"
 #include "brodiffusion/terrain/mp_unet.h"
+#include "brodiffusion/terrain/sampler.h"
 #include "brolm/llm2vec.h"
 #include "brolm/llama3_tokenizer.h"
 #include "brodiffusion/detail/compute.h"
@@ -1603,6 +1604,97 @@ int run_terrain_unet_fwd(int argc, char** argv) {
     return 0;
 }
 
+// Full denoise for one terrain-diffusion stage: DPM-Solver++ for `coarse`,
+// TrigFlow consistency for `base` / `decoder`. Inputs are supplied as raw LE
+// f32 so scripts/terrain_sampler_parity.sh can drive the same noise through the
+// PyTorch reference and this port.
+int run_terrain_sample(int argc, char** argv) {
+    namespace td = brodiffusion::terrain;
+    const char* w   = arg_after(argc, argv, "--weights");   // converted -bro dir
+    const char* stg = arg_after(argc, argv, "--stage");     // coarse | base | decoder
+    const char* np_ = arg_after(argc, argv, "--noise");     // per-step noise field(s)
+    const char* cp  = arg_after(argc, argv, "--cond");      // coarse conditioning image
+    const char* cip = arg_after(argc, argv, "--condin");    // conditional_inputs, flat
+    const char* lp  = arg_after(argc, argv, "--latents");   // decoder latents
+    const char* ss  = arg_after(argc, argv, "--size");
+    const char* op  = arg_after(argc, argv, "--out");
+    if (!w || !stg || !np_ || !ss || !op) {
+        std::fprintf(stderr, "terrain-sample: need --weights --stage --noise --size "
+                             "--out [--cond] [--condin] [--latents]\n");
+        return 2;
+    }
+    const std::string stage = stg;
+    if (stage != "coarse" && stage != "base" && stage != "decoder") {
+        std::fprintf(stderr, "terrain-sample: --stage must be coarse|base|decoder\n");
+        return 2;
+    }
+    const int S = std::atoi(ss);
+    const std::string dir = w;
+
+    brotensor::init();
+    auto cfg = td::MPUNetConfig::from_config_json(dir + "/config.json", stg);
+    td::MPUNet net(cfg);
+    auto f = st::File::open(dir + "/" + stg + ".safetensors");
+    net.load_weights(f);
+
+    const std::size_t plane   = static_cast<std::size_t>(S) * S;
+    const std::size_t n_out   = static_cast<std::size_t>(cfg.out_channels) * plane;
+    const std::size_t n_extra =
+        static_cast<std::size_t>(cfg.in_channels - cfg.out_channels) * plane;
+
+    // conditional_inputs: one scalar per 'float' entry, `dim` values per 'tensor'.
+    std::vector<std::vector<float>> cond;
+    if (!cfg.conditional_inputs.empty()) {
+        if (!cip) throw std::runtime_error("terrain-sample: --condin is required for this stage");
+        std::size_t total = 0;
+        for (const auto& ci : cfg.conditional_inputs) {
+            total += (ci.kind == "tensor") ? static_cast<std::size_t>(ci.dim) : 1u;
+        }
+        auto ch = load_raw_f32(cip, total);
+        std::size_t off = 0;
+        for (const auto& ci : cfg.conditional_inputs) {
+            const std::size_t n = (ci.kind == "tensor") ? static_cast<std::size_t>(ci.dim) : 1u;
+            cond.emplace_back(ch.begin() + static_cast<std::ptrdiff_t>(off),
+                              ch.begin() + static_cast<std::ptrdiff_t>(off + n));
+            off += n;
+        }
+    }
+
+    std::vector<float> out;
+    int steps = 0;
+    if (stage == "coarse") {
+        steps = 20;
+        auto noise = load_raw_f32(np_, n_out);
+        std::vector<float> cimg;
+        if (n_extra) {
+            if (!cp) throw std::runtime_error("terrain-sample: --cond is required for the coarse stage");
+            cimg = load_raw_f32(cp, n_extra);
+        }
+        td::sample_coarse(net, noise.data(), n_extra ? cimg.data() : nullptr,
+                          cond, S, steps, out);
+    } else {
+        const auto t_list = td::trigflow_t_list(/*two_step=*/stage == "base");
+        steps = static_cast<int>(t_list.size());
+        auto noise = load_raw_f32(np_, n_out * t_list.size());
+        std::vector<float> lat;
+        if (n_extra) {
+            if (!lp) throw std::runtime_error("terrain-sample: --latents is required for this stage");
+            lat = load_raw_f32(lp, n_extra);
+        }
+        td::sample_trigflow(net, t_list, noise.data(), n_extra ? lat.data() : nullptr,
+                            cond, S, out);
+    }
+
+    std::ofstream of(op, std::ios::binary | std::ios::trunc);
+    if (!of) throw std::runtime_error(std::string("cannot open --out: ") + op);
+    of.write(reinterpret_cast<const char*>(out.data()),
+             static_cast<std::streamsize>(out.size() * sizeof(float)));
+
+    std::printf("terrain-sample: stage=%s size=%d steps=%d -> (1,%d,%d,%d)\n",
+                stg, S, steps, cfg.out_channels, S, S);
+    return 0;
+}
+
 int run_ardy_motionrep_fwd(int argc, char** argv) {
     const char* lr = arg_after(argc, argv, "--local-rots");
     const char* rp = arg_after(argc, argv, "--root-pos");
@@ -1669,6 +1761,12 @@ int main(int argc, char** argv) {
         try { return run_terrain_unet_fwd(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "terrain-unet-fwd: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "terrain-sample") == 0) {
+        try { return run_terrain_sample(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "terrain-sample: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "ardy-motionrep-fwd") == 0) {

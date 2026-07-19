@@ -189,6 +189,7 @@ target_sources(brodiffusion PRIVATE
     src/ardy/sampler.cpp
     src/ardy/text_conditioner.cpp
     src/terrain/mp_unet.cpp
+    src/terrain/sampler.cpp
     src/triposplat/vae_encoder.cpp
     src/triposplat/flow_model.cpp
     src/triposplat/flow_sobol_pe.cpp
