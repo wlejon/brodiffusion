@@ -14,7 +14,7 @@ compile_commands.json
 *.bin
 *.ppm
 *.png
-
+*.pyc
 # Downloaded model weights and tokenizer files (see scripts/download-weights.ps1).
 weights/
 
