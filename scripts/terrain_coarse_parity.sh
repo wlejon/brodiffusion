@@ -83,6 +83,8 @@ while read -r SEED I1 J1 I2 J2 MODE; do
     latent)      FLAGS="--latent";            CH=5; BAR="$BAR_LATENT" ;;
     latent-raw)  FLAGS="--latent --raw";      CH=6; BAR="$BAR_LATENT" ;;
     latent-init) FLAGS="--latent-init";       CH=5; BAR="$BAR_LATENT" ;;
+    residual)     FLAGS="--residual";          CH=1; BAR="$BAR_LATENT" ;;
+    residual-raw) FLAGS="--residual --raw";    CH=2; BAR="$BAR_LATENT" ;;
     *) echo "   UNKNOWN MODE $MODE"; status=1; continue ;;
   esac
 
@@ -118,8 +120,11 @@ if ref.shape != mine.shape:
 # Coarse channels; the latent stage's five are unnamed latents, so fall back to
 # an index when the count does not match.
 names = ["elev", "elev_minus", "temp", "temp_std", "precip", "precip_std", "weight"]
-if ch <= 6 and os.environ.get("STAGE", "").startswith("latent"):
+stage = os.environ.get("STAGE", "")
+if stage.startswith("latent"):
     names = [f"lat{i}" for i in range(5)] + ["weight"]
+elif stage.startswith("residual"):
+    names = ["residual", "weight"]
 ref  = ref.reshape(ch, -1)
 mine = mine.reshape(ch, -1)
 
@@ -154,6 +159,9 @@ done <<'CASES'
 1234 0 0 64 64 latent-raw
 77 -96 -96 -32 -32 latent
 5 -1000 500 -936 564 latent
+1234 0 0 512 512 residual
+1234 0 0 512 512 residual-raw
+77 -768 -768 -256 -256 residual
 CASES
 
 [ "$status" -eq 0 ] && echo "ALL COARSE PARITY OK" || echo "COARSE PARITY FAILED"

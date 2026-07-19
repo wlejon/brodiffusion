@@ -62,6 +62,14 @@ constexpr int kCoarsePatch      = 4;
 constexpr float kCondInputMean[7] = {14.99f, 11.65f, 15.87f, 619.26f, 833.12f, 69.40f, 0.66f};
 constexpr float kCondInputStd[7]  = {21.72f, 21.78f, 10.40f, 452.29f, 738.09f, 34.59f, 0.47f};
 
+// Decoder tiling. Much larger tiles than the other stages, and the only stage
+// whose tile size is a pipeline setting rather than a constant — upstream
+// exposes decoder_tile_size/stride as constructor kwargs. The shipped default is
+// 512/384, and no shipped config overrides it.
+constexpr int kDecoderTileSize   = 512;
+constexpr int kDecoderTileStride = 384;
+constexpr int kDecoderChannels   = 2;   // 1 model output + the weight channel
+
 // The conditioning vector's six segments, in order: the 4x4 elevation patch, the
 // 4x4 p5 patch, the four climate means, the 4x4 validity mask, the histogram,
 // and the noise level. 58 values, which is the base net's conditioner width.
@@ -272,6 +280,43 @@ WorldPipeline::WorldPipeline(const std::string& weights_dir, std::uint64_t seed)
         std::vector<InfiniteTensor*>{latent_init_.get(), coarse_.get()},
         std::vector<TensorWindow>{latent_out, coarse_arg},
         kLatentBatch, store_.get(), "step_latent_map_0");
+
+    // ── decoder stage ──────────────────────────────────────────────────────
+    decoder_net_ = std::make_unique<MPUNet>(
+        MPUNetConfig::from_config_json(config_path, "decoder"));
+    {
+        auto f = brotensor::safetensors::File::open(weights_dir + "/decoder.safetensors");
+        decoder_net_->load_weights(f);
+    }
+    decoder_weight_window_ = linear_weight_window(kDecoderTileSize);
+
+    const int lc = cfg_.latent_compression;
+    if (kDecoderTileSize % lc != 0 || kDecoderTileStride % lc != 0) {
+        fail("latent_compression " + std::to_string(lc) +
+             " does not divide the decoder tile size/stride");
+    }
+
+    residual_ = std::make_unique<InfiniteTensor>(
+        std::vector<std::int64_t>{kDecoderChannels, -1, -1},
+        [this](const std::vector<std::vector<std::int64_t>>& windows,
+               const std::vector<std::vector<TileBuffer>>& args) {
+            std::vector<TileBuffer> out;
+            out.reserve(windows.size());
+            for (std::size_t b = 0; b < windows.size(); ++b) {
+                out.push_back(residual_tile_(windows[b][1], windows[b][2],
+                                             args.at(0)[b]));
+            }
+            return out;
+        },
+        TensorWindow({kDecoderChannels, kDecoderTileSize, kDecoderTileSize},
+                     {kDecoderChannels, kDecoderTileStride, kDecoderTileStride}),
+        std::vector<InfiniteTensor*>{latent_step0_.get()},
+        // The latent window is the output window divided by the compression, so
+        // one decoder tile reads exactly the latents that sit under it.
+        std::vector<TensorWindow>{
+            TensorWindow({kLatentChannels, kDecoderTileSize / lc, kDecoderTileSize / lc},
+                         {kLatentChannels, kDecoderTileStride / lc, kDecoderTileStride / lc})},
+        /*batch_size=*/1, store_.get(), "init_residual_map");
 }
 
 WorldPipeline::~WorldPipeline() = default;
@@ -505,6 +550,98 @@ TileBuffer WorldPipeline::latent(std::int64_t i1, std::int64_t j1,
     return (*latent_step0_)({Slice{0, kLatentChannels}, Slice{i1, i2}, Slice{j1, j2}});
 }
 
+TileBuffer WorldPipeline::residual_tile_(std::int64_t wi, std::int64_t wj,
+                                         const TileBuffer& latent_tile) {
+    constexpr int S = kDecoderTileSize;
+    const std::size_t plane = static_cast<std::size_t>(S) * S;
+    const int lc = cfg_.latent_compression;
+    const int LS = S / lc;                       // latent tile side
+    const std::size_t lplane = static_cast<std::size_t>(LS) * LS;
+
+    // The decoder conditions on FOUR of the latent map's five channels. The
+    // fifth is the low-frequency elevation band, which the Laplacian
+    // reconstruction consumes directly rather than the network — feeding it here
+    // would both mis-shape the input and hand the decoder information it was
+    // never trained to see.
+    constexpr int kLatentCondCh = 4;
+
+    // Weight-normalise, then upsample by nearest neighbour. Nearest, not
+    // bilinear: the latents are a learned code, and interpolating between codes
+    // is not meaningful — upstream is explicit about this.
+    std::vector<float> up(static_cast<std::size_t>(kLatentCondCh) * plane);
+    {
+        const float* w = latent_tile.data.data() +
+                         static_cast<std::size_t>(kLatentChannels - 1) * lplane;
+        for (int c = 0; c < kLatentCondCh; ++c) {
+            const float* src = latent_tile.data.data() + static_cast<std::size_t>(c) * lplane;
+            float* dst = up.data() + static_cast<std::size_t>(c) * plane;
+            for (int y = 0; y < S; ++y) {
+                const int ly = y / lc;
+                for (int x = 0; x < S; ++x) {
+                    const std::size_t li = static_cast<std::size_t>(ly) * LS + (x / lc);
+                    dst[static_cast<std::size_t>(y) * S + x] = src[li] / w[li];
+                }
+            }
+        }
+    }
+
+    // A single TrigFlow step from a zero sample, so x_t is pure noise on the arc.
+    const float t = trigflow_t_init();
+    const float cos_t = std::cos(t), sin_t = std::sin(t);
+
+    std::vector<float> noise(plane), scratch(plane);
+    gaussian_noise_patch(seed_ + 5819, wi * kDecoderTileStride, wj * kDecoderTileStride,
+                         S, S, 1, S, S, noise.data(), scratch.data());
+
+    const int C_in = decoder_net_->config().in_channels;   // 1 + 4
+    std::vector<float> x_in(static_cast<std::size_t>(C_in) * plane);
+    std::vector<float> x_t(plane);
+    for (std::size_t k = 0; k < plane; ++k) {
+        x_t[k]  = sin_t * (noise[k] * kSigmaData);
+        x_in[k] = x_t[k] / kSigmaData;
+    }
+    std::copy(up.begin(), up.end(), x_in.begin() + static_cast<std::ptrdiff_t>(plane));
+
+    brotensor::Tensor xt = brodiffusion::detail::upload_host(
+        x_in.data(), 1, static_cast<int>(x_in.size()));
+    brotensor::Tensor yt;
+    decoder_net_->forward(xt, /*N=*/1, S, &t, {}, yt);
+
+    std::vector<float> pred;
+    download_f32(yt, pred);
+
+    TileBuffer out;
+    out.shape = {kDecoderChannels, S, S};
+    out.data.resize(static_cast<std::size_t>(kDecoderChannels) * plane);
+    for (std::size_t k = 0; k < plane; ++k) {
+        // Same negated-model-output convention as the latent stage.
+        const float s = (cos_t * x_t[k] + sin_t * kSigmaData * pred[k]) / kSigmaData;
+        out.data[k] = s * decoder_weight_window_[k];
+    }
+    std::copy(decoder_weight_window_.begin(), decoder_weight_window_.end(),
+              out.data.begin() + static_cast<std::ptrdiff_t>(plane));
+    return out;
+}
+
+TileBuffer WorldPipeline::residual(std::int64_t i1, std::int64_t j1,
+                                   std::int64_t i2, std::int64_t j2) {
+    return (*residual_)({Slice{0, kDecoderChannels}, Slice{i1, i2}, Slice{j1, j2}});
+}
+
+TileBuffer WorldPipeline::residual_normalized(std::int64_t i1, std::int64_t j1,
+                                              std::int64_t i2, std::int64_t j2) {
+    TileBuffer raw = residual(i1, j1, i2, j2);
+    const std::size_t plane =
+        static_cast<std::size_t>(raw.shape[1]) * static_cast<std::size_t>(raw.shape[2]);
+
+    TileBuffer out;
+    out.shape = {1, raw.shape[1], raw.shape[2]};
+    out.data.resize(plane);
+    const float* w = raw.data.data() + plane;
+    for (std::size_t k = 0; k < plane; ++k) out.data[k] = raw.data[k] / w[k];
+    return out;
+}
+
 TileBuffer WorldPipeline::latent_init(std::int64_t i1, std::int64_t j1,
                                       std::int64_t i2, std::int64_t j2) {
     return (*latent_init_)({Slice{0, kLatentChannels}, Slice{i1, i2}, Slice{j1, j2}});
@@ -557,6 +694,7 @@ void WorldPipeline::clear_cache() {
     coarse_->clear_cache();
     latent_init_->clear_cache();
     latent_step0_->clear_cache();
+    residual_->clear_cache();
 }
 
 }  // namespace brodiffusion::terrain

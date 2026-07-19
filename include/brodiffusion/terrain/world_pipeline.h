@@ -89,7 +89,7 @@ class WorldPipeline {
 public:
     // `weights_dir` is a converted checkpoint directory (config.json,
     // coarse.safetensors, base.safetensors, synthetic_map_stats.json). The
-    // decoder net is loaded as it is wired.
+    // decoder.safetensors).
     WorldPipeline(const std::string& weights_dir, std::uint64_t seed);
     ~WorldPipeline();
 
@@ -122,6 +122,19 @@ public:
     TileBuffer latent_normalized(std::int64_t i1, std::int64_t j1,
                                  std::int64_t i2, std::int64_t j2);
 
+    // The elevation residual over [i1, i2) x [j1, j2), weighted form: channel 0
+    // is value*weight, channel 1 the weight sum. Shape (2, i2-i1, j2-j1).
+    // These are the FINEST cells the pipeline produces, one per
+    // native_resolution metres, but they are a Laplacian residual and not
+    // elevation. Turning them into metres needs the low-frequency band from the
+    // latent map; that reconstruction is not wired yet.
+    TileBuffer residual(std::int64_t i1, std::int64_t j1,
+                        std::int64_t i2, std::int64_t j2);
+
+    // The residual with the weight division applied: shape (1, h, w).
+    TileBuffer residual_normalized(std::int64_t i1, std::int64_t j1,
+                                   std::int64_t i2, std::int64_t j2);
+
     // The FIRST of the latent stage's two TrigFlow steps, weighted form.
     // Exposed for the parity gate: reading it alone halves the composition
     // depth, which is what distinguishes error accumulating per step from
@@ -148,6 +161,11 @@ private:
     //
     // `prev` is null for the initial step (the sample starts at zero) and
     // otherwise carries the previous step's weighted tiles, one per window.
+    // One decoder tile: upsample four latent channels 8x by nearest neighbour,
+    // take a single TrigFlow step from zero, and apply the weight taper.
+    TileBuffer residual_tile_(std::int64_t wi, std::int64_t wj,
+                              const TileBuffer& latent_tile);
+
     std::vector<TileBuffer> latent_step_(
         const std::vector<std::vector<std::int64_t>>& windows,
         const std::vector<TileBuffer>&                coarse_tiles,
@@ -159,14 +177,17 @@ private:
 
     std::unique_ptr<MPUNet>          coarse_net_;
     std::unique_ptr<MPUNet>          base_net_;
+    std::unique_ptr<MPUNet>          decoder_net_;
     std::unique_ptr<SyntheticMap>    synthetic_;
     std::unique_ptr<MemoryTileStore> store_;
     std::unique_ptr<InfiniteTensor>  coarse_;
     std::unique_ptr<InfiniteTensor>  latent_init_;
     std::unique_ptr<InfiniteTensor>  latent_step0_;
+    std::unique_ptr<InfiniteTensor>  residual_;
 
     std::vector<float> weight_window_;        // 64x64, coarse stage
-    std::vector<float> latent_weight_window_; // 64x64, latent stage
+    std::vector<float> latent_weight_window_;  // 64x64, latent stage
+    std::vector<float> decoder_weight_window_; // 512x512, decoder stage
     // log(tan(atan(snr))/8) per channel, one single-element vector each — the
     // shape MPUNet::forward expects for a batch-1 'float' conditioner.
     std::vector<std::vector<float>> cond_inputs_;

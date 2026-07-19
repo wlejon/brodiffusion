@@ -1885,10 +1885,11 @@ int run_terrain_coarse(int argc, char** argv) {
 
     brotensor::init();
     td::WorldPipeline pipe(w, std::strtoull(sd, nullptr, 10));
-    bool latent = false, latent_init = false;
+    bool latent = false, latent_init = false, residual = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--latent") == 0) latent = true;
         if (std::strcmp(argv[i], "--latent-init") == 0) latent_init = true;
+        if (std::strcmp(argv[i], "--residual") == 0) residual = true;
     }
     if (latent_init) {
         td::TileBuffer li = pipe.latent_init(i1, j1, i2, j2);
@@ -1907,6 +1908,19 @@ int run_terrain_coarse(int argc, char** argv) {
         std::printf("terrain-coarse: latent-init (5, %lld, %lld) -> %s\n",
                     static_cast<long long>(li.shape[1]),
                     static_cast<long long>(li.shape[2]), op);
+        return 0;
+    }
+    if (residual) {
+        td::TileBuffer r = raw ? pipe.residual(i1, j1, i2, j2)
+                               : pipe.residual_normalized(i1, j1, i2, j2);
+        std::ofstream rf(op, std::ios::binary);
+        if (!rf) { std::fprintf(stderr, "terrain-coarse: cannot write %s\n", op); return 1; }
+        rf.write(reinterpret_cast<const char*>(r.data.data()),
+                 static_cast<std::streamsize>(r.data.size() * sizeof(float)));
+        std::printf("terrain-coarse: residual (%lld, %lld, %lld) -> %s\n",
+                    static_cast<long long>(r.shape[0]),
+                    static_cast<long long>(r.shape[1]),
+                    static_cast<long long>(r.shape[2]), op);
         return 0;
     }
     td::TileBuffer out =
