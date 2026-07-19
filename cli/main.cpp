@@ -22,6 +22,7 @@
 #include "brodiffusion/terrain/sampler.h"
 #include "brodiffusion/terrain/infinite_tensor.h"
 #include "brodiffusion/terrain/synthetic_map.h"
+#include "brodiffusion/terrain/world_pipeline.h"
 #include "brolm/llm2vec.h"
 #include "brolm/llama3_tokenizer.h"
 #include "brodiffusion/detail/compute.h"
@@ -1853,6 +1854,51 @@ int run_terrain_synth(int argc, char** argv) {
     return 0;
 }
 
+// The coarse world map over a requested cell range, as raw LE f32. Emits the
+// weight-normalized 6-channel form by default (what you would look at); --raw
+// emits the 7-channel weighted form the next stage consumes. Drives
+// scripts/terrain_coarse_parity.sh against the PyTorch WorldPipeline.
+int run_terrain_coarse(int argc, char** argv) {
+    namespace td = brodiffusion::terrain;
+    const char* w  = arg_after(argc, argv, "--weights");
+    const char* sd = arg_after(argc, argv, "--seed");
+    const char* op = arg_after(argc, argv, "--out");
+    if (!w || !sd || !op) {
+        std::fprintf(stderr, "terrain-coarse: need --weights --seed --out "
+                             "[--i1 --j1 --i2 --j2] [--raw]\n");
+        return 2;
+    }
+    bool raw = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--raw") == 0) raw = true;
+    }
+    auto opt = [&](const char* k, std::int64_t dflt) -> std::int64_t {
+        const char* v = arg_after(argc, argv, k);
+        return v ? std::strtoll(v, nullptr, 10) : dflt;
+    };
+    const std::int64_t i1 = opt("--i1", 0), j1 = opt("--j1", 0);
+    const std::int64_t i2 = opt("--i2", 64), j2 = opt("--j2", 64);
+    if (i2 <= i1 || j2 <= j1) {
+        std::fprintf(stderr, "terrain-coarse: empty range\n");
+        return 2;
+    }
+
+    brotensor::init();
+    td::WorldPipeline pipe(w, std::strtoull(sd, nullptr, 10));
+    td::TileBuffer out = raw ? pipe.coarse(i1, j1, i2, j2)
+                             : pipe.coarse_normalized(i1, j1, i2, j2);
+
+    std::ofstream f(op, std::ios::binary);
+    if (!f) { std::fprintf(stderr, "terrain-coarse: cannot write %s\n", op); return 1; }
+    f.write(reinterpret_cast<const char*>(out.data.data()),
+            static_cast<std::streamsize>(out.data.size() * sizeof(float)));
+    std::printf("terrain-coarse: (%lld, %lld, %lld) -> %s\n",
+                static_cast<long long>(out.shape[0]),
+                static_cast<long long>(out.shape[1]),
+                static_cast<long long>(out.shape[2]), op);
+    return 0;
+}
+
 // Full denoise for one terrain-diffusion stage: DPM-Solver++ for `coarse`,
 // TrigFlow consistency for `base` / `decoder`. Inputs are supplied as raw LE
 // f32 so scripts/terrain_sampler_parity.sh can drive the same noise through the
@@ -2010,6 +2056,12 @@ int main(int argc, char** argv) {
         try { return run_terrain_unet_fwd(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "terrain-unet-fwd: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "terrain-coarse") == 0) {
+        try { return run_terrain_coarse(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "terrain-coarse: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "terrain-sample") == 0) {

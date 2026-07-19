@@ -86,13 +86,20 @@ public:
     SyntheticMap(SyntheticMap&&) noexcept;
     SyntheticMap& operator=(SyntheticMap&&) noexcept;
 
-    // Fills `out` with a (5, i2-i1, j2-j1) C-order block: the quantile-matched
+    // Fills `out` with a (5, x2-x1, y2-y1) C-order block: the quantile-matched
     // fields with finalize() applied, and elevation passed through the signed
     // square root the coarse model was trained against.
     //
-    // `out` must hold 5*(i2-i1)*(j2-j1) floats.
-    void sample(std::int64_t i1, std::int64_t j1,
-                std::int64_t i2, std::int64_t j2, float* out) const;
+    // NOTE THE AXIS ORDER. The leading pair is X (column), not row — this
+    // mirrors upstream's factory, which callers invoke as
+    // `factory(col0, row0, col1, row1)`. Handing it (row, col) transposes the
+    // result, and because every tile this is used on is square, that is
+    // shape-preserving and so passes silently: you get a coherent map of the
+    // wrong place. Pass columns first.
+    //
+    // `out` must hold 5*(x2-x1)*(y2-y1) floats.
+    void sample(std::int64_t x1, std::int64_t y1,
+                std::int64_t x2, std::int64_t y2, float* out) const;
 
     // The raw quantile-matched fields, before finalize(). Exposed because the
     // parity gate checks the two halves separately — a sign error in the lapse
