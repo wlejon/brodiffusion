@@ -43,12 +43,26 @@ PORTED="$REPO/weights/terrain-diffusion-30m-bro"
 [ -d "$PORTED" ]   || { echo "error: $PORTED missing (run convert-terrain-diffusion.py)" >&2; exit 2; }
 mkdir -p "$REPO/.parity"
 
-# The bar. The composition runs 20 solver steps over a network whose own CUDA
-# gate sits at ~1.5e-3 relative, and the reference's device-to-device spread is
-# 1.5e-4, so a few 1e-4 is the expected order here. Anything at 1e-2 or above is
-# a structural difference, not accumulated float error — the transpose this gate
-# caught on first run scored 0.7.
-BAR="2e-3"
+# Two bars, because the two stages have genuinely different error floors.
+#
+# Coarse: 20 solver steps over a network whose own CUDA gate sits at ~1.5e-3,
+# and the reference's device-to-device spread is 1.5e-4, so a few 1e-4 is the
+# expected order. The transpose this gate caught on first run scored 0.7.
+BAR_COARSE="2e-3"
+#
+# Latent: ~4e-3 on the elevation latent, and that is inherited rather than
+# introduced. Measured, not assumed — reading the first of the two TrigFlow
+# steps alone gives 3.810e-3 where both steps give 3.821e-3, so the second step
+# contributes nothing and the discrepancy arrives with the coarse conditioning,
+# amplified about 11x by the 254M base net. Consistency steps are contractive,
+# which is why it does not compound.
+#
+# Note this is NOT an fp16 effect, though it looks like one: the port computes in
+# fp16 on CUDA while the reference is fp32. Running the reference at fp16 for
+# comparison makes it 100x WORSE (0.55 relative on the elevation latent), so
+# upstream's own half-precision path is the degraded one and the port tracks its
+# fp32 path closely. brotensor must be accumulating in fp32.
+BAR_LATENT="2e-2"
 
 status=0
 # Fed by the heredoc at the bottom of the loop rather than a pipe: a pipe would
@@ -61,29 +75,36 @@ while read -r SEED I1 J1 I2 J2 MODE; do
   MINE="$REPO/.parity/coarse_mine_${SEED}_${I1}_${J1}_${MODE}.f32"
   rm -f "$REF" "$MINE"
 
-  RAWFLAG=""
-  [ "$MODE" = "raw" ] && RAWFLAG="--raw"
+  # MODE selects both which tensor to read and which form of it.
+  FLAGS=""; CH=6; BAR="$BAR_COARSE"
+  case "$MODE" in
+    full)        FLAGS="";                    CH=6 ;;
+    raw)         FLAGS="--raw";               CH=7 ;;
+    latent)      FLAGS="--latent";            CH=5; BAR="$BAR_LATENT" ;;
+    latent-raw)  FLAGS="--latent --raw";      CH=6; BAR="$BAR_LATENT" ;;
+    latent-init) FLAGS="--latent-init";       CH=5; BAR="$BAR_LATENT" ;;
+    *) echo "   UNKNOWN MODE $MODE"; status=1; continue ;;
+  esac
 
   echo "== $MODE  seed=$SEED  ($I1,$J1)-($I2,$J2) =="
 
   python "$REPO/scripts/terrain_coarse_ref.py" --weights "$UPSTREAM" --seed "$SEED" \
-      --out "$REF" --i1 "$I1" --j1 "$J1" --i2 "$I2" --j2 "$J2" $RAWFLAG >/dev/null \
+      --out "$REF" --i1 "$I1" --j1 "$J1" --i2 "$I2" --j2 "$J2" $FLAGS >/dev/null \
     || { echo "   REFERENCE FAILED"; status=1; continue; }
 
   "$BIN" terrain-coarse --weights "$PORTED" --seed "$SEED" \
-      --out "$MINE" --i1 "$I1" --j1 "$J1" --i2 "$I2" --j2 "$J2" $RAWFLAG >/dev/null \
+      --out "$MINE" --i1 "$I1" --j1 "$J1" --i2 "$I2" --j2 "$J2" $FLAGS >/dev/null \
     || { echo "   CLI FAILED"; status=1; continue; }
 
   # A stale binary prints usage and exits 0, sailing past the || above; check the
   # byte count rather than trusting the exit code.
-  CH=6; [ "$MODE" = "raw" ] && CH=7
   WANT=$(( (I2 - I1) * (J2 - J1) * CH * 4 ))
   GOT=$(wc -c < "$MINE" 2>/dev/null || echo 0)
   if [ "$GOT" -ne "$WANT" ]; then
     echo "   CLI WROTE $GOT BYTES, EXPECTED $WANT (stale binary?)"; status=1; continue
   fi
 
-  REF="$REF" MINE="$MINE" CH="$CH" BAR="$BAR" python - <<'PY' || status=1
+  REF="$REF" MINE="$MINE" CH="$CH" BAR="$BAR" STAGE="$MODE" python - <<'PY' || status=1
 import os, sys
 import numpy as np
 
@@ -94,7 +115,11 @@ mine = np.fromfile(os.environ["MINE"], dtype="<f4").astype(np.float64)
 if ref.shape != mine.shape:
     print(f"   SHAPE MISMATCH {ref.shape} vs {mine.shape}"); sys.exit(1)
 
+# Coarse channels; the latent stage's five are unnamed latents, so fall back to
+# an index when the count does not match.
 names = ["elev", "elev_minus", "temp", "temp_std", "precip", "precip_std", "weight"]
+if ch <= 6 and os.environ.get("STAGE", "").startswith("latent"):
+    names = [f"lat{i}" for i in range(5)] + ["weight"]
 ref  = ref.reshape(ch, -1)
 mine = mine.reshape(ch, -1)
 
@@ -124,6 +149,11 @@ done <<'CASES'
 1234 0 0 64 64 raw
 77 -96 -96 -32 -32 full
 5 -1000 500 -936 564 full
+1234 0 0 64 64 latent-init
+1234 0 0 64 64 latent
+1234 0 0 64 64 latent-raw
+77 -96 -96 -32 -32 latent
+5 -1000 500 -936 564 latent
 CASES
 
 [ "$status" -eq 0 ] && echo "ALL COARSE PARITY OK" || echo "COARSE PARITY FAILED"

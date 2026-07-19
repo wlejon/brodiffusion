@@ -1,5 +1,6 @@
 #include "brodiffusion/terrain/world_pipeline.h"
 
+#include "brodiffusion/detail/compute.h"
 #include "brodiffusion/detail/json.h"
 #include "brodiffusion/terrain/portable_rng.h"
 #include "brotensor/safetensors.h"
@@ -17,6 +18,23 @@ namespace {
     throw std::runtime_error("world_pipeline: " + msg);
 }
 
+// Pull a device tensor back to host FP32, upconverting the CUDA build's FP16.
+// Same helper as sampler.cpp's; both are file-local because it is four lines and
+// sharing it would mean a header for one function.
+void download_f32(const brotensor::Tensor& t, std::vector<float>& out) {
+    const std::size_t n = static_cast<std::size_t>(t.rows) * t.cols;
+    if (t.dtype == brotensor::Dtype::FP16) {
+        std::vector<std::uint16_t> bits(n);
+        t.copy_to_host_fp16(bits.data());
+        brotensor::sync_all();
+        out.resize(n);
+        for (std::size_t i = 0; i < n; ++i) out[i] = brotensor::fp16_bits_to_fp32(bits[i]);
+        return;
+    }
+    brotensor::sync_all();
+    out = t.to_host_vector();
+}
+
 // Upstream's coarse tiling. TILE_SIZE is the UNet's spatial extent for this
 // stage (not its config `image_size`, which is 16 and only names the modules);
 // TILE_STRIDE is 16 less, so consecutive tiles share a quarter of their width
@@ -25,6 +43,30 @@ constexpr int kCoarseTileSize   = 64;
 constexpr int kCoarseTileStride = kCoarseTileSize - 16;
 constexpr int kCoarseSteps      = 20;
 constexpr int kCoarseChannels   = 7;   // 6 model outputs + the weight channel
+
+// Latent tiling. Note the stride is half the tile, a heavier overlap than the
+// coarse stage's — every latent cell is covered by four windows.
+constexpr int kLatentTileSize   = 64;
+constexpr int kLatentTileStride = kLatentTileSize / 2;
+constexpr int kLatentChannels   = 6;   // 5 model outputs + the weight channel
+constexpr int kLatentBatch      = 16;
+
+// The coarse patch one latent window reads: 4x4 coarse cells at unit stride,
+// offset by -1 so the window is centred on the cell the tile sits over rather
+// than hanging off its corner.
+constexpr int kCoarsePatch      = 4;
+
+// Normalisation for the latent stage's 7-channel conditioning patch. Baked into
+// the checkpoint's training, not read from config.json — upstream carries them
+// as literals in _build_latent_stage and no shipped config overrides them.
+constexpr float kCondInputMean[7] = {14.99f, 11.65f, 15.87f, 619.26f, 833.12f, 69.40f, 0.66f};
+constexpr float kCondInputStd[7]  = {21.72f, 21.78f, 10.40f, 452.29f, 738.09f, 34.59f, 0.47f};
+
+// The conditioning vector's six segments, in order: the 4x4 elevation patch, the
+// 4x4 p5 patch, the four climate means, the 4x4 validity mask, the histogram,
+// and the noise level. 58 values, which is the base net's conditioner width.
+constexpr int kCondSegments[6] = {16, 16, 4, 16, 5, 1};
+constexpr int kCondDim         = 58;
 
 // Read a fixed-length array of doubles. Absent, null, or the wrong length is an
 // error rather than a default: every one of these changes the generated world.
@@ -38,6 +80,25 @@ void read_doubles(const detail::json::Value& obj, const std::string& key,
              " entries, expected " + std::to_string(n));
     }
     for (std::size_t i = 0; i < n; ++i) out[i] = a[i].as_number();
+}
+
+// mp_concat's per-segment scale. EDM2 concatenates magnitude-preserving pieces
+// but a later layer sees each piece in proportion to its channel count, so each
+// segment is rescaled to contribute equally:
+//   C = sqrt(sum_N / sum(w^2)),  scale_i = C / sqrt(N_i) * w_i
+// with equal weights w_i = 1/k. Computed here rather than hard-coded so the
+// relationship to the segment sizes stays visible.
+std::vector<float> mp_concat_scales(const int* sizes, int k) {
+    const double w = 1.0 / k;
+    double sum_n = 0.0;
+    for (int i = 0; i < k; ++i) sum_n += sizes[i];
+    const double C = std::sqrt(sum_n / (k * w * w));
+    std::vector<float> s(static_cast<std::size_t>(k));
+    for (int i = 0; i < k; ++i) {
+        s[static_cast<std::size_t>(i)] =
+            static_cast<float>(C / std::sqrt(static_cast<double>(sizes[i])) * w);
+    }
+    return s;
 }
 
 double read_double(const detail::json::Value& obj, const std::string& key) {
@@ -165,6 +226,52 @@ WorldPipeline::WorldPipeline(const std::string& weights_dir, std::uint64_t seed)
         // the noise field, both of which are pure functions of world position.
         std::vector<InfiniteTensor*>{}, std::vector<TensorWindow>{},
         /*batch_size=*/1, store_.get(), "base_coarse_map");
+
+    // ── latent stage ───────────────────────────────────────────────────────
+    base_net_ = std::make_unique<MPUNet>(
+        MPUNetConfig::from_config_json(config_path, "base"));
+    {
+        auto f = brotensor::safetensors::File::open(weights_dir + "/base.safetensors");
+        base_net_->load_weights(f);
+    }
+    latent_weight_window_ = linear_weight_window(kLatentTileSize);
+
+    const TensorWindow latent_out({kLatentChannels, kLatentTileSize, kLatentTileSize},
+                                  {kLatentChannels, kLatentTileStride, kLatentTileStride});
+    const TensorWindow coarse_arg({kCoarseChannels, kCoarsePatch, kCoarsePatch},
+                                  {kCoarseChannels, 1, 1},
+                                  {0, -1, -1});
+
+    const auto t_list = trigflow_t_list(/*two_step=*/true);
+
+    // Two TrigFlow steps, two tensors. The seed offsets are upstream's literals:
+    // each step draws its own noise field, and reusing one offset would make the
+    // second step re-add the first's noise instead of fresh noise.
+    latent_init_ = std::make_unique<InfiniteTensor>(
+        std::vector<std::int64_t>{kLatentChannels, -1, -1},
+        [this, t_list](const std::vector<std::vector<std::int64_t>>& windows,
+                       const std::vector<std::vector<TileBuffer>>& args) {
+            return latent_step_(windows, args.at(0), /*prev=*/nullptr,
+                                t_list[0], 5819);
+        },
+        latent_out,
+        std::vector<InfiniteTensor*>{coarse_.get()},
+        std::vector<TensorWindow>{coarse_arg},
+        kLatentBatch, store_.get(), "init_latent_map");
+
+    latent_step0_ = std::make_unique<InfiniteTensor>(
+        std::vector<std::int64_t>{kLatentChannels, -1, -1},
+        [this, t_list](const std::vector<std::vector<std::int64_t>>& windows,
+                       const std::vector<std::vector<TileBuffer>>& args) {
+            // args[0] is the previous step at the SAME window, args[1] the
+            // coarse patch — the order the tensor was constructed with.
+            return latent_step_(windows, args.at(1), &args.at(0),
+                                t_list[1], 5820);
+        },
+        latent_out,
+        std::vector<InfiniteTensor*>{latent_init_.get(), coarse_.get()},
+        std::vector<TensorWindow>{latent_out, coarse_arg},
+        kLatentBatch, store_.get(), "step_latent_map_0");
 }
 
 WorldPipeline::~WorldPipeline() = default;
@@ -255,6 +362,173 @@ TileBuffer WorldPipeline::coarse_tile_(std::int64_t wi, std::int64_t wj) {
     return out;
 }
 
+std::vector<TileBuffer> WorldPipeline::latent_step_(
+    const std::vector<std::vector<std::int64_t>>& windows,
+    const std::vector<TileBuffer>&                coarse_tiles,
+    const std::vector<TileBuffer>*                prev,
+    float t, std::uint64_t seed_offset) {
+
+    constexpr int S = kLatentTileSize;
+    const std::size_t plane = static_cast<std::size_t>(S) * S;
+    const int C = base_net_->config().out_channels;       // 5
+    const std::size_t n = static_cast<std::size_t>(C) * plane;
+    const std::size_t B = windows.size();
+
+    const float cos_t = std::cos(t);
+    const float sin_t = std::sin(t);
+
+    static const std::vector<float> kScales = mp_concat_scales(kCondSegments, 6);
+
+    std::vector<float> x_in(B * n);
+    std::vector<float> x_t(B * n);
+    std::vector<float> cond(B * kCondDim);
+    std::vector<float> noise(n), scratch(n);
+
+    constexpr std::size_t patch = kCoarsePatch * kCoarsePatch;   // 16
+
+    for (std::size_t b = 0; b < B; ++b) {
+        const std::int64_t wi = windows[b][1], wj = windows[b][2];
+
+        // Prior sample. The initial step starts from zero; a later step reads
+        // the previous tensor's weighted output, normalises it, and rescales by
+        // sigma_data to undo the division applied when it was stored.
+        std::vector<float> sample(n, 0.0f);
+        if (prev != nullptr) {
+            const TileBuffer& p = (*prev)[b];
+            const float* w = p.data.data() + static_cast<std::size_t>(C) * plane;
+            for (int c = 0; c < C; ++c) {
+                const float* src = p.data.data() + static_cast<std::size_t>(c) * plane;
+                float* dst = sample.data() + static_cast<std::size_t>(c) * plane;
+                for (std::size_t k = 0; k < plane; ++k) dst[k] = src[k] / w[k] * kSigmaData;
+            }
+        }
+
+        // Conditioning: the 4x4 coarse patch, weight-normalised, with an
+        // all-ones validity mask appended as a seventh channel. The mask exists
+        // because upstream can import real-world tiles that leave holes; a
+        // purely generated world has none, so it is constant here — but the
+        // network still expects the channel.
+        const TileBuffer& ct = coarse_tiles[b];
+        float cp[7 * patch];
+        {
+            const float* wsum = ct.data.data() + static_cast<std::size_t>(kCoarseChannels - 1) * patch;
+            for (int c = 0; c < kCoarseChannels - 1; ++c) {
+                const float* src = ct.data.data() + static_cast<std::size_t>(c) * patch;
+                for (std::size_t k = 0; k < patch; ++k) {
+                    cp[static_cast<std::size_t>(c) * patch + k] = src[k] / wsum[k];
+                }
+            }
+            for (std::size_t k = 0; k < patch; ++k) cp[6 * patch + k] = 1.0f;
+        }
+        for (int c = 0; c < 7; ++c) {
+            for (std::size_t k = 0; k < patch; ++k) {
+                cp[static_cast<std::size_t>(c) * patch + k] =
+                    (cp[static_cast<std::size_t>(c) * patch + k] - kCondInputMean[c]) / kCondInputStd[c];
+            }
+        }
+
+        // Assemble the 58-vector: elevation patch, p5 patch, the four climate
+        // channels averaged over the patch's centre 2x2, the mask, the
+        // histogram (zeros for a generated world), and the noise level.
+        float* cv = cond.data() + b * kCondDim;
+        std::size_t off = 0;
+        for (std::size_t k = 0; k < patch; ++k) cv[off++] = cp[k] * kScales[0];
+        for (std::size_t k = 0; k < patch; ++k) cv[off++] = cp[patch + k] * kScales[1];
+        for (int c = 2; c < 6; ++c) {
+            float acc = 0.0f;
+            for (int y = 1; y < 3; ++y) {
+                for (int x = 1; x < 3; ++x) {
+                    acc += cp[static_cast<std::size_t>(c) * patch +
+                              static_cast<std::size_t>(y) * kCoarsePatch + x];
+                }
+            }
+            cv[off++] = acc / 4.0f * kScales[2];
+        }
+        for (std::size_t k = 0; k < patch; ++k) cv[off++] = cp[6 * patch + k] * kScales[3];
+        for (int k = 0; k < 5; ++k) cv[off++] = 0.0f;   // histogram_raw
+        // noise_level is 0, standardised over a uniform [0,1] prior:
+        // (level - 0.5) * sqrt(12).
+        cv[off++] = static_cast<float>((0.0 - 0.5) * std::sqrt(12.0)) * kScales[5];
+
+        // x_t = cos(t)*sample + sin(t)*z, with z the tile-seeded noise scaled by
+        // sigma_data. The model sees x_t / sigma_data.
+        gaussian_noise_patch(seed_ + seed_offset, wi * kLatentTileStride,
+                             wj * kLatentTileStride, S, S, C, S, S,
+                             noise.data(), scratch.data());
+        for (std::size_t k = 0; k < n; ++k) {
+            const float z = noise[k] * kSigmaData;
+            const float v = cos_t * sample[k] + sin_t * z;
+            x_t[b * n + k]  = v;
+            x_in[b * n + k] = v / kSigmaData;
+        }
+    }
+
+    // One batched forward for the whole group. `f` is pure, so batching is a
+    // scheduling concern only — the infinite-tensor gate proved the graph is
+    // batch-invariant, and any residual batch dependence would come from cuDNN
+    // algorithm selection inside the network rather than from here.
+    brotensor::Tensor xt = brodiffusion::detail::upload_host(
+        x_in.data(), static_cast<int>(B), static_cast<int>(n));
+    std::vector<float> labels(B, t);
+    brotensor::Tensor yt;
+    base_net_->forward(xt, static_cast<int>(B), S, labels.data(), {cond}, yt);
+
+    std::vector<float> pred;
+    download_f32(yt, pred);
+
+    std::vector<TileBuffer> out(B);
+    for (std::size_t b = 0; b < B; ++b) {
+        TileBuffer& o = out[b];
+        o.shape = {kLatentChannels, S, S};
+        o.data.resize(static_cast<std::size_t>(kLatentChannels) * plane);
+        for (int c = 0; c < C; ++c) {
+            for (std::size_t k = 0; k < plane; ++k) {
+                const std::size_t i = b * n + static_cast<std::size_t>(c) * plane + k;
+                // The TrigFlow update negates the model output: upstream's
+                // `pred = -model(...)`, so this is
+                //   cos(t)*x_t - sin(t)*sigma_data*(-model)
+                // folded into a plus. Then divide by sigma_data for storage.
+                const float s = (cos_t * x_t[i] + sin_t * kSigmaData * pred[i]) / kSigmaData;
+                o.data[static_cast<std::size_t>(c) * plane + k] =
+                    s * latent_weight_window_[k];
+            }
+        }
+        std::copy(latent_weight_window_.begin(), latent_weight_window_.end(),
+                  o.data.begin() + static_cast<std::ptrdiff_t>(
+                      static_cast<std::size_t>(C) * plane));
+    }
+    return out;
+}
+
+TileBuffer WorldPipeline::latent(std::int64_t i1, std::int64_t j1,
+                                 std::int64_t i2, std::int64_t j2) {
+    return (*latent_step0_)({Slice{0, kLatentChannels}, Slice{i1, i2}, Slice{j1, j2}});
+}
+
+TileBuffer WorldPipeline::latent_init(std::int64_t i1, std::int64_t j1,
+                                      std::int64_t i2, std::int64_t j2) {
+    return (*latent_init_)({Slice{0, kLatentChannels}, Slice{i1, i2}, Slice{j1, j2}});
+}
+
+TileBuffer WorldPipeline::latent_normalized(std::int64_t i1, std::int64_t j1,
+                                            std::int64_t i2, std::int64_t j2) {
+    TileBuffer raw = latent(i1, j1, i2, j2);
+    const std::size_t plane =
+        static_cast<std::size_t>(raw.shape[1]) * static_cast<std::size_t>(raw.shape[2]);
+
+    TileBuffer out;
+    out.shape = {kLatentChannels - 1, raw.shape[1], raw.shape[2]};
+    out.data.resize(static_cast<std::size_t>(kLatentChannels - 1) * plane);
+
+    const float* w = raw.data.data() + static_cast<std::size_t>(kLatentChannels - 1) * plane;
+    for (int c = 0; c < kLatentChannels - 1; ++c) {
+        const float* src = raw.data.data() + static_cast<std::size_t>(c) * plane;
+        float* dst = out.data.data() + static_cast<std::size_t>(c) * plane;
+        for (std::size_t k = 0; k < plane; ++k) dst[k] = src[k] / w[k];
+    }
+    return out;
+}
+
 TileBuffer WorldPipeline::coarse(std::int64_t i1, std::int64_t j1,
                                  std::int64_t i2, std::int64_t j2) {
     return (*coarse_)({Slice{0, kCoarseChannels}, Slice{i1, i2}, Slice{j1, j2}});
@@ -279,6 +553,10 @@ TileBuffer WorldPipeline::coarse_normalized(std::int64_t i1, std::int64_t j1,
     return out;
 }
 
-void WorldPipeline::clear_cache() { coarse_->clear_cache(); }
+void WorldPipeline::clear_cache() {
+    coarse_->clear_cache();
+    latent_init_->clear_cache();
+    latent_step0_->clear_cache();
+}
 
 }  // namespace brodiffusion::terrain

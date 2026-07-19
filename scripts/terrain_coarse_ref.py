@@ -33,12 +33,22 @@ def main() -> int:
     ap.add_argument("--weights", required=True, help="UPSTREAM checkpoint dir (not the -bro one)")
     ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--raw", action="store_true", help="emit the 7-channel weighted form")
+    ap.add_argument("--raw", action="store_true", help="emit the weighted form")
+    ap.add_argument("--latent", action="store_true", help="read the latent stage instead")
+    # The latent stage is two TrigFlow steps across two tensors. Reading the
+    # first alone halves the composition depth, which is what says whether a
+    # discrepancy accumulates per step or arrives from the coarse input.
+    ap.add_argument("--latent-init", action="store_true")
     # CUDA by default, because that is the path that ships. The reference's own
     # CPU-vs-CUDA spread on this stage is 1.5e-4 relative, well under the gate's
     # bar, so running on GPU costs no discrimination — and CPU costs about three
     # orders of magnitude in wall clock here.
     ap.add_argument("--device", default="cuda")
+    # The port computes in FP16 on CUDA (brotensor::compute_dtype), so
+    # --dtype fp16 is what makes the reference comparable rather than
+    # merely close. FP32 is kept available to separate "the port is wrong"
+    # from "the port is running in half precision".
+    ap.add_argument("--dtype", default=None, choices=[None, "fp16", "bf16"])
     ap.add_argument("--i1", type=int, default=0)
     ap.add_argument("--j1", type=int, default=0)
     ap.add_argument("--i2", type=int, default=64)
@@ -67,17 +77,21 @@ def main() -> int:
     # regenerates from scratch — which is the point: a cached tile would hide a
     # nondeterminism bug rather than expose it.
     pipe = WorldPipeline.from_pretrained(
-        weights, seed=int(args.seed), caching_strategy="direct")
+        weights, seed=int(args.seed), caching_strategy="direct", dtype=args.dtype)
     pipe.to(args.device)
     pipe.bind()
 
-    r = pipe.coarse[0:7, args.i1:args.i2, args.j1:args.j2]
+    ch = 6 if (args.latent or args.latent_init) else 7
+    tensor = pipe.latents if args.latent else pipe.coarse
+    if args.latent_init:
+        tensor, ch = pipe.latents.args[0], 6
+    r = tensor[0:ch, args.i1:args.i2, args.j1:args.j2]
     arr = r.cpu().numpy()
     if not args.raw:
-        arr = arr[:6] / arr[6:7]
+        arr = arr[:ch - 1] / arr[ch - 1:ch]
 
     np.asarray(arr, dtype="<f4").tofile(out_path)
-    print(f"coarse{' raw' if args.raw else ''} {arr.shape} "
+    print(f"{'latent' if args.latent else 'coarse'}{' raw' if args.raw else ''} {arr.shape} "
           f"sum {float(arr.sum()):.4f} "
           f"elev [{float(arr[0].min()):.3f}, {float(arr[0].max()):.3f}]")
     return 0

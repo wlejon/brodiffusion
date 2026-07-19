@@ -1885,8 +1885,35 @@ int run_terrain_coarse(int argc, char** argv) {
 
     brotensor::init();
     td::WorldPipeline pipe(w, std::strtoull(sd, nullptr, 10));
-    td::TileBuffer out = raw ? pipe.coarse(i1, j1, i2, j2)
-                             : pipe.coarse_normalized(i1, j1, i2, j2);
+    bool latent = false, latent_init = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--latent") == 0) latent = true;
+        if (std::strcmp(argv[i], "--latent-init") == 0) latent_init = true;
+    }
+    if (latent_init) {
+        td::TileBuffer li = pipe.latent_init(i1, j1, i2, j2);
+        std::ofstream lf(op, std::ios::binary);
+        if (!lf) { std::fprintf(stderr, "terrain-coarse: cannot write %s\n", op); return 1; }
+        // Weight-normalize here rather than adding another public entry point;
+        // the raw form of the intermediate step has no consumer.
+        const std::size_t pl = static_cast<std::size_t>(li.shape[1]) * li.shape[2];
+        const float* wsum = li.data.data() + 5 * pl;
+        std::vector<float> nrm(5 * pl);
+        for (int c = 0; c < 5; ++c) {
+            for (std::size_t k = 0; k < pl; ++k) nrm[c * pl + k] = li.data[c * pl + k] / wsum[k];
+        }
+        lf.write(reinterpret_cast<const char*>(nrm.data()),
+                 static_cast<std::streamsize>(nrm.size() * sizeof(float)));
+        std::printf("terrain-coarse: latent-init (5, %lld, %lld) -> %s\n",
+                    static_cast<long long>(li.shape[1]),
+                    static_cast<long long>(li.shape[2]), op);
+        return 0;
+    }
+    td::TileBuffer out =
+        latent ? (raw ? pipe.latent(i1, j1, i2, j2)
+                      : pipe.latent_normalized(i1, j1, i2, j2))
+               : (raw ? pipe.coarse(i1, j1, i2, j2)
+                      : pipe.coarse_normalized(i1, j1, i2, j2));
 
     std::ofstream f(op, std::ios::binary);
     if (!f) { std::fprintf(stderr, "terrain-coarse: cannot write %s\n", op); return 1; }

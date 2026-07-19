@@ -88,8 +88,8 @@ std::vector<float> linear_weight_window(int size);
 class WorldPipeline {
 public:
     // `weights_dir` is a converted checkpoint directory (config.json,
-    // coarse.safetensors, synthetic_map_stats.json). Loads the coarse stage
-    // only for now; the latent and decoder nets are loaded as they are wired.
+    // coarse.safetensors, base.safetensors, synthetic_map_stats.json). The
+    // decoder net is loaded as it is wired.
     WorldPipeline(const std::string& weights_dir, std::uint64_t seed);
     ~WorldPipeline();
 
@@ -111,6 +111,24 @@ public:
     TileBuffer coarse_normalized(std::int64_t i1, std::int64_t j1,
                                  std::int64_t i2, std::int64_t j2);
 
+    // The latent map over [i1, i2) x [j1, j2), in the same weighted form:
+    // channels 0..4 are value*weight, channel 5 is the weight sum. Shape
+    // (6, i2-i1, j2-j1). Latent cells are `latent_compression` times finer than
+    // coarse cells; one latent cell covers native_resolution*8 metres.
+    TileBuffer latent(std::int64_t i1, std::int64_t j1,
+                      std::int64_t i2, std::int64_t j2);
+
+    // The latent map with the weight division applied: shape (5, h, w).
+    TileBuffer latent_normalized(std::int64_t i1, std::int64_t j1,
+                                 std::int64_t i2, std::int64_t j2);
+
+    // The FIRST of the latent stage's two TrigFlow steps, weighted form.
+    // Exposed for the parity gate: reading it alone halves the composition
+    // depth, which is what distinguishes error accumulating per step from
+    // error arriving already-formed out of the coarse stage.
+    TileBuffer latent_init(std::int64_t i1, std::int64_t j1,
+                           std::int64_t i2, std::int64_t j2);
+
     // Drop every cached tile. Purely an optimisation — the world is a pure
     // function of (seed, position), so a cleared cache changes nothing but time.
     void clear_cache();
@@ -120,15 +138,35 @@ private:
     // weight taper. `wi`/`wj` are window indices, not pixels.
     TileBuffer coarse_tile_(std::int64_t wi, std::int64_t wj);
 
+    // One TrigFlow step of the latent stage, over a whole batch of windows.
+    //
+    // This is a single step rather than a loop because the DAG splits the two
+    // steps across two InfiniteTensors: the first materializes from zero, the
+    // second reads the first's output as an argument. Splitting them is what
+    // lets a tile's first step be cached and reused by neighbours whose second
+    // step needs it, so it is a structural choice and not an artifact.
+    //
+    // `prev` is null for the initial step (the sample starts at zero) and
+    // otherwise carries the previous step's weighted tiles, one per window.
+    std::vector<TileBuffer> latent_step_(
+        const std::vector<std::vector<std::int64_t>>& windows,
+        const std::vector<TileBuffer>&                coarse_tiles,
+        const std::vector<TileBuffer>*                prev,
+        float t, std::uint64_t seed_offset);
+
     WorldPipelineConfig cfg_;
     std::uint64_t       seed_ = 0;
 
     std::unique_ptr<MPUNet>          coarse_net_;
+    std::unique_ptr<MPUNet>          base_net_;
     std::unique_ptr<SyntheticMap>    synthetic_;
     std::unique_ptr<MemoryTileStore> store_;
     std::unique_ptr<InfiniteTensor>  coarse_;
+    std::unique_ptr<InfiniteTensor>  latent_init_;
+    std::unique_ptr<InfiniteTensor>  latent_step0_;
 
-    std::vector<float> weight_window_;
+    std::vector<float> weight_window_;        // 64x64, coarse stage
+    std::vector<float> latent_weight_window_; // 64x64, latent stage
     // log(tan(atan(snr))/8) per channel, one single-element vector each — the
     // shape MPUNet::forward expects for a batch-1 'float' conditioner.
     std::vector<std::vector<float>> cond_inputs_;
