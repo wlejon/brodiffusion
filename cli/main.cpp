@@ -17,6 +17,7 @@
 #include "brodiffusion/ardy/denoiser.h"
 #include "brodiffusion/ardy/sampler.h"
 #include "brodiffusion/ardy/text_conditioner.h"
+#include "brodiffusion/terrain/mp_unet.h"
 #include "brolm/llm2vec.h"
 #include "brolm/llama3_tokenizer.h"
 #include "brodiffusion/detail/compute.h"
@@ -1545,6 +1546,63 @@ int run_ardy_backbone_fwd(int argc, char** argv) {
     return 0;
 }
 
+int run_terrain_unet_fwd(int argc, char** argv) {
+    const char* w   = arg_after(argc, argv, "--weights");   // converted -bro dir
+    const char* stg = arg_after(argc, argv, "--stage");     // coarse | base | decoder
+    const char* xp  = arg_after(argc, argv, "--x");         // (1, C_in, S, S) raw f32
+    const char* np_ = arg_after(argc, argv, "--noise");     // (1,) raw f32
+    const char* cp  = arg_after(argc, argv, "--cond");      // flattened conditioning
+    const char* ss  = arg_after(argc, argv, "--size");
+    const char* op  = arg_after(argc, argv, "--out");
+    if (!w || !stg || !xp || !np_ || !ss || !op) {
+        std::fprintf(stderr, "terrain-unet-fwd: need --weights --stage --x "
+                             "--noise --size --out [--cond]\n");
+        return 2;
+    }
+    const int S = std::atoi(ss);
+    const std::string dir = w;
+
+    brotensor::init();
+    auto cfg = brodiffusion::terrain::MPUNetConfig::from_config_json(
+        dir + "/config.json", stg);
+    brodiffusion::terrain::MPUNet net(cfg);
+    auto f = st::File::open(dir + "/" + stg + ".safetensors");
+    net.load_weights(f);
+
+    auto xh = load_raw_f32(xp, static_cast<size_t>(cfg.in_channels) * S * S);
+    auto nh = load_raw_f32(np_, 1);
+    brotensor::Tensor x = brodiffusion::detail::upload_host(
+        xh.data(), 1, cfg.in_channels * S * S);
+
+    // The flat --cond file is split per conditional input: one scalar for a
+    // 'float' input, `dim` values for a 'tensor' input.
+    std::vector<std::vector<float>> cond;
+    if (!cfg.conditional_inputs.empty()) {
+        if (!cp) throw std::runtime_error("terrain-unet-fwd: --cond is required for this stage");
+        size_t total = 0;
+        for (const auto& ci : cfg.conditional_inputs) {
+            total += (ci.kind == "tensor") ? static_cast<size_t>(ci.dim) : 1u;
+        }
+        auto ch = load_raw_f32(cp, total);
+        size_t off = 0;
+        for (const auto& ci : cfg.conditional_inputs) {
+            const size_t n = (ci.kind == "tensor") ? static_cast<size_t>(ci.dim) : 1u;
+            cond.emplace_back(ch.begin() + static_cast<std::ptrdiff_t>(off),
+                              ch.begin() + static_cast<std::ptrdiff_t>(off + n));
+            off += n;
+        }
+    }
+
+    brotensor::Tensor out;
+    net.forward(x, /*N=*/1, S, nh.data(), cond, out);
+    brotensor::sync_all();
+    dump_latent_f32(op, out);
+    std::printf("terrain-unet-fwd: stage=%s size=%d in=%d out=%d -> (1,%d,%d,%d)\n",
+                stg, S, cfg.in_channels, cfg.out_channels,
+                cfg.out_channels, S, S);
+    return 0;
+}
+
 int run_ardy_motionrep_fwd(int argc, char** argv) {
     const char* lr = arg_after(argc, argv, "--local-rots");
     const char* rp = arg_after(argc, argv, "--root-pos");
@@ -1605,6 +1663,12 @@ int main(int argc, char** argv) {
         try { return run_krea2_fwd(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "krea2-fwd: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "terrain-unet-fwd") == 0) {
+        try { return run_terrain_unet_fwd(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "terrain-unet-fwd: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "ardy-motionrep-fwd") == 0) {
