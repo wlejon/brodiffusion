@@ -18,6 +18,7 @@
 #include "brodiffusion/ardy/sampler.h"
 #include "brodiffusion/ardy/text_conditioner.h"
 #include "brodiffusion/terrain/mp_unet.h"
+#include "brodiffusion/terrain/portable_rng.h"
 #include "brodiffusion/terrain/sampler.h"
 #include "brolm/llm2vec.h"
 #include "brolm/llama3_tokenizer.h"
@@ -1604,6 +1605,82 @@ int run_terrain_unet_fwd(int argc, char** argv) {
     return 0;
 }
 
+// Sample a window of the infinite tile-seeded Gaussian noise field, and
+// optionally self-check the invariants the whole InfiniteDiffusion design rests
+// on. See brodiffusion/terrain/portable_rng.h.
+int run_terrain_rng(int argc, char** argv) {
+    namespace td = brodiffusion::terrain;
+    const char* op = arg_after(argc, argv, "--out");
+    const char* sd = arg_after(argc, argv, "--seed");
+    const char* y0 = arg_after(argc, argv, "--y0");
+    const char* x0 = arg_after(argc, argv, "--x0");
+    const char* hh = arg_after(argc, argv, "--h");
+    const char* ww = arg_after(argc, argv, "--w");
+    const char* cc = arg_after(argc, argv, "--channels");
+    const char* tl = arg_after(argc, argv, "--tile");
+    bool selfcheck = false;
+    for (int i = 2; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--selfcheck") == 0) selfcheck = true;
+    }
+
+    const std::uint64_t seed = sd ? std::strtoull(sd, nullptr, 10) : 12345ULL;
+    const std::int64_t  Y = y0 ? std::strtoll(y0, nullptr, 10) : 0;
+    const std::int64_t  X = x0 ? std::strtoll(x0, nullptr, 10) : 0;
+    const int H = hh ? std::atoi(hh) : 64;
+    const int W = ww ? std::atoi(ww) : 64;
+    const int C = cc ? std::atoi(cc) : 1;
+    const int T = tl ? std::atoi(tl) : 256;
+
+    std::vector<float> scratch(static_cast<size_t>(C) * T * T);
+    std::vector<float> out(static_cast<size_t>(C) * H * W);
+    td::gaussian_noise_patch(seed, Y, X, H, W, C, T, T, out.data(), scratch.data());
+
+    if (op) {
+        std::FILE* f = std::fopen(op, "wb");
+        if (!f) throw std::runtime_error("terrain-rng: cannot open --out");
+        std::fwrite(out.data(), sizeof(float), out.size(), f);
+        std::fclose(f);
+    }
+
+    if (selfcheck) {
+        // The load-bearing invariant: two windows that overlap must agree
+        // EXACTLY on their intersection, or blended tiles show seams. Offset a
+        // second window so it straddles a different set of tile boundaries.
+        const std::int64_t oy = Y + H / 3, ox = X + W / 4;
+        std::vector<float> other(static_cast<size_t>(C) * H * W);
+        td::gaussian_noise_patch(seed, oy, ox, H, W, C, T, T, other.data(), scratch.data());
+        size_t compared = 0, mismatched = 0;
+        for (int c = 0; c < C; ++c) {
+            for (std::int64_t y = oy; y < Y + H; ++y) {
+                for (std::int64_t x = ox; x < X + W; ++x) {
+                    const float a = out[(static_cast<size_t>(c) * H + (y - Y)) * W + (x - X)];
+                    const float b = other[(static_cast<size_t>(c) * H + (y - oy)) * W + (x - ox)];
+                    ++compared;
+                    // Bit-exact, not approximate — the field is a pure function
+                    // of world position, so anything but equality is a bug.
+                    if (a != b) ++mismatched;
+                }
+            }
+        }
+        std::printf("terrain-rng: seam overlap %zu px, %zu mismatched\n", compared, mismatched);
+        if (mismatched != 0) {
+            std::fprintf(stderr, "terrain-rng: SEAM CHECK FAILED\n");
+            return 1;
+        }
+        std::printf("terrain-rng: SEAM CHECK OK\n");
+    }
+
+    double mean = 0.0, m2 = 0.0;
+    for (float v : out) mean += v;
+    mean /= static_cast<double>(out.size());
+    for (float v : out) m2 += (v - mean) * (v - mean);
+    std::printf("terrain-rng: seed=%llu (%lld,%lld) %dx%dx%d tile=%d mean=%+.6f std=%.6f\n",
+                static_cast<unsigned long long>(seed),
+                static_cast<long long>(Y), static_cast<long long>(X),
+                C, H, W, T, mean, std::sqrt(m2 / static_cast<double>(out.size())));
+    return 0;
+}
+
 // Full denoise for one terrain-diffusion stage: DPM-Solver++ for `coarse`,
 // TrigFlow consistency for `base` / `decoder`. Inputs are supplied as raw LE
 // f32 so scripts/terrain_sampler_parity.sh can drive the same noise through the
@@ -1767,6 +1844,12 @@ int main(int argc, char** argv) {
         try { return run_terrain_sample(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "terrain-sample: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "terrain-rng") == 0) {
+        try { return run_terrain_rng(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "terrain-rng: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "ardy-motionrep-fwd") == 0) {
