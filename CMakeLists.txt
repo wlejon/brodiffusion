@@ -196,6 +196,7 @@ target_sources(brodiffusion PRIVATE
     src/terrain/mp_unet.cpp
     src/terrain/sampler.cpp
     src/terrain/synthetic_map.cpp
+    src/terrain/infinite_tensor.cpp
     src/triposplat/vae_encoder.cpp
     src/triposplat/flow_model.cpp
     src/triposplat/flow_sobol_pe.cpp

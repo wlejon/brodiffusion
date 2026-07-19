@@ -20,6 +20,7 @@
 #include "brodiffusion/terrain/mp_unet.h"
 #include "brodiffusion/terrain/portable_rng.h"
 #include "brodiffusion/terrain/sampler.h"
+#include "brodiffusion/terrain/infinite_tensor.h"
 #include "brodiffusion/terrain/synthetic_map.h"
 #include "brolm/llm2vec.h"
 #include "brolm/llama3_tokenizer.h"
@@ -1682,6 +1683,116 @@ int run_terrain_rng(int argc, char** argv) {
     return 0;
 }
 
+// Run the infinite-tensor evaluator over a fixed two-node DAG whose compute
+// functions return only small integers, so every value — including the sums
+// produced when overlapping windows accumulate — is exact in float32 and can be
+// compared bit-for-bit against scripts/terrain_itensor_ref.py. See
+// brodiffusion/terrain/infinite_tensor.h.
+//
+// The scenario mirrors terrain's real coarse->latent edge in miniature: A's
+// output windows overlap, B's overlap too, and B reads A through a window with a
+// negative offset and unit stride.
+int run_terrain_itensor(int argc, char** argv) {
+    namespace td = brodiffusion::terrain;
+    const char* op = arg_after(argc, argv, "--out");
+    const char* bs = arg_after(argc, argv, "--batch");
+    const char* cs = arg_after(argc, argv, "--case");
+    const std::int64_t batch = bs ? std::strtoll(bs, nullptr, 10) : 1;
+    const int          kase  = cs ? std::atoi(cs) : 0;
+
+    // Floored modulo. C++ `%` truncates toward zero, so it goes NEGATIVE for the
+    // negative window indices these cases deliberately exercise, while Python's
+    // `%` floors and stays non-negative. Using `%` here would make the C++ and
+    // the reference disagree on window content — a bug in the test rather than
+    // in the library, and a confusing one to chase.
+    auto floor_mod = [](std::int64_t a, std::int64_t m) -> std::int64_t {
+        const std::int64_t r = a % m;
+        return (r < 0) ? r + m : r;
+    };
+
+    auto f_a = [&](const std::vector<std::vector<std::int64_t>>& widx,
+                   const std::vector<std::vector<td::TileBuffer>>&) {
+        std::vector<td::TileBuffer> out;
+        for (const auto& w : widx) {
+            td::TileBuffer t;
+            t.shape = {2, 4, 4};
+            t.data.resize(2 * 4 * 4);
+            const std::int64_t v = floor_mod(w[1] * 7 + w[2] * 13, 32);
+            for (int c = 0; c < 2; ++c)
+                for (int y = 0; y < 4; ++y)
+                    for (int x = 0; x < 4; ++x)
+                        t.data[(static_cast<std::size_t>(c) * 4 + y) * 4 + x] =
+                            static_cast<float>(v + c * 64 + y * 2 + x);
+            out.push_back(std::move(t));
+        }
+        return out;
+    };
+
+    auto f_b = [&](const std::vector<std::vector<std::int64_t>>& widx,
+                   const std::vector<std::vector<td::TileBuffer>>& args) {
+        std::vector<td::TileBuffer> out;
+        for (std::size_t b = 0; b < widx.size(); ++b) {
+            double s = 0.0;
+            for (float v : args.at(0).at(b).data) s += v;
+            td::TileBuffer t;
+            t.shape = {2, 4, 4};
+            t.data.resize(2 * 4 * 4);
+            for (int c = 0; c < 2; ++c)
+                for (int y = 0; y < 4; ++y)
+                    for (int x = 0; x < 4; ++x)
+                        t.data[(static_cast<std::size_t>(c) * 4 + y) * 4 + x] =
+                            static_cast<float>(s + c * 8 + y + x * 3);
+            out.push_back(std::move(t));
+        }
+        return out;
+    };
+
+    struct Case { std::int64_t c0, c1, y0, y1, x0, x1; };
+    static const Case kCases[] = {
+        {0, 2,   0, 10,   0, 10},
+        {0, 2,  -7,  5, -13, -1},
+        {0, 2,   5,  9,   5,  9},
+        {0, 2, -40, -32,  24, 32},
+    };
+    if (kase < 0 || kase >= static_cast<int>(sizeof(kCases) / sizeof(kCases[0])))
+        throw std::runtime_error("terrain-itensor: --case out of range");
+    const Case& K = kCases[kase];
+
+    td::MemoryTileStore store;
+    td::InfiniteTensor A({2, -1, -1}, f_a, td::TensorWindow({2, 4, 4}, {2, 3, 3}),
+                         {}, {}, 1, &store, "A");
+    td::InfiniteTensor B({2, -1, -1}, f_b, td::TensorWindow({2, 4, 4}, {2, 2, 2}),
+                         {&A}, {td::TensorWindow({2, 3, 3}, {2, 1, 1}, {0, -1, -1})},
+                         batch, &store, "B");
+
+    const std::vector<td::Slice> req = {{K.c0, K.c1}, {K.y0, K.y1}, {K.x0, K.x1}};
+    td::TileBuffer r = B(req);
+    // Read the identical range again. Every window is already processed, so this
+    // must return exactly the same values — if accumulation happened at write
+    // time rather than in read_pixels, the second read would come back doubled.
+    td::TileBuffer r2 = B(req);
+    if (r.data != r2.data) {
+        std::fprintf(stderr, "terrain-itensor: REPEATED READ NOT IDEMPOTENT\n");
+        return 1;
+    }
+
+    if (op) {
+        std::FILE* f = std::fopen(op, "wb");
+        if (!f) throw std::runtime_error("terrain-itensor: cannot open --out");
+        std::fwrite(r.data.data(), sizeof(float), r.data.size(), f);
+        std::fclose(f);
+    }
+
+    double sum = 0.0, lo = r.data.empty() ? 0.0 : r.data[0], hi = lo;
+    for (float v : r.data) { sum += v; if (v < lo) lo = v; if (v > hi) hi = v; }
+    std::printf("terrain-itensor: case %d batch %lld shape [%lld,%lld,%lld] "
+                "sum %.1f min %.1f max %.1f\n",
+                kase, static_cast<long long>(batch),
+                static_cast<long long>(r.shape[0]), static_cast<long long>(r.shape[1]),
+                static_cast<long long>(r.shape[2]), sum, lo, hi);
+    return 0;
+}
+
 // Sample a window of the five-channel synthetic climate map that conditions the
 // coarse stage. See brodiffusion/terrain/synthetic_map.h.
 int run_terrain_synth(int argc, char** argv) {
@@ -1917,6 +2028,12 @@ int main(int argc, char** argv) {
         try { return run_terrain_synth(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "terrain-synth: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "terrain-itensor") == 0) {
+        try { return run_terrain_itensor(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "terrain-itensor: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "ardy-motionrep-fwd") == 0) {
