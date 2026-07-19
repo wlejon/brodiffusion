@@ -69,10 +69,11 @@ os.chdir(td)                                    # upstream resolves its stats ca
 
 from terrain_diffusion.inference.synthetic_map import make_synthetic_map_factory
 
-# WorldPipeline's real defaults — the ones the shipped quantile tables were
-# measured with. The factory's own signature defaults ([1]*5, 0.0) are different
-# and never what the pipeline runs with.
-f = make_synthetic_map_factory(frequency_mult=[1.5, 3, 3, 3, 3],
+# The shipped 30 m checkpoint's values, which must match both the quantile tables
+# in weights/ and SyntheticMapConfig's defaults. NOT WorldPipeline's constructor
+# signature defaults ([1.5, 3, 3, 3, 3]) — from_pretrained overrides those with
+# the config that ships beside the weights.
+f = make_synthetic_map_factory(frequency_mult=[1.0, 1.0, 1.0, 1.0, 1.0],
                                seed=int(e["SEED"]), drop_water_pct=0.5)
 i1, j1, i2, j2 = (int(e[k]) for k in ("I1", "J1", "I2", "J2"))
 a = np.asarray(f.sample_raw(i1, j1, i2, j2)) if e["MODE"] == "raw" \

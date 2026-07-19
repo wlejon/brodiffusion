@@ -67,10 +67,13 @@ struct SyntheticMapStats {
 // Per-channel FBm configuration. Upstream's `frequency_mult` scales a 0.05 base
 // frequency; octaves/lacunarity/gain are fixed per channel.
 struct SyntheticMapConfig {
-    // WorldPipeline's defaults, which are NOT make_synthetic_map_factory's own
-    // signature defaults ([1,1,1,1,1]) — the pipeline always overrides them, and
-    // the shipped quantile tables were measured with these.
-    double frequency_mult[kSyntheticChannels] = {1.5, 3.0, 3.0, 3.0, 3.0};
+    // The shipped 30 m checkpoint's value. WorldPipeline's constructor signature
+    // says {1.5, 3, 3, 3, 3}, but from_pretrained overrides it with the config
+    // that ships beside the weights — so those signature defaults are what runs
+    // only if you build the pipeline by hand. Set this from the checkpoint's
+    // config.json rather than trusting the default if you load a different one;
+    // the quantile tables are measured against whatever value is used here.
+    double frequency_mult[kSyntheticChannels] = {1.0, 1.0, 1.0, 1.0, 1.0};
     // Upstream masks to 31 bits and offsets per channel: seed + c + 1.
     std::uint32_t seed = 0;
 };

@@ -46,13 +46,32 @@ WC_FILES = [
     "wc2.1_10m_bio_15.tif",
 ]
 
-# WorldPipeline's defaults — NOT make_synthetic_map_factory's own signature
-# defaults, which are [1.0]*5 / 0.0 and are never what the pipeline actually runs
-# with. The tables depend on both (drop_water_pct reshapes the elevation
-# histogram by discarding half the ocean), so baking the wrong pair here would
-# produce a plausible-looking file that silently mismatches every generated world.
-PIPELINE_FREQUENCY_MULT = [1.5, 3, 3, 3, 3]
-PIPELINE_DROP_WATER_PCT = 0.5
+# These come from the CHECKPOINT's config.json, never from a default in the
+# source. WorldPipeline's constructor signature says [1.5, 3, 3, 3, 3] / 0.5, but
+# from_pretrained overrides it with the shipped config, and the 30 m checkpoint
+# ships [1.0]*5 / 0.5 — so the signature defaults are what the pipeline runs with
+# only if you construct it by hand. The tables depend on both (frequency sets the
+# noise quantiles, drop_water_pct reshapes the elevation histogram by discarding
+# half the ocean), and the 90 m checkpoint is free to differ, so read them rather
+# than baking in either set.
+FALLBACK_FREQUENCY_MULT = [1.0, 1.0, 1.0, 1.0, 1.0]
+FALLBACK_DROP_WATER_PCT = 0.5
+
+
+def pipeline_constants(config_path: Path):
+    """(frequency_mult, drop_water_pct) from a shipped WorldPipeline config.json."""
+    if not config_path.exists():
+        print(f"==> no {config_path}, falling back to {FALLBACK_FREQUENCY_MULT} / "
+              f"{FALLBACK_DROP_WATER_PCT}")
+        return FALLBACK_FREQUENCY_MULT, FALLBACK_DROP_WATER_PCT
+    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    # A shipped config may legitimately omit a key, in which case the pipeline
+    # really does fall back to its constructor default of None -> [1.5, 3, 3, 3, 3].
+    freq = cfg.get("frequency_mult") or [1.5, 3, 3, 3, 3]
+    drop = cfg.get("drop_water_pct")
+    if drop is None:
+        drop = 0.5
+    return list(freq), float(drop)
 
 
 def ensure_worldclim(global_dir: Path) -> None:
@@ -79,6 +98,9 @@ def main() -> int:
     ap.add_argument("--td-root", default="../terrain-diffusion")
     ap.add_argument("--out-dir", default=None,
                     help="default: weights/terrain-diffusion-30m-bro")
+    ap.add_argument("--config", default=None,
+                    help="shipped pipeline config.json to read frequency_mult / "
+                         "drop_water_pct from (default: weights/terrain-diffusion-30m)")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
@@ -87,6 +109,8 @@ def main() -> int:
     out_dir = Path(args.out_dir).resolve() if args.out_dir \
         else repo / "weights" / "terrain-diffusion-30m-bro"
     out_path = out_dir / "synthetic_map_stats.json"
+    config_path = Path(args.config).resolve() if args.config \
+        else repo / "weights" / "terrain-diffusion-30m" / "config.json"
 
     if out_path.exists() and not args.force:
         print(f"==> {out_path} exists (use --force to rebuild)")
@@ -104,15 +128,17 @@ def main() -> int:
         return 2
     ensure_worldclim(global_dir)
 
+    frequency_mult, drop_water_pct = pipeline_constants(config_path)
+
     # Upstream reads its rasters through paths relative to the CWD, and writes its
     # cache to data/global/, so run from the checkout root and copy the result out.
     sys.path.insert(0, str(td))
     os.chdir(td)
     from terrain_diffusion.inference import synthetic_map as sm
 
-    print(f"==> computing stats (frequency_mult={PIPELINE_FREQUENCY_MULT}, "
-          f"drop_water_pct={PIPELINE_DROP_WATER_PCT})")
-    stats = sm._compute_map_stats(PIPELINE_FREQUENCY_MULT, PIPELINE_DROP_WATER_PCT)
+    print(f"==> computing stats (frequency_mult={frequency_mult}, "
+          f"drop_water_pct={drop_water_pct}) from {config_path}")
+    stats = sm._compute_map_stats(frequency_mult, drop_water_pct)
     sm._save_stats_cache(stats)
 
     src = td / sm.STATS_CACHE_PATH
