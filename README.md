@@ -4,7 +4,9 @@
 [![CodeQL](https://github.com/wlejon/brodiffusion/actions/workflows/codeql.yml/badge.svg)](https://github.com/wlejon/brodiffusion/actions/workflows/codeql.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Diffusion-model (text-to-image) inference, written from scratch in C++20.
+Diffusion-model inference, written from scratch in C++20 — text-to-image
+through the CLI, plus image-to-3D, text-to-motion, and terrain generation as
+library modules.
 Part of the [bro](https://github.com/wlejon/bro) stack, and usable
 standalone as a CLI or library — built on [brotensor](https://github.com/wlejon/brotensor)
 for tensors and compute kernels (CPU / CUDA / Metal), [bromath](https://github.com/wlejon/bromath)
@@ -36,14 +38,50 @@ against a downloaded diffusers model directory — the loader reads
 | PixArt-Sigma | T5-XXL | DiT (ada-norm-single) | DPM-Solver++ (2M) | native 1024px |
 | Krea 2 (Raw / Turbo) | Qwen3-VL, 12 tapped decoder layers | single-stream flow-matching DiT | flow-match Euler | Turbo is the distilled, no-CFG, 8-step checkpoint; LoRA as runtime adapters (INT8-safe, live rescale), optional INT8 DiT |
 
-**TripoSplat** (single-image → 3D Gaussian splats, the generative core of
-[VAST-AI/TripoSplat](https://huggingface.co/VAST-AI/TripoSplat)) is a separate
-module: a Flux.2 VAE image encoder, a flow-matching DiT, and an
-`OctreeGaussianDecoder` producing up to 262144 splats. It's implemented as a
-library only — not yet wired into the CLI, drive it through the headers
-under `brodiffusion/triposplat/`. brodiffusion owns just this generative
-core; the image encoders (DINOv3 + BiRefNet) live in brovisionml and the
-renderer / `GaussianSplatCloud` container lives in bromesh.
+## Other modalities
+
+Three further ports live here as **libraries only** — none is wired into the
+CLI; drive them through their headers. Each is validated the same way as the
+image families, against a reference implementation (`scripts/*_parity.sh`).
+
+### TripoSplat — single image → 3D Gaussian splats
+
+The generative core of
+[VAST-AI/TripoSplat](https://huggingface.co/VAST-AI/TripoSplat): a Flux.2 VAE
+image encoder, a flow-matching DiT, and an `OctreeGaussianDecoder` producing up
+to 262144 splats. Headers under `brodiffusion/triposplat/`. brodiffusion owns
+just this generative core; the image encoders (DINOv3 + BiRefNet) live in
+brovisionml and the renderer / `GaussianSplatCloud` container lives in bromesh.
+
+### ARDY — text → humanoid motion
+
+[nvidia/ARDY-G1-RP](https://huggingface.co/nvidia/ARDY-G1-RP-25FPS-Horizon52),
+autoregressive text-to-motion for the Unitree G1. Headers under
+`brodiffusion/ardy/`: a G1 skeleton + forward kinematics + motion-rep codec
+(`motion_rep.h`), an FSQ motion-tokenizer decoder, a two-stage x0-prediction
+denoiser, LLM2Vec text conditioning (via brolm), and `ArdyMotionGenerator`,
+which rolls arbitrary-length sequences out window-by-window with CFG and
+detokenizes them to explicit 414-dim motion features.
+
+### terrain-diffusion — infinite procedural worlds
+
+[xandergos/terrain-diffusion](https://huggingface.co/xandergos/terrain-diffusion-30m)
+(arXiv 2512.08309), a learned replacement for Perlin noise: infinite,
+deterministic, randomly-accessible terrain with elevation *and* climate.
+Headers under `brodiffusion/terrain/`. Three EDM2 magnitude-preserving UNets
+(`mp_unet.h`) run as a lazily-materialized, tile-cached DAG (`infinite_tensor.h`)
+so any region is a pure function of `(seed, position)` — a region generates
+identically whether or not its neighbours ever existed:
+
+| Stage | Cell size | Output |
+|---|---|---|
+| coarse | 7.7 km | 6ch elevation + climate, conditioned on a synthetic Perlin climate map |
+| latent | `native_resolution * 8` m | 5ch latents, two TrigFlow steps |
+| decoder | `native_resolution` m (30 m default) | elevation Laplacian residual |
+
+`WorldPipeline::elevation(i1, j1, i2, j2)` is the product: elevation in metres
+at native resolution, reconstructed from the decoder's high-pass band and the
+latent map's low-frequency band.
 
 ## Build
 
@@ -126,7 +164,7 @@ pwsh scripts/download-weights.ps1 -Model clip-vit-l-14
 For rate-limited repos, export `HF_TOKEN=hf_...` before running the `.sh`.
 The `weights/` directory is gitignored.
 
-TripoSplat's generative-core weights have their own script (the image-encoder
+The library-only modules have their own scripts. TripoSplat (the image-encoder
 half is fetched by brovisionml):
 
 ```bash
@@ -135,6 +173,33 @@ scripts/download-triposplat.sh vae        # Flux.2 VAE only         (~336 MB)
 scripts/download-triposplat.sh dit        # flow-matching DiT       (~741 MB)
 scripts/download-triposplat.sh decoder    # OctreeGaussian decoder  (~576 MB)
 ```
+
+ARDY, into `weights/ardy-g152/` (FSQ tokenizer + denoiser + normalisation
+stats, ~774 MB). The text frontend additionally needs an LLM2Vec encoder,
+loaded through brolm:
+
+```bash
+scripts/download-ardy.sh [--out-dir DIR] [--force]
+```
+
+terrain-diffusion, into `weights/terrain-diffusion-30m/` (~1.14 GB fp32).
+30 m/cell is the one to use for playable worlds; `--90m` is more expansive:
+
+```bash
+scripts/download-terrain-diffusion.sh [--90m] [--out-dir DIR]
+scripts/convert-terrain-diffusion.py [--src DIR] [--dst DIR]
+```
+
+`--src` defaults to `weights/terrain-diffusion-30m` and `--dst` to
+`<src>-bro`, so with no arguments the two commands chain.
+
+The conversion is required, not a repack: EDM2's `MPConv` force-normalizes
+every weight at inference time, so the converter pre-folds that normalisation
+and gain into flat `{coarse,base,decoder}.safetensors` alongside a resolved
+`config.json`. It also needs `synthetic_map_stats.json` — the quantile tables
+that match the synthetic climate fields onto Earth's real marginals, built
+once offline by `scripts/build-terrain-synthetic-stats.py` (upstream derives
+them at runtime from a WorldClim raster download).
 
 ## CLI
 

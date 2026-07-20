@@ -8,14 +8,14 @@
 // evaluator) into an actual infinite world. It owns the DAG:
 //
 //   base_coarse_map      7 ch  64x64 tiles, stride 48   <- synthetic map + noise
-//     -> init_latent_map        (not yet ported)
-//     -> step_latent_map_0      (not yet ported)
-//     -> init_residual_map      (not yet ported)
+//     -> init_latent_map        6 ch  64x64 tiles       TrigFlow step 1
+//     -> step_latent_map_0      6 ch  64x64 tiles       TrigFlow step 2
+//     -> init_residual_map      2 ch  512x512 tiles     elevation Laplacian
 //
-// Only the coarse stage is wired here so far; the latent and decoder stages
-// follow. The coarse map alone is already meaningful output — it is the world's
-// elevation and climate at 7.7 km/cell, which is what every finer stage is
-// conditioned on.
+// All three stages are wired. `elevation()` is the product — metres at
+// native_resolution — but every intermediate is exposed too, because each is
+// meaningful on its own: the coarse map is the world's elevation and climate at
+// 7.7 km/cell, which is what every finer stage is conditioned on.
 //
 // ── The seventh channel ────────────────────────────────────────────────────
 //
@@ -88,8 +88,8 @@ std::vector<float> linear_weight_window(int size);
 class WorldPipeline {
 public:
     // `weights_dir` is a converted checkpoint directory (config.json,
-    // coarse.safetensors, base.safetensors, synthetic_map_stats.json). The
-    // decoder.safetensors).
+    // coarse.safetensors, base.safetensors, decoder.safetensors,
+    // synthetic_map_stats.json) — see scripts/convert-terrain-diffusion.py.
     WorldPipeline(const std::string& weights_dir, std::uint64_t seed);
     ~WorldPipeline();
 
@@ -127,7 +127,7 @@ public:
     // These are the FINEST cells the pipeline produces, one per
     // native_resolution metres, but they are a Laplacian residual and not
     // elevation. Turning them into metres needs the low-frequency band from the
-    // latent map; that reconstruction is not wired yet.
+    // latent map — that reconstruction is `elevation()` below.
     TileBuffer residual(std::int64_t i1, std::int64_t j1,
                         std::int64_t i2, std::int64_t j2);
 
@@ -174,16 +174,16 @@ private:
     //
     // `prev` is null for the initial step (the sample starts at zero) and
     // otherwise carries the previous step's weighted tiles, one per window.
-    // One decoder tile: upsample four latent channels 8x by nearest neighbour,
-    // take a single TrigFlow step from zero, and apply the weight taper.
-    TileBuffer residual_tile_(std::int64_t wi, std::int64_t wj,
-                              const TileBuffer& latent_tile);
-
     std::vector<TileBuffer> latent_step_(
         const std::vector<std::vector<std::int64_t>>& windows,
         const std::vector<TileBuffer>&                coarse_tiles,
         const std::vector<TileBuffer>*                prev,
         float t, std::uint64_t seed_offset);
+
+    // One decoder tile: upsample four latent channels 8x by nearest neighbour,
+    // take a single TrigFlow step from zero, and apply the weight taper.
+    TileBuffer residual_tile_(std::int64_t wi, std::int64_t wj,
+                              const TileBuffer& latent_tile);
 
     WorldPipelineConfig cfg_;
     std::uint64_t       seed_ = 0;
