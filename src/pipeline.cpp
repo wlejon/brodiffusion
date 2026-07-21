@@ -690,6 +690,75 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
     return p;
 }
 
+namespace {
+
+// Load ONLY the Qwen3-VL text backbone's language-model weights into `model`
+// from an override path (a .gguf, or a diffusers safetensors file/dir), or —
+// when the override is empty — from `<model_dir>/text_encoder`. The vision
+// tower is left to the caller (from_model_dir loads it inline; the in-place
+// reload keeps the resident one). Mirrors from_model_dir's Krea2 text branch.
+void load_qwen3vl_text_weights(brolm::qwen3vl::TextModel& model,
+                               const std::string& model_dir,
+                               const std::string& override_path) {
+    namespace fs = std::filesystem;
+    auto lm_prefix = [](const std::vector<const brotensor::safetensors::File*>& sh)
+            -> std::string {
+        for (const auto* f : sh) {
+            if (f->find("language_model.embed_tokens.weight")) return "language_model.";
+            if (f->find("model.language_model.embed_tokens.weight"))
+                return "model.language_model.";
+        }
+        return "language_model.";
+    };
+
+    if (override_path.empty()) {
+        auto te = detail::open_component_files(
+            (fs::path(model_dir) / "text_encoder").string());
+        std::vector<const brotensor::safetensors::File*> ptrs;
+        for (const auto& f : te) ptrs.push_back(&f);
+        model.load_weights(ptrs, "language_model.");
+        return;
+    }
+
+    const fs::path ovr(override_path);
+    const bool is_gguf =
+        ovr.has_extension() &&
+        (ovr.extension() == ".gguf" || ovr.extension() == ".GGUF");
+    if (is_gguf) {
+        brotensor::gguf::File gf = brotensor::gguf::File::open(ovr.string());
+        model.load_weights(gf);
+        return;
+    }
+
+    std::vector<brotensor::safetensors::File> files;
+    if (fs::is_directory(ovr)) {
+        files = detail::open_component_files(ovr.string());
+    } else {
+        files.push_back(brotensor::safetensors::File::open(ovr.string()));
+    }
+    std::vector<const brotensor::safetensors::File*> ptrs;
+    for (const auto& f : files) ptrs.push_back(&f);
+    model.load_weights(ptrs, lm_prefix(ptrs));
+}
+
+}  // namespace
+
+void Pipeline::reload_krea2_text_encoder(const std::string& model_dir,
+                                         const std::string& text_encoder_path,
+                                         bool quantize) {
+    if (cfg_.model_class != ModelClass::Krea2) {
+        fail("reload_krea2_text_encoder: not a Krea 2 pipeline");
+    }
+    // Reconstruct the backbone from the stored config so no weight slot carries
+    // over from the previous encoder (the INT8 vs dense/quant paths populate
+    // different slots). emplace() frees the old backbone's VRAM before the new
+    // one is built — the DiT/VAE/vision tower are untouched.
+    auto tcfg = cfg_.krea2.text.text;
+    tcfg.quantize_weights = quantize;
+    qwen3vl_model_.emplace(tcfg);
+    load_qwen3vl_text_weights(*qwen3vl_model_, model_dir, text_encoder_path);
+}
+
 void Pipeline::load_weights(const brotensor::safetensors::File& f) {
     load_weights(f,
                  "cond_stage_model.transformer.text_model.",

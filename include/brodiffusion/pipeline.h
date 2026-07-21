@@ -324,6 +324,21 @@ public:
         return from_model_dir(model_dir, ModelDirOptions{});
     }
 
+    // Krea 2 only: reload JUST the Qwen3-VL-4B text backbone in place, leaving
+    // the (25 GB) DiT, the VAE and the vision tower resident and untouched.
+    // The backbone is reconstructed from the pipeline's stored config (a clean
+    // slate — no stale quant/dense weight slots) and its language-model weights
+    // are reloaded from `text_encoder_path` (a .gguf, or a diffusers
+    // safetensors file/dir), or from `<model_dir>/text_encoder` when the path
+    // is empty. `quantize` matches ModelDirOptions::quantize (ignored on the
+    // gguf path, which keeps its own quant). Cross-attention conditioning is
+    // rebuilt on the next prime()/generate(), so no cache flush is needed.
+    // This is the cheap swap for comparing text encoders without re-reading
+    // the whole ~26 GB checkpoint. Throws if this is not a Krea 2 pipeline.
+    void reload_krea2_text_encoder(const std::string& model_dir,
+                                   const std::string& text_encoder_path,
+                                   bool quantize);
+
     // Move-only (owns move-only sub-modules; copies make no sense). The
     // move members and destructor are defined in pipeline.cpp where
     // StepGraphSession is complete.
