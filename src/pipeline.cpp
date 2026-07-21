@@ -12,6 +12,7 @@
 #include "brodiffusion/detail/device.h"
 #include "brodiffusion/lora.h"
 #include "brodiffusion/model_config.h"
+#include "brotensor/gguf.h"
 #include "brotensor/safetensors.h"
 #include "brodiffusion/scheduler.h"
 #include "brolm/t5.h"
@@ -478,25 +479,82 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
         t = stamp("Qwen-Image VAE weights", t);
 
         // The Qwen3-VL-4B text encoder ships unsharded (text_encoder/
-        // model.safetensors); load its language-model subtree.
-        check_cancel();
+        // model.safetensors); load its language-model subtree. The dir's own
+        // shards, as pointers.
         std::vector<const brotensor::safetensors::File*> te_ptrs;
         for (const auto& f : te_files) te_ptrs.push_back(&f);
-        p.qwen3vl_model_->load_weights(te_ptrs, "language_model.");
-        t = stamp("Qwen3-VL weights", t);
 
-        // The checkpoint's Qwen3-VL-4B text encoder ships its vision tower
-        // too (unused by plain text prompting) — load it from the same
-        // shard(s) so krea_encode_image_prompt() can work. Unlike a standalone
-        // Qwen3-VL checkpoint (which nests everything under "model.*", the
-        // default prefix VLM::load_from_directory relies on), this diffusers-
-        // packaged text_encoder strips that wrapper: tensors are top-level
-        // "visual.*" / "language_model.*" (confirmed by reading the actual
-        // safetensors header), matching the explicit "language_model." prefix
-        // already used just above.
+        // The checkpoint's Qwen3-VL-4B text encoder ships its vision tower too
+        // (unused by plain text prompting) — the diffusers-packaged
+        // text_encoder strips the "model.*" wrapper a standalone Qwen3-VL
+        // checkpoint uses, so its tensors are top-level "visual.*" /
+        // "language_model.*". Probe for the right language-model prefix in a
+        // shard set (so a raw "model.language_model.*" checkpoint also loads).
+        auto lm_prefix = [](const std::vector<const brotensor::safetensors::File*>& sh)
+                -> std::string {
+            for (const auto* f : sh) {
+                if (f->find("language_model.embed_tokens.weight")) return "language_model.";
+                if (f->find("model.language_model.embed_tokens.weight"))
+                    return "model.language_model.";
+            }
+            return "language_model.";
+        };
+        auto vis_prefix = [](const std::vector<const brotensor::safetensors::File*>& sh)
+                -> const char* {
+            for (const auto* f : sh) {
+                if (f->find("visual.patch_embed.proj.weight")) return "visual.";
+                if (f->find("model.visual.patch_embed.proj.weight")) return "model.visual.";
+            }
+            return nullptr;
+        };
+
         check_cancel();
-        p.qwen3vl_vision_->load_weights(te_ptrs, "visual.");
-        t = stamp("Qwen3-VL vision tower weights", t);
+        const std::string& te_override = dir_opts.text_encoder_path;
+        if (te_override.empty()) {
+            // Default: text + vision from the bundled text_encoder/ (top-level
+            // "language_model.*" / "visual.*", per the diffusers packaging).
+            p.qwen3vl_model_->load_weights(te_ptrs, "language_model.");
+            t = stamp("Qwen3-VL weights", t);
+            check_cancel();
+            p.qwen3vl_vision_->load_weights(te_ptrs, "visual.");
+            t = stamp("Qwen3-VL vision tower weights", t);
+        } else {
+            const fs::path ovr(te_override);
+            const bool is_gguf =
+                ovr.has_extension() &&
+                (ovr.extension() == ".gguf" || ovr.extension() == ".GGUF");
+            if (is_gguf) {
+                // Text-only gguf: language-model weights from the gguf, vision
+                // tower still from the dir's bundled text_encoder.
+                brotensor::gguf::File gf = brotensor::gguf::File::open(ovr.string());
+                p.qwen3vl_model_->load_weights(gf);
+                t = stamp("Qwen3-VL weights (gguf override)", t);
+                check_cancel();
+                if (const char* vp = vis_prefix(te_ptrs))
+                    p.qwen3vl_vision_->load_weights(te_ptrs, vp);
+                t = stamp("Qwen3-VL vision tower weights", t);
+            } else {
+                // safetensors file or directory of shards.
+                std::vector<brotensor::safetensors::File> ovr_files;
+                if (fs::is_directory(ovr)) {
+                    ovr_files = detail::open_component_files(ovr.string());
+                } else {
+                    ovr_files.push_back(brotensor::safetensors::File::open(ovr.string()));
+                }
+                std::vector<const brotensor::safetensors::File*> ovr_ptrs;
+                for (const auto& f : ovr_files) ovr_ptrs.push_back(&f);
+                p.qwen3vl_model_->load_weights(ovr_ptrs, lm_prefix(ovr_ptrs));
+                t = stamp("Qwen3-VL weights (safetensors override)", t);
+                check_cancel();
+                // Prefer the override's own vision tower; fall back to the dir's.
+                if (const char* vp = vis_prefix(ovr_ptrs)) {
+                    p.qwen3vl_vision_->load_weights(ovr_ptrs, vp);
+                } else if (const char* vp_dir = vis_prefix(te_ptrs)) {
+                    p.qwen3vl_vision_->load_weights(te_ptrs, vp_dir);
+                }
+                t = stamp("Qwen3-VL vision tower weights", t);
+            }
+        }
 
         return p;
     }

@@ -301,6 +301,19 @@ public:
         // throws LoadCancelled. Empty by default (no cancellation). Same
         // convention as GenerateOptions::should_cancel.
         std::function<bool()> should_cancel;
+
+        // Krea 2 only: override the text-encoder (Qwen3-VL-4B) backbone. When
+        // non-empty, the text backbone's language-model weights are loaded from
+        // this path instead of `<model_dir>/text_encoder`. Accepts:
+        //   • a llama.cpp `.gguf` checkpoint (e.g. a Q8_0 quant) — text-only, so
+        //     the vision tower still loads from `<model_dir>/text_encoder`;
+        //   • a diffusers `.safetensors` file or a directory of them — its
+        //     `language_model.*` (or `model.language_model.*`) subtree is used,
+        //     and its `visual.*` tower too when present (else the dir's).
+        // The checkpoint must be the same Qwen3-VL-4B architecture the model
+        // dir's config describes (per-tensor shape checks enforce it). Empty
+        // (default) keeps the bundled text encoder. Ignored for non-Krea2.
+        std::string text_encoder_path;
     };
     static Pipeline from_model_dir(const std::string& model_dir,
                                    const ModelDirOptions& opts);
