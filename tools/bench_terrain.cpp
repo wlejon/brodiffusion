@@ -514,6 +514,89 @@ void bench_world(const std::string& dir, std::uint64_t seed,
     }
 }
 
+// Throughput of each rung of the DAG read on its own.
+//
+// The three stages are three resolutions of the same world — 7.68 km, 240 m and
+// 30 m per cell — and each is a public read, so a caller that only wants the
+// shape of a continent can stop at the coarse map and never pay for the two
+// stages under it. This measures what each rung actually costs per unit of
+// ground, which is the number that decides whether a whole-planet pass at low
+// detail is minutes or days.
+//
+// Sizes are given as an n x n grid of that stage's own windows, so every rung is
+// measured at the same degree of tile amortisation rather than over the same
+// area (the same area would be one coarse tile against 65536 decoder tiles).
+// Each rung reads from a fresh pipeline, so the cost includes every stage it
+// depends on — that is what a caller pays.
+void bench_lod(const std::string& dir, std::uint64_t seed,
+               const std::vector<int>& grids, const std::string& only) {
+    td::WorldPipeline probe(dir, seed);
+    const auto& cfg = probe.config();
+    const double native = cfg.native_resolution;              // m / decoder cell
+    const double latent_m = native * cfg.latent_compression;  // m / latent cell
+    const double coarse_m = latent_m * 32.0;                  // m / coarse cell
+
+    std::printf("\n== lod  seed=%llu\n", static_cast<unsigned long long>(seed));
+    std::printf("   coarse %.0f m/cell, latent %.0f m/cell, elevation %.0f m/cell\n\n",
+                coarse_m, latent_m, native);
+    std::printf("   %-10s %5s %9s %10s %12s %8s %10s %12s\n",
+                "rung", "grid", "cells/side", "km/side", "km2", "s", "km2/s",
+                "hemisphere");
+
+    struct Rung {
+        const char* name;
+        int         stride;    // that stage's window stride, in its own cells
+        double      metres;    // metres per cell
+        int         channels;  // channels a caller keeps
+    };
+    const Rung rungs[] = {
+        {"coarse",    kCoarseTileStride,  coarse_m, 6},
+        {"latent",    kLatentTileStride,  latent_m, 5},
+        {"elevation", kDecoderTileStride, native,   1},
+    };
+
+    // Half of Earth's surface, as an area. The model generates an unbounded
+    // plane and knows nothing about spheres, so this is "that much ground".
+    const double hemisphere_km2 = 2.0 * 3.14159265358979 * 6371.0 * 6371.0;
+
+    for (const Rung& rg : rungs) {
+        if (!only.empty() && only.find(rg.name[0]) == std::string::npos) continue;
+        for (int g : grids) {
+            const std::int64_t n = static_cast<std::int64_t>(g) * rg.stride;
+            const double km_side = static_cast<double>(n) * rg.metres / 1000.0;
+            const double km2     = km_side * km_side;
+
+            td::WorldPipeline pipe(dir, seed);
+            bt::sync_all();
+            const auto t0 = Clock::now();
+            if (rg.name[0] == 'c') {
+                td::TileBuffer b = pipe.coarse_normalized(0, 0, n, n);
+                (void)b;
+            } else if (rg.name[0] == 'l') {
+                td::TileBuffer b = pipe.latent_normalized(0, 0, n, n);
+                (void)b;
+            } else {
+                td::TileBuffer b = pipe.elevation(0, 0, n, n);
+                (void)b;
+            }
+            bt::sync_all();
+            const double dt = since(t0);
+
+            const double rate  = km2 / dt;                    // km2/s
+            const double hemi_s = hemisphere_km2 / rate;
+            const double hemi_cells = hemisphere_km2 * 1e6 / (rg.metres * rg.metres);
+            const double hemi_gb =
+                hemi_cells * rg.channels * 4.0 / (1024.0 * 1024.0 * 1024.0);
+
+            std::printf("   %-10s %5d %9lld %10.1f %12.0f %8.2f %10.0f  "
+                        "%6.1f h, %.1f GB\n",
+                        rg.name, g, static_cast<long long>(n), km_side, km2, dt,
+                        rate, hemi_s / 3600.0, hemi_gb);
+            std::fflush(stdout);
+        }
+    }
+}
+
 // Raster a grid of adjacent regions out of one pipeline. Region (r, c) shares
 // its whole west edge with (r, c-1) and its north edge with (r-1, c), so with a
 // cache big enough to hold the overlap the later regions should come in under
@@ -582,6 +665,13 @@ int main(int argc, char** argv) {
         } else if (mode == "kernels") {
             const char* it = arg_after(argc, argv, "--iters");
             bench_kernels(it ? std::atoi(it) : 20);
+        } else if (mode == "lod") {
+            const char* sd = arg_after(argc, argv, "--seed");
+            // --rungs takes the rungs' initials, e.g. "cl" for coarse+latent.
+            const char* rn = arg_after(argc, argv, "--rungs");
+            bench_lod(w, sd ? std::strtoull(sd, nullptr, 10) : 42ull,
+                      int_list(arg_after(argc, argv, "--grids"), {2, 4, 8}),
+                      rn ? std::string(rn) : std::string());
         } else if (mode == "stream") {
             const char* sd = arg_after(argc, argv, "--seed");
             const char* rg = arg_after(argc, argv, "--region");
