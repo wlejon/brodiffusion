@@ -265,6 +265,10 @@ if(BRODIFFUSION_CLI)
     # Krea 2 kernel-shape microbenchmark (GEMM / flash-attention attribution).
     add_executable(bench_krea2_kernels tools/bench_krea2_kernels.cpp)
     target_link_libraries(bench_krea2_kernels PRIVATE brodiffusion)
+
+    # terrain-diffusion perf harness: per-UNet microbench + end-to-end world.
+    add_executable(bench_terrain tools/bench_terrain.cpp)
+    target_link_libraries(bench_terrain PRIVATE brodiffusion)
 endif()
 
 # --- Krea 2 research C API (krea2_capi.dll, consumed via ctypes) ---
