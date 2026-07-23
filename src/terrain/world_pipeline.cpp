@@ -651,6 +651,17 @@ TileBuffer WorldPipeline::elevation(std::int64_t i1, std::int64_t j1,
     constexpr double kLowfreqStd  = 38.6;
     constexpr double kSigma       = 5.0;
 
+    // One access scope over both reads below. The residual read materializes
+    // the entire latent map underneath itself, and the latent read that follows
+    // wants exactly those tiles — but the decoder tiles it also produced are
+    // 2 MB each against a latent tile's 96 KB, so on any sizeable region they
+    // push the cache over its limit and the latents are the LRU victims. Evict
+    // them when the residual read closes and the latent read below regenerates
+    // every one: measured at 4096x4096, that was 8.9 s of the 36.6 s call, and
+    // it grows with area. Holding the scope open across both makes the pipeline
+    // pay for each tile once.
+    TileStoreAccess access(store_.get());
+
     const std::int64_t scale = cfg_.latent_compression;
 
     // Pad by the blur's reach, then round OUTWARD to whole latent cells so the

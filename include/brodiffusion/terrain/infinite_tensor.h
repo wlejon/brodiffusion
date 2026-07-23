@@ -188,6 +188,31 @@ private:
     int                                 access_depth_     = 0;
 };
 
+// RAII for the store's nested access counter. Eviction is deferred for as long
+// as any scope is open, so a caller that reads several tensors which share
+// upstream dependencies can hold one scope across the lot and be sure the tiles
+// materialized for the first read are still there for the second.
+//
+// This is what keeps a multi-stage read from paying for its own dependencies
+// twice: WorldPipeline::elevation() reads the residual and then the latent map,
+// and the residual's own materialization is what fills the cache with the
+// latents the second read wants. Without a scope spanning both, the tiles are
+// evicted the instant the first read returns and the second read regenerates
+// every one of them.
+class TileStoreAccess {
+public:
+    explicit TileStoreAccess(MemoryTileStore* store) : store_(store) {
+        store_->begin_access();
+    }
+    ~TileStoreAccess() { store_->end_access(); }
+
+    TileStoreAccess(const TileStoreAccess&)            = delete;
+    TileStoreAccess& operator=(const TileStoreAccess&) = delete;
+
+private:
+    MemoryTileStore* store_;
+};
+
 // ─── InfiniteTensor ────────────────────────────────────────────────────────
 
 // The window generator. `window_indices` holds one window index per batch

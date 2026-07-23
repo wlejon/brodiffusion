@@ -282,23 +282,6 @@ TileBuffer MemoryTileStore::read_pixels(const std::string&        tensor_id,
 
 // ─── InfiniteTensor ────────────────────────────────────────────────────────
 
-namespace {
-
-// RAII for the store's nested access counter, so an exception thrown out of `f`
-// cannot leave eviction permanently disabled.
-class AccessGuard {
-public:
-    explicit AccessGuard(MemoryTileStore* store) : store_(store) { store_->begin_access(); }
-    ~AccessGuard() { store_->end_access(); }
-    AccessGuard(const AccessGuard&)            = delete;
-    AccessGuard& operator=(const AccessGuard&) = delete;
-
-private:
-    MemoryTileStore* store_;
-};
-
-}  // namespace
-
 InfiniteTensor::InfiniteTensor(std::vector<std::int64_t>    shape,
                                ComputeFn                    f,
                                TensorWindow                 output_window,
@@ -337,7 +320,7 @@ InfiniteTensor::InfiniteTensor(std::vector<std::int64_t>    shape,
 }
 
 TileBuffer InfiniteTensor::operator()(const std::vector<Slice>& pixel_slices) {
-    AccessGuard guard(store_);
+    TileStoreAccess guard(store_);
     ensure_processed_range({pixel_slices});
     return store_->read_pixels(tensor_id_, pixel_slices);
 }
@@ -365,7 +348,7 @@ void InfiniteTensor::ensure_processed(
 
     // Hold an access open across the upstream materialization so nothing an arg
     // produces here can be evicted before process_windows reads it back.
-    AccessGuard guard(store_);
+    TileStoreAccess guard(store_);
     for (std::size_t i = 0; i < args_.size(); ++i) {
         std::vector<std::vector<Slice>> ranges;
         ranges.reserve(pending.size());
