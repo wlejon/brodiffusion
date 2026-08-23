@@ -2,7 +2,7 @@
 //
 // torch.quasirandom.SobolEngine(dimension=3, scramble=True, seed=123).draw(8192)
 // Baked because torch's scrambled-Sobol RNG is not reproducible in C++.
-// Regenerate via _splat_assets/gen_flow_sobol_pe.py.
+// Regenerate via gen_flow_sobol_pe.py.
 
 #include "brodiffusion/triposplat/flow_model.h"
 
