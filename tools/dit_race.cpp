@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
 
     bt::init();
     std::fprintf(stderr, "[dit_race] default device=%d (0=CPU,1=CUDA)\n",
-                 static_cast<int>(bt::default_device()));
+                 bt::default_device() == bt::Device::CUDA ? 1 : 0);
 
     fs::path tdir = fs::path(model) / "transformer";
     std::string sfile;

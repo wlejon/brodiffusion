@@ -1039,10 +1039,7 @@ PipelineState Pipeline::prime_sana_(std::string_view prompt,
     const float sigma = std::visit(
         [](const auto& s) { return s.init_noise_sigma(); }, scheduler_);
 
-    // 3. Initial latent. The Sana DiT runs FP32 (FP16 overflows), so the latent
-    //    — which the rectified-flow velocity is added to in place — must be FP32
-    //    too, regardless of the GPU backend's FP16 compute dtype. brotensor's
-    //    randn is FP32-native, so the device path needs no cast.
+    const bt::Dtype ldt = denoiser_->compute_dtype();
     if (!opts.init_noise.empty()) {
         if (static_cast<int>(opts.init_noise.size()) != n_lat) {
             fail("prime: init_noise has " +
@@ -1051,17 +1048,33 @@ PipelineState Pipeline::prime_sana_(std::string_view prompt,
         }
         std::vector<float> noise(static_cast<std::size_t>(n_lat));
         for (int i = 0; i < n_lat; ++i) noise[i] = sigma * opts.init_noise[i];
-        state.latent =
+        bt::Tensor host_t =
             bt::Tensor::from_host(noise.data(), 1, n_lat).to(bt::default_device());
+        if (host_t.dtype != ldt) {
+            bt::cast(host_t, state.latent, ldt);
+        } else {
+            state.latent = std::move(host_t);
+        }
     } else if (opts.noise_source == NoiseSource::Torch) {
         std::vector<float> noise =
             detail::torch_randn_f32(opts.seed, static_cast<std::size_t>(n_lat));
         if (sigma != 1.0f) for (int i = 0; i < n_lat; ++i) noise[i] *= sigma;
-        state.latent =
+        bt::Tensor host_t =
             bt::Tensor::from_host(noise.data(), 1, n_lat).to(bt::default_device());
+        if (host_t.dtype != ldt) {
+            bt::cast(host_t, state.latent, ldt);
+        } else {
+            state.latent = std::move(host_t);
+        }
     } else {
-        state.latent = bt::Tensor::empty(1, n_lat, bt::Dtype::FP32);
-        bt::randn(opts.seed, 0, state.latent);
+        if (ldt == bt::Dtype::FP32) {
+            state.latent = bt::Tensor::empty(1, n_lat, bt::Dtype::FP32);
+            bt::randn(opts.seed, 0, state.latent);
+        } else {
+            bt::Tensor f32 = bt::Tensor::empty(1, n_lat, bt::Dtype::FP32);
+            bt::randn(opts.seed, 0, f32);
+            bt::cast(f32, state.latent, ldt);
+        }
         if (sigma != 1.0f) bt::scale_inplace(state.latent, sigma);
     }
 

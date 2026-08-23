@@ -183,19 +183,9 @@ SanaDenoiser::SanaDenoiser(const SanaConfig& cfg) : cfg_(cfg) {
 SanaDenoiser::~SanaDenoiser() = default;
 
 brotensor::Dtype SanaDenoiser::compute_dtype() const {
-    // BF16 on CUDA, FP32 on CPU. Sana needs BF16/FP32 dynamic range, not FP16:
-    // the residual stream grows into the hundreds, the GLU-MBConv FFN's GLU
-    // product and conv_point sum push intermediates past the FP16 finite range
-    // (~65504), and the cross-attention to_q of the raw residual overflows too
-    // — the well-known "Sana in FP16 → NaN" failure. BF16 carries FP32's 8-bit
-    // exponent, so none of those overflow, while halving weight/activation
-    // memory traffic and putting every linear projection on Ada's BF16 tensor
-    // cores (linear_forward_batched_fp16's WMMA path). brotensor's matmul,
-    // rms_norm, layernorm, conv2d and flash attention all have BF16 kernels.
-    // The CPU backend is FP32-only, so fall back to FP32 there.
-    return brotensor::default_device() == brotensor::Device::CUDA
-               ? brotensor::Dtype::BF16
-               : brotensor::Dtype::FP32;
+    // Sana's latent and velocity are FP32 (Sana needs FP32 dynamic range for
+    // sampling stability), while internal attention/FFN layers compute in BF16.
+    return brotensor::Dtype::FP32;
 }
 
 // ─── load_weights ──────────────────────────────────────────────────────────
@@ -207,7 +197,9 @@ void SanaDenoiser::load_weights(const st::File& f, const std::string& prefix) {
     const int CAP     = cfg_.caption_channels;      // 2304
     const int hidden  = static_cast<int>(cfg_.mlp_ratio * D);  // 2880
     const int inv     = 2 * hidden;                 // 5760
-    const bt::Dtype cdt = compute_dtype();          // BF16 on CUDA, FP32 on CPU
+    const bt::Dtype cdt = bt::default_device() == bt::Device::CUDA
+                              ? bt::Dtype::BF16
+                              : bt::Dtype::FP32;
 
     auto load_lin = [&](const std::string& key, int out, int in, Linear& lin,
                         bool bias) {
@@ -298,8 +290,9 @@ void SanaDenoiser::load_weights(const st::File& f, const std::string& prefix) {
 
 void SanaDenoiser::finalize_weights() { finalized_ = true; }
 
-void SanaDenoiser::lin_(const Linear& l, const bt::Tensor& X, bt::Tensor& Y) {
-    detail::linear_batched(l.W, l.has_bias() ? &l.b : nullptr, X, Y);
+void SanaDenoiser::lin_(const Linear& lin, const bt::Tensor& in,
+                        bt::Tensor& out) {
+    detail::linear_batched(lin.W, lin.b.size() > 0 ? &lin.b : nullptr, in, out);
 }
 
 void SanaDenoiser::ensure_ones_(int n) {
@@ -380,10 +373,11 @@ PreparedConditioning SanaDenoiser::prepare(const Conditioning& cond) {
         if (seq.cols != cfg_.caption_channels) {
             fail("prepare: text_embeddings width != caption_channels");
         }
+        const bt::Dtype cdt = patch_embed_.W.dtype;
         bt::Tensor seq_cd, h1, h2;
         const bt::Tensor* in = &seq;
-        if (seq.dtype != compute_dtype()) {
-            bt::cast(seq, seq_cd, compute_dtype());
+        if (seq.dtype != cdt) {
+            bt::cast(seq, seq_cd, cdt);
             in = &seq_cd;
         }
         lin_(cap_l1_, *in, h1);
@@ -417,7 +411,7 @@ void SanaDenoiser::self_attention_(const Block& blk, int N, int H, int W,
     const int D  = cfg_.inner_dim();
     const int hd = kSelfHeadDim;
     const int nh = cfg_.num_attention_heads;
-    const bt::Dtype cdt = compute_dtype();
+    const bt::Dtype cdt = blk.q1.W.dtype;
     const bt::Device dev = x_mod.device;
 
     // Reference-attention identity seam: the cache slot for this (branch, step,
@@ -597,7 +591,7 @@ void SanaDenoiser::self_attention_(const Block& blk, int N, int H, int W,
 void SanaDenoiser::cross_attention_(const Block& blk, const bt::Tensor& ctx,
                                     const bt::Tensor& hidden, bt::Tensor& out) {
     const int nch = cfg_.num_cross_attention_heads;
-    const bt::Dtype cdt = compute_dtype();   // BF16 on CUDA, FP32 on CPU
+    const bt::Dtype cdt = blk.q2.W.dtype;   // BF16 on CUDA, FP32 on CPU
     lin_(blk.q2, hidden, ca_q_);   // (N, D) at cdt
     lin_(blk.k2, ctx, ca_k_);      // (L, D) at cdt
     lin_(blk.v2, ctx, ca_v_);      // (L, D) at cdt
@@ -684,7 +678,7 @@ void SanaDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
     const int IC  = cfg_.in_channels;
     const int OC  = cfg_.out_channels;
     const int N   = H_lat * W_lat;
-    const bt::Dtype cdt = compute_dtype();
+    const bt::Dtype cdt = patch_embed_.W.dtype;
     const bt::Device dev = bt::default_device();
 
     if (latent.rows != 1 || latent.cols != IC * N) {
@@ -803,14 +797,13 @@ void SanaDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
                               cfg_.norm_eps);
     bt::modulate(ln_, scale, shift, mod_);
     lin_(proj_out_, mod_, proj_);                       // (N, patch^2*OC)
-    // patch_size == 1 → unpatchify is sequence_to_nchw with OC channels. The
-    // DiT computes in cdt (BF16 on CUDA); the velocity is returned FP32 so the
-    // sampler integrates the latent at full precision.
-    if (cdt != bt::Dtype::FP32) {
-        bt::sequence_to_nchw(proj_, 1, OC, H_lat, W_lat, out_cd_);
-        bt::cast(out_cd_, out, bt::Dtype::FP32);
+    // patch_size == 1 → unpatchify is sequence_to_nchw with OC channels.
+    bt::Tensor raw_out;
+    bt::sequence_to_nchw(proj_, 1, OC, H_lat, W_lat, raw_out);  // (1, OC*N)
+    if (raw_out.dtype != bt::Dtype::FP32) {
+        bt::cast(raw_out, out, bt::Dtype::FP32);
     } else {
-        bt::sequence_to_nchw(proj_, 1, OC, H_lat, W_lat, out);  // (1, OC*N)
+        out = std::move(raw_out);
     }
 }
 

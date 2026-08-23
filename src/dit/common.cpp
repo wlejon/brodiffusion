@@ -67,7 +67,6 @@ bt::Tensor pack_latents(const bt::Tensor& latent, int latent_channels,
     }
     const int hp = H_lat / 2;
     const int wp = W_lat / 2;
-    const int img_len = hp * wp;
     const int patch = latent_channels * 4;
     const std::size_t expect =
         static_cast<std::size_t>(latent_channels) * H_lat * W_lat;
@@ -75,32 +74,14 @@ bt::Tensor pack_latents(const bt::Tensor& latent, int latent_channels,
         fail("pack_latents: latent has unexpected element count");
     }
 
-    bt::sync_all();
-    std::vector<float> src = download_fp32(latent);
-
-    std::vector<float> packed(static_cast<std::size_t>(img_len) * patch);
-    const std::size_t plane = static_cast<std::size_t>(H_lat) * W_lat;
-    for (int i = 0; i < hp; ++i) {
-        for (int j = 0; j < wp; ++j) {
-            const std::size_t tok =
-                static_cast<std::size_t>(i) * wp + j;
-            for (int c = 0; c < latent_channels; ++c) {
-                for (int dy = 0; dy < 2; ++dy) {
-                    for (int dx = 0; dx < 2; ++dx) {
-                        const std::size_t si =
-                            static_cast<std::size_t>(c) * plane +
-                            static_cast<std::size_t>(2 * i + dy) * W_lat +
-                            static_cast<std::size_t>(2 * j + dx);
-                        const std::size_t di =
-                            tok * patch +
-                            static_cast<std::size_t>(c) * 4 + dy * 2 + dx;
-                        packed[di] = src[si];
-                    }
-                }
-            }
-        }
-    }
-    return detail::upload_host(packed.data(), img_len, patch);
+    // On-device 2x2 spatial merge (channel_major=true matches c*4 + dy*2 + dx)
+    // followed by NCHW -> sequence layout transpose.
+    bt::Tensor merged;
+    bt::spatial_merge_2x2_forward(latent, 1, latent_channels, H_lat, W_lat,
+                                  /*channel_major=*/true, merged);
+    bt::Tensor packed;
+    bt::nchw_to_sequence(merged, 1, patch, hp, wp, packed);
+    return packed;
 }
 
 void unpack_latents(const bt::Tensor& packed, int latent_channels,
@@ -116,36 +97,18 @@ void unpack_latents(const bt::Tensor& packed, int latent_channels,
         fail("unpack_latents: packed has unexpected shape");
     }
 
-    bt::sync_all();
-    std::vector<float> src = download_fp32(packed);
-
-    const std::size_t plane = static_cast<std::size_t>(H_lat) * W_lat;
-    std::vector<float> latent(
-        static_cast<std::size_t>(latent_channels) * plane);
-    for (int i = 0; i < hp; ++i) {
-        for (int j = 0; j < wp; ++j) {
-            const std::size_t tok =
-                static_cast<std::size_t>(i) * wp + j;
-            for (int c = 0; c < latent_channels; ++c) {
-                for (int dy = 0; dy < 2; ++dy) {
-                    for (int dx = 0; dx < 2; ++dx) {
-                        const std::size_t si =
-                            tok * patch +
-                            static_cast<std::size_t>(c) * 4 + dy * 2 + dx;
-                        const std::size_t di =
-                            static_cast<std::size_t>(c) * plane +
-                            static_cast<std::size_t>(2 * i + dy) * W_lat +
-                            static_cast<std::size_t>(2 * j + dx);
-                        latent[di] = src[si];
-                    }
-                }
-            }
-        }
+    // On-device sequence -> NCHW transpose followed by patch_unpack (depth-to-space).
+    bt::Tensor raw;
+    bt::patch_unpack_forward(packed, hp, wp, /*P=*/2,
+                             /*C_total=*/latent_channels,
+                             /*C_keep=*/latent_channels,
+                             /*channel_major=*/true, raw);
+    const bt::Dtype dt = brodiffusion::compute_dtype();
+    if (raw.dtype != dt) {
+        bt::cast(raw, out, dt);
+    } else {
+        out = std::move(raw);
     }
-    bt::Tensor t = detail::upload_host(
-        latent.data(), 1,
-        static_cast<int>(latent.size()));
-    out = t;
 }
 
 // ─── 2D axial RoPE tables ──────────────────────────────────────────────────
