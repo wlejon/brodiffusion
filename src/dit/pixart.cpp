@@ -26,6 +26,7 @@
 #include "brodiffusion/detail/device.h"
 
 #include "brotensor/ops.h"
+#include "brotensor/ops/fused.h"
 #include "brotensor/runtime.h"
 #include "brotensor/safetensors.h"
 #include "brotensor/tensor.h"
@@ -521,9 +522,8 @@ void PixArtDenoiser::body_(const bt::Tensor& latent, int H_lat, int W_lat,
         const bt::Tensor& gate_mlp  = ch_[5];
 
         // 1. self-attn: h += gate_msa * attn1(modulate(LN(h)))
-        detail::layernorm_batched(hidden_, ada_gamma_, ada_beta_, ln_,
-                                  cfg_.norm_eps);
-        bt::modulate(ln_, scale_msa, shift_msa, mod_);
+        bt::fused_layernorm_modulate(hidden_, ada_gamma_, ada_beta_,
+                                     scale_msa, shift_msa, cfg_.norm_eps, mod_);
         self_attention_(blk, mod_, sub_out_);
         bt::broadcast_mul(sub_out_, gate_msa, gated_);
         bt::add_inplace(hidden_, gated_);
@@ -533,9 +533,8 @@ void PixArtDenoiser::body_(const bt::Tensor& latent, int H_lat, int W_lat,
         bt::add_inplace(hidden_, sub_out_);
 
         // 3. feed-forward: h += gate_mlp * ff(modulate(LN(h)))
-        detail::layernorm_batched(hidden_, ada_gamma_, ada_beta_, ln_,
-                                  cfg_.norm_eps);
-        bt::modulate(ln_, scale_mlp, shift_mlp, mod_);
+        bt::fused_layernorm_modulate(hidden_, ada_gamma_, ada_beta_,
+                                     scale_mlp, shift_mlp, cfg_.norm_eps, mod_);
         feed_forward_(blk, mod_, sub_out_);
         bt::broadcast_mul(sub_out_, gate_mlp, gated_);
         bt::add_inplace(hidden_, gated_);
@@ -551,9 +550,8 @@ void PixArtDenoiser::body_(const bt::Tensor& latent, int H_lat, int W_lat,
     bt::copy_d2d(no_[1], 0, scale_, 0, D);
     bt::add_inplace(shift_, emb_);                       // + embedded_timestep
     bt::add_inplace(scale_, emb_);
-    detail::layernorm_batched(hidden_, ada_gamma_, ada_beta_, ln_,
-                              cfg_.norm_eps);
-    bt::modulate(ln_, scale_, shift_, mod_);
+    bt::fused_layernorm_modulate(hidden_, ada_gamma_, ada_beta_,
+                                 scale_, shift_, cfg_.norm_eps, mod_);
     lin_(proj_out_, mod_, proj_);                       // (N, P*P*OC), FP32
 
     // ── unpatchify on the GPU, keeping the first in_channels (drop the learned

@@ -5,6 +5,7 @@
 #include "brodiffusion/detail/device.h"
 
 #include "brotensor/ops.h"
+#include "brotensor/ops/fused.h"
 #include "brotensor/runtime.h"
 #include "brotensor/safetensors.h"
 #include "brotensor/tensor.h"
@@ -451,11 +452,9 @@ void FluxDenoiser::run_double_block_(const DoubleBlock& blk,
     // ── attention sub-layer ───────────────────────────────────────────────
     // img_mod = modulate(LN(img), scale_msa, shift_msa)
     bt::Tensor img_modulated, txt_modulated;
-    detail::layernorm_batched(img_, ada_gamma_, ada_beta_, ln_, 1e-6f);
-    bt::modulate(ln_, i_scale_msa, i_shift_msa, mod_);
+    bt::fused_layernorm_modulate(img_, ada_gamma_, ada_beta_, i_scale_msa, i_shift_msa, 1e-6f, mod_);
     img_modulated = mod_.clone();
-    detail::layernorm_batched(txt_, ada_gamma_, ada_beta_, ln_, 1e-6f);
-    bt::modulate(ln_, t_scale_msa, t_shift_msa, mod_);
+    bt::fused_layernorm_modulate(txt_, ada_gamma_, ada_beta_, t_scale_msa, t_shift_msa, 1e-6f, mod_);
     txt_modulated = mod_.clone();
 
     // Per-head RMSNorm helper: view (L,D) as (L*NH, HD), rms_norm, return a
@@ -527,8 +526,7 @@ void FluxDenoiser::run_double_block_(const DoubleBlock& blk,
 
     // ── MLP sub-layer ─────────────────────────────────────────────────────
     // img = img + gate_mlp * ff(modulate(LN(img), scale_mlp, shift_mlp))
-    detail::layernorm_batched(img_, ada_gamma_, ada_beta_, ln_, 1e-6f);
-    bt::modulate(ln_, i_scale_mlp, i_shift_mlp, mod_);
+    bt::fused_layernorm_modulate(img_, ada_gamma_, ada_beta_, i_scale_mlp, i_shift_mlp, 1e-6f, mod_);
     lin_(blk.ff0, mod_, ff_mid_);
     bt::gelu_forward(ff_mid_, ff_mid_);
     lin_(blk.ff2, ff_mid_, ff_out_);
@@ -536,8 +534,7 @@ void FluxDenoiser::run_double_block_(const DoubleBlock& blk,
     bt::add_inplace(img_, gated_);
 
     // txt = txt + gate_mlp_ctx * ff_context(modulate(LN(txt), ...))
-    detail::layernorm_batched(txt_, ada_gamma_, ada_beta_, ln_, 1e-6f);
-    bt::modulate(ln_, t_scale_mlp, t_shift_mlp, mod_);
+    bt::fused_layernorm_modulate(txt_, ada_gamma_, ada_beta_, t_scale_mlp, t_shift_mlp, 1e-6f, mod_);
     lin_(blk.ffc0, mod_, ff_mid_);
     bt::gelu_forward(ff_mid_, ff_mid_);
     lin_(blk.ffc2, ff_mid_, ff_out_);
@@ -583,8 +580,7 @@ void FluxDenoiser::run_single_block_(const SingleBlock& blk,
     bt::Tensor residual = x_.clone();
 
     // x_mod = modulate(LN(x), scale, shift)
-    detail::layernorm_batched(x_, ada_gamma_, ada_beta_, ln_, 1e-6f);
-    bt::modulate(ln_, scale, shift, mod_);
+    bt::fused_layernorm_modulate(x_, ada_gamma_, ada_beta_, scale, shift, 1e-6f, mod_);
     bt::Tensor x_mod = mod_.clone();
 
     // mlp = gelu(proj_mlp(x_mod))   (D → 4D)
@@ -826,8 +822,7 @@ void FluxDenoiser::forward_impl_(const bt::Tensor& latent,
     slice_modulation_chunks(chunk_row_, D, 2, no_chunks);  // scale, shift
     bt::Tensor no_scale = no_chunks[0].clone();
     bt::Tensor no_shift = no_chunks[1].clone();
-    detail::layernorm_batched(img_part, ada_gamma_, ada_beta_, ln_, 1e-6f);
-    bt::modulate(ln_, no_scale, no_shift, mod_);
+    bt::fused_layernorm_modulate(img_part, ada_gamma_, ada_beta_, no_scale, no_shift, 1e-6f, mod_);
     detail::linear_batched(proj_out_.W, &proj_out_.b, mod_, proj_);  // (img_len,64)
 
     // ── unpack → (1, LC*H_lat*W_lat) ──────────────────────────────────────

@@ -29,6 +29,7 @@
 #include "brodiffusion/detail/device.h"
 
 #include "brotensor/ops.h"
+#include "brotensor/ops/fused.h"
 #include "brotensor/runtime.h"
 #include "brotensor/safetensors.h"
 #include "brotensor/tensor.h"
@@ -760,9 +761,8 @@ void SanaDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
 
         // self-attn: h += gate_msa * attn1(modulate(LN(h)))
         prof("self_attn", [&] {
-            detail::layernorm_batched(hidden_, ada_gamma_, ada_beta_, ln_,
-                                      cfg_.norm_eps);
-            bt::modulate(ln_, scale_msa, shift_msa, mod_);
+            bt::fused_layernorm_modulate(hidden_, ada_gamma_, ada_beta_,
+                                         scale_msa, shift_msa, cfg_.norm_eps, mod_);
             self_attention_(blk, N, H_lat, W_lat, mod_, sub_out_);
             bt::broadcast_mul(sub_out_, gate_msa, gated_);
             bt::add_inplace(hidden_, gated_);
@@ -776,9 +776,8 @@ void SanaDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
 
         // mix-ffn: h += gate_mlp * ff(modulate(LN(h)))
         prof("mix_ffn", [&] {
-            detail::layernorm_batched(hidden_, ada_gamma_, ada_beta_, ln_,
-                                      cfg_.norm_eps);
-            bt::modulate(ln_, scale_mlp, shift_mlp, mod_);
+            bt::fused_layernorm_modulate(hidden_, ada_gamma_, ada_beta_,
+                                         scale_mlp, shift_mlp, cfg_.norm_eps, mod_);
             mix_ffn_(blk, H_lat, W_lat, mod_, sub_out_);
             bt::broadcast_mul(sub_out_, gate_mlp, gated_);
             bt::add_inplace(hidden_, gated_);
@@ -793,9 +792,8 @@ void SanaDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
     bt::Tensor scale = no[1].clone();
     bt::add_inplace(shift, emb_);                       // + embedded_timestep
     bt::add_inplace(scale, emb_);
-    detail::layernorm_batched(hidden_, ada_gamma_, ada_beta_, ln_,
-                              cfg_.norm_eps);
-    bt::modulate(ln_, scale, shift, mod_);
+    bt::fused_layernorm_modulate(hidden_, ada_gamma_, ada_beta_,
+                                 scale, shift, cfg_.norm_eps, mod_);
     lin_(proj_out_, mod_, proj_);                       // (N, patch^2*OC)
     // patch_size == 1 → unpatchify is sequence_to_nchw with OC channels.
     bt::Tensor raw_out;
