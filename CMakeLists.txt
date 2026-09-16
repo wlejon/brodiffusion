@@ -129,6 +129,27 @@ if(NOT TARGET broimage)
     endif()
 endif()
 
+# --- bronze AOT JavaScript compiler & runtime (standalone ../bronze or third_party/bronze fallback) ---
+if(NOT TARGET bronze_runtime_shared)
+    set(BRONZE_BUILD_SHARED_RUNTIME ON CACHE BOOL "" FORCE)
+    set(BRONZE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(BRONZE_WITH_LLVM ON CACHE BOOL "Build bronze's LLVM codegen backend")
+    if(DEFINED BRONZE_DIR AND EXISTS "${BRONZE_DIR}/CMakeLists.txt")
+        # Explicit BRONZE_DIR supplied
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../bronze/CMakeLists.txt")
+        set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bronze" CACHE PATH "bronze AOT compiler source tree")
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bronze/CMakeLists.txt")
+        set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bronze" CACHE PATH "bronze AOT compiler source tree")
+    endif()
+
+    if(NOT BRONZE_DIR OR NOT EXISTS "${BRONZE_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "bronze not found. Either provide ../bronze, third_party/bronze, or pass -DBRONZE_DIR=<path>.")
+    endif()
+
+    add_subdirectory("${BRONZE_DIR}" "${CMAKE_BINARY_DIR}/bronze-build" EXCLUDE_FROM_ALL)
+endif()
+
 # --- brodiffusion library ---
 
 add_library(brodiffusion STATIC)
@@ -277,6 +298,12 @@ if(BRODIFFUSION_KREA2_CAPI)
     add_library(krea2_capi SHARED src/capi/krea2_capi.cpp)
     target_link_libraries(krea2_capi PRIVATE brodiffusion)
     target_compile_definitions(krea2_capi PRIVATE K2_CAPI_BUILD)
+endif()
+
+# --- Standalone Bronze JavaScript API ---
+option(BRODIFFUSION_ENABLE_API "Build Bronze JavaScript API" ON)
+if(BRODIFFUSION_ENABLE_API)
+    add_subdirectory(src/api)
 endif()
 
 # --- Install / export ---
