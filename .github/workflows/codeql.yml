@@ -38,6 +38,10 @@ jobs:
       - uses: actions/checkout@v7
         with: { repository: wlejon/broimage, path: broimage }
 
+      # bronze (and through it brass) is needed at configure for the api;
+      # neither is built here, since only the brodiffusion target is traced.
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
+
       - name: Install Ninja
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
 

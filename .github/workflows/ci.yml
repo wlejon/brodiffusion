@@ -22,6 +22,15 @@ concurrency:
 #     brotensor/
 #     brolm/
 #     broimage/
+#     bronze/        <- the JavaScript runtime brodiffusion_api binds
+#     brass/         <- bronze's code generator
+#
+# bronze and brass are laid out by bronze's checkout-toolchain action and
+# compiled inside this build tree (bronze add_subdirectory()s brass), with the
+# job's own compiler and CRT — the api is bound across bronze's C++ embed
+# boundary, so a prebuilt bronze would be an unverifiable ABI hazard. That is
+# what makes brodiffusion_test_api the check that the library works the way
+# bro uses it.
 #
 # Ninja on Linux/macOS bounds parallelism once brotensor's op TUs are in the
 # build; Windows keeps the VS generator (MSBuild /m is bounded).
@@ -49,6 +58,8 @@ jobs:
         with: { repository: wlejon/brolm, path: brolm }
       - uses: actions/checkout@v7
         with: { repository: wlejon/broimage, path: broimage }
+
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
@@ -91,6 +102,8 @@ jobs:
         with: { repository: wlejon/brolm, path: brolm }
       - uses: actions/checkout@v7
         with: { repository: wlejon/broimage, path: broimage }
+
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install gcovr + Ninja
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gcovr ninja-build
