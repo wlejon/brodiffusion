@@ -511,7 +511,8 @@ void decorateTripoSplatProto(ObjectBuilder& proto) {
 } // namespace
 
 void ensureTriposplatClassesInstalled() {
-    static bool installed = false;
+    // Per thread, like ensureDiffusionClassesInstalled.
+    static thread_local bool installed = false;
     if (installed) return;
     installed = true;
 

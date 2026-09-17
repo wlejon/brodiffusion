@@ -497,7 +497,9 @@ void decoratePipelineStateProto(ObjectBuilder& proto) {
 } // namespace
 
 void ensureDiffusionClassesInstalled() {
-    static bool installed = false;
+    // Once per THREAD: a class's constructor and prototype are the
+    // installing thread's (host_class.h), so a Worker realm installs its own.
+    static thread_local bool installed = false;
     if (installed) return;
     installed = true;
 
