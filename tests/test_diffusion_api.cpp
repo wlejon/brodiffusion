@@ -4,6 +4,10 @@
 #include <iostream>
 #include <string>
 
+// tests/test_diffusion_surface.cpp — the restored Pipeline / PipelineState
+// members (docs/transition-drift.md row H7).
+void brodiffusionTestRestoredSurface();
+
 int main() {
     namespace ev = bronze::embed;
 
@@ -110,6 +114,9 @@ int main() {
     assert(ev::isObject(expSplat));
     auto badSplatCall = ev::call(expSplat, tsp, {});
     assert(badSplatCall.thrown);
+
+    // Methods restored after the QuickJS → bronze port dropped them.
+    brodiffusionTestRestoredSurface();
 
     std::cout << "All brodiffusion_api standalone tests passed successfully!" << std::endl;
     return 0;

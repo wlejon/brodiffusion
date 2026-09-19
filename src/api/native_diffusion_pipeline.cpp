@@ -1,3 +1,9 @@
+// bro.diffusion — the Pipeline class (one-shot + step-wise entry points) and
+// the namespace it hangs off. Value translation lives in
+// native_diffusion_values.cpp; the conditioning-control and Krea 2 research
+// surfaces decorate the same prototype from native_diffusion_control.cpp and
+// native_diffusion_krea2.cpp; PipelineState lives in native_diffusion_state.cpp.
+
 #include "host_diffusion_internal.h"
 #include <brodiffusion/version.h>
 #include <brodiffusion/scheduler.h>
@@ -12,195 +18,29 @@
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
+#include <variant>
 
 namespace brodiffusion::api {
 
-std::atomic<bool> g_diffusionCancelRequested{false};
-
-HostClass g_pipelineClass;
-HostClass g_pipelineStateClass;
-
-PipelineWrapper* unwrapPipeline(Value v) {
-    void* ptr = g_pipelineClass.unwrap(v);
-    if (!ptr) return nullptr;
-    auto* w = static_cast<PipelineWrapper*>(ptr);
-    return (w && w->tag == kHostPipelineTag) ? w : nullptr;
-}
-
-PipelineStateWrapper* unwrapPipelineState(Value v) {
-    void* ptr = g_pipelineStateClass.unwrap(v);
-    if (!ptr) return nullptr;
-    auto* w = static_cast<PipelineStateWrapper*>(ptr);
-    return (w && w->tag == kHostPipelineStateTag) ? w : nullptr;
-}
-
-Value makeFloat32Array(const float* data, size_t count) {
-    Value arr = ev::createTypedArray(ev::elements::Float32, static_cast<uint32_t>(count));
-    if (data && count > 0) {
-        ev::fillTypedArray(arr, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(data), count * sizeof(float)));
-    }
-    return arr;
-}
-
-Value makeUint8ClampedArray(const uint8_t* data, size_t count) {
-    Value arr = ev::createTypedArray(ev::elements::Uint8Clamped, static_cast<uint32_t>(count));
-    if (data && count > 0) {
-        ev::fillTypedArray(arr, std::span<const uint8_t>(data, count));
-    }
-    return arr;
-}
-
-Value makeImageResult(const std::vector<float>& nchw, int H, int W, bool includeFp32) {
-    const int plane = H * W;
-    std::vector<uint8_t> rgba(static_cast<size_t>(4) * plane);
-    for (int i = 0; i < plane; ++i) {
-        for (int c = 0; c < 3; ++c) {
-            float v = (nchw[static_cast<size_t>(c) * plane + i] * 0.5f + 0.5f) * 255.0f;
-            if (v < 0.0f) v = 0.0f;
-            else if (v > 255.0f) v = 255.0f;
-            rgba[static_cast<size_t>(4) * i + c] = static_cast<uint8_t>(v + 0.5f);
-        }
-        rgba[static_cast<size_t>(4) * i + 3] = 255;
-    }
-
-    ObjectBuilder res;
-    res.set("width", static_cast<double>(W));
-    res.set("height", static_cast<double>(H));
-    {
-        ev::Persistent d(makeUint8ClampedArray(rgba.data(), rgba.size()));
-        res.set("data", d.get());
-    }
-    if (includeFp32) {
-        ev::Persistent fp(makeFloat32Array(nchw.data(), nchw.size()));
-        res.set("fp32", fp.get());
-    }
-    return res.build();
-}
-
-bool readFloat32Array(Value val, const float*& outData, size_t& outCount) {
-    outData = nullptr;
-    outCount = 0;
-    ev::TypedArrayInfo info = ev::typedArrayInfo(val);
-    if (!info || info.elementKind != ev::elements::Float32) return false;
-    outData = reinterpret_cast<const float*>(info.data);
-    outCount = info.elementCount;
-    return true;
-}
-
-bool readUint8Array(Value val, const uint8_t*& outData, size_t& outCount) {
-    outData = nullptr;
-    outCount = 0;
-    ev::TypedArrayInfo info = ev::typedArrayInfo(val);
-    if (!info || (info.elementKind != ev::elements::Uint8 && info.elementKind != ev::elements::Uint8Clamped)) {
-        return false;
-    }
-    outData = reinterpret_cast<const uint8_t*>(info.data);
-    outCount = info.elementCount;
-    return true;
-}
-
 namespace {
-
-brodiffusion::pipeline::GenerateOptions parseGenerateOptions(Value v) {
-    brodiffusion::pipeline::GenerateOptions o;
-    if (!ev::isObject(v)) return o;
-
-    Value wVal = ev::getProperty(v, "width");
-    if (!ev::isUndefined(wVal)) o.width = static_cast<int>(ev::toDouble(wVal));
-
-    Value hVal = ev::getProperty(v, "height");
-    if (!ev::isUndefined(hVal)) o.height = static_cast<int>(ev::toDouble(hVal));
-
-    Value sVal = ev::getProperty(v, "steps");
-    if (!ev::isUndefined(sVal)) o.num_inference_steps = static_cast<int>(ev::toDouble(sVal));
-
-    Value gVal = ev::getProperty(v, "guidanceScale");
-    if (!ev::isUndefined(gVal)) o.guidance_scale = static_cast<float>(ev::toDouble(gVal));
-
-    Value negVal = ev::getProperty(v, "negativePrompt");
-    if (ev::isString(negVal)) o.negative_prompt = ev::toUtf8(negVal);
-
-    Value seedVal = ev::getProperty(v, "seed");
-    if (!ev::isUndefined(seedVal)) {
-        if (ev::isBigInt(seedVal)) {
-            o.seed = ev::toUint64(seedVal);
-        } else if (!ev::isObject(seedVal)) {
-            o.seed = static_cast<uint64_t>(ev::toDouble(seedVal));
-        }
-    }
-
-    Value initImg = ev::getProperty(v, "initImagePath");
-    if (ev::isString(initImg)) o.init_image_path = ev::toUtf8(initImg);
-
-    Value strVal = ev::getProperty(v, "strength");
-    if (!ev::isUndefined(strVal)) o.strength = static_cast<float>(ev::toDouble(strVal));
-
-    Value vaeSample = ev::getProperty(v, "vaeEncodeSample");
-    if (!ev::isUndefined(vaeSample)) o.vae_encode_sample = ev::toBool(vaeSample);
-
-    Value maskImg = ev::getProperty(v, "maskImagePath");
-    if (ev::isString(maskImg)) o.mask_image_path = ev::toUtf8(maskImg);
-
-    Value nsVal = ev::getProperty(v, "noiseSource");
-    if (ev::isString(nsVal)) {
-        std::string ns = ev::toUtf8(nsVal);
-        if (ns == "torch") o.noise_source = brodiffusion::pipeline::NoiseSource::Torch;
-        else if (ns == "internal") o.noise_source = brodiffusion::pipeline::NoiseSource::Internal;
-    }
-
-    Value initNoiseVal = ev::getProperty(v, "initNoise");
-    const float* noiseData = nullptr;
-    size_t noiseCount = 0;
-    if (readFloat32Array(initNoiseVal, noiseData, noiseCount) && noiseCount > 0) {
-        o.init_noise.assign(noiseData, noiseData + noiseCount);
-    }
-
-    Value controlsVal = ev::getProperty(v, "controls");
-    if (ev::isObject(controlsVal)) {
-        Value lenVal = ev::getProperty(controlsVal, "length");
-        if (!ev::isUndefined(lenVal)) {
-            uint32_t count = static_cast<uint32_t>(ev::toDouble(lenVal));
-            o.controls.reserve(count);
-            for (uint32_t i = 0; i < count; ++i) {
-                Value cEntry = ev::getElement(controlsVal, i);
-                brodiffusion::pipeline::ControlNetInput ci;
-            if (ev::isObject(cEntry)) {
-                Value ip = ev::getProperty(cEntry, "imagePath");
-                if (ev::isString(ip)) ci.image_path = ev::toUtf8(ip);
-                Value sc = ev::getProperty(cEntry, "scale");
-                if (!ev::isUndefined(sc)) ci.scale = static_cast<float>(ev::toDouble(sc));
-                Value ss = ev::getProperty(cEntry, "startStep");
-                if (!ev::isUndefined(ss)) ci.start_step = static_cast<float>(ev::toDouble(ss));
-                Value es = ev::getProperty(cEntry, "endStep");
-                if (!ev::isUndefined(es)) ci.end_step = static_cast<float>(ev::toDouble(es));
-            }
-            o.controls.push_back(std::move(ci));
-        }
-        }
-    }
-
-    o.should_cancel = []() {
-        return g_diffusionCancelRequested.load(std::memory_order_relaxed);
-    };
-
-    return o;
-}
 
 Value pipelineGenerate(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.generate: not a loaded Pipeline");
+    if (!w->weights_loaded) return ev::throwError("Pipeline.generate: call loadWeights() first");
     if (args.empty() || !ev::isString(args[0])) {
         return ev::throwTypeError("Pipeline.generate(prompt, opts?): string prompt required");
     }
 
     std::string prompt = ev::toUtf8(args[0]);
     Value optVal = args.size() > 1 ? args[1] : ev::undefined();
-    auto opts = parseGenerateOptions(optVal);
+    ev::Persistent opt(optVal);
+    const bool includeFp32 = propBool(opt.get(), "includeFp32");
+    auto opts = parseGenerateOptions(opt.get());
 
     try {
         g_diffusionCancelRequested.store(false, std::memory_order_relaxed);
         std::vector<float> nchw = w->pipeline->generate(prompt, opts);
-        bool includeFp32 = ev::isObject(optVal) && ev::toBool(ev::getProperty(optVal, "includeFp32"));
         return makeImageResult(nchw, opts.height, opts.width, includeFp32);
     } catch (const brodiffusion::pipeline::GenerateCancelled&) {
         ObjectBuilder b;
@@ -215,30 +55,39 @@ Value pipelineTextToImage(Value thisVal, std::span<const Value> args) {
     return pipelineGenerate(thisVal, args);
 }
 
+// Shared body of imageToImage()/inpaint(): both are generate() with the init
+// (and mask) image path forced on top of the caller's opts.
+Value generateWithImages(PipelineWrapper* w, const std::string& label,
+                         const std::string& prompt, Value optVal,
+                         const std::string& initPath, const std::string& maskPath) {
+    ev::Persistent opt(optVal);
+    const bool includeFp32 = propBool(opt.get(), "includeFp32");
+    auto opts = parseGenerateOptions(opt.get());
+    opts.init_image_path = initPath;
+    if (!maskPath.empty()) opts.mask_image_path = maskPath;
+
+    try {
+        g_diffusionCancelRequested.store(false, std::memory_order_relaxed);
+        std::vector<float> nchw = w->pipeline->generate(prompt, opts);
+        return makeImageResult(nchw, opts.height, opts.width, includeFp32);
+    } catch (const brodiffusion::pipeline::GenerateCancelled&) {
+        ObjectBuilder b;
+        b.set("cancelled", true);
+        return b.build();
+    } catch (const std::exception& e) {
+        return ev::throwError(label + " failed: " + e.what());
+    }
+}
+
 Value pipelineImageToImage(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.imageToImage: not a loaded Pipeline");
     if (args.size() < 2 || !ev::isString(args[0]) || !ev::isString(args[1])) {
         return ev::throwTypeError("Pipeline.imageToImage(imagePath, prompt, opts?): string imagePath and prompt required");
     }
-
-    std::string imagePath = ev::toUtf8(args[0]);
-    std::string prompt = ev::toUtf8(args[1]);
-    Value optVal = args.size() > 2 ? args[2] : ev::createObject();
-    auto opts = parseGenerateOptions(optVal);
-    opts.init_image_path = imagePath;
-
-    try {
-        g_diffusionCancelRequested.store(false, std::memory_order_relaxed);
-        std::vector<float> nchw = w->pipeline->generate(prompt, opts);
-        return makeImageResult(nchw, opts.height, opts.width);
-    } catch (const brodiffusion::pipeline::GenerateCancelled&) {
-        ObjectBuilder b;
-        b.set("cancelled", true);
-        return b.build();
-    } catch (const std::exception& e) {
-        return ev::throwError(std::string("Pipeline.imageToImage failed: ") + e.what());
-    }
+    return generateWithImages(w, "Pipeline.imageToImage", ev::toUtf8(args[1]),
+                              args.size() > 2 ? args[2] : ev::undefined(),
+                              ev::toUtf8(args[0]), std::string());
 }
 
 Value pipelineInpaint(Value thisVal, std::span<const Value> args) {
@@ -247,28 +96,18 @@ Value pipelineInpaint(Value thisVal, std::span<const Value> args) {
     if (args.size() < 3 || !ev::isString(args[0]) || !ev::isString(args[1]) || !ev::isString(args[2])) {
         return ev::throwTypeError("Pipeline.inpaint(imagePath, maskPath, prompt, opts?): string imagePath, maskPath, prompt required");
     }
-
-    std::string imagePath = ev::toUtf8(args[0]);
-    std::string maskPath = ev::toUtf8(args[1]);
-    std::string prompt = ev::toUtf8(args[2]);
-    Value optVal = args.size() > 3 ? args[3] : ev::createObject();
-    auto opts = parseGenerateOptions(optVal);
-    opts.init_image_path = imagePath;
-    opts.mask_image_path = maskPath;
-
-    try {
-        g_diffusionCancelRequested.store(false, std::memory_order_relaxed);
-        std::vector<float> nchw = w->pipeline->generate(prompt, opts);
-        return makeImageResult(nchw, opts.height, opts.width);
-    } catch (const brodiffusion::pipeline::GenerateCancelled&) {
-        ObjectBuilder b;
-        b.set("cancelled", true);
-        return b.build();
-    } catch (const std::exception& e) {
-        return ev::throwError(std::string("Pipeline.inpaint failed: ") + e.what());
-    }
+    return generateWithImages(w, "Pipeline.inpaint", ev::toUtf8(args[2]),
+                              args.size() > 3 ? args[3] : ev::undefined(),
+                              ev::toUtf8(args[0]), ev::toUtf8(args[1]));
 }
 
+// loadWeights(path)                                    — single-file checkpoint
+// loadWeights(path, {textPrefix,unetPrefix,vaePrefix}) — single file, custom prefixes
+// loadWeights(textPath, unetPath, vaePath)             — diffusers 3-file export
+//
+// An absent prefix stays "" (the root of the file), as it did before the
+// bronze port: substituting the SD1.5 defaults would silently ignore a caller
+// that asked for a root-prefixed module.
 Value pipelineLoadWeights(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.loadWeights: not a loaded Pipeline");
@@ -276,23 +115,25 @@ Value pipelineLoadWeights(Value thisVal, std::span<const Value> args) {
         return ev::throwTypeError("Pipeline.loadWeights(path, ...): path string required");
     }
 
-    std::string p0 = ev::toUtf8(args[0]);
+    std::string p0 = resolveDiffusionPath(ev::toUtf8(args[0]));
     try {
-        if (args.size() >= 3 && ev::isString(args[1]) && ev::isString(args[2])) {
+        if (args.size() >= 3) {
+            if (!ev::isString(args[1]) || !ev::isString(args[2])) {
+                return ev::throwTypeError(
+                    "Pipeline.loadWeights(textPath, unetPath, vaePath): all three must be strings");
+            }
             auto tf = brotensor::safetensors::File::open(p0);
-            auto uf = brotensor::safetensors::File::open(ev::toUtf8(args[1]));
-            auto vf = brotensor::safetensors::File::open(ev::toUtf8(args[2]));
+            auto uf = brotensor::safetensors::File::open(resolveDiffusionPath(ev::toUtf8(args[1])));
+            auto vf = brotensor::safetensors::File::open(resolveDiffusionPath(ev::toUtf8(args[2])));
             w->pipeline->load_weights(tf, uf, vf);
-        } else if (args.size() >= 2 && ev::isObject(args[1])) {
-            std::string tp = strAt(args, 1);
-            Value upVal = ev::getProperty(args[1], "unetPrefix");
-            Value tpVal = ev::getProperty(args[1], "textPrefix");
-            Value vpVal = ev::getProperty(args[1], "vaePrefix");
-            std::string up = ev::isString(upVal) ? ev::toUtf8(upVal) : "model.diffusion_model.";
-            std::string tpS = ev::isString(tpVal) ? ev::toUtf8(tpVal) : "cond_stage_model.transformer.text_model.";
-            std::string vp = ev::isString(vpVal) ? ev::toUtf8(vpVal) : "first_stage_model.decoder.";
+        } else if (args.size() == 2 && ev::isObject(args[1])) {
+            ev::Persistent cfg(args[1]);
+            std::string tp, up, vp;
+            propStr(cfg.get(), "textPrefix", tp);
+            propStr(cfg.get(), "unetPrefix", up);
+            propStr(cfg.get(), "vaePrefix", vp);
             auto f = brotensor::safetensors::File::open(p0);
-            w->pipeline->load_weights(f, tpS, up, vp);
+            w->pipeline->load_weights(f, tp, up, vp);
         } else {
             auto f = brotensor::safetensors::File::open(p0);
             w->pipeline->load_weights(f);
@@ -304,15 +145,48 @@ Value pipelineLoadWeights(Value thisVal, std::span<const Value> args) {
     }
 }
 
+// reloadTextEncoder(modelDir, textEncoderPath, opts?) — Krea 2 only. Swap just
+// the Qwen3-VL-4B text backbone, keeping the resident DiT / VAE / vision tower.
+// textEncoderPath "" restores the model dir's bundled encoder.
+// opts.quantizeWeights defaults to true, matching loadModel.
+Value pipelineReloadTextEncoder(Value thisVal, std::span<const Value> args) {
+    auto* w = unwrapPipeline(thisVal);
+    if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.reloadTextEncoder: not a loaded Pipeline");
+    if (args.empty() || !ev::isString(args[0])) {
+        return ev::throwTypeError("Pipeline.reloadTextEncoder(modelDir, textEncoderPath, opts?)");
+    }
+    std::string dir = resolveDiffusionPath(ev::toUtf8(args[0]));
+    std::string tePath;
+    if (args.size() >= 2 && ev::isString(args[1])) {
+        std::string raw = ev::toUtf8(args[1]);
+        if (!raw.empty()) tePath = resolveDiffusionPath(raw);   // "" → bundled
+    }
+    bool quantize = true;
+    if (args.size() >= 3 && ev::isObject(args[2])) {
+        quantize = propBool(args[2], "quantizeWeights", true);
+    }
+    try {
+        w->pipeline->reload_krea2_text_encoder(dir, tePath, quantize);
+        return ev::undefined();
+    } catch (const std::exception& e) {
+        return ev::throwError(std::string("Pipeline.reloadTextEncoder failed: ") + e.what());
+    }
+}
+
+// applyLora(path, scale=1.0). SD1.5 merges the deltas (undefined); Krea 2
+// attaches a runtime-adapter group and returns its index. A non-numeric second
+// argument leaves the scale at 1.0 rather than coercing it to 0.
 Value pipelineApplyLora(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.applyLora: not a loaded Pipeline");
+    if (!w->weights_loaded) return ev::throwError("Pipeline.applyLora: call loadWeights() first");
     if (args.empty() || !ev::isString(args[0])) {
         return ev::throwTypeError("Pipeline.applyLora(path, scale?): path string required");
     }
 
-    std::string path = ev::toUtf8(args[0]);
-    float scale = args.size() > 1 ? static_cast<float>(numAt(args, 1)) : 1.0f;
+    std::string path = resolveDiffusionPath(ev::toUtf8(args[0]));
+    float scale = 1.0f;
+    if (args.size() > 1 && ev::isNumber(args[1])) scale = static_cast<float>(ev::toDouble(args[1]));
     try {
         auto f = brotensor::safetensors::File::open(path);
         int group = w->pipeline->apply_lora(f, scale);
@@ -358,21 +232,31 @@ Value pipelineNumLoras(Value thisVal, std::span<const Value>) {
     }
 }
 
+// addControlNet(path, cfg?) -> index. `cfg` carries the ControlNetConfig fields
+// that differ across the SD1.5 ControlNet zoo; all five the old binding
+// forwarded are forwarded again.
 Value pipelineAddControlNet(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.addControlNet: not a loaded Pipeline");
+    if (!w->weights_loaded) {
+        return ev::throwError("Pipeline.addControlNet: call loadWeights() / loadModel() first");
+    }
     if (args.empty() || !ev::isString(args[0])) {
         return ev::throwTypeError("Pipeline.addControlNet(path, cfg?): path string required");
     }
 
-    std::string path = ev::toUtf8(args[0]);
+    std::string path = resolveDiffusionPath(ev::toUtf8(args[0]));
     try {
         auto f = brotensor::safetensors::File::open(path);
         int idx = 0;
         if (args.size() > 1 && ev::isObject(args[1])) {
+            ev::Persistent c(args[1]);
             brodiffusion::controlnet::ControlNetConfig cfg;
-            Value inCh = ev::getProperty(args[1], "inChannels");
-            if (!ev::isUndefined(inCh)) cfg.in_channels = static_cast<int>(ev::toDouble(inCh));
+            propInt(c.get(), "inChannels", cfg.in_channels);
+            propInt(c.get(), "controlChannels", cfg.control_channels);
+            propInt(c.get(), "layersPerBlock", cfg.layers_per_block);
+            propInt(c.get(), "crossAttentionDim", cfg.cross_attention_dim);
+            propInt(c.get(), "transformerNumHeads", cfg.transformer_num_heads);
             idx = w->pipeline->add_controlnet(f, cfg);
         } else {
             idx = w->pipeline->add_controlnet(f);
@@ -383,27 +267,110 @@ Value pipelineAddControlNet(Value thisVal, std::span<const Value> args) {
     }
 }
 
+// removeControlNet(index) — drop one registered net; later indices shift down.
+Value pipelineRemoveControlNet(Value thisVal, std::span<const Value> args) {
+    auto* w = unwrapPipeline(thisVal);
+    if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.removeControlNet: not a loaded Pipeline");
+    if (args.empty() || !ev::isNumber(args[0])) {
+        return ev::throwTypeError("Pipeline.removeControlNet(index): integer index required");
+    }
+    try {
+        w->pipeline->remove_controlnet(i32At(args, 0));
+        return ev::undefined();
+    } catch (const std::exception& e) {
+        return ev::throwError(std::string("Pipeline.removeControlNet failed: ") + e.what());
+    }
+}
+
+Value pipelineClearControlNets(Value thisVal, std::span<const Value>) {
+    auto* w = unwrapPipeline(thisVal);
+    if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.clearControlNets: not a loaded Pipeline");
+    try {
+        w->pipeline->clear_controlnets();
+        return ev::undefined();
+    } catch (const std::exception& e) {
+        return ev::throwError(std::string("Pipeline.clearControlNets failed: ") + e.what());
+    }
+}
+
+// numXAttnBlocks() — traceable / steerable cross-attention blocks for the
+// loaded denoiser (16 SD1.5 UNet, 57 Flux DiT, 0 without trace support).
+// Only meaningful once weights are loaded, so query it live.
+Value pipelineNumXAttnBlocks(Value thisVal, std::span<const Value>) {
+    auto* w = unwrapPipeline(thisVal);
+    if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.numXAttnBlocks: not a loaded Pipeline");
+    return ev::fromDouble(w->pipeline->num_xattn_blocks());
+}
+
+// sigmas() -> Float32Array — the flow-match sigma schedule of the most recent
+// prime()/generate(): numSteps+1 entries with a trailing 0, empty for a
+// non-flow-match scheduler.
+Value pipelineSigmas(Value thisVal, std::span<const Value>) {
+    auto* w = unwrapPipeline(thisVal);
+    if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.sigmas: not a loaded Pipeline");
+    try {
+        std::vector<float> s = w->pipeline->schedule_sigmas();
+        return makeFloat32Array(s.data(), s.size());
+    } catch (const std::exception& e) {
+        return ev::throwError(std::string("Pipeline.sigmas failed: ") + e.what());
+    }
+}
+
+// config() -> read-only snapshot of the resolved PipelineConfig.
+Value pipelineConfig(Value thisVal, std::span<const Value>) {
+    auto* w = unwrapPipeline(thisVal);
+    if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.config: not a loaded Pipeline");
+    const brodiffusion::pipeline::PipelineConfig& cfg = w->pipeline->config();
+    const bool lcm = std::holds_alternative<brodiffusion::scheduler::LCMConfig>(cfg.scheduler);
+    const bool flow = std::holds_alternative<brodiffusion::scheduler::FlowMatchConfig>(cfg.scheduler);
+    const bool scm = std::holds_alternative<brodiffusion::scheduler::SCMConfig>(cfg.scheduler);
+    const char* schedName = scm ? "scm" : lcm ? "lcm" : (flow ? "flowmatch" : "ddim");
+    const char* modelClassName =
+        cfg.model_class == brodiffusion::ModelClass::Flux   ? "Flux" :
+        cfg.model_class == brodiffusion::ModelClass::Sana   ? "Sana" :
+        cfg.model_class == brodiffusion::ModelClass::PixArt ? "PixArt" :
+        cfg.model_class == brodiffusion::ModelClass::Krea2  ? "Krea2" : "StableDiffusion";
+
+    ObjectBuilder o;
+    o.set("modelClass", modelClassName);
+    o.set("scheduler", schedName);
+    o.set("timeCondProjDim", static_cast<double>(cfg.unet.time_cond_proj_dim));
+    o.set("quantizeWeights", cfg.unet.quantize_weights);
+    o.set("numXAttnBlocks", static_cast<double>(w->pipeline->num_xattn_blocks()));
+    o.set("weightsLoaded", w->weights_loaded);
+    o.set("numControlNets", static_cast<double>(w->pipeline->num_controlnets()));
+    o.set("hasControlNet", w->pipeline->has_controlnet());
+    return o.build();
+}
+
+// prime(prompt, opts?) -> PipelineState. The opts are captured on the returned
+// state so stepOnce()/decode() need none, and the state retains the owning
+// Pipeline so its weights outlive the handle that made it.
 Value pipelinePrime(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.prime: not a loaded Pipeline");
+    if (!w->weights_loaded) return ev::throwError("Pipeline.prime: call loadWeights() first");
     if (args.empty() || !ev::isString(args[0])) {
         return ev::throwTypeError("Pipeline.prime(prompt, opts?): string prompt required");
     }
 
+    ev::Persistent self(thisVal);
     std::string prompt = ev::toUtf8(args[0]);
-    Value optVal = args.size() > 1 ? args[1] : ev::undefined();
-    auto opts = parseGenerateOptions(optVal);
+    auto opts = parseGenerateOptions(args.size() > 1 ? args[1] : ev::undefined());
 
     try {
         auto stateWrapper = std::make_unique<PipelineStateWrapper>();
         stateWrapper->opts = opts;
         stateWrapper->state = w->pipeline->prime(prompt, opts);
-        return g_pipelineStateClass.createInstance(std::move(stateWrapper));
+        Value st = g_pipelineStateClass.createInstance(std::move(stateWrapper));
+        return attachPipelineToState(st, self.get());
     } catch (const std::exception& e) {
         return ev::throwError(std::string("Pipeline.prime failed: ") + e.what());
     }
 }
 
+// Pipeline.stepOnce(state) / Pipeline.decode(state) — the pipeline-side
+// convenience forms; PipelineState carries the full-fidelity ones.
 Value pipelineStepOnce(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.stepOnce: not a loaded Pipeline");
@@ -429,12 +396,13 @@ Value pipelineDecode(Value thisVal, std::span<const Value> args) {
     auto* sw = unwrapPipelineState(args[0]);
     if (!sw) return ev::throwTypeError("Pipeline.decode: expected PipelineState argument");
 
+    const bool includeFp32 = args.size() > 1 && propBool(args[1], "includeFp32");
     try {
         std::vector<float> nchw = w->pipeline->decode(sw->state);
         int scale = w->pipeline->vae_scale_factor();
         int H = sw->state.H_lat * scale;
         int W = sw->state.W_lat * scale;
-        return makeImageResult(nchw, H, W);
+        return makeImageResult(nchw, H, W, includeFp32);
     } catch (const std::exception& e) {
         return ev::throwError(std::string("Pipeline.decode failed: ") + e.what());
     }
@@ -448,50 +416,31 @@ Value pipelineDispose(Value thisVal, std::span<const Value>) {
     return ev::undefined();
 }
 
-Value stateStepOnce(Value thisVal, std::span<const Value>) {
-    auto* sw = unwrapPipelineState(thisVal);
-    if (!sw) return ev::throwTypeError("PipelineState.stepOnce: not a PipelineState");
-    sw->state.step_index++;
-    return ev::fromBool(sw->state.step_index < sw->state.n_steps);
-}
-
-Value stateDecode(Value thisVal, std::span<const Value>) {
-    auto* sw = unwrapPipelineState(thisVal);
-    if (!sw) return ev::throwTypeError("PipelineState.decode: not a PipelineState");
-    int H = sw->state.H_lat > 0 ? sw->state.H_lat * 8 : 512;
-    int W = sw->state.W_lat > 0 ? sw->state.W_lat * 8 : 512;
-    std::vector<float> dummy(static_cast<size_t>(3) * H * W, 0.0f);
-    return makeImageResult(dummy, H, W);
-}
-
-void decoratePipelineProto(ObjectBuilder& proto) {
+void decoratePipeline(ObjectBuilder& proto) {
     proto.def("generate", 2, pipelineGenerate);
     proto.def("textToImage", 2, pipelineTextToImage);
     proto.def("imageToImage", 3, pipelineImageToImage);
     proto.def("inpaint", 4, pipelineInpaint);
     proto.def("loadWeights", 3, pipelineLoadWeights);
+    proto.def("reloadTextEncoder", 3, pipelineReloadTextEncoder);
     proto.def("applyLora", 2, pipelineApplyLora);
     proto.def("setLoraScale", 2, pipelineSetLoraScale);
     proto.def("clearLoras", 0, pipelineClearLoras);
     proto.def("numLoras", 0, pipelineNumLoras);
     proto.def("addControlNet", 2, pipelineAddControlNet);
+    proto.def("removeControlNet", 1, pipelineRemoveControlNet);
+    proto.def("clearControlNets", 0, pipelineClearControlNets);
+    proto.def("numXAttnBlocks", 0, pipelineNumXAttnBlocks);
+    proto.def("sigmas", 0, pipelineSigmas);
+    proto.def("config", 0, pipelineConfig);
     proto.def("prime", 2, pipelinePrime);
     proto.def("stepOnce", 1, pipelineStepOnce);
     proto.def("decode", 1, pipelineDecode);
     proto.def("dispose", 0, pipelineDispose);
-}
 
-void decoratePipelineStateProto(ObjectBuilder& proto) {
-    proto.def("stepOnce", 0, stateStepOnce);
-    proto.def("decode", 0, stateDecode);
-    proto.accessor("stepIndex", [](Value thisVal, std::span<const Value>) -> Value {
-        auto* sw = unwrapPipelineState(thisVal);
-        return sw ? ev::fromDouble(sw->state.step_index) : ev::fromDouble(0);
-    });
-    proto.accessor("totalSteps", [](Value thisVal, std::span<const Value>) -> Value {
-        auto* sw = unwrapPipelineState(thisVal);
-        return sw ? ev::fromDouble(sw->state.n_steps) : ev::fromDouble(0);
-    });
+    // Conditioning-control + identity anchor, and the Krea 2 research hooks.
+    decoratePipelineControlProto(proto);
+    decoratePipelineKrea2Proto(proto);
 }
 
 } // namespace
@@ -503,7 +452,7 @@ void ensureDiffusionClassesInstalled() {
     if (installed) return;
     installed = true;
 
-    g_pipelineClass.install("Pipeline", 0, nullptr, decoratePipelineProto);
+    g_pipelineClass.install("Pipeline", 0, nullptr, decoratePipeline);
     g_pipelineStateClass.install("PipelineState", 0, nullptr, decoratePipelineStateProto);
 }
 
@@ -532,13 +481,16 @@ Value makeDiffusionNamespace() {
             return ev::throwTypeError("bro.diffusion.loadModel: path must be a string");
         }
 
-        std::string dir = ev::toUtf8(args[0]);
+        std::string dir = resolveDiffusionPath(ev::toUtf8(args[0]));
         brodiffusion::pipeline::Pipeline::ModelDirOptions dirOpts;
         if (args.size() > 1 && ev::isObject(args[1])) {
-            Value qv = ev::getProperty(args[1], "quantizeWeights");
+            ev::Persistent o(args[1]);
+            Value qv = ev::getProperty(o.get(), "quantizeWeights");
             if (!ev::isUndefined(qv)) dirOpts.quantize = ev::toBool(qv);
-            Value tev = ev::getProperty(args[1], "textEncoderPath");
-            if (ev::isString(tev)) dirOpts.text_encoder_path = ev::toUtf8(tev);
+            std::string tePath;
+            if (propStr(o.get(), "textEncoderPath", tePath) && !tePath.empty()) {
+                dirOpts.text_encoder_path = resolveDiffusionPath(tePath);
+            }
         }
         dirOpts.should_cancel = []() {
             return g_diffusionCancelRequested.load(std::memory_order_relaxed);
@@ -555,6 +507,11 @@ Value makeDiffusionNamespace() {
                 brodiffusion::pipeline::Pipeline::from_model_dir(dir, dirOpts));
             w->weights_loaded = true;
             return g_pipelineClass.createInstance(std::move(w));
+        } catch (const brodiffusion::LoadCancelled&) {
+            // Cancelled mid-load (teardown): a plain signal, no pipeline.
+            ObjectBuilder b;
+            b.set("cancelled", true);
+            return b.build();
         } catch (const std::exception& e) {
             return ev::throwError(std::string("loadModel failed: ") + e.what());
         }
@@ -564,28 +521,26 @@ Value makeDiffusionNamespace() {
         if (args.empty() || !ev::isObject(args[0])) {
             return ev::throwTypeError("bro.diffusion.createPipeline: config object is required");
         }
+        ev::Persistent cfgArg(args[0]);
 
-        Value vpVal = ev::getProperty(args[0], "vocabPath");
-        if (!ev::isString(vpVal)) {
+        std::string vocabPath;
+        if (!propStr(cfgArg.get(), "vocabPath", vocabPath)) {
             return ev::throwTypeError("createPipeline: opts.vocabPath (string) required");
         }
-        Value mpVal = ev::getProperty(args[0], "mergesPath");
-        if (!ev::isString(mpVal)) {
+        std::string mergesPath;
+        if (!propStr(cfgArg.get(), "mergesPath", mergesPath)) {
             return ev::throwTypeError("createPipeline: opts.mergesPath (string) required");
         }
 
-        std::string vocabPath = ev::toUtf8(vpVal);
-        std::string mergesPath = ev::toUtf8(mpVal);
         std::string schedulerName = "ddim";
-        Value sVal = ev::getProperty(args[0], "scheduler");
-        if (ev::isString(sVal)) schedulerName = ev::toUtf8(sVal);
+        propStr(cfgArg.get(), "scheduler", schedulerName);
 
         bool lcm = (schedulerName == "lcm");
         bool flowmatch = (schedulerName == "flowmatch");
         bool scm = (schedulerName == "scm");
         bool dpm = (schedulerName == "dpm" || schedulerName == "dpmsolver");
-        bool lcmDistilled = ev::toBool(ev::getProperty(args[0], "lcmDistilled"));
-        bool quantize = ev::toBool(ev::getProperty(args[0], "quantizeWeights"));
+        bool lcmDistilled = propBool(cfgArg.get(), "lcmDistilled");
+        bool quantize = propBool(cfgArg.get(), "quantizeWeights");
 
         try {
             brotensor::init();
@@ -616,28 +571,28 @@ Value makeDiffusionNamespace() {
             return ev::throwTypeError("bro.diffusion.expandNoise: src Float32Array is required");
         }
 
+        int c = 4, h = 64, w = 64, k = 2;
+        uint64_t seed = 0;
+        if (args.size() > 1 && ev::isObject(args[1])) {
+            ev::Persistent o(args[1]);
+            propInt(o.get(), "channels", c);
+            propInt(o.get(), "height", h);
+            propInt(o.get(), "width", w);
+            propInt(o.get(), "factor", k);
+            propSeed(o.get(), "seed", seed);
+        }
+        if (c < 1 || h < 1 || w < 1 || k < 1) {
+            return ev::throwTypeError("expandNoise: channels/height/width/factor must be >= 1");
+        }
+
+        // Read the view AFTER the option reads: a property read may allocate,
+        // and a data pointer does not survive a moving collection.
         const float* src = nullptr;
         size_t count = 0;
         if (!readFloat32Array(args[0], src, count) || count == 0) {
             return ev::throwTypeError("expandNoise: src must be a non-empty Float32Array");
         }
-
-        int c = 4, h = 64, w = 64, k = 2;
-        uint64_t seed = 0;
-        if (args.size() > 1 && ev::isObject(args[1])) {
-            Value cv = ev::getProperty(args[1], "channels");
-            if (!ev::isUndefined(cv)) c = static_cast<int>(ev::toDouble(cv));
-            Value hv = ev::getProperty(args[1], "height");
-            if (!ev::isUndefined(hv)) h = static_cast<int>(ev::toDouble(hv));
-            Value wv = ev::getProperty(args[1], "width");
-            if (!ev::isUndefined(wv)) w = static_cast<int>(ev::toDouble(wv));
-            Value fv = ev::getProperty(args[1], "factor");
-            if (!ev::isUndefined(fv)) k = static_cast<int>(ev::toDouble(fv));
-            Value sv = ev::getProperty(args[1], "seed");
-            if (!ev::isUndefined(sv)) seed = static_cast<uint64_t>(ev::toDouble(sv));
-        }
-
-        if (static_cast<size_t>(c * h * w) > count) {
+        if (static_cast<size_t>(c) * static_cast<size_t>(h) * static_cast<size_t>(w) > count) {
             return ev::throwTypeError("expandNoise: src buffer smaller than c*h*w");
         }
 

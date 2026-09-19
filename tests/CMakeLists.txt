@@ -116,7 +116,7 @@ target_compile_definitions(brodiffusion_test_flow_sampler PRIVATE
 
 # Bronze standalone JavaScript API test
 if(BRODIFFUSION_ENABLE_API)
-    add_executable(brodiffusion_test_api test_diffusion_api.cpp)
+    add_executable(brodiffusion_test_api test_diffusion_api.cpp test_diffusion_surface.cpp)
     target_include_directories(brodiffusion_test_api PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/api
     )

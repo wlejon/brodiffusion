@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
@@ -90,5 +91,88 @@ public:
 private:
     std::span<const Value> args_;
 };
+
+// ── option-bag readers ─────────────────────────────────────────────────────
+// The old QuickJS bindings read an options object key by key, leaving the
+// caller's default in place when the key is absent. These mirror getInt /
+// getNum / getStr / getBool from diffusion_bindings.cpp so a port reads the
+// same way.
+
+inline bool propStr(Value obj, const char* key, std::string& dst) {
+    if (!ev::isObject(obj)) return false;
+    Value v = ev::getProperty(obj, key);
+    if (!ev::isString(v)) return false;
+    dst = ev::toUtf8(v);
+    return true;
+}
+
+inline void propInt(Value obj, const char* key, int& dst) {
+    if (!ev::isObject(obj)) return;
+    Value v = ev::getProperty(obj, key);
+    if (ev::isNumber(v)) dst = static_cast<int>(ev::toDouble(v));
+}
+
+inline void propNum(Value obj, const char* key, float& dst) {
+    if (!ev::isObject(obj)) return;
+    Value v = ev::getProperty(obj, key);
+    if (ev::isNumber(v)) dst = static_cast<float>(ev::toDouble(v));
+}
+
+inline bool propBool(Value obj, const char* key, bool def = false) {
+    if (!ev::isObject(obj)) return def;
+    Value v = ev::getProperty(obj, key);
+    if (ev::isUndefined(v) || ev::isNull(v)) return def;
+    return ev::toBool(v);
+}
+
+// A plain JS number (lossless to 2^53) or a BigInt (full range).
+inline void propSeed(Value obj, const char* key, uint64_t& dst) {
+    if (!ev::isObject(obj)) return;
+    Value v = ev::getProperty(obj, key);
+    if (ev::isBigInt(v)) dst = ev::toUint64(v);
+    else if (ev::isNumber(v)) dst = static_cast<uint64_t>(ev::toInt64(v));
+}
+
+// ── arrays ─────────────────────────────────────────────────────────────────
+// bronze::embed has no createArray; an empty array literal is the portable
+// way to mint one. The accumulator is rooted because setElement allocates.
+
+inline Value hostArrayOf(size_t count, const std::function<Value(size_t)>& make) {
+    ev::Persistent arr(ev::parseJson("[]").value);
+    for (size_t i = 0; i < count; ++i) {
+        ev::Persistent item(make(i));
+        arr.set(ev::setElement(arr.get(), static_cast<uint32_t>(i), item.get()));
+    }
+    return arr.get();
+}
+
+// Length of an array-like (JS `.length`), 0 for a non-object.
+inline uint32_t arrayLength(Value v) {
+    if (!ev::isObject(v)) return 0;
+    Value len = ev::getProperty(v, "length");
+    if (!ev::isNumber(len)) return 0;
+    double d = ev::toDouble(len);
+    return (d > 0.0 && d < 4294967295.0) ? static_cast<uint32_t>(d) : 0;
+}
+
+// Object.keys(obj): own enumerable string keys, for the option bags keyed by
+// user-chosen names (the control-axis weight map).
+inline std::vector<std::string> objectKeys(Value obj) {
+    std::vector<std::string> out;
+    if (!ev::isObject(obj)) return out;
+    ev::Persistent root(obj);
+    auto objectCtor = ev::globalValue("Object");
+    if (!objectCtor.found || !ev::isObject(objectCtor.value)) return out;
+    ev::Persistent keysFn(ev::getProperty(objectCtor.value, "keys"));
+    if (!ev::isFunction(keysFn.get())) return out;
+    const Value callArgs[1] = {root.get()};
+    ev::CallResult r = ev::call(keysFn.get(), ev::undefined(), std::span<const Value>(callArgs, 1));
+    if (r.thrown || !ev::isObject(r.value)) return out;
+    ev::Persistent arr(r.value);
+    const uint32_t n = arrayLength(arr.get());
+    out.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) out.push_back(ev::toUtf8(ev::getElement(arr.get(), i)));
+    return out;
+}
 
 } // namespace brodiffusion::api

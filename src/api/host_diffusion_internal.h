@@ -7,6 +7,8 @@
 
 #include <brodiffusion/pipeline.h>
 #include <brodiffusion/controlnet.h>
+#include <brodiffusion/denoiser.h>
+#include <brodiffusion/krea2_text.h>
 #include <brodiffusion/vae.h>
 #include <brodiffusion/triposplat/flow_model.h>
 #include <brodiffusion/triposplat/octree_decoder.h>
@@ -87,6 +89,37 @@ Value makeImageResult(const std::vector<float>& nchw, int H, int W, bool include
 
 bool readFloat32Array(Value val, const float*& outData, size_t& outCount);
 bool readUint8Array(Value val, const uint8_t*& outData, size_t& outCount);
+
+// A model dir / weight file / LoRA / ControlNet / control-dictionary path as
+// the host's resolver sees it (api.h setPathResolver), or unchanged when no
+// resolver is installed.
+std::string resolveDiffusionPath(const std::string& path);
+
+// ── shared by the pipeline / control / krea2 / state translation units ─────
+
+// Download a brotensor::Tensor to host FP32, converting FP16/BF16 bits as
+// needed — brodiffusion tensors carry the compute dtype.
+std::vector<float> downloadTensorFloats(const brotensor::Tensor& t);
+
+// { rows, cols, data: Float32Array } ↔ brotensor::Tensor (host FP32).
+bool tensorFromJs(Value v, brotensor::Tensor& out);
+Value tensorToJs(const brotensor::Tensor& t);
+
+// krea2::TextConditioning -> { embeds, mask }.
+Value textConditioningToJs(const brodiffusion::krea2::TextConditioning& tc);
+
+// Map a JS opts object onto GenerateOptions (defaults kept for absent keys).
+brodiffusion::pipeline::GenerateOptions parseGenerateOptions(Value v);
+
+// A PipelineState retains its owning Pipeline through a `__pipeline` property
+// so the weights cannot be collected while a state (or a clone) is alive.
+Value attachPipelineToState(Value stateVal, Value pipelineVal);
+brodiffusion::pipeline::Pipeline* pipelineOfState(Value stateVal);
+
+// Prototype decoration, split across TUs to keep each file small.
+void decoratePipelineControlProto(ObjectBuilder& proto);
+void decoratePipelineKrea2Proto(ObjectBuilder& proto);
+void decoratePipelineStateProto(ObjectBuilder& proto);
 bool readImageInput(Value val, std::vector<uint8_t>& rgba, int& w, int& h, std::string& err);
 
 bool saveSplatPLY(const brodiffusion::triposplat::GaussianSplats& splats, const std::string& path);
