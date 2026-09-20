@@ -247,7 +247,10 @@ Value pipelineSetIdentityAnchor(Value thisVal, std::span<const Value> args) {
     auto opts = parseGenerateOptions(opt.get());
 
     try {
-        g_diffusionCancelRequested.store(false, std::memory_order_relaxed);
+        w->cancel_requested.store(false, std::memory_order_relaxed);
+        opts.should_cancel = [w]() {
+            return w->cancel_requested.load(std::memory_order_relaxed);
+        };
         std::vector<float> img = w->pipeline->capture_identity_anchor(prompt, opts);
         return makeImageResult(img, opts.height, opts.width, includeFp32);
     } catch (const brodiffusion::pipeline::GenerateCancelled&) {

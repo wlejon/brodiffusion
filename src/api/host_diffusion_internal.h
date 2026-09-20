@@ -39,6 +39,7 @@ struct PipelineWrapper {
     uint32_t tag = kHostPipelineTag;
     std::unique_ptr<brodiffusion::pipeline::Pipeline> pipeline;
     bool weights_loaded = false;
+    std::atomic<bool> cancel_requested{false};
 };
 
 struct PipelineStateWrapper {

@@ -39,7 +39,10 @@ Value pipelineGenerate(Value thisVal, std::span<const Value> args) {
     auto opts = parseGenerateOptions(opt.get());
 
     try {
-        g_diffusionCancelRequested.store(false, std::memory_order_relaxed);
+        w->cancel_requested.store(false, std::memory_order_relaxed);
+        opts.should_cancel = [w]() {
+            return w->cancel_requested.load(std::memory_order_relaxed);
+        };
         std::vector<float> nchw = w->pipeline->generate(prompt, opts);
         return makeImageResult(nchw, opts.height, opts.width, includeFp32);
     } catch (const brodiffusion::pipeline::GenerateCancelled&) {
@@ -67,7 +70,10 @@ Value generateWithImages(PipelineWrapper* w, const std::string& label,
     if (!maskPath.empty()) opts.mask_image_path = maskPath;
 
     try {
-        g_diffusionCancelRequested.store(false, std::memory_order_relaxed);
+        w->cancel_requested.store(false, std::memory_order_relaxed);
+        opts.should_cancel = [w]() {
+            return w->cancel_requested.load(std::memory_order_relaxed);
+        };
         std::vector<float> nchw = w->pipeline->generate(prompt, opts);
         return makeImageResult(nchw, opts.height, opts.width, includeFp32);
     } catch (const brodiffusion::pipeline::GenerateCancelled&) {
@@ -357,6 +363,10 @@ Value pipelinePrime(Value thisVal, std::span<const Value> args) {
     ev::Persistent self(thisVal);
     std::string prompt = ev::toUtf8(args[0]);
     auto opts = parseGenerateOptions(args.size() > 1 ? args[1] : ev::undefined());
+    w->cancel_requested.store(false, std::memory_order_relaxed);
+    opts.should_cancel = [w]() {
+        return w->cancel_requested.load(std::memory_order_relaxed);
+    };
 
     try {
         auto stateWrapper = std::make_unique<PipelineStateWrapper>();
@@ -416,6 +426,13 @@ Value pipelineDispose(Value thisVal, std::span<const Value>) {
     return ev::undefined();
 }
 
+Value pipelineCancel(Value thisVal, std::span<const Value>) {
+    auto* w = unwrapPipeline(thisVal);
+    if (!w) return ev::throwTypeError("Pipeline.cancel: not a Pipeline");
+    w->cancel_requested.store(true, std::memory_order_relaxed);
+    return ev::undefined();
+}
+
 void decoratePipeline(ObjectBuilder& proto) {
     proto.def("generate", 2, pipelineGenerate);
     proto.def("textToImage", 2, pipelineTextToImage);
@@ -437,6 +454,7 @@ void decoratePipeline(ObjectBuilder& proto) {
     proto.def("stepOnce", 1, pipelineStepOnce);
     proto.def("decode", 1, pipelineDecode);
     proto.def("dispose", 0, pipelineDispose);
+    proto.def("cancel", 0, pipelineCancel);
 
     // Conditioning-control + identity anchor, and the Krea 2 research hooks.
     decoratePipelineControlProto(proto);
@@ -604,7 +622,13 @@ Value makeDiffusionNamespace() {
         }
     });
 
-    diff.def("cancel", 0, [](Value, std::span<const Value>) -> Value {
+    diff.def("cancel", 0, [](Value, std::span<const Value> args) -> Value {
+        if (!args.empty()) {
+            if (auto* w = unwrapPipeline(args[0])) {
+                w->cancel_requested.store(true, std::memory_order_relaxed);
+                return ev::undefined();
+            }
+        }
         g_diffusionCancelRequested.store(true, std::memory_order_relaxed);
         return ev::undefined();
     });
