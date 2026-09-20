@@ -14,8 +14,10 @@
 #include "brodiffusion/dit/pixart.h"
 #include "brodiffusion/dit/qwenimage21.h"
 #include "brodiffusion/krea2_text.h"
+#include "brodiffusion/qwenimage21_text.h"
 #include "brodiffusion/vae_qwenimage.h"
 #include "brodiffusion/vae_qwenimage21.h"
+#include "brodiffusion/detail/safetensors_dir.h"
 
 #include "brolm/qwen3vl_config.h"
 #include "brolm/qwen3vl_text.h"
@@ -410,6 +412,88 @@ int run_krea2_text_fwd(int argc, char** argv) {
         dump_latent_f32(mp, cond.prompt_embeds_mask);
         std::printf("krea2-text-fwd: wrote mask (%d,%d) to %s\n",
                     cond.prompt_embeds_mask.rows, cond.prompt_embeds_mask.cols, mp);
+    }
+    return 0;
+}
+
+// Run the Qwen-Image 2.1 text-conditioning pathway (prompt -> the Qwen3-VL-8B
+// last-hidden-state rows the DiT's txt_in consumes) and dump the embeddings,
+// the validity mask and the token ids. Diffed against
+// scripts/qwenimage21_text_ref.py.
+int run_qi21_text_fwd(int argc, char** argv) {
+    const char* wdir = arg_after(argc, argv, "--weights-dir");
+    const char* tdir = arg_after(argc, argv, "--tokenizer-dir");
+    const char* prompt = arg_after(argc, argv, "--prompt");
+    const char* op = arg_after(argc, argv, "--out");
+    const char* mp = arg_after(argc, argv, "--mask-out");
+    const char* ip = arg_after(argc, argv, "--ids-out");
+    bool quantize = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--quantize") == 0) quantize = true;
+    }
+    if (!wdir || !prompt || !op) {
+        std::fprintf(stderr,
+            "qi21-text-fwd: need --weights-dir --prompt --out "
+            "[--tokenizer-dir D] [--mask-out F] [--ids-out F] [--quantize]\n");
+        return 2;
+    }
+    brotensor::init();
+
+    const std::string wd = wdir;
+    // The tokenizer assets live under processor/ in a Qwen-Image 2.1 dir
+    // (there is no tokenizer/ subdirectory).
+    const std::string td = tdir ? std::string(tdir) : wd + "/processor";
+
+    auto tok = brolm::qwen3vl::Tokenizer::load(td + "/vocab.json",
+                                               td + "/merges.txt");
+    auto cfg = brolm::qwen3vl::Qwen3VLConfig::load(wd + "/text_encoder/config.json");
+    cfg.text.quantize_weights = quantize;
+    // We only ever read hidden states from this backbone, never logits, so the
+    // untied lm_head (151936x4096 — 1.2 GiB at BF16) is dead weight. Claiming
+    // tied embeddings makes brolm skip loading it entirely.
+    cfg.text.tie_word_embeddings = true;
+    brolm::qwen3vl::TextModel model(cfg.text);
+
+    auto te_files = brodiffusion::detail::open_component_files(
+        wd + "/text_encoder");
+    std::vector<const st::File*> te_ptrs;
+    for (const auto& f : te_files) te_ptrs.push_back(&f);
+    model.load_weights(te_ptrs, "model.language_model.");
+    brotensor::sync_all();
+
+    auto cond = brodiffusion::qwenimage21::encode_prompt(tok, model, prompt);
+    brotensor::sync_all();
+
+    brotensor::Tensor emb = cond.embeds;
+    if (emb.dtype != brotensor::Dtype::FP32) {
+        brotensor::Tensor f32;
+        brotensor::cast(emb, f32, brotensor::Dtype::FP32);
+        brotensor::sync_all();
+        emb = std::move(f32);
+    }
+    dump_latent_f32(op, emb);
+    std::printf("qi21-text-fwd: wrote prompt_embeds (%d,%d) to %s\n",
+                emb.rows, emb.cols, op);
+    if (mp) {
+        dump_latent_f32(mp, cond.mask);
+        std::printf("qi21-text-fwd: wrote mask (%d,%d) to %s\n",
+                    cond.mask.rows, cond.mask.cols, mp);
+    }
+    if (ip) {
+        // Only the SURVIVING ids — the reference's post-drop sequence.
+        std::vector<std::int32_t> kept;
+        for (std::size_t i = static_cast<std::size_t>(cond.drop_idx);
+             i < cond.token_ids.size(); ++i) {
+            kept.push_back(static_cast<std::int32_t>(cond.token_ids[i]));
+        }
+        std::ofstream f(ip, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            throw std::runtime_error(std::string("cannot open --ids-out: ") + ip);
+        }
+        f.write(reinterpret_cast<const char*>(kept.data()),
+                static_cast<std::streamsize>(kept.size() * sizeof(std::int32_t)));
+        std::printf("qi21-text-fwd: wrote %zu token ids to %s\n",
+                    kept.size(), ip);
     }
     return 0;
 }

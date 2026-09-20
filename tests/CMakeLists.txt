@@ -65,6 +65,15 @@ brodiffusion_add_test(brodiffusion_test_krea2_text test_krea2_text.cpp)
 target_compile_definitions(brodiffusion_test_krea2_text PRIVATE
     BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
 
+# Qwen-Image 2.1 text conditioning (prompt -> Qwen3-VL-8B last hidden states).
+# Template-invariant checks always run; the tokenizer and end-to-end parts are
+# gated on weights/qwen-image-2.1 (processor/ + text_encoder/), and the model
+# is loaded INT8 so it fits alongside anything else on the card. Numerical
+# parity is scripts/qwenimage21_text_parity.sh.
+brodiffusion_add_test(brodiffusion_test_qwenimage21_text test_qwenimage21_text.cpp)
+target_compile_definitions(brodiffusion_test_qwenimage21_text PRIVATE
+    BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
+
 # Krea 2 image DiT (Krea2Transformer2DModel). Synthetic smoke always runs; the
 # real 12.9B forward is opt-in (BRODIFFUSION_KREA2_DIT_REAL=1) since it exceeds a
 # 24 GB card in BF16. Numerical parity is scripts/krea2_dit_parity.sh.

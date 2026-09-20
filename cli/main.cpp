@@ -139,6 +139,7 @@ const Command kCommands[] = {
     {"krea2-text-fwd",     cli::run_krea2_text_fwd},
     {"krea2-fwd",          cli::run_krea2_fwd},
     {"qi21-fwd",           cli::run_qi21_fwd},
+    {"qi21-text-fwd",      cli::run_qi21_text_fwd},
     {"terrain-unet-fwd",   cli::run_terrain_unet_fwd},
     {"terrain-laplacian",  cli::run_terrain_laplacian},
     {"terrain-coarse",     cli::run_terrain_coarse},

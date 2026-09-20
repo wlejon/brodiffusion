@@ -81,6 +81,7 @@ int run_qi21_vae_fwd(int argc, char** argv);
 int run_krea2_text_fwd(int argc, char** argv);
 int run_krea2_fwd(int argc, char** argv);
 int run_qi21_fwd(int argc, char** argv);
+int run_qi21_text_fwd(int argc, char** argv);
 
 // ── ardy (cmd_ardy.cpp) ─────────────────────────────────────────────────────
 
