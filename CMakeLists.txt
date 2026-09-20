@@ -221,6 +221,7 @@ target_sources(brodiffusion PRIVATE
     src/detail/safetensors_dir.cpp
     src/lora.cpp
     src/pipeline.cpp
+    src/pipeline_krea2.cpp
     src/image_io.cpp
     src/fused.cpp
     src/optim.cpp
@@ -291,7 +292,14 @@ endif()
 # --- CLI ---
 option(BRODIFFUSION_CLI "Build the brodiffusion CLI" ${PROJECT_IS_TOP_LEVEL})
 if(BRODIFFUSION_CLI)
-    add_executable(brodiffusion_cli cli/main.cpp)
+    add_executable(brodiffusion_cli
+        cli/main.cpp
+        cli/cli_common.cpp
+        cli/cmd_txt2img.cpp
+        cli/cmd_model_fwd.cpp
+        cli/cmd_ardy.cpp
+        cli/cmd_terrain.cpp
+    )
     target_link_libraries(brodiffusion_cli PRIVATE brodiffusion)
     # OUTPUT_NAME collides with the static lib's basename: on MSVC, an
     # executable that exports any symbol also emits an import library, and

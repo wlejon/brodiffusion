@@ -630,6 +630,15 @@ private:
     // rows, for the conditioning-control seam's content-rows policy.
     void encode_prompt_(std::string_view prompt, brotensor::Tensor& out,
                         int* content_end = nullptr);
+    // Per-model-family construction + component loading for from_model_dir().
+    // Defined in pipeline_krea2.cpp / pipeline_qwenimage21.cpp so the big
+    // family-specific weight-plumbing stays out of pipeline.cpp. `cfg` is the
+    // PipelineConfig from_model_dir already built from the model directory's
+    // JSON (including the quantize flags).
+    static Pipeline from_model_dir_krea2_(const std::string& model_dir,
+                                          const PipelineConfig& cfg,
+                                          const ModelDirOptions& opts);
+
     // Sana txt2img priming: Gemma-encode prompt(s), prepare conditioning, and
     // allocate the FP32 initial latent (32x downsample, 32 channels). Returns a
     // step_index=0 state. Called from prime() when model_class_ == Sana.
