@@ -72,6 +72,15 @@ brodiffusion_add_test(brodiffusion_test_krea2_dit test_krea2_dit.cpp)
 target_compile_definitions(brodiffusion_test_krea2_dit PRIVATE
     BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
 
+# Qwen-Image 2.1 image DiT (QwenImage21Transformer2DModel) + its Denoiser.
+# Synthetic smoke (including the prefix KV cache's "cached step == full
+# prefill" contract) always runs; the real 7.1B forward is opt-in
+# (BRODIFFUSION_QI21_DIT_REAL=1) and loads INT8 so it fits a 24 GB card.
+# Numerical parity is scripts/qwenimage21_dit_parity.sh.
+brodiffusion_add_test(brodiffusion_test_qwenimage21_dit test_qwenimage21_dit.cpp)
+target_compile_definitions(brodiffusion_test_qwenimage21_dit PRIVATE
+    BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
+
 # Sana Linear DiT (SanaTransformer2DModel) denoiser smoke test. Gated entirely
 # on the real Sana 0.6B transformer checkpoint under weights/sana-600m/transformer
 # (skips cleanly when absent — no compact synthetic fixture for this DiT).
