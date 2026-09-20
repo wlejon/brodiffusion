@@ -25,10 +25,13 @@
 #include "brodiffusion/detail/torch_rng.h"
 #include "brodiffusion/dit/sana.h"
 #include "brodiffusion/dit/krea2.h"
+#include "brodiffusion/dit/qwenimage21.h"
 #include "brodiffusion/sana_text.h"
 #include "brodiffusion/krea2_text.h"
+#include "brodiffusion/qwenimage21_text.h"
 #include "brodiffusion/vae_dcae.h"
 #include "brodiffusion/vae_qwenimage.h"
+#include "brodiffusion/vae_qwenimage21.h"
 #include "brodiffusion/image_io.h"
 
 #include "brotensor/ops.h"
@@ -229,7 +232,28 @@ std::unique_ptr<Denoiser> make_denoiser(const PipelineConfig& cfg) {
         return std::make_unique<dit::Krea2Denoiser>(cfg.krea2.transformer,
                                                     cfg.krea2.patch_size);
     }
+    if (cfg.model_class == ModelClass::QwenImage21) {
+        return std::make_unique<dit::QwenImage21Denoiser>(
+            cfg.qwenimage21.transformer);
+    }
     return std::make_unique<unet::UNet>(cfg.unet);
+}
+
+// Is the classifier-free-guidance branch live for this generation?
+//
+// Every model but Qwen-Image 2.1 reads `guidance_scale` as diffusers'
+// `guidance_scale`: 1.0 is the no-op value and anything else (including the
+// below-1 "negative guidance" some callers use) runs both branches.
+// Qwen-Image 2.1 follows the reference pipeline's `true_cfg_scale`, whose
+// gate is `> 1` — its default is 1.0, meaning a plain single-branch sample,
+// and a value below 1 is not a request for an uncond pass. prime() and
+// step_once() must agree here or a step would combine against an uncond
+// prediction prime() never encoded.
+bool cfg_branch_active(ModelClass model_class, const Denoiser& denoiser,
+                       bool is_lcm, float guidance_scale) {
+    if (!denoiser.uses_cfg() || is_lcm) return false;
+    if (model_class == ModelClass::QwenImage21) return guidance_scale > 1.0f;
+    return guidance_scale != 1.0f;
 }
 
 }  // namespace
@@ -345,15 +369,25 @@ Pipeline::Pipeline(const PipelineConfig& cfg,
       vae_(cfg.vae),                       // KL-VAE unused for Krea 2
       vae_encoder_(encoder_config_from_decoder(cfg.vae)),
       scheduler_(make_scheduler(cfg.scheduler)),
-      vae_qwen_(std::in_place, cfg.krea2.vae),
-      qwen3vl_model_(std::in_place, cfg.krea2.text.text),
       qwen3vl_tokenizer_(std::move(qwen3vl_tok)),
-      qwen3vl_vision_(std::in_place, cfg.krea2.text.vision,
-                      cfg.krea2.text.text.hidden_size),
       qwen3vl_pp_() {
-    if (cfg.model_class != ModelClass::Krea2) {
+    // Both families share the Qwen3-VL text frontend but nothing else: Krea 2
+    // pairs it with the 8x Qwen-Image VAE and a vision tower, Qwen-Image 2.1
+    // with the 16x RGBA VAE (both halves) and — for now — no tower. Build only
+    // the half that will be loaded; the other stays nullopt, so a wrong-class
+    // access fails on the optional instead of silently using empty weights.
+    if (cfg.model_class == ModelClass::Krea2) {
+        vae_qwen_.emplace(cfg.krea2.vae);
+        qwen3vl_model_.emplace(cfg.krea2.text.text);
+        qwen3vl_vision_.emplace(cfg.krea2.text.vision,
+                                cfg.krea2.text.text.hidden_size);
+    } else if (cfg.model_class == ModelClass::QwenImage21) {
+        vae_qi21_.emplace(cfg.qwenimage21.vae);
+        vae_qi21_encoder_.emplace(cfg.qwenimage21.vae);
+        qwen3vl_model_.emplace(cfg.qwenimage21.text.text);
+    } else {
         fail("Pipeline: the (cfg, qwen3vl_tok) constructor requires "
-             "model_class == Krea2");
+             "model_class == Krea2 or QwenImage21");
     }
 }
 
@@ -381,6 +415,7 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
     cfg.gemma         = mc.gemma;
     cfg.sana_max_seq_len = mc.sana_max_seq_len;
     cfg.krea2         = mc.krea2;
+    cfg.qwenimage21   = mc.qwenimage21;
     cfg.scheduler     = mc.scheduler;
     if (dir_opts.quantize) {
         cfg.unet.quantize_weights = true;
@@ -388,6 +423,22 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
         cfg.t5.quantize_weights   = true;
         cfg.krea2.transformer.quantize_weights = true;
         cfg.krea2.text.text.quantize_weights   = true;
+        cfg.qwenimage21.transformer.quantize_weights = true;
+    }
+    if (mc.model_class == ModelClass::QwenImage21) {
+        // The 2.1 text backbone is Qwen3-VL *8B* — ~17 GB at BF16, which
+        // cannot share a 24 GB card with a 14 GB DiT under any arrangement.
+        // INT8 (W8A16, ~8.5 GB) is how this model class runs on one GPU at
+        // all, so it is the default here rather than a --quantize opt-in; the
+        // parity script measures the cost (cosine ~0.997 against an fp32
+        // reference, tighter than the bf16 reference's own 0.996).
+        cfg.qwenimage21.text.text.quantize_weights =
+            (brotensor::default_device() != brotensor::Device::CPU);
+        // Nothing in the diffusion path ever reads logits from this backbone —
+        // only hidden states — so the untied lm_head (151936x4096, 1.2 GiB at
+        // BF16) is dead weight. Telling brolm the embeddings are tied makes it
+        // skip that tensor entirely.
+        cfg.qwenimage21.text.text.tie_word_embeddings = true;
     }
 
     const fs::path root(model_dir);
@@ -436,6 +487,10 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
 
     if (mc.model_class == ModelClass::Krea2) {
         return from_model_dir_krea2_(model_dir, cfg, dir_opts);
+    }
+
+    if (mc.model_class == ModelClass::QwenImage21) {
+        return from_model_dir_qwenimage21_(model_dir, cfg, dir_opts);
     }
 
     if (mc.model_class == ModelClass::PixArt) {
@@ -908,9 +963,16 @@ PipelineState Pipeline::prime(std::string_view prompt,
     if (model_class_ == ModelClass::Sana) {
         return prime_sana_(prompt, opts);
     }
+    // Resolution granularity is the autoencoder's stride — 8 for the KL-VAEs,
+    // 16 for Qwen-Image 2.1's residual VAE. The reference pipeline silently
+    // rounds a request down to a multiple of 2*vae_scale_factor; rounding
+    // behind the caller's back would make decode()'s buffer a different size
+    // than the width/height they wrote the PNG with, so demand it instead.
+    const int vsf = vae_scale_factor();
     if (opts.height <= 0 || opts.width <= 0 ||
-        opts.height % 8 != 0 || opts.width % 8 != 0) {
-        fail("height and width must be positive multiples of 8");
+        opts.height % vsf != 0 || opts.width % vsf != 0) {
+        fail("height and width must be positive multiples of " +
+             std::to_string(vsf));
     }
     if (opts.num_inference_steps <= 0) fail("num_inference_steps must be positive");
     if (!opts.init_image_path.empty() && !opts.init_noise.empty()) {
@@ -980,14 +1042,15 @@ PipelineState Pipeline::prime(std::string_view prompt,
         controlnet_active_ = true;
     }
 
-    const int H_lat = opts.height / 8;
-    const int W_lat = opts.width  / 8;
-    // Latent channel count is denoiser-defined (4 for SD1.5, 16 for Flux).
+    const int H_lat = opts.height / vsf;
+    const int W_lat = opts.width  / vsf;
+    // Latent channel count is denoiser-defined (4 for SD1.5, 16 for Flux,
+    // 64 for Qwen-Image 2.1).
     const int C_lat = denoiser_->latent_channels();
     const int n_lat = C_lat * H_lat * W_lat;
     const bool is_lcm = std::holds_alternative<scheduler::LCM>(scheduler_);
-    const bool do_cfg = denoiser_->uses_cfg() && !is_lcm &&
-                        (opts.guidance_scale != 1.0f);
+    const bool do_cfg = cfg_branch_active(model_class_, *denoiser_, is_lcm,
+                                          opts.guidance_scale);
 
     // 0. Finalize denoiser weights (W8A16 quantisation happens here if enabled).
     denoiser_->finalize_weights();
@@ -1125,6 +1188,43 @@ PipelineState Pipeline::prime(std::string_view prompt,
                              std::chrono::steady_clock::now() - enc_t0).count());
         }
         conditioning_.guidance = 0.0f;
+    } else if (model_class_ == ModelClass::QwenImage21) {
+        // Qwen-Image 2.1: the DiT cross-reads a Qwen3-VL-8B hidden-state run
+        // (the chat template's post-system rows), with an all-ones validity
+        // mask at batch 1. Guidance is `true_cfg_scale`: at the reference
+        // default of 1.0 there is no uncond branch at all, so the negative
+        // prompt is only encoded when the caller asks for > 1.
+        if (!qwen3vl_model_ || !qwen3vl_tokenizer_) {
+            fail("prime: QwenImage21 pipeline missing Qwen3-VL model / "
+                 "tokenizer");
+        }
+        const bool enc_time = std::getenv("BRODIFFUSION_TIME") != nullptr;
+        const auto enc_t0 = std::chrono::steady_clock::now();
+        qwenimage21::TextConditioning pos = qwenimage21::encode_prompt(
+            *qwen3vl_tokenizer_, *qwen3vl_model_, std::string(prompt));
+        conditioning_.text_embeddings      = std::move(pos.embeds);
+        conditioning_.text_embeddings_mask = std::move(pos.mask);
+        if (do_cfg) {
+            qwenimage21::TextConditioning neg = qwenimage21::encode_prompt(
+                *qwen3vl_tokenizer_, *qwen3vl_model_,
+                std::string(opts.negative_prompt));
+            conditioning_.uncond_embeddings      = std::move(neg.embeds);
+            conditioning_.uncond_embeddings_mask = std::move(neg.mask);
+            conditioning_.has_uncond = true;
+        } else {
+            conditioning_.has_uncond = false;
+            conditioning_.uncond_embeddings      = bt::Tensor{};
+            conditioning_.uncond_embeddings_mask = bt::Tensor{};
+        }
+        if (enc_time) {
+            brotensor::sync_all();
+            std::fprintf(stderr,
+                         "[time] Qwen3-VL encode (%d pass%s): %.3f s\n",
+                         do_cfg ? 2 : 1, do_cfg ? "es" : "",
+                         std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - enc_t0).count());
+        }
+        conditioning_.guidance = 0.0f;
     } else {
         int content_end = -1;
         encode_prompt_(prompt, conditioning_.text_embeddings, &content_end);
@@ -1199,7 +1299,14 @@ PipelineState Pipeline::prime(std::string_view prompt,
     // image token count; DDIM / LCM ignore the second argument. We set the
     // schedule *before* building the initial latent so img2img can pick a
     // t_start off the populated timesteps_ vector.
-    const int image_seq_len = (H_lat / 2) * (W_lat / 2);
+    // Dynamic shifting keys on the DiT's TOKEN count, which is the packed
+    // sequence length — one token per 2x2 latent group for Flux / Krea 2,
+    // but one per latent pixel for Qwen-Image 2.1 (patch_size 1). At 1024²
+    // that is 4096 tokens there against 1024 here, and mu is a function of
+    // it, so getting this wrong shifts the whole sigma schedule.
+    const int image_seq_len = (model_class_ == ModelClass::QwenImage21)
+                                  ? H_lat * W_lat
+                                  : (H_lat / 2) * (W_lat / 2);
     std::visit([&](auto& s) {
         using S = std::decay_t<decltype(s)>;
         if constexpr (std::is_same_v<S, scheduler::FlowMatch>) {
@@ -1511,8 +1618,8 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
         return;
     }
     const bool is_lcm = std::holds_alternative<scheduler::LCM>(scheduler_);
-    const bool do_cfg = denoiser_->uses_cfg() && !is_lcm &&
-                        (opts.guidance_scale != 1.0f);
+    const bool do_cfg = cfg_branch_active(model_class_, *denoiser_, is_lcm,
+                                          opts.guidance_scale);
     const int i = state.step_index;
     const float t = timestep_at(scheduler_, i);
     const int n_lat = denoiser_->latent_channels() *
@@ -1759,6 +1866,17 @@ std::vector<float> Pipeline::decode(const PipelineState& state) {
         vae_qwen_->decode(state.latent, state.H_lat, state.W_lat, decoded_);
         n_img = cfg_.krea2.vae.input_channels *
                 (state.H_lat * 8) * (state.W_lat * 8);
+    } else if (model_class_ == ModelClass::QwenImage21) {
+        // Qwen-Image 2.1's VAE is 16x and RGBA on both ends. decode() applies
+        // the per-channel latents_mean/std denormalisation itself (exactly the
+        // `latents * latents_std + latents_mean` the reference pipeline does
+        // just before vae.decode), so the raw pipeline-scale latent goes
+        // straight in — pre-scaling it here would apply the affine twice. The
+        // fourth (alpha) plane is dropped below.
+        if (!vae_qi21_) fail("decode: Qwen-Image 2.1 decoder not loaded");
+        vae_qi21_->decode(state.latent, state.H_lat, state.W_lat, decoded_);
+        n_img = cfg_.qwenimage21.vae.out_channels *
+                (state.H_lat * 16) * (state.W_lat * 16);
     } else {
         vae_.decode(state.latent, state.H_lat, state.W_lat, decoded_);
         n_img = cfg_.vae.out_channels *
@@ -1771,29 +1889,35 @@ std::vector<float> Pipeline::decode(const PipelineState& state) {
                          std::chrono::steady_clock::now() - vae_t0).count());
     }
     // The decoded tensor carries the VAE's arithmetic dtype — FP16 on a GPU
-    // backend, BF16 for a force_upcast VAE (Flux), FP32 on CPU. Convert the
-    // 16-bit cases to float as needed.
-    if (decoded_.dtype == bt::Dtype::FP16) {
+    // backend, BF16 for a force_upcast VAE (Flux, Qwen-Image 2.1), FP32 on
+    // CPU. Convert the 16-bit cases to float as needed.
+    std::vector<float> out;
+    if (decoded_.dtype == bt::Dtype::FP16 || decoded_.dtype == bt::Dtype::BF16) {
+        const bool is_fp16 = decoded_.dtype == bt::Dtype::FP16;
         std::vector<std::uint16_t> dec_bits(static_cast<std::size_t>(n_img));
-        decoded_.copy_to_host_fp16(dec_bits.data());
-        std::vector<float> out(static_cast<std::size_t>(n_img));
+        if (is_fp16) decoded_.copy_to_host_fp16(dec_bits.data());
+        else         decoded_.copy_to_host_bf16(dec_bits.data());
+        out.resize(static_cast<std::size_t>(n_img));
         for (int i = 0; i < n_img; ++i) {
+            const std::uint16_t b = dec_bits[static_cast<std::size_t>(i)];
             out[static_cast<std::size_t>(i)] =
-                bt::fp16_bits_to_fp32(dec_bits[static_cast<std::size_t>(i)]);
+                is_fp16 ? bt::fp16_bits_to_fp32(b) : bt::bf16_bits_to_fp32(b);
         }
-        return out;
+    } else {
+        out = decoded_.to_host_vector();
     }
-    if (decoded_.dtype == bt::Dtype::BF16) {
-        std::vector<std::uint16_t> dec_bits(static_cast<std::size_t>(n_img));
-        decoded_.copy_to_host_bf16(dec_bits.data());
-        std::vector<float> out(static_cast<std::size_t>(n_img));
-        for (int i = 0; i < n_img; ++i) {
-            out[static_cast<std::size_t>(i)] =
-                bt::bf16_bits_to_fp32(dec_bits[static_cast<std::size_t>(i)]);
-        }
-        return out;
+
+    // Qwen-Image 2.1's autoencoder is RGBA: it reconstructs four planes and
+    // the pipeline's contract is three. The layout is planar NCHW, so the RGB
+    // the caller wants is exactly the leading 3/4 of the buffer and dropping
+    // alpha is a truncation.
+    if (model_class_ == ModelClass::QwenImage21 &&
+        cfg_.qwenimage21.vae.out_channels == 4) {
+        const std::size_t rgb =
+            static_cast<std::size_t>(3) * (state.H_lat * 16) * (state.W_lat * 16);
+        if (out.size() >= rgb) out.resize(rgb);
     }
-    return decoded_.to_host_vector();
+    return out;
 }
 
 // ── reference-attention identity anchor (Sana only) ────────────────────────

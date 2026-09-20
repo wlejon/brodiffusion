@@ -37,6 +37,7 @@ against a downloaded diffusers model directory — the loader reads
 | Sana / Sana-Sprint | Gemma-2 | linear-attention DiT | flow-match Euler / SCM (TrigFlow) | native 1024px; Sprint is the 2-step guidance-distilled variant |
 | PixArt-Sigma | T5-XXL | DiT (ada-norm-single) | DPM-Solver++ (2M) | native 1024px |
 | Krea 2 (Raw / Turbo) | Qwen3-VL, 12 tapped decoder layers | single-stream flow-matching DiT | flow-match Euler | Turbo is the distilled, no-CFG, 8-step checkpoint; LoRA as runtime adapters (INT8-safe, live rescale), optional INT8 DiT |
+| Qwen-Image 2.1 | Qwen3-VL-8B, last hidden state | block-causal single-stream DiT, prefix KV cache | flow-match Euler (dynamic shift) | native 1024px, 40 steps, `true_cfg_scale` 1.0 (no CFG by default); 16x RGBA VAE, 64-ch unpacked latents; INT8 text encoder by default, optional INT8 DiT |
 
 ## Other modalities
 

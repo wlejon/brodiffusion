@@ -223,6 +223,7 @@ target_sources(brodiffusion PRIVATE
     src/lora.cpp
     src/pipeline.cpp
     src/pipeline_krea2.cpp
+    src/pipeline_qwenimage21.cpp
     src/image_io.cpp
     src/fused.cpp
     src/optim.cpp

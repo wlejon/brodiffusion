@@ -35,6 +35,7 @@
 #include "brodiffusion/vae.h"
 #include "brodiffusion/vae_dcae.h"
 #include "brodiffusion/vae_qwenimage.h"
+#include "brodiffusion/vae_qwenimage21.h"
 #include "brolm/qwen3vl_text.h"
 #include "brolm/qwen3vl_tokenizer.h"
 #include "brolm/qwen3vl_vision.h"
@@ -72,6 +73,7 @@ struct PipelineConfig {
     brolm::gemma::Gemma2Config gemma;       // Sana (Gemma-2 text encoder)
     int                      sana_max_seq_len = 300;  // Gemma caption length
     Krea2ModelConfig         krea2;         // Krea 2 (transformer + VAE + Qwen3-VL)
+    QwenImage21ModelConfig   qwenimage21;   // Qwen-Image 2.1 (DiT + VAE + Qwen3-VL)
     // DDIM (default, vanilla SD1.5) or LCM (latent-consistency, distilled
     // checkpoints with unet.time_cond_proj_dim > 0) or FlowMatch (Flux). The
     // pipeline branches on the active alternative; existing call sites that
@@ -275,10 +277,20 @@ public:
     // CLIP tokenizer/encoder members stay default-constructed and unused).
     Pipeline(const PipelineConfig& cfg, brolm::t5::Tokenizer t5_tok);
 
-    // Krea 2 constructor: builds a Krea2Denoiser (single-stream flow DiT) + the
-    // Qwen-Image VAE decoder + the Qwen3-VL-4B text encoder, and owns the
-    // Qwen3-VL tokenizer. Valid only when cfg.model_class == ModelClass::Krea2.
-    // No CLIP frontend / KL-VAE (those members stay default-constructed).
+    // Qwen3-VL-conditioned constructor, shared by the two model families whose
+    // text frontend is a Qwen3-VL backbone:
+    //
+    //   Krea 2       — Krea2Denoiser (single-stream flow DiT) + the Qwen-Image
+    //                  VAE decoder + the Qwen3-VL-4B text encoder and its
+    //                  vision tower (for image-as-prompt).
+    //   QwenImage21  — QwenImage21Denoiser (block-causal single-stream DiT) +
+    //                  the 16x RGBA Qwen-Image 2.1 VAE (decoder + encoder) +
+    //                  the Qwen3-VL-8B text encoder. No vision tower yet — the
+    //                  image-conditioned edit path is a later chunk.
+    //
+    // Owns the Qwen3-VL tokenizer either way. Valid only when cfg.model_class
+    // is Krea2 or QwenImage21; no CLIP frontend / KL-VAE (those members stay
+    // default-constructed).
     Pipeline(const PipelineConfig& cfg, brolm::qwen3vl::Tokenizer qwen3vl_tok);
 
     // Build a fully-loaded Pipeline from a diffusers model directory: reads the
@@ -484,11 +496,14 @@ public:
     int num_xattn_blocks() const { return denoiser_->num_xattn_blocks(); }
 
     // Latent→pixel upscale factor of the active autoencoder: 8 for the SD /
-    // Flux KL-VAE, 32 for Sana's DC-AE f32c32. A decoded image is therefore
+    // Flux / Krea 2 KL-VAE, 32 for Sana's DC-AE f32c32, 16 for Qwen-Image
+    // 2.1's residual RGBA VAE. A decoded image is therefore
     // (state.H_lat * vae_scale_factor()) × (state.W_lat * vae_scale_factor())
     // pixels — the dimensions of decode()'s buffer. Always valid; never throws.
     int vae_scale_factor() const {
-        return model_class_ == ModelClass::Sana ? 32 : 8;
+        if (model_class_ == ModelClass::Sana) return 32;
+        if (model_class_ == ModelClass::QwenImage21) return 16;
+        return 8;
     }
 
     const PipelineConfig& config() const { return cfg_; }
@@ -638,6 +653,9 @@ private:
     static Pipeline from_model_dir_krea2_(const std::string& model_dir,
                                           const PipelineConfig& cfg,
                                           const ModelDirOptions& opts);
+    static Pipeline from_model_dir_qwenimage21_(const std::string& model_dir,
+                                                const PipelineConfig& cfg,
+                                                const ModelDirOptions& opts);
 
     // Sana txt2img priming: Gemma-encode prompt(s), prepare conditioning, and
     // allocate the FP32 initial latent (32x downsample, 32 channels). Returns a
@@ -695,6 +713,17 @@ private:
     // from_model_dir() loads its weights.
     std::optional<brolm::qwen3vl::VisionTower> qwen3vl_vision_;
     brolm::qwen3vl::PreprocessConfig           qwen3vl_pp_;
+
+    // ── Qwen-Image 2.1-only sub-modules ───────────────────────────────────
+    // The QwenImage21Denoiser lives in denoiser_; the text frontend reuses
+    // qwen3vl_model_ / qwen3vl_tokenizer_ above (an 8B backbone here, and no
+    // vision tower until the edit path lands). decode() routes to vae_qi21_,
+    // which is the 16x RGBA residual VAE: it emits four planes and decode()
+    // drops the alpha one. The encoder is constructed alongside so the
+    // image-conditioned paths have it resident; it is loaded from the same
+    // single VAE file. Both empty for every other model class.
+    std::optional<vae_qwenimage21::Decoder>  vae_qi21_;
+    std::optional<vae_qwenimage21::Encoder>  vae_qi21_encoder_;
 
     // Model-agnostic raw conditioning, rebuilt each prime(). Kept around for
     // trace-mode / ControlNet access to the raw text context (those paths
