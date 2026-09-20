@@ -3,6 +3,7 @@
 #include "brodiffusion/vae_qwenimage21.h"
 #include "brodiffusion/krea2_text.h"
 #include "brodiffusion/dit/krea2.h"
+#include "brodiffusion/dit/qwenimage21.h"
 #include "brodiffusion/detail/json.h"
 #include "brolm/qwen3vl_config.h"
 #include "brolm/qwen3vl_text.h"
@@ -1135,6 +1136,152 @@ int run_krea2_fwd(int argc, char** argv) {
     return 0;
 }
 
+// Parse a QwenImage21Transformer2DModel config.json into a QwenImage21Config.
+brodiffusion::dit::QwenImage21Config load_qi21_config(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open config: " + path);
+    std::string text((std::istreambuf_iterator<char>(f)),
+                     std::istreambuf_iterator<char>());
+    namespace j = brodiffusion::detail::json;
+    j::Value v = j::parse(text);
+    brodiffusion::dit::QwenImage21Config c;
+    c.patch_size = v.get_int("patch_size", c.patch_size);
+    c.in_channels = v.get_int("in_channels", c.in_channels);
+    c.out_channels = v.get_int("out_channels", c.out_channels);
+    c.num_layers = v.get_int("num_layers", c.num_layers);
+    c.attention_head_dim = v.get_int("attention_head_dim", c.attention_head_dim);
+    c.num_attention_heads = v.get_int("num_attention_heads", c.num_attention_heads);
+    c.context_in_dim = v.get_int("context_in_dim", c.context_in_dim);
+    c.mlp_ratio = v.get_int("mlp_ratio", c.mlp_ratio);
+    c.axes_dims_rope = v.get_int_array("axes_dims_rope", c.axes_dims_rope);
+    c.eps = v.get_float("eps", c.eps);
+    c.causal_condition = v.get_bool("causal_condition", c.causal_condition);
+    return c;
+}
+
+// Open a transformer component directory's safetensors (single file or the
+// shard set named by its .index.json).
+std::vector<st::File> open_transformer_shards(const std::string& wd) {
+    std::vector<st::File> files;
+    const std::string index = wd + "/diffusion_pytorch_model.safetensors.index.json";
+    std::ifstream idxf(index, std::ios::binary);
+    if (idxf) {
+        std::string text((std::istreambuf_iterator<char>(idxf)),
+                         std::istreambuf_iterator<char>());
+        namespace j = brodiffusion::detail::json;
+        j::Value v = j::parse(text);
+        const auto& wm = v.at("weight_map");
+        std::vector<std::string> names;
+        for (const auto& m : wm.as_object()) {
+            const std::string s = m.second.as_string();
+            if (std::find(names.begin(), names.end(), s) == names.end())
+                names.push_back(s);
+        }
+        std::sort(names.begin(), names.end());
+        files.reserve(names.size());
+        for (const std::string& n : names) files.push_back(st::File::open(wd + "/" + n));
+    } else {
+        files.push_back(st::File::open(wd + "/diffusion_pytorch_model.safetensors"));
+    }
+    return files;
+}
+
+// Hidden debug subcommand: run ONE (or two consecutive) Qwen-Image 2.1 DiT
+// forward(s) on fixed inputs — packed latent, Qwen3-VL text hidden states,
+// timestep, latent token grid — read from raw float32 files, dump the
+// velocity. Diffed against scripts/qwenimage21_dit_ref.py.
+//
+// With --steps 2 the first forward extracts the prefix KV cache and the second
+// decodes from it: --out receives step 1's velocity and --out2 step 2's, so
+// parity can cover the cached path. --no-cache runs without a cache at all
+// (full prefill every step), which is what the cached result must match.
+int run_qi21_fwd(int argc, char** argv) {
+    const char* wdir = arg_after(argc, argv, "--weights-dir");
+    const char* cfgp = arg_after(argc, argv, "--config");
+    const char* lp = arg_after(argc, argv, "--latent");
+    const char* ep = arg_after(argc, argv, "--embeds");
+    const char* op = arg_after(argc, argv, "--out");
+    const char* op2 = arg_after(argc, argv, "--out2");
+    const char* ts = arg_after(argc, argv, "--t");
+    const char* ts2 = arg_after(argc, argv, "--t2");
+    const char* hps = arg_after(argc, argv, "--hp");
+    const char* wps = arg_after(argc, argv, "--wp");
+    const char* seqs = arg_after(argc, argv, "--seq");
+    const char* steps_s = arg_after(argc, argv, "--steps");
+    bool quantize = false, no_cache = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--quantize") == 0) quantize = true;
+        if (std::strcmp(argv[i], "--no-cache") == 0) no_cache = true;
+    }
+    if (!wdir || !lp || !ep || !op || !ts || !hps || !wps || !seqs) {
+        std::fprintf(stderr,
+            "qi21-fwd: need --weights-dir --latent --embeds --out --t --hp "
+            "--wp --seq [--config F] [--steps N] [--out2 F] [--t2 T] "
+            "[--quantize] [--no-cache]\n");
+        return 2;
+    }
+    const int hp = std::atoi(hps), wp = std::atoi(wps);
+    const int text_seq = std::atoi(seqs);
+    const int steps = steps_s ? std::atoi(steps_s) : 1;
+    const float t = static_cast<float>(std::atof(ts));
+    const float t2 = ts2 ? static_cast<float>(std::atof(ts2)) : t;
+    brotensor::init();
+
+    const std::string wd = wdir;
+    auto cfg = load_qi21_config(cfgp ? std::string(cfgp) : wd + "/config.json");
+    cfg.quantize_weights = quantize;
+    brodiffusion::dit::QwenImage21Transformer2DModel model(cfg);
+
+    std::vector<st::File> files = open_transformer_shards(wd);
+    std::vector<const st::File*> shards;
+    for (const st::File& f : files) shards.push_back(&f);
+    model.load_weights(shards, "");
+
+    const int img_len = hp * wp;
+    auto lat_h = load_latent_f32(lp, img_len * cfg.in_channels);
+    auto emb_h = load_latent_f32(ep, text_seq * cfg.context_in_dim);
+    brotensor::Tensor lat =
+        brotensor::Tensor::from_host(lat_h.data(), img_len, cfg.in_channels)
+            .to(brotensor::default_device());
+    brotensor::Tensor emb =
+        brotensor::Tensor::from_host(emb_h.data(), text_seq, cfg.context_in_dim)
+            .to(brotensor::default_device());
+
+    brotensor::Tensor txt;
+    model.encode_text(emb, txt);
+
+    brodiffusion::dit::QwenImage21PrefixCache cache;
+    auto* cache_ptr = no_cache ? nullptr : &cache;
+
+    auto dump = [&](const char* path, brotensor::Tensor& out) {
+        brotensor::sync_all();
+        if (out.dtype != brotensor::Dtype::FP32) {
+            brotensor::Tensor out_f32;
+            brotensor::cast(out, out_f32, brotensor::Dtype::FP32);
+            brotensor::sync_all();
+            out = std::move(out_f32);
+        }
+        dump_latent_f32(path, out);
+        std::printf("qi21-fwd: wrote velocity (%d,%d) to %s\n", out.rows,
+                    out.cols, path);
+    };
+
+    brotensor::Tensor out;
+    model.forward(lat, hp, wp, txt, t, cache_ptr, out);
+    dump(op, out);
+
+    if (steps >= 2) {
+        if (!op2) {
+            std::fprintf(stderr, "qi21-fwd: --steps 2 needs --out2\n");
+            return 2;
+        }
+        brotensor::Tensor out2;
+        model.forward(lat, hp, wp, txt, t2, cache_ptr, out2);
+        dump(op2, out2);
+    }
+    return 0;
+}
+
 // ── ARDY motion-rep parity (scripts/ardy_motionrep_ref.py) ──────────────────
 // Reads float64 local rotation matrices + root positions, runs the ARDY motion
 // codec forward (features) and inverse (posed joints + recovered local rots),
@@ -2232,6 +2379,12 @@ int main(int argc, char** argv) {
         try { return run_krea2_fwd(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "krea2-fwd: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "qi21-fwd") == 0) {
+        try { return run_qi21_fwd(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "qi21-fwd: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "terrain-unet-fwd") == 0) {

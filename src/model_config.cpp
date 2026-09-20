@@ -401,6 +401,42 @@ void populate_krea2_vae(const json::Value& cfg, vae_qwenimage::Config& out) {
     out.latents_std     = get_float_array(cfg, "latents_std", out.latents_std);
 }
 
+void populate_qwenimage21_transformer(const json::Value& cfg,
+                                      dit::QwenImage21Config& out) {
+    out.patch_size          = cfg.get_int("patch_size", out.patch_size);
+    out.in_channels         = cfg.get_int("in_channels", out.in_channels);
+    out.out_channels        = cfg.get_int("out_channels", out.out_channels);
+    out.num_layers          = cfg.get_int("num_layers", out.num_layers);
+    out.attention_head_dim  = cfg.get_int("attention_head_dim",
+                                          out.attention_head_dim);
+    out.num_attention_heads = cfg.get_int("num_attention_heads",
+                                          out.num_attention_heads);
+    out.context_in_dim      = cfg.get_int("context_in_dim", out.context_in_dim);
+    out.mlp_ratio           = cfg.get_int("mlp_ratio", out.mlp_ratio);
+    out.axes_dims_rope      = cfg.get_int_array("axes_dims_rope",
+                                                out.axes_dims_rope);
+    out.eps                 = cfg.get_float("eps", out.eps);
+    out.causal_condition    = cfg.get_bool("causal_condition",
+                                           out.causal_condition);
+}
+
+void populate_qwenimage21_vae(const json::Value& cfg,
+                              vae_qwenimage21::Config& out) {
+    out.base_dim         = cfg.get_int("base_dim", out.base_dim);
+    out.decoder_base_dim = cfg.get_int("decoder_base_dim", out.decoder_base_dim);
+    out.z_dim            = cfg.get_int("z_dim", out.z_dim);
+    out.dim_mult         = cfg.get_int_array("dim_mult", out.dim_mult);
+    out.num_res_blocks   = cfg.get_int("num_res_blocks", out.num_res_blocks);
+    out.attn_scales      = get_float_array(cfg, "attn_scales", out.attn_scales);
+    out.temperal_downsample =
+        get_bool_array(cfg, "temperal_downsample", out.temperal_downsample);
+    out.dropout          = cfg.get_float("dropout", out.dropout);
+    out.in_channels      = cfg.get_int("in_channels", out.in_channels);
+    out.out_channels     = cfg.get_int("out_channels", out.out_channels);
+    out.latents_mean     = get_float_array(cfg, "latents_mean", out.latents_mean);
+    out.latents_std      = get_float_array(cfg, "latents_std", out.latents_std);
+}
+
 }  // namespace
 
 ModelConfig load_model_config(const std::string& model_dir) {
@@ -427,6 +463,8 @@ ModelConfig load_model_config(const std::string& model_dir) {
         out.model_class = ModelClass::PixArt;
     } else if (contains_ci(class_name, "Krea2")) {
         out.model_class = ModelClass::Krea2;
+    } else if (contains_ci(class_name, "QwenImage21")) {
+        out.model_class = ModelClass::QwenImage21;
     } else {
         out.model_class = ModelClass::Unknown;
     }
@@ -435,6 +473,22 @@ ModelConfig load_model_config(const std::string& model_dir) {
     const bool is_sana   = (out.model_class == ModelClass::Sana);
     const bool is_pixart = (out.model_class == ModelClass::PixArt);
     const bool is_krea2  = (out.model_class == ModelClass::Krea2);
+    const bool is_qi21   = (out.model_class == ModelClass::QwenImage21);
+
+    // --- Qwen-Image 2.1: transformer + Qwen3-VL encoder configs (the VAE is
+    //     read with the other VAEs below) ---
+    if (is_qi21) {
+        const fs::path tf_cfg = root / "transformer" / "config.json";
+        if (fs::exists(tf_cfg)) {
+            populate_qwenimage21_transformer(parse_file(tf_cfg),
+                                             out.qwenimage21.transformer);
+        }
+        const fs::path te_cfg = root / "text_encoder" / "config.json";
+        if (fs::exists(te_cfg)) {
+            out.qwenimage21.text =
+                brolm::qwen3vl::Qwen3VLConfig::load(te_cfg.string());
+        }
+    }
 
     // --- Krea 2: transformer + VAE + Qwen3-VL text encoder configs ---
     if (is_krea2) {
@@ -454,7 +508,7 @@ ModelConfig load_model_config(const std::string& model_dir) {
     }
 
     // --- unet/config.json (StableDiffusion only) ---
-    if (!is_flux && !is_sana && !is_pixart && !is_krea2) {
+    if (!is_flux && !is_sana && !is_pixart && !is_krea2 && !is_qi21) {
         const fs::path unet_cfg = root / "unet" / "config.json";
         if (fs::exists(unet_cfg)) {
             populate_unet(parse_file(unet_cfg), out.unet);
@@ -511,7 +565,8 @@ ModelConfig load_model_config(const std::string& model_dir) {
     }
 
     // --- vae/config.json (AutoencoderDC for Sana, AutoencoderKLQwenImage for
-    //     Krea 2, AutoencoderKL otherwise) ---
+    //     Krea 2, AutoencoderKLQwenImage21 for Qwen-Image 2.1, AutoencoderKL
+    //     otherwise) ---
     {
         const fs::path vae_cfg = root / "vae" / "config.json";
         if (fs::exists(vae_cfg)) {
@@ -519,6 +574,9 @@ ModelConfig load_model_config(const std::string& model_dir) {
                 populate_dcae(parse_file(vae_cfg), out.dcae);
             } else if (is_krea2) {
                 populate_krea2_vae(parse_file(vae_cfg), out.krea2.vae);
+            } else if (is_qi21) {
+                populate_qwenimage21_vae(parse_file(vae_cfg),
+                                         out.qwenimage21.vae);
             } else {
                 populate_vae(parse_file(vae_cfg), out.vae);
             }
@@ -526,8 +584,8 @@ ModelConfig load_model_config(const std::string& model_dir) {
     }
 
     // --- text_encoder/config.json (CLIP; Sana's Gemma-2, PixArt's T5, and
-    //     Krea 2's Qwen3-VL are handled above) ---
-    if (!is_sana && !is_pixart && !is_krea2) {
+    //     Krea 2's / Qwen-Image 2.1's Qwen3-VL are handled above) ---
+    if (!is_sana && !is_pixart && !is_krea2 && !is_qi21) {
         const fs::path te_cfg = root / "text_encoder" / "config.json";
         if (fs::exists(te_cfg)) {
             populate_text_encoder(parse_file(te_cfg), out.text_encoder);
@@ -575,7 +633,7 @@ ModelConfig load_model_config(const std::string& model_dir) {
             }
         } else {
             // Missing scheduler config: default per model class.
-            if (is_flux || is_sana || is_krea2) {
+            if (is_flux || is_sana || is_krea2 || is_qi21) {
                 out.scheduler = scheduler::FlowMatchConfig{};
             } else if (is_pixart) {
                 out.scheduler = scheduler::DPMSolverConfig{};

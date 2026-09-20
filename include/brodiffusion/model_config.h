@@ -17,6 +17,7 @@
 #include "brodiffusion/vae.h"
 #include "brodiffusion/vae_dcae.h"
 #include "brodiffusion/vae_qwenimage.h"
+#include "brodiffusion/vae_qwenimage21.h"
 #include "brolm/clip.h"
 #include "brodiffusion/scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
@@ -27,6 +28,7 @@
 #include "brodiffusion/dit/sana.h"
 #include "brodiffusion/dit/pixart.h"
 #include "brodiffusion/dit/krea2.h"
+#include "brodiffusion/dit/qwenimage21.h"
 #include "brolm/t5.h"
 #include "brolm/gemma2_config.h"
 #include "brolm/qwen3vl_config.h"
@@ -36,7 +38,9 @@
 
 namespace brodiffusion {
 
-enum class ModelClass { StableDiffusion, Flux, Sana, PixArt, Krea2, Unknown };
+enum class ModelClass {
+    StableDiffusion, Flux, Sana, PixArt, Krea2, QwenImage21, Unknown
+};
 
 // Pipeline-level Krea 2 configuration — the trio of component configs the
 // Krea2 branch needs, plus the two model_index.json scalars. Distinct from
@@ -49,6 +53,18 @@ struct Krea2ModelConfig {
     brolm::qwen3vl::Qwen3VLConfig text;          // text_encoder/config.json
     bool is_distilled = false;   // model_index.json: false=Raw (CFG), true=Turbo
     int  patch_size   = 2;       // model_index.json: 2x2 latent packing
+};
+
+// Pipeline-level Qwen-Image 2.1 configuration — the trio of component configs
+// the QwenImage21 branch needs. Distinct from dit::QwenImage21Config (the
+// transformer's own hyper-parameters, held in `transformer` here). The text
+// encoder is a full Qwen3-VL vision-language model: its image tower feeds
+// condition images into the same prompt stream the DiT consumes, so the whole
+// Qwen3VLConfig is kept, not just the text half.
+struct QwenImage21ModelConfig {
+    dit::QwenImage21Config        transformer;   // transformer/config.json
+    vae_qwenimage21::Config       vae;           // vae/config.json
+    brolm::qwen3vl::Qwen3VLConfig text;          // text_encoder/config.json
 };
 
 // Architecture + hyper-parameters of a diffusers model directory, read from
@@ -77,6 +93,8 @@ struct ModelConfig {
     // PixArt model dir — from_model_dir resolves them from a sibling t5-xxl dir.
 
     Krea2ModelConfig krea2;            // populated for ModelClass::Krea2
+
+    QwenImage21ModelConfig qwenimage21;  // populated for ModelClass::QwenImage21
 
     std::variant<scheduler::DDIMConfig,
                  scheduler::LCMConfig,

@@ -554,7 +554,9 @@ Value pipelineConfig(Value thisVal, std::span<const Value>) {
         cfg.model_class == brodiffusion::ModelClass::Flux   ? "Flux" :
         cfg.model_class == brodiffusion::ModelClass::Sana   ? "Sana" :
         cfg.model_class == brodiffusion::ModelClass::PixArt ? "PixArt" :
-        cfg.model_class == brodiffusion::ModelClass::Krea2  ? "Krea2" : "StableDiffusion";
+        cfg.model_class == brodiffusion::ModelClass::Krea2  ? "Krea2" :
+        cfg.model_class == brodiffusion::ModelClass::QwenImage21 ? "QwenImage21"
+                                                                 : "StableDiffusion";
 
     ObjectBuilder o;
     o.set("modelClass", modelClassName);
