@@ -1208,6 +1208,7 @@ int run_qi21_fwd(int argc, char** argv) {
     const char* wps = arg_after(argc, argv, "--wp");
     const char* seqs = arg_after(argc, argv, "--seq");
     const char* steps_s = arg_after(argc, argv, "--steps");
+    const char* bench_s = arg_after(argc, argv, "--bench");
     bool quantize = false, no_cache = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--quantize") == 0) quantize = true;
@@ -1235,7 +1236,22 @@ int run_qi21_fwd(int argc, char** argv) {
     std::vector<st::File> files = open_transformer_shards(wd);
     std::vector<const st::File*> shards;
     for (const st::File& f : files) shards.push_back(&f);
+    std::size_t free_before = 0, total_dev = 0;
+    brotensor::device_mem_info(brotensor::default_device(), free_before,
+                               total_dev);
     model.load_weights(shards, "");
+    brotensor::sync_all();
+    {
+        std::size_t free_after = 0, total_after = 0;
+        if (brotensor::device_mem_info(brotensor::default_device(), free_after,
+                                       total_after) &&
+            free_before > free_after) {
+            std::printf("qi21-fwd: weights resident %.2f GiB (device %.2f GiB "
+                        "free of %.2f)\n",
+                        (free_before - free_after) / 1073741824.0,
+                        free_after / 1073741824.0, total_after / 1073741824.0);
+        }
+    }
 
     const int img_len = hp * wp;
     auto lat_h = load_latent_f32(lp, img_len * cfg.in_channels);
@@ -1278,6 +1294,32 @@ int run_qi21_fwd(int argc, char** argv) {
         brotensor::Tensor out2;
         model.forward(lat, hp, wp, txt, t2, cache_ptr, out2);
         dump(op2, out2);
+    }
+
+    // --bench N: N further forwards off the (already extracted) prefix cache,
+    // reporting the steady-state per-step cost the denoising loop pays, plus
+    // the peak device residency including the cache and activations.
+    if (bench_s) {
+        const int n = std::atoi(bench_s);
+        brotensor::Tensor bo;
+        model.forward(lat, hp, wp, txt, 0.5f, cache_ptr, bo);   // warm-up
+        brotensor::sync_all();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < n; ++i) {
+            model.forward(lat, hp, wp, txt, 0.5f, cache_ptr, bo);
+        }
+        brotensor::sync_all();
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms =
+            std::chrono::duration<double, std::milli>(t1 - t0).count() /
+            (n > 0 ? n : 1);
+        std::size_t free_now = 0, total_now = 0;
+        brotensor::device_mem_info(brotensor::default_device(), free_now,
+                                   total_now);
+        std::printf("qi21-fwd: %d cached steps at %dx%d: %.1f ms/step "
+                    "(device %.2f GiB in use)\n",
+                    n, hp, wp, ms,
+                    (total_now - free_now) / 1073741824.0);
     }
     return 0;
 }
