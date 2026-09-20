@@ -242,6 +242,10 @@ Value krea2PrimeFromTaps(Value thisVal, std::span<const Value> args) {
                                   "{rows,cols,data} tensors required");
     }
     auto opts = parseGenerateOptions(args.size() >= 3 ? args[2] : ev::undefined());
+    w->cancel_requested.store(false, std::memory_order_relaxed);
+    opts.should_cancel = [w]() {
+        return w->cancel_requested.load(std::memory_order_relaxed);
+    };
 
     brotensor::Tensor uembeds, umask;
     bool haveUncond = false;

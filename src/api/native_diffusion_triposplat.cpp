@@ -15,7 +15,6 @@
 
 namespace brodiffusion::api {
 
-std::atomic<bool> g_triposplatCancelRequested{false};
 HostClass g_tripoSplatClass;
 
 TripoSplatWrapper* unwrapTripoSplat(Value v) {
@@ -345,7 +344,7 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
         return ev::throwTypeError("generate(image, opts): image required");
     }
 
-    g_triposplatCancelRequested.store(false, std::memory_order_relaxed);
+    w->cancel_requested.store(false, std::memory_order_relaxed);
 
     int seed = 42, steps = 20, numGaussians = 131072;
     float guidance = 3.0f, shift = 3.0f;
@@ -386,7 +385,7 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
         w->vae->encode(vae_px, kCanvas, kCanvas, vae_tok);
         brotensor::sync_all();
 
-        if (g_triposplatCancelRequested.load(std::memory_order_relaxed)) {
+        if (w->cancel_requested.load(std::memory_order_relaxed)) {
             ObjectBuilder b;
             b.set("cancelled", true);
             return b.build();
@@ -411,7 +410,7 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
             auto dino_out = w->dino->encode(dino_px, kCanvas, kCanvas);
             brotensor::sync_all();
 
-            if (g_triposplatCancelRequested.load(std::memory_order_relaxed)) {
+            if (w->cancel_requested.load(std::memory_order_relaxed)) {
                 ObjectBuilder b;
                 b.set("cancelled", true);
                 return b.build();
@@ -451,15 +450,15 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
         sopts.steps = steps;
         sopts.guidance_scale = guidance;
         sopts.shift = shift;
-        sopts.should_cancel = []() {
-            return g_triposplatCancelRequested.load(std::memory_order_relaxed);
+        sopts.should_cancel = [w]() {
+            return w->cancel_requested.load(std::memory_order_relaxed);
         };
 
         brotensor::Tensor latent;
         brodiffusion::triposplat::sample_latent(*w->flow, feature1, feature2, noise_lat, noise_cam, sopts, latent);
         brotensor::sync_all();
 
-        if (g_triposplatCancelRequested.load(std::memory_order_relaxed)) {
+        if (w->cancel_requested.load(std::memory_order_relaxed)) {
             ObjectBuilder b;
             b.set("cancelled", true);
             return b.build();
@@ -522,6 +521,13 @@ Value tripoExportSplat(Value thisVal, std::span<const Value> args) {
     return ev::fromBool(true);
 }
 
+Value tripoCancel(Value thisVal, std::span<const Value>) {
+    auto* w = unwrapTripoSplat(thisVal);
+    if (!w) return ev::throwTypeError("TripoSplatPipeline.cancel: not a TripoSplatPipeline");
+    w->cancel_requested.store(true, std::memory_order_relaxed);
+    return ev::undefined();
+}
+
 void decorateTripoSplatProto(ObjectBuilder& proto) {
     proto.def("generate", 2, tripoGenerate);
     proto.def("imageTo3D", 2, tripoGenerate);
@@ -529,6 +535,7 @@ void decorateTripoSplatProto(ObjectBuilder& proto) {
     proto.def("savePly", 1, tripoExportPLY);
     proto.def("exportSplat", 1, tripoExportSplat);
     proto.def("saveSplat", 1, tripoExportSplat);
+    proto.def("cancel", 0, tripoCancel);
     proto.accessor("device", [](Value thisVal, std::span<const Value>) -> Value {
         auto* w = unwrapTripoSplat(thisVal);
         if (!w) return ev::fromUtf8("CPU");
@@ -660,8 +667,12 @@ Value makeTriposplatNamespace() {
         }
     });
 
-    tsp.def("cancel", 0, [](Value, std::span<const Value>) -> Value {
-        g_triposplatCancelRequested.store(true, std::memory_order_relaxed);
+    tsp.def("cancel", 0, [](Value, std::span<const Value> args) -> Value {
+        if (!args.empty()) {
+            if (auto* w = unwrapTripoSplat(args[0])) {
+                w->cancel_requested.store(true, std::memory_order_relaxed);
+            }
+        }
         return ev::undefined();
     });
 

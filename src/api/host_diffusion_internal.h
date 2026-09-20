@@ -61,6 +61,7 @@ struct TripoSplatWrapper {
     std::unique_ptr<brodiffusion::triposplat::Flux2VaeEncoder> vae;
     brotensor::Device device = brotensor::Device::CPU;
     brodiffusion::triposplat::GaussianSplats lastSplats;
+    std::atomic<bool> cancel_requested{false};
 };
 
 struct VaeWrapper {
@@ -69,9 +70,6 @@ struct VaeWrapper {
     std::unique_ptr<brodiffusion::vae::Encoder> encoder;
     bool weights_loaded = false;
 };
-
-extern std::atomic<bool> g_diffusionCancelRequested;
-extern std::atomic<bool> g_triposplatCancelRequested;
 
 extern HostClass g_pipelineClass;
 extern HostClass g_pipelineStateClass;

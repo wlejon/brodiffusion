@@ -12,8 +12,6 @@
 
 namespace brodiffusion::api {
 
-std::atomic<bool> g_diffusionCancelRequested{false};
-
 namespace {
 
 // Set once by the host (bro) at install time; empty in a standalone build, in
@@ -175,7 +173,6 @@ Value textConditioningToJs(const brodiffusion::krea2::TextConditioning& tc) {
 brodiffusion::pipeline::GenerateOptions parseGenerateOptions(Value v) {
     brodiffusion::pipeline::GenerateOptions o;
     if (!ev::isObject(v)) {
-        o.should_cancel = [] { return g_diffusionCancelRequested.load(std::memory_order_relaxed); };
         return o;
     }
     ev::Persistent root(v);
@@ -232,7 +229,6 @@ brodiffusion::pipeline::GenerateOptions parseGenerateOptions(Value v) {
         }
     }
 
-    o.should_cancel = [] { return g_diffusionCancelRequested.load(std::memory_order_relaxed); };
     return o;
 }
 

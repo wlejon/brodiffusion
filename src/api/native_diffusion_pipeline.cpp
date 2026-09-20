@@ -587,9 +587,7 @@ Value makeDiffusionNamespace() {
                 dirOpts.text_encoder_path = resolveDiffusionPath(tePath);
             }
         }
-        dirOpts.should_cancel = []() {
-            return g_diffusionCancelRequested.load(std::memory_order_relaxed);
-        };
+        dirOpts.should_cancel = nullptr;
 
         if (!std::filesystem::exists(dir)) {
             return ev::throwError(std::string("loadModel failed: model dir not found: ") + dir);
@@ -706,8 +704,14 @@ Value makeDiffusionNamespace() {
                 w->cancel_requested.store(true, std::memory_order_relaxed);
                 return ev::undefined();
             }
+            if (unwrapPipelineState(args[0])) {
+                Value p = ev::getProperty(args[0], "__pipeline");
+                if (auto* pw = unwrapPipeline(p)) {
+                    pw->cancel_requested.store(true, std::memory_order_relaxed);
+                    return ev::undefined();
+                }
+            }
         }
-        g_diffusionCancelRequested.store(true, std::memory_order_relaxed);
         return ev::undefined();
     });
 

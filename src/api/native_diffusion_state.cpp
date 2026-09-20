@@ -28,6 +28,15 @@ Value stateStepOnce(Value thisVal, std::span<const Value> args) {
     brodiffusion::pipeline::Pipeline* pipe = pipelineOfState(thisVal);
     if (!pipe) return ev::throwError("PipelineState.stepOnce: pipeline handle lost");
 
+    Value p = ev::getProperty(thisVal, "__pipeline");
+    if (auto* pw = unwrapPipeline(p)) {
+        if (pw->cancel_requested.load(std::memory_order_relaxed)) {
+            ObjectBuilder b;
+            b.set("cancelled", true);
+            return b.build();
+        }
+    }
+
     ev::Persistent ctrl(args.empty() ? ev::undefined() : args[0]);
     const bool wantTrace = propBool(ctrl.get(), "trace");
 
@@ -247,6 +256,13 @@ void decoratePipelineStateProto(ObjectBuilder& proto) {
     proto.accessor("latentHeight", [](Value thisVal, std::span<const Value>) -> Value {
         auto* sw = unwrapPipelineState(thisVal);
         return ev::fromDouble(sw ? sw->state.H_lat : 0);
+    });
+    proto.def("cancel", 0, [](Value thisVal, std::span<const Value>) -> Value {
+        Value p = ev::getProperty(thisVal, "__pipeline");
+        if (auto* pw = unwrapPipeline(p)) {
+            pw->cancel_requested.store(true, std::memory_order_relaxed);
+        }
+        return ev::undefined();
     });
 }
 
