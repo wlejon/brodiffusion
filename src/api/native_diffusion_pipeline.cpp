@@ -330,7 +330,9 @@ Value pipelineConfig(Value thisVal, std::span<const Value>) {
     const bool lcm = std::holds_alternative<brodiffusion::scheduler::LCMConfig>(cfg.scheduler);
     const bool flow = std::holds_alternative<brodiffusion::scheduler::FlowMatchConfig>(cfg.scheduler);
     const bool scm = std::holds_alternative<brodiffusion::scheduler::SCMConfig>(cfg.scheduler);
-    const char* schedName = scm ? "scm" : lcm ? "lcm" : (flow ? "flowmatch" : "ddim");
+    const bool dpm = std::holds_alternative<brodiffusion::scheduler::DPMSolverConfig>(cfg.scheduler);
+    const char* schedName = !w->scheduler_name.empty() ? w->scheduler_name.c_str() :
+        (scm ? "scm" : lcm ? "lcm" : (flow ? "flowmatch" : (dpm ? "dpm" : "ddim")));
     const char* modelClassName =
         cfg.model_class == brodiffusion::ModelClass::Flux   ? "Flux" :
         cfg.model_class == brodiffusion::ModelClass::Sana   ? "Sana" :
@@ -379,19 +381,94 @@ Value pipelinePrime(Value thisVal, std::span<const Value> args) {
     }
 }
 
-// Pipeline.stepOnce(state) / Pipeline.decode(state) — the pipeline-side
-// convenience forms; PipelineState carries the full-fidelity ones.
+// Pipeline.stepOnce(state, ctrl?) / Pipeline.decode(state) — the pipeline-side
+// convenience forms; accepts optional trace and attnBias/logitBias control.
 Value pipelineStepOnce(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.stepOnce: not a loaded Pipeline");
-    if (args.empty()) return ev::throwTypeError("Pipeline.stepOnce(state): state required");
+    if (args.empty()) return ev::throwTypeError("Pipeline.stepOnce(state, ctrl?): state required");
 
     auto* sw = unwrapPipelineState(args[0]);
     if (!sw) return ev::throwTypeError("Pipeline.stepOnce: expected PipelineState argument");
 
+    bool wantTrace = false;
+    Value biasVal = ev::undefined();
+    if (args.size() > 1) {
+        if (ev::isObject(args[1])) {
+            wantTrace = propBool(args[1], "trace");
+            biasVal = ev::getProperty(args[1], "attnBias");
+            if (ev::isUndefined(biasVal) || ev::isNull(biasVal)) {
+                biasVal = ev::getProperty(args[1], "logitBias");
+            }
+        } else if (ev::isBool(args[1])) {
+            wantTrace = ev::toBool(args[1]);
+            if (args.size() > 2) biasVal = args[2];
+        }
+    }
+
+    std::vector<brotensor::Tensor> owned;
+    std::vector<const brotensor::Tensor*> ptrs;
+    bool haveBias = false;
+    if (ev::isObject(biasVal)) {
+        haveBias = true;
+        const int n = w->pipeline->num_xattn_blocks();
+        const uint32_t len = arrayLength(biasVal);
+        if (static_cast<int>(len) != n) {
+            return ev::throwRangeError(
+                "Pipeline.stepOnce: attnBias length " + std::to_string(len) +
+                " must equal numXAttnBlocks() " + std::to_string(n));
+        }
+        owned.reserve(static_cast<size_t>(n));
+        ptrs.reserve(static_cast<size_t>(n));
+        std::vector<bool> present(static_cast<size_t>(n), false);
+        for (int i = 0; i < n; ++i) {
+            ev::Persistent e(ev::getElement(biasVal, static_cast<uint32_t>(i)));
+            if (!ev::isObject(e.get())) continue;
+            present[static_cast<size_t>(i)] = true;
+            int Lq = 0, Lk = 0;
+            propInt(e.get(), "Lq", Lq);
+            propInt(e.get(), "Lk", Lk);
+            Value dv = ev::getProperty(e.get(), "data");
+            const float* fp = nullptr;
+            size_t cnt = 0;
+            const bool ok = readFloat32Array(dv, fp, cnt) && fp && Lq > 0 && Lk > 0 &&
+                            cnt == static_cast<size_t>(Lq) * static_cast<size_t>(Lk);
+            if (!ok) {
+                return ev::throwTypeError(
+                    "Pipeline.stepOnce: attnBias[" + std::to_string(i) +
+                    "] must be { data: Float32Array(Lq*Lk), Lq, Lk } or null");
+            }
+            owned.push_back(brotensor::Tensor::from_host(fp, Lq, Lk));
+        }
+        size_t next = 0;
+        for (int i = 0; i < n; ++i) {
+            ptrs.push_back(present[static_cast<size_t>(i)] ? &owned[next++] : nullptr);
+        }
+    }
+
+    brodiffusion::AttentionTrace trace;
+    brodiffusion::AttentionTrace* tracePtr = wantTrace ? &trace : nullptr;
+    const std::vector<const brotensor::Tensor*>* biasPtr = haveBias ? &ptrs : nullptr;
+
     try {
-        w->pipeline->step_once(sw->state, sw->opts);
+        w->pipeline->step_once(sw->state, sw->opts, tracePtr, biasPtr);
         bool hasMore = sw->state.step_index < sw->state.n_steps;
+        if (wantTrace) {
+            ObjectBuilder res;
+            res.set("hasMore", hasMore);
+            ev::Persistent arr(hostArrayOf(trace.size(), [&trace](size_t i) -> Value {
+                const brotensor::Tensor& t = trace[i];
+                std::vector<float> host = downloadTensorFloats(t);
+                ObjectBuilder entry;
+                entry.set("Lq", static_cast<double>(t.rows));
+                entry.set("Lk", static_cast<double>(t.cols));
+                ev::Persistent d(makeFloat32Array(host.data(), host.size()));
+                entry.set("data", d.get());
+                return entry.build();
+            }));
+            res.set("trace", arr.get());
+            return res.build();
+        }
         return ev::fromBool(hasMore);
     } catch (const std::exception& e) {
         return ev::throwError(std::string("Pipeline.stepOnce failed: ") + e.what());
@@ -451,7 +528,7 @@ void decoratePipeline(ObjectBuilder& proto) {
     proto.def("sigmas", 0, pipelineSigmas);
     proto.def("config", 0, pipelineConfig);
     proto.def("prime", 2, pipelinePrime);
-    proto.def("stepOnce", 1, pipelineStepOnce);
+    proto.def("stepOnce", 2, pipelineStepOnce);
     proto.def("decode", 1, pipelineDecode);
     proto.def("dispose", 0, pipelineDispose);
     proto.def("cancel", 0, pipelineCancel);
@@ -554,7 +631,7 @@ Value makeDiffusionNamespace() {
         propStr(cfgArg.get(), "scheduler", schedulerName);
 
         bool lcm = (schedulerName == "lcm");
-        bool flowmatch = (schedulerName == "flowmatch");
+        bool flowmatch = (schedulerName == "flowmatch" || schedulerName == "euler");
         bool scm = (schedulerName == "scm");
         bool dpm = (schedulerName == "dpm" || schedulerName == "dpmsolver");
         bool lcmDistilled = propBool(cfgArg.get(), "lcmDistilled");
@@ -577,6 +654,7 @@ Value makeDiffusionNamespace() {
             cfg.unet.quantize_weights = quantize;
 
             auto w = std::make_unique<PipelineWrapper>();
+            w->scheduler_name = schedulerName;
             w->pipeline = std::make_unique<brodiffusion::pipeline::Pipeline>(cfg, std::move(tok));
             return g_pipelineClass.createInstance(std::move(w));
         } catch (const std::exception& e) {

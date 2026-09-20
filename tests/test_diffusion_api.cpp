@@ -1,6 +1,9 @@
 #include <brodiffusion/version.h>
 #include "../src/api/api.h"
+#include "../src/api/object_builder.h"
 #include <cassert>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -114,6 +117,62 @@ int main() {
     assert(ev::isObject(expSplat));
     auto badSplatCall = ev::call(expSplat, tsp, {});
     assert(badSplatCall.thrown);
+
+    // Test triposplat.load dinov3 validation
+    {
+        brodiffusion::api::ObjectBuilder loadOpts;
+        loadOpts.set("dinov3", "/tmp/nonexistent_dino_test.safetensors");
+        loadOpts.set("vae", "/tmp/nonexistent_vae_test.safetensors");
+        loadOpts.set("flow", "/tmp/nonexistent_flow_test.safetensors");
+        loadOpts.set("decoder", "/tmp/nonexistent_dec_test.safetensors");
+        const ev::Value lArgs[1] = {loadOpts.build()};
+        auto badLoadCall = ev::call(tspLoadFn, tsp, std::span<const ev::Value>(lArgs, 1));
+        assert(badLoadCall.thrown);
+        std::string err = ev::toUtf8(badLoadCall.value);
+        assert(err.find("dinov3") != std::string::npos);
+        std::cout << "  bro.triposplat.load() rejects non-existent dinov3: " << err << std::endl;
+    }
+
+    // Test createPipeline with euler scheduler and stepOnce
+    {
+        auto tmp = std::filesystem::temp_directory_path();
+        auto vp = tmp / "brodiffusion_api_test_vocab.json";
+        auto mp = tmp / "brodiffusion_api_test_merges.txt";
+        std::ofstream(vp, std::ios::binary | std::ios::trunc) << "{\"a\":1,\"a</w>\":2}";
+        std::ofstream(mp) << "#version: test\n";
+
+        auto createPipeFn = ev::getProperty(diff, "createPipeline");
+        assert(ev::isObject(createPipeFn));
+        brodiffusion::api::ObjectBuilder pipeOpts;
+        pipeOpts.set("vocabPath", vp.string());
+        pipeOpts.set("mergesPath", mp.string());
+        pipeOpts.set("scheduler", "euler");
+        const ev::Value pArgs[1] = {pipeOpts.build()};
+        auto pipeRes = ev::call(createPipeFn, diff, std::span<const ev::Value>(pArgs, 1));
+        assert(!pipeRes.thrown);
+        assert(ev::isObject(pipeRes.value));
+
+        auto pipeCfgFn = ev::getProperty(pipeRes.value, "config");
+        assert(ev::isObject(pipeCfgFn));
+        auto cfgRes = ev::call(pipeCfgFn, pipeRes.value, {});
+        assert(!cfgRes.thrown);
+        assert(ev::isObject(cfgRes.value));
+        std::string sched = ev::toUtf8(ev::getProperty(cfgRes.value, "scheduler"));
+        assert(sched == "euler");
+        std::cout << "  bro.diffusion.createPipeline({ scheduler: 'euler' }) config().scheduler: " << sched << std::endl;
+
+        // Test Pipeline.stepOnce validation
+        auto stepOnceFn = ev::getProperty(pipeRes.value, "stepOnce");
+        assert(ev::isObject(stepOnceFn));
+        auto badStep = ev::call(stepOnceFn, pipeRes.value, {});
+        assert(badStep.thrown);
+        std::string stepErr = ev::toUtf8(badStep.value);
+        assert(stepErr.find("state required") != std::string::npos);
+        std::cout << "  Pipeline.prototype.stepOnce validates arguments: " << stepErr << std::endl;
+
+        std::filesystem::remove(vp);
+        std::filesystem::remove(mp);
+    }
 
     // Methods restored after the QuickJS → bronze port dropped them.
     brodiffusionTestRestoredSurface();

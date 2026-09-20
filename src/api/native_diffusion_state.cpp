@@ -37,7 +37,11 @@ Value stateStepOnce(Value thisVal, std::span<const Value> args) {
     std::vector<const brotensor::Tensor*> ptrs;
     bool haveBias = false;
     if (ev::isObject(ctrl.get())) {
-        ev::Persistent biasArr(ev::getProperty(ctrl.get(), "attnBias"));
+        Value bVal = ev::getProperty(ctrl.get(), "attnBias");
+        if (ev::isUndefined(bVal) || ev::isNull(bVal)) {
+            bVal = ev::getProperty(ctrl.get(), "logitBias");
+        }
+        ev::Persistent biasArr(bVal);
         if (ev::isObject(biasArr.get())) {
             haveBias = true;
             // Denoiser-generic block count: 16 for the SD1.5 UNet, 57 for the

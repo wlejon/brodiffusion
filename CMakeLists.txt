@@ -129,6 +129,21 @@ if(NOT TARGET broimage)
     endif()
 endif()
 
+# --- brovisionml (vision backbones — DINOv3, etc.) ---
+set(BROVISIONML_DIR "${CMAKE_SOURCE_DIR}/../brovisionml" CACHE PATH
+    "Path to standalone brovisionml repo (set to a missing path to force submodule fallback)")
+if(NOT TARGET brovisionml)
+    if(EXISTS "${BROVISIONML_DIR}/CMakeLists.txt")
+        add_subdirectory("${BROVISIONML_DIR}" "${CMAKE_BINARY_DIR}/brovisionml" EXCLUDE_FROM_ALL)
+    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/brovisionml/CMakeLists.txt")
+        add_subdirectory(third_party/brovisionml EXCLUDE_FROM_ALL)
+    else()
+        message(FATAL_ERROR
+            "brovisionml not found at ${BROVISIONML_DIR} or third_party/brovisionml. "
+            "Clone the brovisionml repo next to this repo, or override with -DBROVISIONML_DIR=...")
+    endif()
+endif()
+
 # --- bronze, the JavaScript runtime the api binds ---
 # A checkout beside this one (../bronze, with ../brass beside it — bronze
 # resolves and add_subdirectory()s its own code generator), the layout of a

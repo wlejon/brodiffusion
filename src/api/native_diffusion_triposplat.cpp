@@ -1,7 +1,9 @@
 #include "host_diffusion_internal.h"
 #include <broimage/decode.h>
+#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
+#include <brovisionml/dinov3.h>
 
 #include <algorithm>
 #include <cmath>
@@ -393,8 +395,38 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
         const int K = 4101; // 5 prefix + 4096 tokens
         const int D1 = 1280;
         const int D2 = 128;
-        std::vector<float> f1(static_cast<size_t>(K) * D1, 0.0f);
-        brotensor::Tensor feature1 = uploadCompute(f1.data(), K, D1);
+        brotensor::Tensor feature1;
+        if (w->dino) {
+            static const float kDinoMean[3] = {0.485f, 0.456f, 0.406f};
+            static const float kDinoStd[3]  = {0.229f, 0.224f, 0.225f};
+            std::vector<float> dino_in(static_cast<size_t>(3) * HW);
+            for (int c = 0; c < 3; ++c) {
+                for (int i = 0; i < HW; ++i) {
+                    dino_in[static_cast<size_t>(c) * HW + i] =
+                        (rgb01[static_cast<size_t>(i) * 3 + c] - kDinoMean[c]) / kDinoStd[c];
+                }
+            }
+            brotensor::Tensor dino_px = brotensor::Tensor::from_host_on(
+                w->dino->device(), dino_in.data(), 1, 3 * HW);
+            auto dino_out = w->dino->encode(dino_px, kCanvas, kCanvas);
+            brotensor::sync_all();
+
+            if (g_triposplatCancelRequested.load(std::memory_order_relaxed)) {
+                ObjectBuilder b;
+                b.set("cancelled", true);
+                return b.build();
+            }
+
+            if (brotensor::compute_dtype() == brotensor::Dtype::FP16 &&
+                dino_out.last_hidden_state.dtype != brotensor::Dtype::FP16) {
+                brotensor::cast(dino_out.last_hidden_state, feature1, brotensor::Dtype::FP16);
+            } else {
+                feature1 = std::move(dino_out.last_hidden_state);
+            }
+        } else {
+            std::vector<float> f1(static_cast<size_t>(K) * D1, 0.0f);
+            feature1 = uploadCompute(f1.data(), K, D1);
+        }
 
         std::vector<float> vt = downloadF32(vae_tok);
         const int Tvae = vae_tok.rows;
@@ -538,20 +570,29 @@ Value makeTriposplatNamespace() {
         }
 
         Value dinoV = ev::getProperty(args[0], "dinov3");
+        if (ev::isUndefined(dinoV) || ev::isNull(dinoV)) {
+            dinoV = ev::getProperty(args[0], "dino");
+        }
         Value vaeV = ev::getProperty(args[0], "vae");
         Value flowV = ev::getProperty(args[0], "flow");
         Value decV = ev::getProperty(args[0], "decoder");
 
-        if (!ev::isString(dinoV) || !ev::isString(vaeV) || !ev::isString(flowV) || !ev::isString(decV)) {
+        if (!ev::isString(vaeV) || !ev::isString(flowV) || !ev::isString(decV)) {
             return ev::throwTypeError("load: dinov3, vae, flow and decoder paths are all required");
         }
 
-        std::string p_dino = ev::toUtf8(dinoV);
+        std::string p_dino;
+        if (ev::isString(dinoV)) {
+            p_dino = ev::toUtf8(dinoV);
+        } else if (!ev::isUndefined(dinoV) && !ev::isNull(dinoV)) {
+            return ev::throwTypeError("load: dinov3, vae, flow and decoder paths are all required");
+        }
+
         std::string p_vae = ev::toUtf8(vaeV);
         std::string p_flow = ev::toUtf8(flowV);
         std::string p_dec = ev::toUtf8(decV);
 
-        if (!std::filesystem::exists(p_dino)) {
+        if (!p_dino.empty() && !std::filesystem::exists(p_dino)) {
             return ev::throwError("triposplat.load failed: cannot open dinov3 file " + p_dino);
         }
         if (!std::filesystem::exists(p_vae)) {
@@ -580,6 +621,20 @@ Value makeTriposplatNamespace() {
 
             auto w = std::make_unique<TripoSplatWrapper>();
             w->device = device;
+
+            if (!p_dino.empty() && std::filesystem::exists(p_dino)) {
+                w->dino = std::make_unique<brovisionml::dinov3::Backbone>(brovisionml::dinov3::Config::vit_h());
+                const std::string ext = ".safetensors";
+                const bool isFile = std::filesystem::is_regular_file(p_dino) ||
+                                    (p_dino.size() >= ext.size() &&
+                                     p_dino.compare(p_dino.size() - ext.size(), ext.size(), ext) == 0);
+                if (isFile) {
+                    w->dino->load_file(p_dino);
+                } else {
+                    w->dino->load(p_dino);
+                }
+                w->dino->to(device);
+            }
 
             w->vae = std::make_unique<brodiffusion::triposplat::Flux2VaeEncoder>();
             {

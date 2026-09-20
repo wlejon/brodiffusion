@@ -25,6 +25,10 @@
 #include <string>
 #include <vector>
 
+namespace brovisionml::dinov3 {
+class Backbone;
+}
+
 namespace brodiffusion::api {
 
 namespace ev = bronze::embed;
@@ -39,6 +43,7 @@ struct PipelineWrapper {
     uint32_t tag = kHostPipelineTag;
     std::unique_ptr<brodiffusion::pipeline::Pipeline> pipeline;
     bool weights_loaded = false;
+    std::string scheduler_name;
     std::atomic<bool> cancel_requested{false};
 };
 
@@ -50,6 +55,7 @@ struct PipelineStateWrapper {
 
 struct TripoSplatWrapper {
     uint32_t tag = kHostTripoSplatTag;
+    std::unique_ptr<brovisionml::dinov3::Backbone> dino;
     std::unique_ptr<brodiffusion::triposplat::FlowDiT> flow;
     std::unique_ptr<brodiffusion::triposplat::OctreeGaussianDecoder> decoder;
     std::unique_ptr<brodiffusion::triposplat::Flux2VaeEncoder> vae;

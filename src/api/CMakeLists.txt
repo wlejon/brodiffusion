@@ -19,6 +19,7 @@ target_include_directories(brodiffusion_api PUBLIC
 target_link_libraries(brodiffusion_api PUBLIC
     brodiffusion
     brotensor
+    brovisionml
     bronze_runtime_shared
 )
 
