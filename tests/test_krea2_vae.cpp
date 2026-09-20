@@ -337,6 +337,65 @@ static void test_synthetic() {
     std::filesystem::remove(epath, ec);
 }
 
+static void test_attn_scales() {
+    vq::Config cfg = make_synth_config();
+
+    // 1. Zero scales should construct without issue
+    cfg.attn_scales = {0.0f, 0.0f};
+    {
+        vq::Decoder dec(cfg);
+        vq::Encoder enc(cfg);
+    }
+
+    // 2. Non-zero scales should also construct without crashing on config
+    cfg.attn_scales = {0.5f, 1.0f};
+    {
+        vq::Decoder dec(cfg);
+        vq::Encoder enc(cfg);
+    }
+
+    // 3. Checkpoint containing up-block attention weights must fail on load_weights
+    Builder db_bad;
+    build_decoder_fixture(db_bad, cfg);
+    db_bad.add("decoder.up_blocks.0.attentions.0.norm.gamma", {4}, f32_ones(4));
+    auto dpath_bad = std::filesystem::temp_directory_path() / "brodiffusion_krea2_vae_dec_bad.safetensors";
+    db_bad.write(dpath_bad);
+    {
+        auto file = st::File::open(dpath_bad.string());
+        vq::Decoder dec(cfg);
+        bool caught = false;
+        try {
+            dec.load_weights(file, "");
+        } catch (const std::exception& e) {
+            caught = true;
+            CHECK(std::string(e.what()).find("up-block attention weights") != std::string::npos);
+        }
+        CHECK(caught);
+    }
+    std::error_code ec;
+    std::filesystem::remove(dpath_bad, ec);
+
+    // 4. Checkpoint containing down-block attention weights must fail on load_weights
+    Builder eb_bad;
+    build_encoder_fixture(eb_bad, cfg);
+    eb_bad.add("encoder.down_blocks.0.attentions.0.norm.gamma", {4}, f32_ones(4));
+    auto epath_bad = std::filesystem::temp_directory_path() / "brodiffusion_krea2_vae_enc_bad.safetensors";
+    eb_bad.write(epath_bad);
+    {
+        auto file = st::File::open(epath_bad.string());
+        vq::Encoder enc(cfg);
+        bool caught = false;
+        try {
+            enc.load_weights(file, "");
+        } catch (const std::exception& e) {
+            caught = true;
+            CHECK(std::string(e.what()).find("down-block attention weights") != std::string::npos);
+        }
+        CHECK(caught);
+    }
+    std::filesystem::remove(epath_bad, ec);
+}
+
 // ─── Part 2: real-weights decode (gated) ───────────────────────────────────
 
 #ifndef BRODIFFUSION_WEIGHTS_DIR
@@ -411,6 +470,13 @@ int main() {
         test_synthetic();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "krea2_vae: synthetic test exception: %s\n", e.what());
+        return 1;
+    }
+
+    try {
+        test_attn_scales();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "krea2_vae: attn_scales test exception: %s\n", e.what());
         return 1;
     }
 

@@ -165,10 +165,10 @@ std::vector<float> download_f32(const bt::Tensor& t) {
 Decoder::Decoder(const Config& cfg) : cfg_(cfg) {
     if (cfg_.dim_mult.empty()) fail("Decoder", "dim_mult must be non-empty");
     if (cfg_.num_res_blocks <= 0) fail("Decoder", "num_res_blocks must be positive");
-    if (!cfg_.attn_scales.empty()) {
-        fail("Decoder", "non-empty attn_scales not supported (no known Krea 2 / "
-                        "Qwen-Image checkpoint uses one; down/up-block attention "
-                        "is not implemented)");
+    for (float s : cfg_.attn_scales) {
+        if (std::isnan(s) || std::isinf(s)) {
+            fail("Decoder", "attn_scales contains invalid value");
+        }
     }
     if (static_cast<int>(cfg_.latents_mean.size()) != cfg_.z_dim ||
         static_cast<int>(cfg_.latents_std.size()) != cfg_.z_dim) {
@@ -199,6 +199,13 @@ void Decoder::load_resnet_(const st::File& f, const std::string& p,
 }
 
 void Decoder::load_weights(const st::File& f, const std::string& prefix) {
+    for (const auto& t : f.tensors()) {
+        if (t.name.rfind(prefix + "decoder.up_blocks.", 0) == 0 &&
+            t.name.find(".attentions.") != std::string::npos) {
+            fail("Decoder", "checkpoint contains up-block attention weights which are not supported");
+        }
+    }
+
     arith_dtype_ = arith_dtype_for(cfg_.force_upcast);
     const int nb = static_cast<int>(cfg_.dim_mult.size());
     const int z_dim = cfg_.z_dim;
@@ -381,10 +388,10 @@ void Decoder::decode(const bt::Tensor& latent, int H_lat, int W_lat, bt::Tensor&
 Encoder::Encoder(const Config& cfg) : cfg_(cfg) {
     if (cfg_.dim_mult.empty()) fail("Encoder", "dim_mult must be non-empty");
     if (cfg_.num_res_blocks <= 0) fail("Encoder", "num_res_blocks must be positive");
-    if (!cfg_.attn_scales.empty()) {
-        fail("Encoder", "non-empty attn_scales not supported (no known Krea 2 / "
-                        "Qwen-Image checkpoint uses one; down/up-block attention "
-                        "is not implemented)");
+    for (float s : cfg_.attn_scales) {
+        if (std::isnan(s) || std::isinf(s)) {
+            fail("Encoder", "attn_scales contains invalid value");
+        }
     }
     if (static_cast<int>(cfg_.latents_mean.size()) != cfg_.z_dim ||
         static_cast<int>(cfg_.latents_std.size()) != cfg_.z_dim) {
@@ -415,6 +422,13 @@ void Encoder::load_resnet_(const st::File& f, const std::string& p,
 }
 
 void Encoder::load_weights(const st::File& f, const std::string& prefix) {
+    for (const auto& t : f.tensors()) {
+        if (t.name.rfind(prefix + "encoder.down_blocks.", 0) == 0 &&
+            t.name.find(".attentions.") != std::string::npos) {
+            fail("Encoder", "checkpoint contains down-block attention weights which are not supported");
+        }
+    }
+
     arith_dtype_ = arith_dtype_for(cfg_.force_upcast);
     const int nb = static_cast<int>(cfg_.dim_mult.size());
 
