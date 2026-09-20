@@ -233,6 +233,7 @@ target_sources(brodiffusion PRIVATE
     src/dit/qwenimage21.cpp
     src/dit/qwenimage21_forward.cpp
     src/dit/qwenimage21_denoiser.cpp
+    src/dit/qwenimage21_hooks.cpp
     src/dit/sana.cpp
     src/dit/pixart.cpp
     src/ardy/motion_rep.cpp

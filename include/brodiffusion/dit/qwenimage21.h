@@ -111,6 +111,23 @@ struct QwenImage21Segment {
     int w = 0;          // Image only: latent token columns
 };
 
+// Which of the two modulation rows a research delta addresses. Under
+// causal_condition the prefix (text / condition-image) rows are modulated
+// from the t = 0 row and the target image's rows from the sampled t, so the
+// two are independently steerable — unlike Krea 2, where one shared vector
+// drives every row.
+//
+// IMPORTANT: the prefix rows are only ever computed on the EXTRACT step (the
+// first forward against a fresh prefix KV cache). A Prefix / Both delta armed
+// after that step has no effect until the cache is reset — Pipeline's
+// qi21_set_mod_delta() resets it for you; a bare DiT caller must call
+// QwenImage21PrefixCache::reset() itself.
+enum class QwenImage21ModTarget {
+    Target = 0,   // the sampled-t row: the image being generated
+    Prefix = 1,   // the t = 0 row: text and condition-image tokens
+    Both   = 2
+};
+
 // Per-layer post-RoPE K/V of the joint sequence's prefix, plus the layout it
 // was extracted for. Owned by the caller (the Denoiser keeps one per CFG
 // branch); reset() drops it so the next forward re-extracts.
@@ -121,10 +138,32 @@ public:
     int  prefix_len() const { return prefix_len_; }
     int  target_hp() const { return hp_; }
     int  target_wp() const { return wp_; }
+    int  num_layers() const { return static_cast<int>(k_.size()); }
     // Does this cache describe the same joint layout as (prefix_len, hp, wp)?
     bool matches(int prefix_len, int hp, int wp) const {
         return valid() && prefix_len_ == prefix_len && hp_ == hp && wp_ == wp;
     }
+
+    // ── research surface over the cached prefix ───────────────────────────
+    //
+    // The cache IS the text conditioning as far as every step after the first
+    // is concerned: attenuating or mixing it steers generation without
+    // re-encoding a prompt. Both operations are in-place on the post-RoPE K/V
+    // and take effect on the very next cached forward.
+
+    // Multiply layers [layer_lo, layer_hi)'s cached K by `k_scale` and V by
+    // `v_scale`. 1/1 over the full range is a no-op. Attenuating V alone
+    // fades the prefix's contribution while leaving the attention pattern it
+    // induces intact; attenuating K alone flattens that pattern instead.
+    void scale_kv(int layer_lo, int layer_hi, float k_scale, float v_scale);
+
+    // Linear blend towards another cache's prefix:
+    //     k = (1-alpha)*k + alpha*other.k   (and likewise v)
+    // `other` must describe the same layout (same prefix_len / target grid /
+    // layer count), which in practice means two prompts that tokenize to the
+    // same length. alpha 0 is a no-op, 1 replaces this prefix wholesale.
+    // Throws std::runtime_error on a layout mismatch.
+    void blend_from(const QwenImage21PrefixCache& other, float alpha);
 
 private:
     friend class QwenImage21Transformer2DModel;
@@ -196,6 +235,79 @@ public:
                        float timestep, QwenImage21PrefixCache* cache,
                        brotensor::Tensor& out);
 
+    // ── research hooks ────────────────────────────────────────────────────
+    //
+    // Every hook below is armed on the model and applies to every subsequent
+    // forward until cleared. They are the Qwen-Image 2.1 analogue of Krea 2's
+    // set_mod_delta / gate dials (dit/krea2.h), shaped by the two structural
+    // differences: there is ONE modulation vector for all 32 blocks (so a
+    // block range is realised by computing a second, deltaed copy of it), and
+    // the prefix and target rows read DIFFERENT rows of it.
+
+    // Modulation delta (the AdaLN seam): add `delta` (1, 4*hidden_size, any
+    // device/dtype) to the shared modulation OUTPUT — the pre-chunk vector
+    // laid out [scale1, gate1, scale2, gate2] — for blocks
+    // [block_lo, block_hi), on the row named by `target`. The delta lands
+    // BEFORE the gates' tanh, so a gate component saturates rather than
+    // running away. An empty tensor clears the hook.
+    //
+    // See QwenImage21ModTarget: a Prefix / Both delta only takes effect on an
+    // extract step, so reset the prefix cache after arming one.
+    void set_mod_delta(const brotensor::Tensor& delta, int block_lo,
+                       int block_hi,
+                       QwenImage21ModTarget target = QwenImage21ModTarget::Target);
+
+    // Timestep-embedding readout at flow time `timestep`, no image forward.
+    //   temb_out: (2, hidden_size) FP32 — row 0 the sampled t, row 1 t = 0.
+    //   mod_out:  (2, 4*hidden_size) FP32, the raw modulation output in the
+    //             same row order, BEFORE tanh — i.e. exactly the space
+    //             set_mod_delta() adds into.
+    // With causal_condition disabled both rows carry the sampled t.
+    void compute_time_mod(float timestep, brotensor::Tensor& temb_out,
+                          brotensor::Tensor& mod_out);
+
+    // Gate scale: scalar multipliers on the POST-tanh residual gates of
+    // blocks [block_lo, block_hi). `attn_scale` scales gate1 (the attention
+    // sublayer), `mlp_scale` gate2 (the SwiGLU sublayer); orthogonally,
+    // `txt_scale` scales the gate the PREFIX rows see and `img_scale` the one
+    // the TARGET rows see. All four at 1 clears the hook.
+    void set_gate_scale(float attn_scale, float mlp_scale, float txt_scale,
+                        float img_scale, int block_lo, int block_hi);
+
+    // Per-token gate mask over blocks [block_lo, block_hi): after the tanh
+    // (and any set_gate_scale), both sublayers' gated residual for row r is
+    // multiplied by mask[r]. `mask` holds prefix_len + hp*wp values in joint
+    // forward order (any device/dtype); a cached step reads only its target
+    // slice. Zeroing a row removes that token's residual updates entirely for
+    // the masked blocks. An empty tensor clears; a forward whose joint length
+    // differs from the mask skips it.
+    void set_gate_mask(const brotensor::Tensor& mask, int block_lo,
+                       int block_hi);
+
+    // Gate activity capture: when `sink` is non-null, every subsequent
+    // forward overwrites it with the per-row mean EFFECTIVE attention gate of
+    // each block, layout (num_layers, prefix_len + hp*wp) row-major — the
+    // value that actually multiplied that row's attention residual, i.e.
+    // mean_d tanh(gate1)[d] times the row's set_gate_scale factor times its
+    // set_gate_mask entry. On a cached step the prefix columns carry the
+    // values the extract step would have applied (the prefix rows are not
+    // recomputed), so the row layout stays stable across a denoise loop.
+    //
+    // Note what this can and cannot show: the modulation is SHARED by all 32
+    // blocks, so with no hooks armed every block's row is the same pair of
+    // constants (one for the prefix rows, one for the target rows). The
+    // capture exists to verify a mask / scale landed where it was aimed and
+    // to read the two gate magnitudes against the timestep — not to find
+    // per-block structure, of which the architecture has none.
+    // nullptr disables. The pointer must outlive captures.
+    void capture_gates(std::vector<float>* sink);
+
+    // norm_out scale delta: add `delta` (1, hidden_size) to the final
+    // adaptive scale the target rows pass through on the way to proj_out —
+    // the cheapest single knob on the model's output magnitude / colour.
+    // An empty tensor clears.
+    void set_norm_out_scale_delta(const brotensor::Tensor& delta);
+
     const QwenImage21Config& config() const { return cfg_; }
     brotensor::Dtype compute_dtype() const;
 
@@ -227,6 +339,15 @@ private:
         brotensor::Tensor scale1_t, gate1_t, scale2_t, gate2_t;
         brotensor::Tensor scale1_0, gate1_0, scale2_0, gate2_0;
         brotensor::Tensor final_scale;   // norm_out, target rows (t)
+        // set_gate_scale variants of the four gates, built once per forward
+        // and used by the blocks inside [gate_lo_, gate_hi_). Valid only when
+        // `scaled` is true.
+        brotensor::Tensor gs1_t, gs2_t, gs1_0, gs2_0;
+        bool scaled = false;
+        // Mean over hidden of each gate, for capture_gates(). Index order
+        // matches [gate1_t, gate1_0, gs1_t, gs1_0].
+        float mean_g1_t = 0.0f, mean_g1_0 = 0.0f;
+        float mean_gs1_t = 0.0f, mean_gs1_0 = 0.0f;
     };
 
     void load_impl_(const std::vector<const brotensor::safetensors::File*>& shards,
@@ -239,8 +360,26 @@ private:
     // Non-affine LayerNorm (eps = cfg_.eps) over (L, hidden).
     void layernorm_(const brotensor::Tensor& X, brotensor::Tensor& Y);
 
-    // Timestep embedding + shared modulation chunks, for flow time `timestep`.
-    void build_modulation_(float timestep, Modulation& m);
+    // Timestep embedding + shared modulation chunks, for flow time
+    // `timestep`. When `m_delta` is non-null and a set_mod_delta() hook is
+    // armed, it additionally receives the deltaed variant and *has_delta is
+    // set — blocks inside the delta's range use that one. `raw_mod` /
+    // `raw_temb`, when non-null, receive the (n_rows, 4*hidden) modulation
+    // output and the (n_rows, hidden) time embedding before any chunking,
+    // which is what compute_time_mod() reads back.
+    void build_modulation_(float timestep, Modulation& m,
+                           Modulation* m_delta = nullptr,
+                           bool* has_delta = nullptr,
+                           brotensor::Tensor* raw_temb = nullptr,
+                           brotensor::Tensor* raw_mod = nullptr);
+    // Slice one (n_rows, 4*hidden) modulation output into the per-sublayer
+    // rows, applying tanh to the gates and the norm_out scale delta.
+    void chunk_modulation_(const brotensor::Tensor& mod,
+                           const brotensor::Tensor& final_all, Modulation& m);
+    // Fill m's gs* variants from its gates under the set_gate_scale factors.
+    void scale_gates_(Modulation& m);
+    // Mean over hidden of a (1, hidden) row, on host.
+    float row_mean_(const brotensor::Tensor& row) const;
 
     // cos/sin RoPE tables for the joint sequence described by `prefix` +
     // the target (hp, wp). Both (L, head_dim/2) FP32 on the default device.
@@ -270,6 +409,27 @@ private:
     // the layer caches hold the PREFIX only, and these hold the
     // [prefix ; target] concatenation a cached step attends against).
     brotensor::Tensor k_full_, v_full_;
+
+    // ── research-hook state ───────────────────────────────────────────────
+    brotensor::Tensor mod_delta_;      // (1, 4*hidden) compute dtype; empty = off
+    int mod_delta_lo_ = 0, mod_delta_hi_ = 0;
+    QwenImage21ModTarget mod_delta_target_ = QwenImage21ModTarget::Target;
+
+    brotensor::Tensor norm_out_delta_; // (1, hidden) compute dtype; empty = off
+
+    float gate_attn_scale_ = 1.0f, gate_mlp_scale_ = 1.0f;
+    float gate_txt_scale_  = 1.0f, gate_img_scale_ = 1.0f;
+    int gate_lo_ = 0, gate_hi_ = 0;
+
+    brotensor::Tensor gate_mask_;      // (L, 1) compute dtype; empty = off
+    std::vector<float> gate_mask_host_;  // the same values, for gate capture
+    int gate_mask_lo_ = 0, gate_mask_hi_ = 0;
+    // (Lq, hidden) rank-1 expansion of the active mask slice, built once per
+    // forward and reused by every masked block.
+    brotensor::Tensor gate_mask_full_;
+    brotensor::Tensor gate_ones_row_;  // (1, hidden) ones
+
+    std::vector<float>* gate_sink_ = nullptr;
 };
 
 // QwenImage21Denoiser — QwenImage21Transformer2DModel behind brodiffusion's

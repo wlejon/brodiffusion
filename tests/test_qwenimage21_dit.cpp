@@ -385,6 +385,323 @@ static void test_denoiser() {
     std::filesystem::remove(path, ec);
 }
 
+// ── research hooks ─────────────────────────────────────────────────────────
+//
+// The contract every hook shares: at its identity setting it is BIT-EXACT
+// with the unhooked forward (research must be able to leave the plumbing in
+// place and dial it to zero), and off-identity it changes exactly what its
+// doc comment says it changes.
+static void test_hooks() {
+    qd::QwenImage21Config cfg = synth_cfg();
+    auto path = write_fixture(cfg, "brodiffusion_qi21_hooks_test.safetensors");
+    auto file = st::File::open(path.string());
+    qd::QwenImage21Transformer2DModel model(cfg);
+    model.load_weights(file, "");
+
+    const int hp = 6, wp = 4, text_seq = 5;
+    const int img_len = hp * wp;
+    const int H = cfg.hidden_size();
+    const int L = text_seq + img_len;
+
+    bt::Tensor lat = bdtest::bd_upload(
+        rnd(static_cast<std::size_t>(img_len) * cfg.in_channels, 3001),
+        img_len, cfg.in_channels);
+    bt::Tensor emb = bdtest::bd_upload(
+        rnd(static_cast<std::size_t>(text_seq) * cfg.context_in_dim, 3002),
+        text_seq, cfg.context_in_dim);
+    bt::Tensor txt;
+    model.encode_text(emb, txt);
+
+    bt::Tensor out;
+    model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+    bt::sync_all();
+    const std::vector<float> base = download_any(out);
+
+    // ── identity settings are no-ops, bit for bit ─────────────────────────
+    model.set_mod_delta(bt::Tensor(), 0, 0);
+    model.set_gate_scale(1.0f, 1.0f, 1.0f, 1.0f, 0, cfg.num_layers);
+    model.set_gate_mask(bt::Tensor(), 0, 0);
+    model.set_norm_out_scale_delta(bt::Tensor());
+    model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+    bt::sync_all();
+    CHECK(base == download_any(out));
+
+    // A zero delta over every block is also exactly a no-op.
+    {
+        std::vector<float> z(static_cast<std::size_t>(4) * H, 0.0f);
+        bt::Tensor zd = bdtest::bd_upload(z, 1, 4 * H);
+        model.set_mod_delta(zd, 0, cfg.num_layers, qd::QwenImage21ModTarget::Both);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        CHECK(base == download_any(out));
+        model.set_mod_delta(bt::Tensor(), 0, 0);
+    }
+    // An all-ones mask over every block, likewise.
+    {
+        std::vector<float> ones(static_cast<std::size_t>(L), 1.0f);
+        bt::Tensor mt = bdtest::bd_upload(ones, L, 1);
+        model.set_gate_mask(mt, 0, cfg.num_layers);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        CHECK(base == download_any(out));
+        model.set_gate_mask(bt::Tensor(), 0, 0);
+    }
+
+    // ── time-mod readout ──────────────────────────────────────────────────
+    {
+        bt::Tensor temb, mods;
+        model.compute_time_mod(0.7f, temb, mods);
+        CHECK(temb.rows == 2 && temb.cols == H);
+        CHECK(mods.rows == 2 && mods.cols == 4 * H);
+        CHECK(temb.dtype == bt::Dtype::FP32 && mods.dtype == bt::Dtype::FP32);
+        std::vector<float> mh = bdtest::bd_download(mods);
+        int nf = 0;
+        for (float v : mh) if (!std::isfinite(v)) ++nf;
+        CHECK(nf == 0);
+        // The t = 0 row differs from the sampled-t row (that is the whole
+        // point of causal_condition).
+        double diff = 0.0;
+        for (int i = 0; i < 4 * H; ++i) {
+            diff = std::max(diff, std::abs(static_cast<double>(mh[i]) -
+                                           mh[static_cast<std::size_t>(4 * H + i)]));
+        }
+        CHECK(diff > 1e-6);
+        // t = 0 must be the same row whatever t was sampled.
+        bt::Tensor temb2, mods2;
+        model.compute_time_mod(0.2f, temb2, mods2);
+        std::vector<float> mh2 = bdtest::bd_download(mods2);
+        for (int i = 0; i < 4 * H; ++i) {
+            CHECK(mh[static_cast<std::size_t>(4 * H + i)] ==
+                  mh2[static_cast<std::size_t>(4 * H + i)]);
+        }
+    }
+
+    // ── a Target delta leaves the extract step's prefix K/V untouched ─────
+    //
+    // The prefix rows are modulated from t = 0, so steering the sampled-t row
+    // cannot move them — which is what makes the prefix KV cache survive a
+    // Target-side experiment. Compare the caches an extract step produces.
+    {
+        std::vector<float> d(static_cast<std::size_t>(4) * H);
+        for (std::size_t i = 0; i < d.size(); ++i) {
+            d[i] = 0.05f * static_cast<float>(static_cast<int>(i % 7) - 3);
+        }
+        bt::Tensor dt_ = bdtest::bd_upload(d, 1, 4 * H);
+
+        // Extract a reference cache with no hook armed.
+        qd::QwenImage21PrefixCache c_ref;
+        model.forward(lat, hp, wp, txt, 0.7f, &c_ref, out);
+        bt::sync_all();
+
+        // Extract a second one with a Target-only delta armed.
+        model.set_mod_delta(dt_, 0, cfg.num_layers,
+                            qd::QwenImage21ModTarget::Target);
+        qd::QwenImage21PrefixCache c_tgt;
+        bt::Tensor out_t;
+        model.forward(lat, hp, wp, txt, 0.7f, &c_tgt, out_t);
+        bt::sync_all();
+        // The velocity moved...
+        CHECK(rel_maxdiff(base, download_any(out_t)) > 1e-4);
+        model.set_mod_delta(bt::Tensor(), 0, 0);
+
+        // ...but the two caches hold the SAME prefix K/V: with the hook
+        // cleared again, a cached step off either one is bit-identical. Only
+        // the t = 0 row feeds the prefix, and a Target delta does not touch
+        // it — which is exactly why a Target-side experiment survives the
+        // cache.
+        bt::Tensor out_a, out_b;
+        model.forward(lat, hp, wp, txt, 0.4f, &c_ref, out_a);
+        bt::sync_all();
+        const std::vector<float> from_ref = download_any(out_a);
+        model.forward(lat, hp, wp, txt, 0.4f, &c_tgt, out_b);
+        bt::sync_all();
+        CHECK(from_ref == download_any(out_b));
+
+        // A Prefix delta, by contrast, changes the cache it extracts — the
+        // same cached step off it lands somewhere else.
+        model.set_mod_delta(dt_, 0, cfg.num_layers,
+                            qd::QwenImage21ModTarget::Prefix);
+        qd::QwenImage21PrefixCache c_pre;
+        bt::Tensor tmp_pre;
+        model.forward(lat, hp, wp, txt, 0.7f, &c_pre, tmp_pre);
+        bt::sync_all();
+        model.set_mod_delta(bt::Tensor(), 0, 0);
+        bt::Tensor out_pc;
+        model.forward(lat, hp, wp, txt, 0.4f, &c_pre, out_pc);
+        bt::sync_all();
+        CHECK(rel_maxdiff(from_ref, download_any(out_pc)) > 1e-4);
+
+        // A Prefix delta also moves the extract step's own output.
+        model.set_mod_delta(dt_, 0, cfg.num_layers,
+                            qd::QwenImage21ModTarget::Prefix);
+        model.set_mod_delta(dt_, 0, cfg.num_layers,
+                            qd::QwenImage21ModTarget::Prefix);
+        bt::Tensor out_p;
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out_p);
+        bt::sync_all();
+        std::vector<float> vp = download_any(out_p);
+        CHECK(rel_maxdiff(base, vp) > 1e-4);
+        CHECK(rel_maxdiff(download_any(out_t), vp) > 1e-6);
+        model.set_mod_delta(bt::Tensor(), 0, 0);
+
+        // A block-range delta is not a whole-model delta.
+        model.set_mod_delta(dt_, cfg.num_layers - 1, cfg.num_layers,
+                            qd::QwenImage21ModTarget::Target);
+        bt::Tensor out_r;
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out_r);
+        bt::sync_all();
+        std::vector<float> vr = download_any(out_r);
+        CHECK(rel_maxdiff(base, vr) > 1e-6);
+        CHECK(rel_maxdiff(download_any(out_t), vr) > 1e-6);
+        model.set_mod_delta(bt::Tensor(), 0, 0);
+    }
+
+    // ── gate scale ────────────────────────────────────────────────────────
+    {
+        model.set_gate_scale(0.5f, 1.0f, 1.0f, 1.0f, 0, cfg.num_layers);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        CHECK(rel_maxdiff(base, download_any(out)) > 1e-4);
+        // Scaling only the prefix side is a different move from only the
+        // target side.
+        model.set_gate_scale(1.0f, 1.0f, 0.5f, 1.0f, 0, cfg.num_layers);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        std::vector<float> v_txt = download_any(out);
+        model.set_gate_scale(1.0f, 1.0f, 1.0f, 0.5f, 0, cfg.num_layers);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        CHECK(rel_maxdiff(v_txt, download_any(out)) > 1e-5);
+        model.set_gate_scale(1.0f, 1.0f, 1.0f, 1.0f, 0, 0);
+    }
+
+    // ── gate mask: zeroing a block range zeroes its contribution ──────────
+    //
+    // With every row of the mask at 0 over blocks [lo, hi), those blocks add
+    // nothing to the residual — so the whole model collapses to the one built
+    // from the remaining blocks. Check that against a zero gate scale, which
+    // is the same statement through the other hook.
+    {
+        std::vector<float> zeros(static_cast<std::size_t>(L), 0.0f);
+        bt::Tensor mz = bdtest::bd_upload(zeros, L, 1);
+        model.set_gate_mask(mz, 1, cfg.num_layers);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        std::vector<float> v_masked = download_any(out);
+        model.set_gate_mask(bt::Tensor(), 0, 0);
+
+        model.set_gate_scale(0.0f, 0.0f, 1.0f, 1.0f, 1, cfg.num_layers);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        CHECK(rel_maxdiff(v_masked, download_any(out)) < 1e-6);
+        model.set_gate_scale(1.0f, 1.0f, 1.0f, 1.0f, 0, 0);
+        CHECK(rel_maxdiff(base, v_masked) > 1e-4);
+    }
+
+    // ── gate capture shapes ───────────────────────────────────────────────
+    {
+        std::vector<float> sink;
+        model.capture_gates(&sink);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        CHECK(sink.size() ==
+              static_cast<std::size_t>(cfg.num_layers) * static_cast<std::size_t>(L));
+        int nf = 0;
+        for (float v : sink) if (!std::isfinite(v)) ++nf;
+        CHECK(nf == 0);
+        // The prefix columns carry the t = 0 gate, the target columns the
+        // sampled-t gate — one shared modulation, so the two are constant
+        // within their own span.
+        CHECK(sink[0] == sink[static_cast<std::size_t>(text_seq - 1)]);
+        CHECK(sink[static_cast<std::size_t>(text_seq)] ==
+              sink[static_cast<std::size_t>(L - 1)]);
+
+        // A half-range mask shows up in the capture where it was aimed.
+        std::vector<float> m(static_cast<std::size_t>(L), 1.0f);
+        m[static_cast<std::size_t>(text_seq)] = 0.0f;
+        bt::Tensor mt = bdtest::bd_upload(m, L, 1);
+        model.set_gate_mask(mt, 0, 1);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        CHECK(sink[static_cast<std::size_t>(text_seq)] == 0.0f);
+        CHECK(sink[static_cast<std::size_t>(L) +
+                   static_cast<std::size_t>(text_seq)] != 0.0f);
+        model.set_gate_mask(bt::Tensor(), 0, 0);
+        model.capture_gates(nullptr);
+    }
+
+    // ── norm_out scale delta ──────────────────────────────────────────────
+    {
+        std::vector<float> d(static_cast<std::size_t>(H), 0.25f);
+        bt::Tensor dt_ = bdtest::bd_upload(d, 1, H);
+        model.set_norm_out_scale_delta(dt_);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        CHECK(rel_maxdiff(base, download_any(out)) > 1e-4);
+        model.set_norm_out_scale_delta(bt::Tensor());
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        CHECK(base == download_any(out));
+    }
+
+    // ── prefix KV cache surface ───────────────────────────────────────────
+    {
+        qd::QwenImage21PrefixCache c1;
+        model.forward(lat, hp, wp, txt, 0.7f, &c1, out);
+        bt::sync_all();
+        CHECK(c1.num_layers() == cfg.num_layers);
+
+        bt::Tensor cached;
+        model.forward(lat, hp, wp, txt, 0.4f, &c1, cached);
+        bt::sync_all();
+        std::vector<float> v_plain = download_any(cached);
+
+        // Scaling V attenuates the prefix's contribution.
+        c1.scale_kv(0, cfg.num_layers, 1.0f, 0.5f);
+        model.forward(lat, hp, wp, txt, 0.4f, &c1, cached);
+        bt::sync_all();
+        CHECK(rel_maxdiff(v_plain, download_any(cached)) > 1e-4);
+        // ... and 1/1 is exactly a no-op.
+        c1.scale_kv(0, cfg.num_layers, 1.0f, 2.0f);
+        model.forward(lat, hp, wp, txt, 0.4f, &c1, cached);
+        bt::sync_all();
+        CHECK(rel_maxdiff(v_plain, download_any(cached)) < 2e-3);
+
+        // Blending towards a second prompt's cache.
+        bt::Tensor emb2 = bdtest::bd_upload(
+            rnd(static_cast<std::size_t>(text_seq) * cfg.context_in_dim, 3003),
+            text_seq, cfg.context_in_dim);
+        bt::Tensor txt2;
+        model.encode_text(emb2, txt2);
+        qd::QwenImage21PrefixCache c2;
+        bt::Tensor tmp;
+        model.forward(lat, hp, wp, txt2, 0.7f, &c2, tmp);
+        bt::sync_all();
+
+        qd::QwenImage21PrefixCache c3;
+        model.forward(lat, hp, wp, txt, 0.7f, &c3, tmp);
+        bt::sync_all();
+        c3.blend_from(c2, 0.0f);      // no-op
+        model.forward(lat, hp, wp, txt, 0.4f, &c3, cached);
+        bt::sync_all();
+        CHECK(rel_maxdiff(v_plain, download_any(cached)) < 2e-3);
+        c3.blend_from(c2, 0.5f);
+        model.forward(lat, hp, wp, txt, 0.4f, &c3, cached);
+        bt::sync_all();
+        CHECK(rel_maxdiff(v_plain, download_any(cached)) > 1e-4);
+
+        // A layout mismatch is an error, not silent garbage.
+        qd::QwenImage21PrefixCache c4;
+        bool threw = false;
+        try { c4.blend_from(c2, 0.5f); }
+        catch (const std::exception&) { threw = true; }
+        CHECK(threw);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
 // ── cooperative cancel ─────────────────────────────────────────────────────
 static void test_load_cancel() {
     qd::QwenImage21Config cfg = synth_cfg();   // num_layers == 2
@@ -510,6 +827,11 @@ int main() {
     try { test_denoiser(); }
     catch (const std::exception& e) {
         std::fprintf(stderr, "qi21_dit: denoiser exception: %s\n", e.what());
+        return 1;
+    }
+    try { test_hooks(); }
+    catch (const std::exception& e) {
+        std::fprintf(stderr, "qi21_dit: hooks exception: %s\n", e.what());
         return 1;
     }
     try { test_load_cancel(); }

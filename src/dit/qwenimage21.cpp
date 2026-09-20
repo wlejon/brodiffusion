@@ -334,10 +334,10 @@ void QwenImage21Transformer2DModel::encode_text(
 
 // ─── timestep embedding + shared modulation ────────────────────────────────
 
-void QwenImage21Transformer2DModel::build_modulation_(float timestep,
-                                                      Modulation& m) {
+void QwenImage21Transformer2DModel::build_modulation_(
+    float timestep, Modulation& m, Modulation* m_delta, bool* has_delta,
+    bt::Tensor* raw_temb, bt::Tensor* raw_mod) {
     const bt::Dtype dt = flux_compute_dtype();
-    const int H = cfg_.hidden_size();
     const bt::Device dev = bt::default_device();
 
     // Two timestep rows: the sampled t and t = 0. Under causal_condition the
@@ -359,6 +359,52 @@ void QwenImage21Transformer2DModel::build_modulation_(float timestep,
     bt::Tensor temb_act = temb.clone();
     bt::silu_forward(temb_act, temb_act);         // modulation.0 == nn.SiLU
     bt::Tensor mod = lin_(modulation_, temb_act); // (n_rows, 4H)
+
+    // norm_out: LN(x) * (1 + linear(silu(temb))). Only the target rows go
+    // through it, so only the sampled row's scale is needed.
+    bt::Tensor final_all = lin_(norm_out_lin_, temb_act);   // (n_rows, H)
+
+    if (raw_temb) *raw_temb = temb;
+    if (raw_mod)  *raw_mod  = mod;
+
+    chunk_modulation_(mod, final_all, m);
+
+    // Research hook (set_mod_delta): a second, deltaed copy of the shared
+    // modulation for the blocks inside the hook's range. The delta lands on
+    // the raw output, so it passes through the gates' tanh like the base
+    // value does.
+    if (m_delta != nullptr && has_delta != nullptr) *has_delta = false;
+    if (m_delta != nullptr && has_delta != nullptr && mod_delta_.size() > 0 &&
+        mod_delta_hi_ > mod_delta_lo_) {
+        bt::Tensor mod2 = mod.clone();
+        const bool do_target =
+            mod_delta_target_ != QwenImage21ModTarget::Prefix;
+        const bool do_prefix =
+            mod_delta_target_ != QwenImage21ModTarget::Target;
+        if (do_target) {
+            bt::Tensor r0 = qi21::row_view(mod2, 0, 1);
+            bt::add_inplace(r0, mod_delta_);
+        }
+        if (do_prefix && n_rows == 2) {
+            bt::Tensor r1 = qi21::row_view(mod2, 1, 1);
+            bt::add_inplace(r1, mod_delta_);
+        } else if (do_prefix && n_rows == 1 && !do_target) {
+            // causal_condition disabled: there is only the sampled row, and
+            // every token reads it — a Prefix-only delta is that row's delta.
+            bt::Tensor r0 = qi21::row_view(mod2, 0, 1);
+            bt::add_inplace(r0, mod_delta_);
+        }
+        chunk_modulation_(mod2, final_all, *m_delta);
+        *has_delta = true;
+    }
+}
+
+void QwenImage21Transformer2DModel::chunk_modulation_(
+    const bt::Tensor& mod, const bt::Tensor& final_all, Modulation& m) {
+    const bt::Dtype dt = flux_compute_dtype();
+    const int H = cfg_.hidden_size();
+    const bt::Device dev = bt::default_device();
+    const int n_rows = mod.rows;
 
     // Chunk order: [mod1.scale, mod1.gate, mod2.scale, mod2.gate]. The gates
     // enter the residual through tanh(), and the modulation is shared by
@@ -386,11 +432,13 @@ void QwenImage21Transformer2DModel::build_modulation_(float timestep,
         m.scale2_0 = m.scale2_t; m.gate2_0 = m.gate2_t;
     }
 
-    // norm_out: LN(x) * (1 + linear(silu(temb))). Only the target rows go
-    // through it, so only the sampled row's scale is needed.
-    bt::Tensor final_all = lin_(norm_out_lin_, temb_act);   // (n_rows, H)
     detail::resize_like(m.final_scale, 1, H, dt, dev);
     bt::copy_d2d(final_all, 0, m.final_scale, 0, H);
+    // Research hook (set_norm_out_scale_delta).
+    if (norm_out_delta_.size() > 0) bt::add_inplace(m.final_scale, norm_out_delta_);
+
+    m.scaled = false;
+    scale_gates_(m);
 }
 
 }  // namespace brodiffusion::dit

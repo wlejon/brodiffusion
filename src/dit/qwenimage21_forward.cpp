@@ -229,8 +229,12 @@ void QwenImage21Transformer2DModel::forward_joint(
     const int Lq = cached_mode ? img_len : L;
 
     // ── timestep embedding + shared modulation ───────────────────────────
-    Modulation mod;
-    build_modulation_(timestep, mod);
+    // `mod_d` is the set_mod_delta() variant; blocks inside the hook's range
+    // read it instead of `mod`. Built once, not per block — the modulation is
+    // four (1, hidden) rows.
+    Modulation mod, mod_d;
+    bool has_mod_delta = false;
+    build_modulation_(timestep, mod, &mod_d, &has_mod_delta);
 
     // Rows [0, prefix_len) of THIS forward's query block carry the t = 0
     // modulation; the rest carry the sampled t. A cached step runs target rows
@@ -315,12 +319,62 @@ void QwenImage21Transformer2DModel::forward_joint(
         bt::broadcast_mul(row_view(src, mod_split, Lq - mod_split), g_post, d1);
     };
 
+    // Research hook (set_gate_mask): the rank-1 (Lq, hidden) expansion of the
+    // active slice of the per-token mask, built once here and reused by every
+    // block inside the hook's range. A cached step reads the mask's TARGET
+    // slice — the prefix rows it describes are not being recomputed.
+    const bool mask_on =
+        gate_mask_.size() == static_cast<std::size_t>(L) &&
+        gate_mask_hi_ > gate_mask_lo_;
+    if (mask_on) {
+        if (gate_ones_row_.rows != 1 || gate_ones_row_.cols != H ||
+            gate_ones_row_.dtype != dt) {
+            gate_ones_row_ = bt::Tensor::zeros_on(dev, 1, H, dt);
+            bt::add_scalar_inplace(gate_ones_row_, 1.0f);
+        }
+        const bt::Tensor mcol = row_view(gate_mask_, rope_off, Lq);
+        bt::matmul(mcol, gate_ones_row_, gate_mask_full_);
+    }
+    // Research hook (capture_gates): rows = blocks, cols = the FULL joint
+    // sequence, so the layout is stable whether the step extracted or decoded.
+    if (gate_sink_ != nullptr) {
+        gate_sink_->assign(
+            static_cast<std::size_t>(cfg_.num_layers) * static_cast<std::size_t>(L),
+            0.0f);
+    }
+
     for (int i = 0; i < cfg_.num_layers; ++i) {
         const Block& b = blocks_[static_cast<std::size_t>(i)];
 
+        // Which modulation this block reads (set_mod_delta), and whether its
+        // gates carry the set_gate_scale factors / the set_gate_mask.
+        const Modulation& M =
+            (has_mod_delta && i >= mod_delta_lo_ && i < mod_delta_hi_) ? mod_d
+                                                                      : mod;
+        const bool gscale = M.scaled && i >= gate_lo_ && i < gate_hi_;
+        const bt::Tensor& g1_0 = gscale ? M.gs1_0 : M.gate1_0;
+        const bt::Tensor& g1_t = gscale ? M.gs1_t : M.gate1_t;
+        const bt::Tensor& g2_0 = gscale ? M.gs2_0 : M.gate2_0;
+        const bt::Tensor& g2_t = gscale ? M.gs2_t : M.gate2_t;
+        const bool gmask = mask_on && i >= gate_mask_lo_ && i < gate_mask_hi_;
+
+        if (gate_sink_ != nullptr) {
+            float* dst = gate_sink_->data() +
+                         static_cast<std::size_t>(i) * static_cast<std::size_t>(L);
+            const float gp = gscale ? M.mean_gs1_0 : M.mean_g1_0;
+            const float gt = gscale ? M.mean_gs1_t : M.mean_g1_t;
+            for (int r = 0; r < prefix_len; ++r) dst[r] = gp;
+            for (int r = prefix_len; r < L; ++r) dst[r] = gt;
+            if (gmask && gate_mask_host_.size() == static_cast<std::size_t>(L)) {
+                for (int r = 0; r < L; ++r) {
+                    dst[r] *= gate_mask_host_[static_cast<std::size_t>(r)];
+                }
+            }
+        }
+
         // ── attention sublayer ───────────────────────────────────────────
         layernorm_(x, ln);
-        modulate_rows(ln, mod.scale1_0, mod.scale1_t, xm);
+        modulate_rows(ln, M.scale1_0, M.scale1_t, xm);
 
         bt::Tensor q = lin_(b.to_q, xm);
         bt::Tensor k = lin_(b.to_k, xm);
@@ -382,18 +436,20 @@ void QwenImage21Transformer2DModel::forward_joint(
         }
 
         bt::Tensor ao = lin_(b.to_out, attn_cat);
-        gate_rows(ao, mod.gate1_0, mod.gate1_t, gated);
+        gate_rows(ao, g1_0, g1_t, gated);
+        if (gmask) bt::mul_inplace(gated, gate_mask_full_);
         bt::add_inplace(x, gated);
 
         // ── SwiGLU feed-forward ──────────────────────────────────────────
         layernorm_(x, ln);
-        modulate_rows(ln, mod.scale2_0, mod.scale2_t, xm);
+        modulate_rows(ln, M.scale2_0, M.scale2_t, xm);
         bt::Tensor g = lin_(b.mlp_gate, xm);
         bt::silu_forward(g, g);
         bt::Tensor p = lin_(b.mlp_proj, xm);
         bt::mul_inplace(g, p);
         bt::Tensor mo = lin_(b.mlp_out, g);
-        gate_rows(mo, mod.gate2_0, mod.gate2_t, gated);
+        gate_rows(mo, g2_0, g2_t, gated);
+        if (gmask) bt::mul_inplace(gated, gate_mask_full_);
         bt::add_inplace(x, gated);
     }
 
