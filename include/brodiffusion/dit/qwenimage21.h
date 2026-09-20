@@ -499,6 +499,18 @@ public:
     // invalidates the matching prefix cache; call reset_cache() after.
     brotensor::Tensor& text_rows(PreparedConditioning& prepared, bool uncond);
 
+    // Mutable access to a branch's prefix KV cache — the research seam over
+    // the cached text K/V (QwenImage21PrefixCache::scale_kv / blend_from),
+    // which after the extract step IS what the target attends to. Throws if
+    // `uncond` is true but no uncond branch was prepared.
+    QwenImage21PrefixCache& prefix_cache(PreparedConditioning& prepared,
+                                         bool uncond);
+
+    // True when prepare() built an uncond branch (guidance_scale > 1 at prime
+    // time). Lets a caller apply a prefix-side hook to both branches without
+    // guessing.
+    bool has_uncond(const PreparedConditioning& prepared) const;
+
 private:
     QwenImage21Transformer2DModel model_;
     brotensor::Tensor packed_;   // (H_lat*W_lat, in_channels) input scratch

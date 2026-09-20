@@ -41,6 +41,8 @@
 #include "brolm/qwen3vl_vision.h"
 #include "brolm/qwen3vl_prompt.h"
 #include "brodiffusion/krea2_text.h"
+#include "brodiffusion/qwenimage21_text.h"
+#include "brodiffusion/dit/qwenimage21.h"
 
 #include "brotensor/tensor.h"
 
@@ -639,6 +641,143 @@ public:
     krea2::TextConditioning krea_encode_image_prompt(const float* pixels,
                                                      int H, int W);
 
+    // ── Qwen-Image 2.1 research hooks (the qwenimage21_capi seam) ─────────
+    //
+    // Direct forwarding to dit::QwenImage21Transformer2DModel's research
+    // hooks (dit/qwenimage21.h carries the full semantics of each) plus the
+    // conditioning entry points the model class needs. Every method below
+    // throws if model_class_ != QwenImage21.
+    //
+    // Two things differ from the Krea 2 block above, both consequences of
+    // 2.1's prefix KV cache:
+    //   * a hook that touches the PREFIX (the t = 0 modulation row, the
+    //     cached text K/V, the prepared text rows) only takes effect on an
+    //     extract step, so these methods reset the most recently primed
+    //     conditioning's caches for you — see qi21_reset_cache().
+    //   * the conditioning is ONE (n, 4096) tensor of Qwen3-VL hidden states
+    //     rather than a layer stack, so the control-axis machinery
+    //     (cond_control(), loadControlDictionary / setControlVector) applies
+    //     to it directly, before prepare(), exactly as it does for Sana.
+
+    // Modulation delta on blocks [block_lo, block_hi); `delta` is
+    // (1, 4*qi21_hidden_size()) or empty to clear. `target` picks the target
+    // row, the prefix row or both; a prefix-side delta resets the live prefix
+    // cache so the next step re-extracts under it.
+    void qi21_set_mod_delta(const brotensor::Tensor& delta, int block_lo,
+                            int block_hi,
+                            dit::QwenImage21ModTarget target =
+                                dit::QwenImage21ModTarget::Target);
+
+    // Timestep readout at `timestep` — the SAME 0..1000-scale value
+    // qi21_step_timestep() returns and step_once() consumes; the flow-time
+    // conversion happens here. temb_out: (2, hidden); mod_out: (2, 4*hidden),
+    // row 0 = the sampled t, row 1 = t = 0.
+    void qi21_time_mod(float timestep, brotensor::Tensor& temb_out,
+                       brotensor::Tensor& mod_out);
+
+    // The active scheduler's timestep for `state.step_index`. Qwen-Image 2.1
+    // pairs exclusively with the FlowMatch scheduler.
+    float qi21_step_timestep(const PipelineState& state) const;
+
+    // Post-tanh gate dials over blocks [block_lo, block_hi): attn/mlp pick
+    // the sublayer, txt/img pick the row class. All four at 1 clears.
+    void qi21_set_gate_scale(float attn_scale, float mlp_scale,
+                             float txt_scale, float img_scale, int block_lo,
+                             int block_hi);
+
+    // Per-token gate mask over blocks [block_lo, block_hi); `mask` holds
+    // prefix_len + img_len values in joint forward order. Empty clears.
+    void qi21_set_gate_mask(const brotensor::Tensor& mask, int block_lo,
+                            int block_hi);
+
+    // Gate activity capture; qi21_gates() reads back the most recent step,
+    // row-major (qi21_num_layers(), prefix_len + img_len).
+    void qi21_capture_gates(bool enable);
+    std::vector<float> qi21_gates() const;
+
+    // norm_out scale delta, (1, qi21_hidden_size()) or empty to clear.
+    void qi21_set_norm_out_scale_delta(const brotensor::Tensor& delta);
+
+    // Sizing accessors, so nothing downstream hardcodes 4096 / 32 / 64 / 16.
+    int qi21_hidden_size() const;
+    int qi21_num_layers() const;
+    int qi21_text_hidden_dim() const;
+    int qi21_latent_channels() const;
+
+    // ── prefix cache surface ──────────────────────────────────────────────
+
+    // Drop both CFG branches' prefix KV caches on the most recently primed
+    // conditioning, forcing the next step to re-extract. Needed after any
+    // change to the prefix side — edited text rows, a prefix-side mod delta,
+    // a control axis applied out of band. A no-op when nothing has been
+    // primed yet (or the state that owned it has been destroyed).
+    void qi21_reset_cache();
+
+    // Attenuate the live prefix cache's K/V for layers [layer_lo, layer_hi).
+    // Applies to the cond branch, and to the uncond branch when one was
+    // prepared. Takes effect on the very next step, with no re-extraction.
+    void qi21_scale_prefix_kv(int layer_lo, int layer_hi, float k_scale,
+                              float v_scale);
+
+    // Read / replace the prepared text rows — txt_in's (n_valid, hidden)
+    // output, the joint sequence's text half. The setter resets the prefix
+    // cache so the change lands. `uncond` selects the negative branch (only
+    // present when guidance_scale > 1 at prime time).
+    brotensor::Tensor qi21_text_rows(bool uncond = false) const;
+    void qi21_set_text_rows(const brotensor::Tensor& rows, bool uncond = false);
+
+    // ── conditioning entry points ─────────────────────────────────────────
+
+    // Encode `prompt` into 2.1's raw text conditioning: the (n, 4096)
+    // Qwen3-VL-8B hidden-state rows the DiT's txt_in consumes, an all-ones
+    // validity mask, and the template's token ids. This is the exact tensor
+    // prime() builds internally and the space control axes are minted in
+    // (encode_conditioning() returns its `embeds`).
+    qwenimage21::TextConditioning qi21_encode_prompt(std::string_view prompt);
+
+    // Prime a step-wise generation from caller-supplied (n, 4096) rows
+    // instead of encoding a prompt — the analogue of krea_prime_from_taps().
+    // `mask` may be empty (all rows valid). uncond_embeds/uncond_mask may be
+    // null; when guidance_scale > 1 the uncond branch then falls back to
+    // encoding opts.negative_prompt normally.
+    PipelineState qi21_prime_from_text(const brotensor::Tensor& embeds,
+                                       const brotensor::Tensor& mask,
+                                       const brotensor::Tensor* uncond_embeds,
+                                       const brotensor::Tensor* uncond_mask,
+                                       const GenerateOptions& opts);
+
+    // ── image seam (the resident 16x RGBA VAE) ────────────────────────────
+
+    // Encode RGB pixels into a pipeline-scale latent. `pixels` is FP32 CHW in
+    // [0,1], length 3*H*W; H and W must be multiples of vae_scale_factor()
+    // (16). An opaque alpha plane is appended internally (2.1's autoencoder
+    // is RGBA on both ends). Returns (1, 64*H/16*W/16) NCHW — the shape
+    // PipelineState::latent carries.
+    brotensor::Tensor qi21_encode_image(const float* pixels, int H, int W);
+
+    // Decode a pipeline-scale latent (1, 64*h_lat*w_lat) to RGB, FP32 CHW in
+    // [-1,1], length 3*(16*h_lat)*(16*w_lat) — alpha dropped, exactly as
+    // decode() does for a generation.
+    std::vector<float> qi21_decode(const brotensor::Tensor& latent, int h_lat,
+                                   int w_lat);
+
+    // ── text-encoder residency ────────────────────────────────────────────
+
+    // Free the Qwen3-VL-8B backbone. It is ~8.5 GiB and sits completely idle
+    // once prime() has run, so releasing it is what buys a BF16 DiT or a
+    // bigger canvas on a 24 GB card. A primed PipelineState keeps working:
+    // its conditioning is already encoded and the prefix cache is downstream
+    // of it. qi21_encode_prompt() / prime() throw until the encoder is
+    // reloaded. Safe to call twice.
+    void qi21_release_text_encoder();
+    bool qi21_text_encoder_resident() const;
+    // Reload the backbone into a pipeline it was released from (or swap in a
+    // different one). `text_encoder_path` is a .gguf or a diffusers
+    // safetensors file/dir; empty means `<model_dir>/text_encoder`.
+    void qi21_reload_text_encoder(const std::string& model_dir,
+                                  const std::string& text_encoder_path,
+                                  bool quantize);
+
 private:
     // Encode a prompt to the CLIP (77, hidden) conditioning. If content_end is
     // non-null, it receives the EOS index (first eos_id) = end of the content
@@ -758,6 +897,29 @@ private:
     // scheduler setup, CUDA graph keying) with zero duplication.
     std::optional<krea2::TextConditioning> krea_taps_override_;
     std::optional<krea2::TextConditioning> krea_uncond_taps_override_;
+
+    // The Qwen-Image 2.1 counterparts of the four members above.
+    // qi21_gate_sink_ backs qi21_capture_gates()/qi21_gates();
+    // qi21_text_override_ is consumed by prime()'s QwenImage21 branch when
+    // qi21_prime_from_text() set it.
+    std::vector<float> qi21_gate_sink_;
+    std::optional<qwenimage21::TextConditioning> qi21_text_override_;
+    std::optional<qwenimage21::TextConditioning> qi21_uncond_text_override_;
+    // A weak handle on the conditioning the most recent prime() produced.
+    // Qwen-Image 2.1's prefix KV cache lives inside it, and every prefix-side
+    // research hook has to invalidate that cache — but the payload is owned
+    // by the PipelineState the caller holds, not by Pipeline, so this is
+    // deliberately non-owning: a hook called after the state was dropped is a
+    // no-op rather than a dangling write.
+    std::weak_ptr<PreparedConditioning> last_prepared_;
+    // What the currently-armed Qwen-Image 2.1 hooks do to the PREFIX side.
+    // Only an extract step applies a prefix-side hook, so the cache has to be
+    // dropped both when one is armed AND when one is cleared — the latter is
+    // why these are remembered rather than read off the arguments.
+    bool  qi21_mod_delta_hits_prefix_ = false;
+    bool  qi21_gate_mask_armed_       = false;
+    float qi21_prefix_gate_attn_      = 1.0f;
+    float qi21_prefix_gate_mlp_       = 1.0f;
 
     // Working buffers reused across step_once() calls. The current latent
     // lives on PipelineState, not here.

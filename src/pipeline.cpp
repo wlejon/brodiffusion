@@ -779,6 +779,11 @@ bt::Tensor Pipeline::encode_conditioning(std::string_view prompt) {
         krea2::TextConditioning tc = krea_encode_prompt_taps(prompt);
         return krea_encode_text(tc.prompt_embeds, tc.prompt_embeds_mask);
     }
+    if (model_class_ == ModelClass::QwenImage21) {
+        // Qwen-Image 2.1: the raw (n, 4096) Qwen3-VL-8B rows — the space
+        // prime() applies control axes in, and what txt_in consumes.
+        return qi21_encode_prompt(prompt).embeds;
+    }
     // CLIP-based models (SD / Flux): reuse the fixed-length CLIP encode path.
     bt::Tensor out;
     encode_prompt_(prompt, out);
@@ -1194,20 +1199,46 @@ PipelineState Pipeline::prime(std::string_view prompt,
         // mask at batch 1. Guidance is `true_cfg_scale`: at the reference
         // default of 1.0 there is no uncond branch at all, so the negative
         // prompt is only encoded when the caller asks for > 1.
-        if (!qwen3vl_model_ || !qwen3vl_tokenizer_) {
-            fail("prime: QwenImage21 pipeline missing Qwen3-VL model / "
-                 "tokenizer");
+        // The backbone is only needed for the branches this prime actually
+        // encodes — qi21_prime_from_text() supplies rows for one or both, and
+        // qi21_release_text_encoder() may have freed the 8.5 GiB model in
+        // between. Check per branch rather than up front.
+        const bool need_pos_encode = !qi21_text_override_.has_value();
+        const bool need_neg_encode = do_cfg && !qi21_uncond_text_override_;
+        if ((need_pos_encode || need_neg_encode) &&
+            (!qwen3vl_model_ || !qwen3vl_tokenizer_)) {
+            fail("prime: QwenImage21 pipeline has no Qwen3-VL text encoder "
+                 "(it was released — reload it, or prime from caller-supplied "
+                 "rows with qi21_prime_from_text)");
         }
         const bool enc_time = std::getenv("BRODIFFUSION_TIME") != nullptr;
         const auto enc_t0 = std::chrono::steady_clock::now();
-        qwenimage21::TextConditioning pos = qwenimage21::encode_prompt(
-            *qwen3vl_tokenizer_, *qwen3vl_model_, std::string(prompt));
+        // qi21_prime_from_text() parks caller-edited rows here; consume them
+        // instead of encoding, so both prime paths share every later step.
+        qwenimage21::TextConditioning pos =
+            qi21_text_override_
+                ? std::move(*qi21_text_override_)
+                : qwenimage21::encode_prompt(*qwen3vl_tokenizer_,
+                                             *qwen3vl_model_,
+                                             std::string(prompt));
+        qi21_text_override_.reset();
         conditioning_.text_embeddings      = std::move(pos.embeds);
         conditioning_.text_embeddings_mask = std::move(pos.mask);
+        // Conditioning-space control seam. 2.1's conditioning is ONE
+        // (n, 4096) run of Qwen3-VL hidden states, so the axes apply to it
+        // directly here — before prepare() runs txt_in over it — exactly as
+        // they do for Sana, rather than after fusion the way Krea 2 needs.
+        // There is no BOS row to protect (row 0 is the template's
+        // <|im_start|>), so every row is steered.
+        cond_control_.apply(conditioning_.text_embeddings, /*row_end=*/-1,
+                            /*row_start=*/0);
         if (do_cfg) {
-            qwenimage21::TextConditioning neg = qwenimage21::encode_prompt(
-                *qwen3vl_tokenizer_, *qwen3vl_model_,
-                std::string(opts.negative_prompt));
+            qwenimage21::TextConditioning neg =
+                qi21_uncond_text_override_
+                    ? std::move(*qi21_uncond_text_override_)
+                    : qwenimage21::encode_prompt(
+                          *qwen3vl_tokenizer_, *qwen3vl_model_,
+                          std::string(opts.negative_prompt));
             conditioning_.uncond_embeddings      = std::move(neg.embeds);
             conditioning_.uncond_embeddings_mask = std::move(neg.mask);
             conditioning_.has_uncond = true;
@@ -1216,6 +1247,7 @@ PipelineState Pipeline::prime(std::string_view prompt,
             conditioning_.uncond_embeddings      = bt::Tensor{};
             conditioning_.uncond_embeddings_mask = bt::Tensor{};
         }
+        qi21_uncond_text_override_.reset();
         if (enc_time) {
             brotensor::sync_all();
             std::fprintf(stderr,
@@ -1251,6 +1283,9 @@ PipelineState Pipeline::prime(std::string_view prompt,
     // returned state, shared across all states branched from this prime.
     auto prepared = std::make_shared<PreparedConditioning>(
         denoiser_->prepare(conditioning_));
+    // Non-owning handle for the Qwen-Image 2.1 prefix-cache hooks, which have
+    // to reach into the payload the caller's PipelineState owns.
+    last_prepared_ = prepared;
 
     // Conditioning-space control seam for Krea 2: unlike Sana/CLIP (steered
     // BEFORE prepare(), on the raw per-token conditioning), Krea 2's raw

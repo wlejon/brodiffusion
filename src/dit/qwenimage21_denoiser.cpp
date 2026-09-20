@@ -155,6 +155,25 @@ bt::Tensor& QwenImage21Denoiser::text_rows(PreparedConditioning& prepared,
     return prep->txt;
 }
 
+QwenImage21PrefixCache& QwenImage21Denoiser::prefix_cache(
+    PreparedConditioning& prepared, bool uncond) {
+    auto* prep = dynamic_cast<QwenImage21Prepared*>(prepared.get());
+    if (!prep) fail_den("prefix_cache: prepared conditioning has the wrong type");
+    if (uncond) {
+        if (!prep->has_uncond) {
+            fail_den("prefix_cache: uncond requested but no uncond "
+                     "conditioning was prepared");
+        }
+        return prep->uncond_cache;
+    }
+    return prep->cache;
+}
+
+bool QwenImage21Denoiser::has_uncond(const PreparedConditioning& prepared) const {
+    const auto* prep = dynamic_cast<const QwenImage21Prepared*>(prepared.get());
+    return prep != nullptr && prep->has_uncond;
+}
+
 void QwenImage21Denoiser::forward(const bt::Tensor& latent, int H_lat,
                                   int W_lat, float timestep,
                                   const PreparedConditioning& prepared,
