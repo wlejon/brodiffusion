@@ -336,6 +336,14 @@ if(BRODIFFUSION_KREA2_CAPI)
     target_compile_definitions(krea2_capi PRIVATE K2_CAPI_BUILD)
 endif()
 
+# --- Qwen-Image 2.1 research C API (qwenimage21_capi.dll) ---
+option(BRODIFFUSION_QWENIMAGE21_CAPI "Build the Qwen-Image 2.1 research C API DLL" ${PROJECT_IS_TOP_LEVEL})
+if(BRODIFFUSION_QWENIMAGE21_CAPI)
+    add_library(qwenimage21_capi SHARED src/capi/qwenimage21_capi.cpp)
+    target_link_libraries(qwenimage21_capi PRIVATE brodiffusion)
+    target_compile_definitions(qwenimage21_capi PRIVATE QI_CAPI_BUILD)
+endif()
+
 # --- Standalone Bronze JavaScript API ---
 option(BRODIFFUSION_ENABLE_API "Build Bronze JavaScript API" ON)
 if(BRODIFFUSION_ENABLE_API)
