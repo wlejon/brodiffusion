@@ -5,6 +5,7 @@ add_library(brodiffusion_api STATIC
     native_diffusion_pipeline.cpp
     native_diffusion_control.cpp
     native_diffusion_krea2.cpp
+    native_diffusion_qwenimage21.cpp
     native_diffusion_state.cpp
     native_diffusion_triposplat.cpp
     native_diffusion_vae.cpp

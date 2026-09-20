@@ -127,6 +127,7 @@ brodiffusion::pipeline::Pipeline* pipelineOfState(Value stateVal);
 // Prototype decoration, split across TUs to keep each file small.
 void decoratePipelineControlProto(ObjectBuilder& proto);
 void decoratePipelineKrea2Proto(ObjectBuilder& proto);
+void decoratePipelineQwenImage21Proto(ObjectBuilder& proto);
 void decoratePipelineStateProto(ObjectBuilder& proto);
 bool readImageInput(Value val, std::vector<uint8_t>& rgba, int& w, int& h, std::string& err);
 

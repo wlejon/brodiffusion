@@ -204,6 +204,22 @@ Value stateKrea2StepTimestep(Value thisVal, std::span<const Value>) {
     }
 }
 
+// qwenImage21StepTimestep() -> number — the active scheduler's timestep for
+// this state's current step_index (0..1000 scale), the same value step_once()
+// will feed the denoiser next and the one qwenImage21TimeMod() takes.
+// Qwen-Image 2.1 only.
+Value stateQwenImage21StepTimestep(Value thisVal, std::span<const Value>) {
+    auto* sw = unwrapPipelineState(thisVal);
+    if (!sw) return ev::throwTypeError("PipelineState.qwenImage21StepTimestep: not a PipelineState");
+    brodiffusion::pipeline::Pipeline* pipe = pipelineOfState(thisVal);
+    if (!pipe) return ev::throwError("PipelineState.qwenImage21StepTimestep: pipeline handle lost");
+    try {
+        return ev::fromDouble(static_cast<double>(pipe->qi21_step_timestep(sw->state)));
+    } catch (const std::exception& e) {
+        return ev::throwError(std::string("PipelineState.qwenImage21StepTimestep failed: ") + e.what());
+    }
+}
+
 // clone() -> PipelineState — deep-copy the state (one latent clone). The
 // owning Pipeline handle is carried forward so the clone stays valid.
 Value stateClone(Value thisVal, std::span<const Value>) {
@@ -229,6 +245,7 @@ void decoratePipelineStateProto(ObjectBuilder& proto) {
     proto.def("latent", 0, stateLatent);
     proto.def("setLatent", 1, stateSetLatent);
     proto.def("krea2StepTimestep", 0, stateKrea2StepTimestep);
+    proto.def("qwenImage21StepTimestep", 0, stateQwenImage21StepTimestep);
     proto.def("clone", 0, stateClone);
 
     proto.accessor("stepIndex", [](Value thisVal, std::span<const Value>) -> Value {

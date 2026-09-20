@@ -46,11 +46,23 @@ const char* const kPipelineMethods[] = {
     "krea2CaptureGates", "krea2Gates", "krea2HiddenSize", "krea2NumLayers",
     "krea2EncodePromptTaps", "krea2EncodeText", "krea2EncodeImagePrompt",
     "krea2PrimeFromTaps",
+    // Qwen-Image 2.1 research hooks
+    "qwenImage21SetModDelta", "qwenImage21TimeMod", "qwenImage21SetGateScale",
+    "qwenImage21SetGateMask", "qwenImage21SetNormOutScaleDelta",
+    "qwenImage21CaptureGates", "qwenImage21Gates", "qwenImage21HiddenSize",
+    "qwenImage21NumLayers", "qwenImage21TextHiddenDim",
+    "qwenImage21EncodePrompt", "qwenImage21PrimeFromText",
+    "qwenImage21TextRows", "qwenImage21SetTextRows",
+    "qwenImage21ScalePrefixKv", "qwenImage21ResetCache",
+    "qwenImage21EncodeImage", "qwenImage21Decode",
+    "qwenImage21ReleaseTextEncoder", "qwenImage21TextEncoderResident",
+    "qwenImage21ReloadTextEncoder",
 };
 
 // Every method restored onto PipelineState.prototype.
 const char* const kStateMethods[] = {
-    "stepOnce", "decode", "latent", "setLatent", "krea2StepTimestep", "clone",
+    "stepOnce", "decode", "latent", "setLatent", "krea2StepTimestep",
+    "qwenImage21StepTimestep", "clone",
 };
 
 // PipelineState accessors. They must answer on a non-state `this` without
@@ -110,6 +122,8 @@ void brodiffusionTestRestoredSurface() {
         {"loadWeights", 3}, {"applyLora", 2}, {"addControlNet", 2},
         {"generate", 2}, {"prime", 2}, {"setControlVector", 4},
         {"krea2PrimeFromTaps", 5}, {"krea2EncodeImagePrompt", 3},
+        {"qwenImage21SetModDelta", 4}, {"qwenImage21SetGateScale", 6},
+        {"qwenImage21PrimeFromText", 5}, {"qwenImage21Decode", 3},
     };
     for (const auto& a : kArity) {
         ev::Persistent fn(ev::getProperty(pipeProto.get(), a.name));

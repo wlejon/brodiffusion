@@ -767,9 +767,11 @@ void decoratePipeline(ObjectBuilder& proto) {
         return ev::undefined();
     });
 
-    // Conditioning-control + identity anchor, and the Krea 2 research hooks.
+    // Conditioning-control + identity anchor, and the per-model research
+    // hook blocks (Krea 2, Qwen-Image 2.1).
     decoratePipelineControlProto(proto);
     decoratePipelineKrea2Proto(proto);
+    decoratePipelineQwenImage21Proto(proto);
 }
 
 } // namespace
