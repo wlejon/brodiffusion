@@ -35,6 +35,10 @@ struct FlowMatchConfig {
     bool  use_dynamic_shifting = false;  // flux-dev resolution-dependent shift
     float base_shift          = 0.5f;
     float max_shift           = 1.15f;
+    // Qwen-Image 2.1: after shifting, stretch the schedule so the final
+    // sigma lands on `shift_terminal` (diffusers stretch_shift_to_terminal).
+    // 0 disables the stretch (every other model).
+    float shift_terminal      = 0.0f;
     int   base_image_seq_len  = 256;
     int   max_image_seq_len   = 4096;
 };

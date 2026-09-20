@@ -175,6 +175,9 @@ scheduler::FlowMatchConfig parse_flow_match(const json::Value& cfg) {
         cfg.get_int("base_image_seq_len", c.base_image_seq_len);
     c.max_image_seq_len =
         cfg.get_int("max_image_seq_len", c.max_image_seq_len);
+    // diffusers stores `null` for models without a terminal stretch; get_float
+    // falls back to the default on a non-number.
+    c.shift_terminal = cfg.get_float("shift_terminal", c.shift_terminal);
     return c;
 }
 

@@ -1,5 +1,6 @@
 #include "brodiffusion/pipeline.h"
 #include "brodiffusion/vae_qwenimage.h"
+#include "brodiffusion/vae_qwenimage21.h"
 #include "brodiffusion/krea2_text.h"
 #include "brodiffusion/dit/krea2.h"
 #include "brodiffusion/detail/json.h"
@@ -913,6 +914,59 @@ int run_krea2_vae_fwd(int argc, char** argv) {
     }
     dump_latent_f32(op, out);
     std::printf("krea2-vae-fwd: wrote image (%d,%d) to %s\n", out.rows, out.cols, op);
+    return 0;
+}
+
+// Hidden debug subcommand: one Qwen-Image 2.1 VAE pass on raw float32 files.
+//   decode: --weights <vae.safetensors> --latent <f32> --out <f32> --H --W
+//           (latent (z_dim,H,W) raw pipeline scale -> RGBA (4,16H,16W))
+//   encode: --weights <vae.safetensors> --image <f32> --out <f32> --H --W
+//           (RGBA (4,H,W) in [-1,1] -> latent (z_dim,H/16,W/16), mean sample)
+// Diffed against scripts/qwenimage21_vae_ref.py. Not in usage().
+int run_qi21_vae_fwd(int argc, char** argv) {
+    const char* w  = arg_after(argc, argv, "--weights");
+    const char* lp = arg_after(argc, argv, "--latent");
+    const char* ip = arg_after(argc, argv, "--image");
+    const char* op = arg_after(argc, argv, "--out");
+    const char* Hs = arg_after(argc, argv, "--H");
+    const char* Ws = arg_after(argc, argv, "--W");
+    if (!w || (!lp && !ip) || !op || !Hs || !Ws) {
+        std::fprintf(stderr,
+            "qi21-vae-fwd: need --weights (--latent | --image) --out --H --W\n");
+        return 2;
+    }
+    const int H = std::atoi(Hs), W = std::atoi(Ws);
+    brotensor::init();
+
+    namespace vq = brodiffusion::vae_qwenimage21;
+    vq::Config cfg;
+    auto f = st::File::open(w);
+    brotensor::Tensor out;
+    if (lp) {
+        vq::Decoder dec(cfg);
+        dec.load_weights(f, "");
+        auto lat_h = load_latent_f32(lp, cfg.z_dim * H * W);
+        brotensor::Tensor lat =
+            brotensor::Tensor::from_host(lat_h.data(), 1, cfg.z_dim * H * W)
+                .to(brotensor::default_device());
+        dec.decode(lat, H, W, out);
+    } else {
+        vq::Encoder enc(cfg);
+        enc.load_weights(f, "");
+        auto img_h = load_latent_f32(ip, cfg.in_channels * H * W);
+        brotensor::Tensor img =
+            brodiffusion::detail::upload_host(img_h.data(), 1, cfg.in_channels * H * W);
+        enc.encode(img, H, W, nullptr, out);
+    }
+    brotensor::sync_all();
+    if (out.dtype != brotensor::Dtype::FP32) {
+        brotensor::Tensor out_f32;
+        brotensor::cast(out, out_f32, brotensor::Dtype::FP32);
+        brotensor::sync_all();
+        out = std::move(out_f32);
+    }
+    dump_latent_f32(op, out);
+    std::printf("qi21-vae-fwd: wrote (%d,%d) to %s\n", out.rows, out.cols, op);
     return 0;
 }
 
@@ -2160,6 +2214,12 @@ int main(int argc, char** argv) {
         try { return run_krea2_vae_fwd(argc, argv); }
         catch (const std::exception& e) {
             std::fprintf(stderr, "krea2-vae-fwd: %s\n", e.what()); return 1;
+        }
+    }
+    if (std::strcmp(argv[1], "qi21-vae-fwd") == 0) {
+        try { return run_qi21_vae_fwd(argc, argv); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "qi21-vae-fwd: %s\n", e.what()); return 1;
         }
     }
     if (std::strcmp(argv[1], "krea2-text-fwd") == 0) {

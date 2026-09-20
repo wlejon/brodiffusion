@@ -70,6 +70,18 @@ void FlowMatch::set_timesteps(int num_inference_steps, int image_seq_len) {
         }
     }
 
+    // 2b. Optional terminal stretch (diffusers stretch_shift_to_terminal):
+    //     one_minus_z = 1 - sigmas; scale = one_minus_z[-1] / (1 - terminal);
+    //     sigmas = 1 - one_minus_z / scale.
+    if (cfg_.shift_terminal > 0.0f) {
+        const float last = 1.0f - sigma[static_cast<std::size_t>(N) - 1];
+        const float scale = last / (1.0f - cfg_.shift_terminal);
+        for (int i = 0; i < N; ++i) {
+            float& s = sigma[static_cast<std::size_t>(i)];
+            s = 1.0f - (1.0f - s) / scale;
+        }
+    }
+
     // 3. Continuous timesteps = sigma * num_train_timesteps.
     timesteps_.resize(static_cast<std::size_t>(N));
     for (int i = 0; i < N; ++i) {

@@ -1,4 +1,4 @@
-#include "brodiffusion/vae_qwenimage.h"
+#include "brodiffusion/vae_qwenimage21.h"
 #include "brodiffusion/detail/compute.h"
 #include "brodiffusion/detail/device.h"
 #include "brotensor/safetensors.h"
@@ -8,27 +8,26 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
-namespace brodiffusion::vae_qwenimage {
+namespace brodiffusion::vae_qwenimage21 {
 
 namespace bt = ::brotensor;
 namespace st = ::brotensor::safetensors;
 
 namespace {
 
-// PyTorch F.normalize's default eps (QwenImageRMS_norm never passes an
-// explicit one) — see the header comment on why rms_norm_forward's
-// sqrt(mean+eps) is numerically equivalent to F.normalize's max(norm,eps)
-// for any non-degenerate (non-all-zero) channel vector.
+// F.normalize's default eps — see vae_qwenimage.h.
 constexpr float kRmsEps = 1e-12f;
 
 [[noreturn]] void fail(const char* who, const std::string& msg) {
-    throw std::runtime_error(std::string("vae_qwenimage::") + who + ": " + msg);
+    throw std::runtime_error(std::string("vae_qwenimage21::") + who + ": " + msg);
 }
 
 const st::TensorView& need(const st::File& f, const std::string& key, const char* who) {
@@ -81,9 +80,8 @@ bt::Tensor upload_at(const std::vector<float>& host, int rows, int cols, bt::Dty
     return bt::Tensor::from_host(host.data(), rows, cols);
 }
 
-// Plain (no temporal axis) tensor: a norm gamma / conv bias (numel==rows*cols)
-// or a 2D conv weight (attention 1x1s, resample 3x3s) already shaped
-// [Cout,Cin,kh,kw] with no leading kT axis to slice.
+// Every checkpoint tensor is a plain 2D conv filter [Cout,Cin,kh,kw], a
+// bias, or a norm gamma — numel must equal rows*cols.
 void load_plain(const st::File& f, const std::string& key, int rows, int cols,
                 bt::Dtype want, bt::Tensor& dst, const char* who) {
     const st::TensorView& v = need(f, key, who);
@@ -96,49 +94,11 @@ void load_plain(const st::File& f, const std::string& key, int rows, int cols,
     dst = upload_at(host, rows, cols, want);
 }
 
-// Causal-Conv3d weight [Cout,Cin,kT,kH,kW]: slice out the LAST temporal tap
-// (the num_frames=1 reduction — see vae_qwenimage.h) into an ordinary 2D
-// (Cout, Cin*kH*kW) filter.
-void load_conv_lasttap(const st::File& f, const std::string& key,
-                       int Cout, int Cin, int kT, int kHW,
-                       bt::Dtype want, bt::Tensor& dst, const char* who) {
-    const st::TensorView& v = need(f, key, who);
-    const int64_t expected = static_cast<int64_t>(Cout) * Cin * kT * kHW;
-    if (v.numel() != expected) {
-        fail(who, key + ": shape mismatch (expected Cout*Cin*kT*kHW=" +
-             std::to_string(expected) + ", got " + std::to_string(v.numel()) + ")");
-    }
-    std::vector<float> host = view_to_float(v, who, key);
-    std::vector<float> sliced(static_cast<std::size_t>(Cout) * static_cast<std::size_t>(Cin) *
-                              static_cast<std::size_t>(kHW));
-    for (int64_t oc = 0; oc < Cout; ++oc) {
-        for (int64_t ic = 0; ic < Cin; ++ic) {
-            const std::size_t src_off =
-                (static_cast<std::size_t>(oc) * static_cast<std::size_t>(Cin) +
-                 static_cast<std::size_t>(ic)) * static_cast<std::size_t>(kT) * static_cast<std::size_t>(kHW) +
-                static_cast<std::size_t>(kT - 1) * static_cast<std::size_t>(kHW);
-            const std::size_t dst_off =
-                (static_cast<std::size_t>(oc) * static_cast<std::size_t>(Cin) +
-                 static_cast<std::size_t>(ic)) * static_cast<std::size_t>(kHW);
-            std::memcpy(&sliced[dst_off], &host[src_off],
-                       static_cast<std::size_t>(kHW) * sizeof(float));
-        }
-    }
-    dst = upload_at(sliced, Cout, Cin * kHW, want);
-}
-
-// Non-owning reinterpretation of `count` elements of `t` at element offset
-// `off`, reshaped to (rows,cols). Lets q/k/v be sliced out of a fused to_qkv
-// weight without a copy (mirrors vae_dcae.cpp's sub_view).
 bt::Tensor sub_view(const bt::Tensor& t, int64_t off, int rows, int cols) {
     char* p = static_cast<char*>(t.data) + off * bt::dtype_size_bytes(t.dtype);
     return bt::Tensor::view(t.device, p, rows, cols, t.dtype);
 }
 
-// Host download of a device tensor to FP32, regardless of its (FP32/FP16/
-// BF16) storage dtype. Used for the per-channel latents_mean/latents_std
-// affine, which has no ready-made broadcast op in brotensor's op set (z_dim
-// is tiny — 16 channels — so a host round-trip is not perf-sensitive).
 std::vector<float> download_f32(const bt::Tensor& t) {
     bt::sync_all();
     if (t.dtype == bt::Dtype::FP16) {
@@ -156,6 +116,36 @@ std::vector<float> download_f32(const bt::Tensor& t) {
     return t.to_host_vector();
 }
 
+// Parity debugging: when BRODIFFUSION_VAE_DUMP names a directory, every
+// stage boundary of encode()/decode() is written there as raw FP32
+// (<dir>/qi21_<enc|dec>_<name>.f32) for diffing against the reference
+// hooks in scripts/qwenimage21_vae_ref.py.
+void maybe_dump(const char* name, const bt::Tensor& t) {
+    const char* dir = std::getenv("BRODIFFUSION_VAE_DUMP");
+    if (!dir || !dir[0]) return;
+    std::vector<float> v = download_f32(t);
+    const std::string path = std::string(dir) + "/qi21_" + name + ".f32";
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return;
+    std::fwrite(v.data(), sizeof(float), v.size(), f);
+    std::fclose(f);
+}
+
+void check_config(const Config& cfg, const char* who) {
+    if (cfg.dim_mult.empty()) fail(who, "dim_mult must be non-empty");
+    if (cfg.num_res_blocks <= 0) fail(who, "num_res_blocks must be positive");
+    if (!cfg.attn_scales.empty()) fail(who, "non-empty attn_scales is not supported");
+    // One flag per stage TRANSITION (diffusers indexes it only for
+    // i != last), so nb-1 entries; longer lists are tolerated.
+    if (cfg.temperal_downsample.size() + 1 < cfg.dim_mult.size()) {
+        fail(who, "temperal_downsample needs at least dim_mult.size()-1 entries");
+    }
+    if (static_cast<int>(cfg.latents_mean.size()) != cfg.z_dim ||
+        static_cast<int>(cfg.latents_std.size()) != cfg.z_dim) {
+        fail(who, "latents_mean/latents_std must have z_dim entries");
+    }
+}
+
 }  // namespace
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -163,17 +153,7 @@ std::vector<float> download_f32(const bt::Tensor& t) {
 // ═══════════════════════════════════════════════════════════════════════
 
 Decoder::Decoder(const Config& cfg) : cfg_(cfg) {
-    if (cfg_.dim_mult.empty()) fail("Decoder", "dim_mult must be non-empty");
-    if (cfg_.num_res_blocks <= 0) fail("Decoder", "num_res_blocks must be positive");
-    for (float s : cfg_.attn_scales) {
-        if (std::isnan(s) || std::isinf(s)) {
-            fail("Decoder", "attn_scales contains invalid value");
-        }
-    }
-    if (static_cast<int>(cfg_.latents_mean.size()) != cfg_.z_dim ||
-        static_cast<int>(cfg_.latents_std.size()) != cfg_.z_dim) {
-        fail("Decoder", "latents_mean/latents_std must have z_dim entries");
-    }
+    check_config(cfg_, "Decoder");
     up_blocks_.resize(cfg_.dim_mult.size());
 }
 
@@ -182,48 +162,41 @@ Decoder::~Decoder() = default;
 void Decoder::load_resnet_(const st::File& f, const std::string& p,
                            int C_in, int C_out, Resnet& r) {
     load_plain(f, p + "norm1.gamma", C_in, 1, arith_dtype_, r.norm1_g, "Decoder");
-    load_conv_lasttap(f, p + "conv1.weight", C_out, C_in, 3, 9, arith_dtype_, r.conv1_W, "Decoder");
+    load_plain(f, p + "conv1.weight", C_out, C_in * 9, arith_dtype_, r.conv1_W, "Decoder");
     load_plain(f, p + "conv1.bias", C_out, 1, arith_dtype_, r.conv1_b, "Decoder");
     load_plain(f, p + "norm2.gamma", C_out, 1, arith_dtype_, r.norm2_g, "Decoder");
-    load_conv_lasttap(f, p + "conv2.weight", C_out, C_out, 3, 9, arith_dtype_, r.conv2_W, "Decoder");
+    load_plain(f, p + "conv2.weight", C_out, C_out * 9, arith_dtype_, r.conv2_W, "Decoder");
     load_plain(f, p + "conv2.bias", C_out, 1, arith_dtype_, r.conv2_b, "Decoder");
 
     r.C_in = C_in;
     r.C_out = C_out;
     r.has_shortcut = (C_in != C_out);
     if (r.has_shortcut) {
-        load_conv_lasttap(f, p + "conv_shortcut.weight", C_out, C_in, 1, 1,
-                          arith_dtype_, r.short_W, "Decoder");
+        load_plain(f, p + "conv_shortcut.weight", C_out, C_in, arith_dtype_, r.short_W, "Decoder");
         load_plain(f, p + "conv_shortcut.bias", C_out, 1, arith_dtype_, r.short_b, "Decoder");
     }
 }
 
 void Decoder::load_weights(const st::File& f, const std::string& prefix) {
-    for (const auto& t : f.tensors()) {
-        if (t.name.rfind(prefix + "decoder.up_blocks.", 0) == 0 &&
-            t.name.find(".attentions.") != std::string::npos) {
-            fail("Decoder", "checkpoint contains up-block attention weights which are not supported");
-        }
-    }
-
     arith_dtype_ = arith_dtype_for(cfg_.force_upcast);
     const int nb = static_cast<int>(cfg_.dim_mult.size());
     const int z_dim = cfg_.z_dim;
 
-    // dims = base_dim * [dim_mult.back(), dim_mult[nb-1], ..., dim_mult[0]]
-    // (matches diffusers' `[dim*u for u in [dim_mult[-1]] + dim_mult[::-1]]`).
+    // dims = decoder_base_dim * [dim_mult.back()] + reversed(dim_mult).
     std::vector<int> dims;
     dims.reserve(static_cast<std::size_t>(nb) + 1);
-    dims.push_back(cfg_.base_dim * cfg_.dim_mult.back());
-    for (int i = nb - 1; i >= 0; --i) dims.push_back(cfg_.base_dim * cfg_.dim_mult[i]);
+    dims.push_back(cfg_.decoder_base_dim * cfg_.dim_mult.back());
+    for (int i = nb - 1; i >= 0; --i) {
+        dims.push_back(cfg_.decoder_base_dim * cfg_.dim_mult[static_cast<std::size_t>(i)]);
+    }
 
     load_plain(f, prefix + "post_quant_conv.weight", z_dim, z_dim, arith_dtype_,
-              post_quant_W_, "Decoder");
+               post_quant_W_, "Decoder");
     load_plain(f, prefix + "post_quant_conv.bias", z_dim, 1, arith_dtype_,
-              post_quant_b_, "Decoder");
+               post_quant_b_, "Decoder");
 
-    load_conv_lasttap(f, prefix + "decoder.conv_in.weight", dims[0], z_dim, 3, 9,
-                      arith_dtype_, conv_in_W_, "Decoder");
+    load_plain(f, prefix + "decoder.conv_in.weight", dims[0], z_dim * 9,
+               arith_dtype_, conv_in_W_, "Decoder");
     load_plain(f, prefix + "decoder.conv_in.bias", dims[0], 1, arith_dtype_, conv_in_b_, "Decoder");
 
     load_resnet_(f, prefix + "decoder.mid_block.resnets.0.", dims[0], dims[0], mid_res0_);
@@ -238,12 +211,14 @@ void Decoder::load_weights(const st::File& f, const std::string& prefix) {
         mid_attn_.C = dims[0];
     }
 
+    // temperal_upsample = reversed(temperal_downsample[:nb-1]); decoder
+    // stage i (< nb-1) reads entry nb-2-i.
     for (int i = 0; i < nb; ++i) {
-        int in_dim = dims[static_cast<std::size_t>(i)];
+        const int in_dim = dims[static_cast<std::size_t>(i)];
         const int out_dim = dims[static_cast<std::size_t>(i) + 1];
-        if (i > 0) in_dim /= 2;
 
         UpBlock& ub = up_blocks_[static_cast<std::size_t>(i)];
+        ub.C_in = in_dim;
         ub.C_out = out_dim;
         ub.resnets.resize(static_cast<std::size_t>(cfg_.num_res_blocks) + 1);
         for (int j = 0; j <= cfg_.num_res_blocks; ++j) {
@@ -254,20 +229,36 @@ void Decoder::load_weights(const st::File& f, const std::string& prefix) {
         }
 
         ub.has_upsampler = (i < nb - 1);
+        ub.temporal = ub.has_upsampler &&
+                      cfg_.temperal_downsample[static_cast<std::size_t>(nb - 2 - i)];
         if (ub.has_upsampler) {
             const std::string up = prefix + "decoder.up_blocks." + std::to_string(i) +
-                                   ".upsamplers.0.resample.1.";
-            load_plain(f, up + "weight", out_dim / 2, out_dim * 9, arith_dtype_, ub.up_W, "Decoder");
-            load_plain(f, up + "bias", out_dim / 2, 1, arith_dtype_, ub.up_b, "Decoder");
+                                   ".upsampler.resample.1.";
+            load_plain(f, up + "weight", out_dim, out_dim * 9, arith_dtype_, ub.up_W, "Decoder");
+            load_plain(f, up + "bias", out_dim, 1, arith_dtype_, ub.up_b, "Decoder");
+            // upsampler.time_conv.* (upsample3d) is never executed for a
+            // single frame — intentionally not read.
+
+            // Validate the DupUp3D reduction this stage needs (see header).
+            const int factor = (ub.temporal ? 2 : 1) * 4;
+            if ((static_cast<int64_t>(out_dim) * factor) % in_dim != 0) {
+                fail("Decoder", "up_block " + std::to_string(i) +
+                     ": DupUp3D requires out*factor % in == 0");
+            }
+            const int repeats = out_dim * factor / in_dim;
+            if (ub.temporal && repeats != 8 && repeats != 4) {
+                fail("Decoder", "up_block " + std::to_string(i) +
+                     ": unsupported temporal DupUp3D repeats=" + std::to_string(repeats));
+            }
         }
     }
 
     const int firstC = dims.back();
     load_plain(f, prefix + "decoder.norm_out.gamma", firstC, 1, arith_dtype_, norm_out_g_, "Decoder");
-    load_conv_lasttap(f, prefix + "decoder.conv_out.weight", cfg_.input_channels, firstC, 3, 9,
-                      arith_dtype_, conv_out_W_, "Decoder");
-    load_plain(f, prefix + "decoder.conv_out.bias", cfg_.input_channels, 1, arith_dtype_,
-              conv_out_b_, "Decoder");
+    load_plain(f, prefix + "decoder.conv_out.weight", cfg_.out_channels, firstC * 9,
+               arith_dtype_, conv_out_W_, "Decoder");
+    load_plain(f, prefix + "decoder.conv_out.bias", cfg_.out_channels, 1, arith_dtype_,
+               conv_out_b_, "Decoder");
 }
 
 void Decoder::apply_rmsnorm_(const bt::Tensor& gamma, int C, int H, int W,
@@ -316,10 +307,33 @@ void Decoder::apply_attention_(const Attention& a, int H, int W, bt::Tensor& x) 
 }
 
 void Decoder::apply_upsample_(const UpBlock& u, int H, int W, bt::Tensor& x) {
+    // nearest-exact 2x at an integer factor is plain nearest; conv keeps
+    // out_dim -> out_dim (upsample_out_dim=out_dim).
     bt::upsample_nearest_2x(x, 1, u.C_out, H, W, up_t_);
     bt::conv2d_forward(up_t_, u.up_W, &u.up_b, 1, u.C_out, 2 * H, 2 * W,
-                       u.C_out / 2, 3, 3, 1, 1, 1, 1, 1, 1, y_);
+                       u.C_out, 3, 3, 1, 1, 1, 1, 1, 1, y_);
     std::swap(x, y_);
+}
+
+void Decoder::apply_dup_shortcut_(const UpBlock& u, int H, int W,
+                                  const bt::Tensor& x_copy, bt::Tensor& out) {
+    const int HW = H * W;
+    if (!u.temporal) {
+        // factor_t=1: repeat_interleave(4*out/in) + pixel_shuffle(2).
+        bt::pixel_shuffle_upsample_2x_forward(x_copy, 1, u.C_in, H, W, u.C_out, out);
+        return;
+    }
+    const int repeats = u.C_out * 8 / u.C_in;
+    if (repeats == 8) {
+        // in == out: every kept slot reads the same channel -> nearest 2x.
+        bt::upsample_nearest_2x(x_copy, 1, u.C_in, H, W, out);
+        return;
+    }
+    // repeats == 4 (in == 2*out): kept frame slot maps output channel o to
+    // input channel 2o+1 -> gather odd channels, then nearest 2x.
+    detail::resize_like(gather_, 1, u.C_out * HW, x_copy.dtype, x_copy.device);
+    bt::copy_d2d_strided(x_copy, HW, 2 * HW, gather_, 0, HW, HW, u.C_out);
+    bt::upsample_nearest_2x(gather_, 1, u.C_out, H, W, out);
 }
 
 void Decoder::decode(const bt::Tensor& latent, int H_lat, int W_lat, bt::Tensor& out) {
@@ -332,11 +346,7 @@ void Decoder::decode(const bt::Tensor& latent, int H_lat, int W_lat, bt::Tensor&
 
     const int spatial = H_lat * W_lat;
 
-    // Per-channel denormalize: latent = latent*latents_std + latents_mean
-    // (the diffusers pipeline applies this BEFORE calling vae.decode(); see
-    // vae_qwenimage.h). Host-side affine — z_dim (16) is tiny, no
-    // per-channel broadcast op exists in brotensor, and this runs once per
-    // decode call.
+    // Per-channel denormalise (pipeline-side in diffusers).
     std::vector<float> lat_h = download_f32(latent);
     for (int c = 0; c < z_dim; ++c) {
         const float mean = cfg_.latents_mean[static_cast<std::size_t>(c)];
@@ -346,39 +356,47 @@ void Decoder::decode(const bt::Tensor& latent, int H_lat, int W_lat, bt::Tensor&
     }
     x_ = upload_at(lat_h, 1, z_dim * spatial, arith_dtype_);
 
-    // post_quant_conv (1x1).
     bt::conv2d_forward(x_, post_quant_W_, &post_quant_b_, 1, z_dim, H_lat, W_lat,
                        z_dim, 1, 1, 1, 1, 0, 0, 1, 1, y_);
     std::swap(x_, y_);
 
-    // conv_in.
     const int mid_C = conv_in_W_.rows;
     bt::conv2d_forward(x_, conv_in_W_, &conv_in_b_, 1, z_dim, H_lat, W_lat,
                        mid_C, 3, 3, 1, 1, 1, 1, 1, 1, y_);
     std::swap(x_, y_);
+    maybe_dump("dec_conv_in", x_);
 
-    // mid_block: resnet -> attention -> resnet.
     apply_resnet_(mid_res0_, H_lat, W_lat, x_);
     apply_attention_(mid_attn_, H_lat, W_lat, x_);
     apply_resnet_(mid_res1_, H_lat, W_lat, x_);
+    maybe_dump("dec_mid_block", x_);
 
-    // up_blocks.
     int H = H_lat, W = W_lat;
+    int ub_idx = 0;
     for (auto& ub : up_blocks_) {
+        if (ub.has_upsampler) {
+            // Residual up-block: main = upsample(resnets(x)); out = main +
+            // DupUp3D(x). Keep x for the shortcut.
+            x_copy_ = x_.clone();
+        }
         for (auto& r : ub.resnets) apply_resnet_(r, H, W, x_);
         if (ub.has_upsampler) {
             apply_upsample_(ub, H, W, x_);
+            apply_dup_shortcut_(ub, H, W, x_copy_, short_);
+            bt::add_inplace(x_, short_);
             H *= 2;
             W *= 2;
         }
+        maybe_dump(("dec_up" + std::to_string(ub_idx++)).c_str(), x_);
     }
 
-    // norm_out + SiLU + conv_out.
     const int firstC = norm_out_g_.rows;
     apply_rmsnorm_(norm_out_g_, firstC, H, W, x_, y_);
     bt::silu_forward(y_, y_);
     bt::conv2d_forward(y_, conv_out_W_, &conv_out_b_, 1, firstC, H, W,
-                       cfg_.input_channels, 3, 3, 1, 1, 1, 1, 1, 1, out);
+                       cfg_.out_channels, 3, 3, 1, 1, 1, 1, 1, 1, out);
+    maybe_dump("dec_conv_out", out);
+    bt::clamp(out, -1.0f, 1.0f);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -386,17 +404,7 @@ void Decoder::decode(const bt::Tensor& latent, int H_lat, int W_lat, bt::Tensor&
 // ═══════════════════════════════════════════════════════════════════════
 
 Encoder::Encoder(const Config& cfg) : cfg_(cfg) {
-    if (cfg_.dim_mult.empty()) fail("Encoder", "dim_mult must be non-empty");
-    if (cfg_.num_res_blocks <= 0) fail("Encoder", "num_res_blocks must be positive");
-    for (float s : cfg_.attn_scales) {
-        if (std::isnan(s) || std::isinf(s)) {
-            fail("Encoder", "attn_scales contains invalid value");
-        }
-    }
-    if (static_cast<int>(cfg_.latents_mean.size()) != cfg_.z_dim ||
-        static_cast<int>(cfg_.latents_std.size()) != cfg_.z_dim) {
-        fail("Encoder", "latents_mean/latents_std must have z_dim entries");
-    }
+    check_config(cfg_, "Encoder");
     down_blocks_.resize(cfg_.dim_mult.size());
 }
 
@@ -405,69 +413,76 @@ Encoder::~Encoder() = default;
 void Encoder::load_resnet_(const st::File& f, const std::string& p,
                            int C_in, int C_out, Resnet& r) {
     load_plain(f, p + "norm1.gamma", C_in, 1, arith_dtype_, r.norm1_g, "Encoder");
-    load_conv_lasttap(f, p + "conv1.weight", C_out, C_in, 3, 9, arith_dtype_, r.conv1_W, "Encoder");
+    load_plain(f, p + "conv1.weight", C_out, C_in * 9, arith_dtype_, r.conv1_W, "Encoder");
     load_plain(f, p + "conv1.bias", C_out, 1, arith_dtype_, r.conv1_b, "Encoder");
     load_plain(f, p + "norm2.gamma", C_out, 1, arith_dtype_, r.norm2_g, "Encoder");
-    load_conv_lasttap(f, p + "conv2.weight", C_out, C_out, 3, 9, arith_dtype_, r.conv2_W, "Encoder");
+    load_plain(f, p + "conv2.weight", C_out, C_out * 9, arith_dtype_, r.conv2_W, "Encoder");
     load_plain(f, p + "conv2.bias", C_out, 1, arith_dtype_, r.conv2_b, "Encoder");
 
     r.C_in = C_in;
     r.C_out = C_out;
     r.has_shortcut = (C_in != C_out);
     if (r.has_shortcut) {
-        load_conv_lasttap(f, p + "conv_shortcut.weight", C_out, C_in, 1, 1,
-                          arith_dtype_, r.short_W, "Encoder");
+        load_plain(f, p + "conv_shortcut.weight", C_out, C_in, arith_dtype_, r.short_W, "Encoder");
         load_plain(f, p + "conv_shortcut.bias", C_out, 1, arith_dtype_, r.short_b, "Encoder");
     }
 }
 
 void Encoder::load_weights(const st::File& f, const std::string& prefix) {
-    for (const auto& t : f.tensors()) {
-        if (t.name.rfind(prefix + "encoder.down_blocks.", 0) == 0 &&
-            t.name.find(".attentions.") != std::string::npos) {
-            fail("Encoder", "checkpoint contains down-block attention weights which are not supported");
-        }
-    }
-
     arith_dtype_ = arith_dtype_for(cfg_.force_upcast);
     const int nb = static_cast<int>(cfg_.dim_mult.size());
 
-    // dims = base_dim * ([1] + dim_mult) — matches diffusers'
-    // `[dim*u for u in [1] + dim_mult]`.
+    // dims = base_dim * ([1] + dim_mult).
     std::vector<int> dims;
     dims.reserve(static_cast<std::size_t>(nb) + 1);
     dims.push_back(cfg_.base_dim);
     for (int i = 0; i < nb; ++i) dims.push_back(cfg_.base_dim * cfg_.dim_mult[static_cast<std::size_t>(i)]);
 
-    load_conv_lasttap(f, prefix + "encoder.conv_in.weight", dims[0], cfg_.input_channels, 3, 9,
-                      arith_dtype_, conv_in_W_, "Encoder");
+    load_plain(f, prefix + "encoder.conv_in.weight", dims[0], cfg_.in_channels * 9,
+               arith_dtype_, conv_in_W_, "Encoder");
     load_plain(f, prefix + "encoder.conv_in.bias", dims[0], 1, arith_dtype_, conv_in_b_, "Encoder");
 
-    // The checkpoint stores every resnet AND every downsampler in encoder.
-    // down_blocks as one running FLAT index (unlike the decoder's nested
-    // up_blocks.{i}.resnets.{j}) — see vae_qwenimage.h.
-    int flat_idx = 0;
     for (int i = 0; i < nb; ++i) {
         const int in_dim = dims[static_cast<std::size_t>(i)];
         const int out_dim = dims[static_cast<std::size_t>(i) + 1];
 
         DownBlock& db = down_blocks_[static_cast<std::size_t>(i)];
+        db.C_in = in_dim;
         db.C_out = out_dim;
         db.resnets.resize(static_cast<std::size_t>(cfg_.num_res_blocks));
         for (int j = 0; j < cfg_.num_res_blocks; ++j) {
             const int Ci = (j == 0) ? in_dim : out_dim;
-            const std::string rp = prefix + "encoder.down_blocks." + std::to_string(flat_idx) + ".";
+            const std::string rp = prefix + "encoder.down_blocks." + std::to_string(i) +
+                                   ".resnets." + std::to_string(j) + ".";
             load_resnet_(f, rp, Ci, out_dim, db.resnets[static_cast<std::size_t>(j)]);
-            ++flat_idx;
         }
 
         db.has_downsampler = (i < nb - 1);
+        db.temporal = db.has_downsampler &&
+                      cfg_.temperal_downsample[static_cast<std::size_t>(i)];
         if (db.has_downsampler) {
-            const std::string dp = prefix + "encoder.down_blocks." + std::to_string(flat_idx) +
-                                   ".resample.1.";
+            const std::string dp = prefix + "encoder.down_blocks." + std::to_string(i) +
+                                   ".downsampler.resample.1.";
             load_plain(f, dp + "weight", out_dim, out_dim * 9, arith_dtype_, db.down_W, "Encoder");
             load_plain(f, dp + "bias", out_dim, 1, arith_dtype_, db.down_b, "Encoder");
-            ++flat_idx;
+            // downsampler.time_conv.* (downsample3d) never executes for one
+            // frame — intentionally not read.
+        }
+
+        // Validate the AvgDown3D reduction this stage needs (see header).
+        const int factor = (db.temporal ? 2 : 1) * (db.has_downsampler ? 4 : 1);
+        if ((static_cast<int64_t>(in_dim) * factor) % out_dim != 0) {
+            fail("Encoder", "down_block " + std::to_string(i) +
+                 ": AvgDown3D requires in*factor % out == 0");
+        }
+        const int group = in_dim * factor / out_dim;
+        if (db.has_downsampler && group != 4) {
+            fail("Encoder", "down_block " + std::to_string(i) +
+                 ": unsupported AvgDown3D group_size=" + std::to_string(group));
+        }
+        if (!db.has_downsampler && group != 1) {
+            fail("Encoder", "down_block " + std::to_string(i) +
+                 ": non-identity AvgDown3D on the last stage is unsupported");
         }
     }
 
@@ -486,8 +501,8 @@ void Encoder::load_weights(const st::File& f, const std::string& prefix) {
 
     load_plain(f, prefix + "encoder.norm_out.gamma", mid_C, 1, arith_dtype_, norm_out_g_, "Encoder");
     const int twoZ = 2 * cfg_.z_dim;
-    load_conv_lasttap(f, prefix + "encoder.conv_out.weight", twoZ, mid_C, 3, 9,
-                      arith_dtype_, conv_out_W_, "Encoder");
+    load_plain(f, prefix + "encoder.conv_out.weight", twoZ, mid_C * 9,
+               arith_dtype_, conv_out_W_, "Encoder");
     load_plain(f, prefix + "encoder.conv_out.bias", twoZ, 1, arith_dtype_, conv_out_b_, "Encoder");
 
     load_plain(f, prefix + "quant_conv.weight", twoZ, twoZ, arith_dtype_, quant_W_, "Encoder");
@@ -540,8 +555,7 @@ void Encoder::apply_attention_(const Attention& a, int H, int W, bt::Tensor& x) 
 }
 
 void Encoder::apply_downsample_(const DownBlock& d, int H, int W, bt::Tensor& x) {
-    // Diffusers Downsample2D-equivalent: F.pad(x,(0,1,0,1)) then stride-2 3x3
-    // conv, pad=0 (matches vae.cpp's Encoder::apply_downsample_).
+    // ZeroPad2d((0,1,0,1)) then stride-2 3x3 conv, pad 0.
     bt::pad2d_forward(x, 1, d.C_out, H, W, /*pad_top=*/0, /*pad_bottom=*/1,
                       /*pad_left=*/0, /*pad_right=*/1, /*mode=*/0, pad_);
     bt::conv2d_forward(pad_, d.down_W, &d.down_b, 1, d.C_out, H + 1, W + 1,
@@ -549,16 +563,37 @@ void Encoder::apply_downsample_(const DownBlock& d, int H, int W, bt::Tensor& x)
     std::swap(x, y_);
 }
 
+void Encoder::apply_avg_shortcut_(const DownBlock& d, int H, int W,
+                                  const bt::Tensor& x_copy, bt::Tensor& out) {
+    if (!d.has_downsampler) {
+        // factor 1, in == out: identity.
+        out = x_copy.clone();
+        return;
+    }
+    if (!d.temporal) {
+        // factor_t=1, factor_s=2, group_size 4 (in == out): plain 2x2 avg-pool.
+        bt::downsample_avg_2x(x_copy, 1, d.C_in, H, W, out);
+        return;
+    }
+    // factor_t=2, factor_s=2, group_size 4 (out == 2*in): the zero frame
+    // padded at the front of T fills the even output channels; odd channel
+    // o is the 2x2 avg-pool of input channel o/2.
+    const int HWq = (H / 2) * (W / 2);
+    bt::downsample_avg_2x(x_copy, 1, d.C_in, H, W, pool_);
+    out = bt::Tensor::zeros_on(x_copy.device, 1, d.C_out * HWq, x_copy.dtype);
+    bt::copy_d2d_strided(pool_, 0, HWq, out, HWq, 2 * HWq, HWq, d.C_in);
+}
+
 void Encoder::encode(const bt::Tensor& image, int H, int W,
                      const bt::Tensor* eps, bt::Tensor& out) {
     if (conv_in_W_.size() == 0) fail("Encoder", "encode: weights not loaded");
     if (H <= 0 || W <= 0) fail("Encoder", "encode: H and W must be positive");
-    const int total_ds = 1 << (static_cast<int>(cfg_.dim_mult.size()) - 1);
+    const int total_ds = cfg_.spatial_scale();
     if (H % total_ds != 0 || W % total_ds != 0) {
         fail("Encoder", "encode: H and W must be multiples of " + std::to_string(total_ds));
     }
-    if (image.rows != 1 || image.cols != cfg_.input_channels * H * W) {
-        fail("Encoder", "encode: image must be (1, input_channels*H*W)");
+    if (image.rows != 1 || image.cols != cfg_.in_channels * H * W) {
+        fail("Encoder", "encode: image must be (1, in_channels*H*W)");
     }
 
     const int H_lat = H / total_ds, W_lat = W / total_ds;
@@ -572,23 +607,30 @@ void Encoder::encode(const bt::Tensor& image, int H, int W,
     }
 
     const int dims0 = conv_in_W_.rows;
-    bt::conv2d_forward(x_, conv_in_W_, &conv_in_b_, 1, cfg_.input_channels, H, W,
+    bt::conv2d_forward(x_, conv_in_W_, &conv_in_b_, 1, cfg_.in_channels, H, W,
                        dims0, 3, 3, 1, 1, 1, 1, 1, 1, y_);
     std::swap(x_, y_);
+    maybe_dump("enc_conv_in", x_);
 
     int Hc = H, Wc = W;
+    int db_idx = 0;
     for (auto& db : down_blocks_) {
+        x_copy_ = x_.clone();
         for (auto& r : db.resnets) apply_resnet_(r, Hc, Wc, x_);
+        if (db.has_downsampler) apply_downsample_(db, Hc, Wc, x_);
+        apply_avg_shortcut_(db, Hc, Wc, x_copy_, short_);
+        bt::add_inplace(x_, short_);
         if (db.has_downsampler) {
-            apply_downsample_(db, Hc, Wc, x_);
             Hc /= 2;
             Wc /= 2;
         }
+        maybe_dump(("enc_down" + std::to_string(db_idx++)).c_str(), x_);
     }
 
     apply_resnet_(mid_res0_, Hc, Wc, x_);
     apply_attention_(mid_attn_, Hc, Wc, x_);
     apply_resnet_(mid_res1_, Hc, Wc, x_);
+    maybe_dump("enc_mid_block", x_);
 
     const int mid_C = norm_out_g_.rows;
     apply_rmsnorm_(norm_out_g_, mid_C, Hc, Wc, x_, y_);
@@ -596,16 +638,15 @@ void Encoder::encode(const bt::Tensor& image, int H, int W,
     const int twoZ = 2 * z_dim;
     bt::conv2d_forward(y_, conv_out_W_, &conv_out_b_, 1, mid_C, Hc, Wc,
                        twoZ, 3, 3, 1, 1, 1, 1, 1, 1, x_);
+    maybe_dump("enc_conv_out", x_);
 
     bt::conv2d_forward(x_, quant_W_, &quant_b_, 1, twoZ, H_lat, W_lat,
                        twoZ, 1, 1, 1, 1, 0, 0, 1, 1, moments_);
+    maybe_dump("enc_quant", moments_);
 
-    // Split (mean, logvar) along the channel axis — channel-major NCHW, so
-    // mean occupies the first half of channels, logvar the second (matches
-    // torch.chunk(parameters, 2, dim=1)). copy_d2d is a raw byte copy, so the
-    // halves must stay at moments_'s (arithmetic, BF16 on CUDA) dtype rather
-    // than the FP16 compute dtype; the caller-facing compute dtype is
-    // restored by the affine re-upload below.
+    // Split (mean, logvar) along the channel axis. copy_d2d is a raw byte
+    // copy, so the halves must stay at moments_'s (arithmetic) dtype — the
+    // caller-facing compute dtype is restored by the affine re-upload below.
     const int half = z_dim * spatial_lat;
     detail::resize_like(out, 1, half, moments_.dtype, moments_.device);
     bt::copy_d2d(moments_, 0, out, 0, half);
@@ -630,8 +671,6 @@ void Encoder::encode(const bt::Tensor& image, int H, int W,
         bt::add_inplace(out, std_dev);
     }
 
-    // out = (sample - latents_mean) / latents_std, per z_dim channel. Host-
-    // side affine (see Decoder::decode's comment).
     std::vector<float> out_h = download_f32(out);
     for (int c = 0; c < z_dim; ++c) {
         const float mean = cfg_.latents_mean[static_cast<std::size_t>(c)];
@@ -642,4 +681,4 @@ void Encoder::encode(const bt::Tensor& image, int H, int W,
     out = upload_at(out_h, 1, half, brodiffusion::compute_dtype());
 }
 
-}  // namespace brodiffusion::vae_qwenimage
+}  // namespace brodiffusion::vae_qwenimage21

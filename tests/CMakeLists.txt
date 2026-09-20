@@ -51,6 +51,13 @@ brodiffusion_add_test(brodiffusion_test_krea2_vae test_krea2_vae.cpp)
 target_compile_definitions(brodiffusion_test_krea2_vae PRIVATE
     BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
 
+# Qwen-Image 2.1 VAE: synthetic-weights smoke (every residual-shortcut
+# reduction) plus a real-weights encode->decode round trip gated on
+# weights/qwen-image-2.1/vae (skips cleanly when absent).
+brodiffusion_add_test(brodiffusion_test_qwenimage21_vae test_qwenimage21_vae.cpp)
+target_compile_definitions(brodiffusion_test_qwenimage21_vae PRIVATE
+    BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
+
 # Krea 2 text conditioning (prompt -> tapped Qwen3-VL hidden states + mask).
 # Template-invariant checks always run; the end-to-end path is gated on the
 # real Qwen3-VL-4B text encoder + tokenizer under weights/krea-2-raw.
