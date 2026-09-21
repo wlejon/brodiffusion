@@ -135,8 +135,10 @@ set(BROVISIONML_DIR "${CMAKE_SOURCE_DIR}/../brovisionml" CACHE PATH
 if(NOT TARGET brovisionml)
     if(EXISTS "${BROVISIONML_DIR}/CMakeLists.txt")
         add_subdirectory("${BROVISIONML_DIR}" "${CMAKE_BINARY_DIR}/brovisionml" EXCLUDE_FROM_ALL)
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/brovisionml/CMakeLists.txt")
+        add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/third_party/brovisionml" "${CMAKE_BINARY_DIR}/brovisionml" EXCLUDE_FROM_ALL)
     elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/brovisionml/CMakeLists.txt")
-        add_subdirectory(third_party/brovisionml EXCLUDE_FROM_ALL)
+        add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/brovisionml" "${CMAKE_BINARY_DIR}/brovisionml" EXCLUDE_FROM_ALL)
     else()
         message(FATAL_ERROR
             "brovisionml not found at ${BROVISIONML_DIR} or third_party/brovisionml. "
