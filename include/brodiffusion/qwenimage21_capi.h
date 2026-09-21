@@ -106,6 +106,51 @@ QI_API int qi_get_prompt_embeds(qi_ctx* c, float* out);
 QI_API int qi_prompt_num_ids(qi_ctx* c);
 QI_API int qi_get_prompt_ids(qi_ctx* c, int32_t* out);
 
+/* ── image-conditioned prompt encoding (QI_LOAD_TE) ────────────────────────
+ * The same two-call protocol, with condition images: the template reserves a
+ * run of rows per image and the Qwen3-VL vision tower's output stands in
+ * their place. Returns n_valid (which now COUNTS the image rows), or -1.
+ *
+ * `image_paths` are decoded and resized to
+ * calculate_dimensions(output_resolution², aspect) — each side a multiple of
+ * 32 — so the vision grid and the autoencoder's latent grid describe the same
+ * picture. Pass 0 for output_resolution to take the default 1024.
+ *
+ * The three getters below say where the images landed. Driving a forward from
+ * here means:
+ *   1. qi_get_prompt_embeds -> (n_valid, text_hidden_dim)
+ *   2. drop the rows qi_get_prompt_pad_mask marks, and run qi_encode_text
+ *      over what is left — txt_in is row-independent, and the DiT fills those
+ *      rows from the condition LATENTS (through a different projection),
+ *      not from the encoder's output
+ *   3. qi_encode_image each condition image at the grid
+ *      qi_get_prompt_image_grid reports, concatenate the results in template
+ *      order, and hand them to qi_set_condition_latents
+ *   4. qi_forward as usual — it reads the armed prefix. */
+QI_API int qi_encode_prompt_images(qi_ctx* c, const char* prompt,
+                                   const char* const* image_paths,
+                                   int n_images, int output_resolution);
+
+/* image_pad_mask: n_valid int32s, 1 at a condition-image slot. All zero after
+ * a plain qi_encode_prompt. */
+QI_API int qi_get_prompt_pad_mask(qi_ctx* c, int32_t* out);
+
+/* How many condition images the parked prompt carries (0 for text-only), and
+ * the latent grid the i-th one needs from the autoencoder. Each image
+ * occupies h_lat*w_lat latent tokens and four times fewer encoder rows. */
+QI_API int qi_prompt_num_images(qi_ctx* c);
+QI_API int qi_get_prompt_image_grid(qi_ctx* c, int index, int* h_lat,
+                                    int* w_lat);
+
+/* Arm the condition latents for every later qi_forward: (n_tokens,
+ * latent_channels) in template order, already at pipeline scale (what
+ * qi_encode_image returns, transposed to token-major). The prefix layout
+ * comes from the parked prompt's image runs, so encode the prompt first.
+ * latents == NULL clears, returning to text-to-image. Resets the prefix KV
+ * cache either way. */
+QI_API int qi_set_condition_latents(qi_ctx* c, const float* latents,
+                                    int n_tokens);
+
 /* ── DiT (QI_LOAD_DIT) ─────────────────────────────────────────────────── */
 
 /* txt_in over the encoder's hidden states — the timestep-independent half.

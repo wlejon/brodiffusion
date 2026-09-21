@@ -119,6 +119,14 @@ Value textConditioningToJs(const brodiffusion::krea2::TextConditioning& tc);
 // Map a JS opts object onto GenerateOptions (defaults kept for absent keys).
 brodiffusion::pipeline::GenerateOptions parseGenerateOptions(Value v);
 
+// Fill in a canvas the caller asked to inherit: Qwen-Image 2.1 condition
+// images with no explicit width/height leave both at 0, meaning "take the
+// last image's aspect at outputResolution". prime() applies the same rule
+// internally, but the binding needs the numbers too — they are what the
+// returned image object is described by. No-op when the size is already set.
+void resolveDerivedSize(brodiffusion::pipeline::Pipeline& p,
+                        brodiffusion::pipeline::GenerateOptions& o);
+
 // A PipelineState retains its owning Pipeline through a `__pipeline` property
 // so the weights cannot be collected while a state (or a clone) is alive.
 Value attachPipelineToState(Value stateVal, Value pipelineVal);

@@ -17,6 +17,7 @@
 
 #include "brodiffusion/detail/safetensors_dir.h"
 #include "brodiffusion/dit/qwenimage21.h"
+#include "brodiffusion/image_io.h"
 #include "brodiffusion/model_config.h"
 #include "brodiffusion/qwenimage21_text.h"
 #include "brodiffusion/vae_qwenimage21.h"
@@ -99,9 +100,15 @@ struct qi_ctx {
     std::optional<bd::vae_qwenimage21::Decoder> vae;
     std::optional<bd::vae_qwenimage21::Encoder> vae_enc;
 
-    // Most recent qi_encode_prompt result.
+    std::optional<brolm::qwen3vl::VisionTower> vision;
+
+    // Most recent qi_encode_prompt / qi_encode_prompt_images result.
     bd::qwenimage21::TextConditioning prompt;
     bool have_prompt = false;
+
+    // Condition latents armed by qi_set_condition_latents, plus the prefix
+    // segments the parked prompt's image runs imply. Empty = text-to-image.
+    bd::dit::QwenImage21EditPrefix edit;
 
     // The live prefix KV cache and its saved snapshots.
     bd::dit::QwenImage21PrefixCache cache;
@@ -144,6 +151,23 @@ qi_ctx* qi_open(const char* model_dir, int components, int quantize) {
             std::vector<const bt::safetensors::File*> ptrs;
             for (const auto& f : files) ptrs.push_back(&f);
             ctx->te->load_weights(ptrs, lm_prefix(ptrs));
+            // The vision tower rides in the same shards. Optional: a
+            // text-only checkpoint still opens, and qi_encode_prompt_images
+            // is the only entry point that misses it.
+            const char* vp = nullptr;
+            for (const auto* f : ptrs) {
+                if (f->find("visual.patch_embed.proj.weight")) {
+                    vp = "visual."; break;
+                }
+                if (f->find("model.visual.patch_embed.proj.weight")) {
+                    vp = "model.visual."; break;
+                }
+            }
+            if (vp != nullptr) {
+                ctx->vision.emplace(ctx->mc.qwenimage21.text.vision,
+                                    ctx->mc.qwenimage21.text.text.hidden_size);
+                ctx->vision->load_weights(ptrs, vp);
+            }
         }
         if (components & QI_LOAD_DIT) {
             ctx->dit.emplace(ctx->mc.qwenimage21.transformer);
@@ -199,9 +223,168 @@ int qi_encode_prompt(qi_ctx* c, const char* prompt) {
         c->prompt = bd::qwenimage21::encode_prompt(*c->tokenizer, *c->te,
                                                    prompt ? prompt : "");
         c->have_prompt = true;
+        // A new prompt invalidates any armed image prefix: its segments were
+        // cut to the previous prompt's row counts.
+        c->edit = bd::dit::QwenImage21EditPrefix{};
+        c->cache.reset();
         n = c->prompt.n_valid();
     });
     return rc == 0 ? n : -1;
+}
+
+int qi_encode_prompt_images(qi_ctx* c, const char* prompt,
+                            const char* const* image_paths, int n_images,
+                            int output_resolution) {
+    int n = -1;
+    const int rc = guarded([&] {
+        if (!c->te || !c->tokenizer) {
+            throw std::runtime_error("qi_encode_prompt_images: TE not loaded "
+                                     "(open with QI_LOAD_TE)");
+        }
+        if (!c->vision) {
+            throw std::runtime_error("qi_encode_prompt_images: this "
+                                     "checkpoint's text_encoder carries no "
+                                     "vision tower");
+        }
+        if (!image_paths || n_images <= 0) {
+            throw std::runtime_error("qi_encode_prompt_images: pass at least "
+                                     "one image path");
+        }
+        const int res = output_resolution > 0 ? output_resolution : 1024;
+        const double area = static_cast<double>(res) * static_cast<double>(res);
+
+        // One resize per image, to the geometry that makes the vision grid and
+        // the latent grid agree; the vision tower gets the alpha composited
+        // over white, as the checkpoint was trained.
+        std::vector<bd::HostImage> rgba;
+        std::vector<std::vector<float>> rgb;
+        rgba.reserve(static_cast<std::size_t>(n_images));
+        rgb.reserve(static_cast<std::size_t>(n_images));
+        for (int i = 0; i < n_images; ++i) {
+            if (image_paths[i] == nullptr) {
+                throw std::runtime_error("qi_encode_prompt_images: image path " +
+                                         std::to_string(i) + " is NULL");
+            }
+            bd::HostImage native = bd::load_image_rgba(image_paths[i]);
+            int w = 0, h = 0;
+            bd::qwenimage21::calculate_dimensions(
+                area,
+                static_cast<double>(native.W) / static_cast<double>(native.H),
+                w, h);
+            rgba.push_back(bd::resize_rgba(native, w, h));
+            rgb.push_back(bd::composite_over_white(rgba.back()));
+        }
+        std::vector<brolm::qwen3vl::ImageInput> inputs(rgb.size());
+        for (std::size_t i = 0; i < rgb.size(); ++i) {
+            inputs[i].pixels = rgb[i].data();
+            inputs[i].H = rgba[i].H;
+            inputs[i].W = rgba[i].W;
+        }
+        brolm::qwen3vl::PreprocessConfig pp;
+        c->prompt = bd::qwenimage21::encode_prompt_with_images(
+            *c->tokenizer, *c->te, *c->vision, pp, prompt ? prompt : "",
+            inputs);
+        c->have_prompt = true;
+        c->edit = bd::dit::QwenImage21EditPrefix{};
+        c->cache.reset();
+        n = c->prompt.n_valid();
+    });
+    return rc == 0 ? n : -1;
+}
+
+int qi_get_prompt_pad_mask(qi_ctx* c, int32_t* out) {
+    return guarded([&] {
+        if (!c->have_prompt) {
+            throw std::runtime_error("qi_get_prompt_pad_mask: encode a prompt "
+                                     "first");
+        }
+        if (!out) throw std::runtime_error("qi_get_prompt_pad_mask: out is NULL");
+        const std::size_t n = static_cast<std::size_t>(c->prompt.n_valid());
+        for (std::size_t i = 0; i < n; ++i) {
+            out[i] = (i < c->prompt.image_pad_mask.size() &&
+                      c->prompt.image_pad_mask[i]) ? 1 : 0;
+        }
+    });
+}
+
+int qi_prompt_num_images(qi_ctx* c) {
+    return c->have_prompt ? static_cast<int>(c->prompt.image_runs.size()) : -1;
+}
+
+int qi_get_prompt_image_grid(qi_ctx* c, int index, int* h_lat, int* w_lat) {
+    return guarded([&] {
+        if (!c->have_prompt) {
+            throw std::runtime_error("qi_get_prompt_image_grid: encode a "
+                                     "prompt first");
+        }
+        if (index < 0 ||
+            static_cast<std::size_t>(index) >= c->prompt.image_runs.size()) {
+            throw std::runtime_error("qi_get_prompt_image_grid: index out of "
+                                     "range");
+        }
+        const auto& r = c->prompt.image_runs[static_cast<std::size_t>(index)];
+        if (h_lat) *h_lat = r.h_lat;
+        if (w_lat) *w_lat = r.w_lat;
+    });
+}
+
+int qi_set_condition_latents(qi_ctx* c, const float* latents, int n_tokens) {
+    return guarded([&] {
+        c->cache.reset();
+        c->edit = bd::dit::QwenImage21EditPrefix{};
+        if (latents == nullptr) return;
+        if (!c->have_prompt) {
+            throw std::runtime_error("qi_set_condition_latents: encode a "
+                                     "prompt with images first — the prefix "
+                                     "layout comes from its image runs");
+        }
+        if (c->prompt.image_runs.empty()) {
+            throw std::runtime_error("qi_set_condition_latents: the parked "
+                                     "prompt carries no condition images");
+        }
+        int expect = 0;
+        for (const auto& r : c->prompt.image_runs) expect += r.h_lat * r.w_lat;
+        if (n_tokens != expect) {
+            throw std::runtime_error(
+                "qi_set_condition_latents: got " + std::to_string(n_tokens) +
+                " latent tokens, the prompt's image runs need " +
+                std::to_string(expect));
+        }
+        const int ic = c->mc.qwenimage21.transformer.in_channels;
+        c->edit.cond_latents = bt::Tensor::from_host(latents, n_tokens, ic)
+                                   .to(bt::default_device());
+
+        // Segments: text runs between the image runs, in row order. The image
+        // runs' rows are encoder SLOTS (one per four latents); the segment
+        // carries the latent grid instead.
+        const int n_valid = c->prompt.n_valid();
+        std::size_t next = 0;
+        int row = 0;
+        while (row < n_valid) {
+            if (next < c->prompt.image_runs.size() &&
+                c->prompt.image_runs[next].row == row) {
+                const auto& r = c->prompt.image_runs[next];
+                bd::dit::QwenImage21Segment s;
+                s.kind     = bd::dit::QwenImage21Segment::Kind::Image;
+                s.h        = r.h_lat;
+                s.w        = r.w_lat;
+                s.n_tokens = r.h_lat * r.w_lat;
+                c->edit.segments.push_back(s);
+                row += r.n_slots;
+                ++next;
+                continue;
+            }
+            int end = n_valid;
+            if (next < c->prompt.image_runs.size()) {
+                end = c->prompt.image_runs[next].row;
+            }
+            bd::dit::QwenImage21Segment s;
+            s.kind     = bd::dit::QwenImage21Segment::Kind::Text;
+            s.n_tokens = end - row;
+            c->edit.segments.push_back(s);
+            row = end;
+        }
+    });
 }
 
 int qi_get_prompt_embeds(qi_ctx* c, float* out) {
@@ -276,14 +459,45 @@ int qi_forward(qi_ctx* c, const float* latent, int h_lat, int w_lat,
         const bt::Dtype dt = c->dit->compute_dtype();
         if (dt != bt::Dtype::FP32) bt::cast(txt_f32, txt_dev, dt);
 
+        // The joint prefix: the armed image layout, or one text run.
+        std::vector<bd::dit::QwenImage21Segment> segments;
+        int prefix_len = n_txt;
+        if (!c->edit.empty()) {
+            segments = c->edit.segments;
+            prefix_len = 0;
+            int n_text = 0;
+            for (const auto& s : segments) {
+                if (s.kind == bd::dit::QwenImage21Segment::Kind::Text) {
+                    n_text += s.n_tokens;
+                    prefix_len += s.n_tokens;
+                } else {
+                    prefix_len += s.h * s.w;
+                }
+            }
+            if (n_text != n_txt) {
+                throw std::runtime_error(
+                    "qi_forward: the armed condition prefix expects " +
+                    std::to_string(n_text) + " text rows but got " +
+                    std::to_string(n_txt) + " — pass qi_encode_text's output "
+                    "over the NON-image rows only (see qi_get_prompt_pad_mask)");
+            }
+        } else {
+            bd::dit::QwenImage21Segment s;
+            s.kind     = bd::dit::QwenImage21Segment::Kind::Text;
+            s.n_tokens = n_txt;
+            segments.push_back(s);
+        }
+
         // A layout change invalidates the cache. Anything else — including an
         // edit to the text rows at the same length — is the caller's to
         // declare with qi_reset_cache().
-        if (c->cache.valid() && !c->cache.matches(n_txt, h_lat, w_lat)) {
+        if (c->cache.valid() && !c->cache.matches(prefix_len, h_lat, w_lat)) {
             c->cache.reset();
         }
         bt::Tensor v;
-        c->dit->forward(lat, h_lat, w_lat, txt_dev, timestep, &c->cache, v);
+        c->dit->forward_joint(lat, h_lat, w_lat, txt_dev,
+                              c->edit.empty() ? nullptr : &c->edit.cond_latents,
+                              segments, timestep, &c->cache, v);
         download_fp32(v, out);
     });
 }

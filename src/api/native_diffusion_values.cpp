@@ -229,7 +229,58 @@ brodiffusion::pipeline::GenerateOptions parseGenerateOptions(Value v) {
         }
     }
 
+    // conditionImages: Qwen-Image 2.1's image-conditioned generation. Each
+    // entry is either a path string or { path } / { pixels, width, height,
+    // channels? } with pixels a planar CHW Float32Array in [0, 1]. Together
+    // with outputResolution these are the whole edit surface on generate():
+    // leaving width/height off (or at 0) derives the canvas from the last
+    // image's aspect, as the reference pipeline does.
+    {
+        ev::Persistent images(ev::getProperty(root.get(), "conditionImages"));
+        const uint32_t count = arrayLength(images.get());
+        o.condition_images.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            Value entry = ev::getElement(images.get(), i);
+            brodiffusion::pipeline::ConditionImage ci;
+            if (ev::isString(entry)) {
+                ci.path = ev::toUtf8(entry);
+            } else if (ev::isObject(entry)) {
+                ev::Persistent e(entry);
+                propStr(e.get(), "path", ci.path);
+                propInt(e.get(), "width", ci.W);
+                propInt(e.get(), "height", ci.H);
+                propInt(e.get(), "channels", ci.channels);
+                Value pv = ev::getProperty(e.get(), "pixels");
+                const float* px = nullptr;
+                size_t n = 0;
+                if (readFloat32Array(pv, px, n) && n > 0) {
+                    ci.pixels.assign(px, px + n);
+                }
+            }
+            o.condition_images.push_back(std::move(ci));
+        }
+    }
+    propInt(root.get(), "outputResolution", o.output_resolution);
+    if (!o.condition_images.empty()) {
+        // width/height default to 512 for every other path, which here would
+        // silently override the aspect the caller asked to inherit. An
+        // explicit number still wins; absent (or 0) means "derive it".
+        Value wv = ev::getProperty(root.get(), "width");
+        Value hv = ev::getProperty(root.get(), "height");
+        if (!ev::isNumber(wv) || !ev::isNumber(hv)) {
+            o.width = 0;
+            o.height = 0;
+        }
+    }
+
     return o;
+}
+
+void resolveDerivedSize(brodiffusion::pipeline::Pipeline& p,
+                        brodiffusion::pipeline::GenerateOptions& o) {
+    if (o.condition_images.empty()) return;
+    if (o.width > 0 && o.height > 0) return;
+    p.qi21_resolve_size(o, o.width, o.height);
 }
 
 Value attachPipelineToState(Value stateVal, Value pipelineVal) {

@@ -222,6 +222,11 @@ Value pipelineGenerate(Value thisVal, std::span<const Value> args) {
     ev::Persistent opt(optVal);
     const bool includeFp32 = propBool(opt.get(), "includeFp32");
     auto opts = parseGenerateOptions(opt.get());
+    try {
+        resolveDerivedSize(*w->pipeline, opts);
+    } catch (const std::exception& e) {
+        return ev::throwError(std::string("Pipeline.generate failed: ") + e.what());
+    }
 
     Value onDoneVal = ev::isObject(opt.get()) ? ev::getProperty(opt.get(), "onDone") : ev::undefined();
     const bool isAsync = ev::isFunction(onDoneVal) || propBool(opt.get(), "async");
@@ -259,6 +264,11 @@ Value pipelineGenerateAsync(Value thisVal, std::span<const Value> args) {
     ev::Persistent opt(optVal);
     const bool includeFp32 = propBool(opt.get(), "includeFp32");
     auto opts = parseGenerateOptions(opt.get());
+    try {
+        resolveDerivedSize(*w->pipeline, opts);
+    } catch (const std::exception& e) {
+        return ev::throwError(std::string("Pipeline.generateAsync failed: ") + e.what());
+    }
     Value onDoneVal = ev::isObject(opt.get()) ? ev::getProperty(opt.get(), "onDone") : ev::undefined();
 
     return dispatchGenerateAsync(thisVal, w, std::move(prompt), std::move(opts), includeFp32, onDoneVal);
@@ -584,6 +594,11 @@ Value pipelinePrime(Value thisVal, std::span<const Value> args) {
     ev::Persistent self(thisVal);
     std::string prompt = ev::toUtf8(args[0]);
     auto opts = parseGenerateOptions(args.size() > 1 ? args[1] : ev::undefined());
+    try {
+        resolveDerivedSize(*w->pipeline, opts);
+    } catch (const std::exception& e) {
+        return ev::throwError(std::string("Pipeline.prime failed: ") + e.what());
+    }
     w->cancel_requested.store(false, std::memory_order_relaxed);
     opts.should_cancel = [w]() {
         return w->cancel_requested.load(std::memory_order_relaxed);

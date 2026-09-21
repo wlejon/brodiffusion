@@ -408,6 +408,173 @@ Value qi21EncodePrompt(Value thisVal, std::span<const Value> args) {
     }
 }
 
+// A JS condition-image list — each entry a path string, or { path } /
+// { pixels, width, height, channels? } with pixels a planar CHW Float32Array
+// in [0, 1]. The same shape generate({ conditionImages }) accepts, read here
+// too so the two image entry points cannot drift apart.
+std::vector<brodiffusion::pipeline::ConditionImage> readConditionImages(
+    Value arrVal) {
+    std::vector<brodiffusion::pipeline::ConditionImage> out;
+    ev::Persistent arr(arrVal);
+    const std::uint32_t count = arrayLength(arr.get());
+    out.reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        ev::Persistent entry(ev::getElement(arr.get(), i));
+        brodiffusion::pipeline::ConditionImage ci;
+        if (ev::isString(entry.get())) {
+            ci.path = ev::toUtf8(entry.get());
+        } else if (ev::isObject(entry.get())) {
+            propStr(entry.get(), "path", ci.path);
+            propInt(entry.get(), "width", ci.W);
+            propInt(entry.get(), "height", ci.H);
+            propInt(entry.get(), "channels", ci.channels);
+            Value pv = ev::getProperty(entry.get(), "pixels");
+            const float* px = nullptr;
+            std::size_t n = 0;
+            if (readFloat32Array(pv, px, n) && n > 0) {
+                ci.pixels.assign(px, px + n);
+            }
+        }
+        out.push_back(std::move(ci));
+    }
+    return out;
+}
+
+// qwenImage21EncodePromptImages(prompt, images, outputResolution?)
+//   -> { embeds, mask, ids, dropIdx, imagePadMask, imageRuns }
+//
+// The image-conditioned counterpart of qwenImage21EncodePrompt: `images` is
+// an array of path strings (or { path } objects), and the returned rows now
+// include one run per condition image, filled by the Qwen3-VL vision tower.
+// `imagePadMask` is an Int32Array marking those rows; `imageRuns` gives each
+// image's { row, slots, hLat, wLat } — the latent grid to encode it at.
+Value qi21EncodePromptImages(Value thisVal, std::span<const Value> args) {
+    auto* w = qi21Pipeline(thisVal);
+    if (!w) return notQi21("qwenImage21EncodePromptImages");
+    if (!w->weights_loaded) {
+        return ev::throwError(
+            "Pipeline.qwenImage21EncodePromptImages: call loadWeights() first");
+    }
+    if (args.empty() || !ev::isString(args[0])) {
+        return ev::throwTypeError(
+            "Pipeline.qwenImage21EncodePromptImages(prompt, images, "
+            "outputResolution?): prompt string required");
+    }
+    std::string prompt = ev::toUtf8(args[0]);
+
+    std::vector<brodiffusion::pipeline::ConditionImage> images;
+    if (args.size() >= 2) images = readConditionImages(args[1]);
+    if (images.empty()) {
+        return ev::throwTypeError(
+            "Pipeline.qwenImage21EncodePromptImages: images must hold at "
+            "least one entry — use qwenImage21EncodePrompt for text only");
+    }
+    int resolution = 1024;
+    if (args.size() >= 3 && ev::isNumber(args[2])) {
+        resolution = static_cast<int>(ev::toDouble(args[2]));
+    }
+
+    try {
+        brodiffusion::qwenimage21::TextConditioning tc =
+            w->pipeline->qi21_encode_prompt_images(prompt, images, resolution);
+        ObjectBuilder o;
+        {
+            ev::Persistent e(tensorToJs(tc.embeds));
+            o.set("embeds", e.get());
+        }
+        {
+            ev::Persistent m(tensorToJs(tc.mask));
+            o.set("mask", m.get());
+        }
+        {
+            ev::Persistent ids(makeInt32Array(tc.token_ids));
+            o.set("ids", ids.get());
+        }
+        o.set("dropIdx", static_cast<double>(tc.drop_idx));
+        {
+            std::vector<int> pad(tc.image_pad_mask.begin(),
+                                 tc.image_pad_mask.end());
+            ev::Persistent p(makeInt32Array(pad));
+            o.set("imagePadMask", p.get());
+        }
+        {
+            ev::Persistent runs(hostArrayOf(
+                tc.image_runs.size(), [&](std::size_t i) -> Value {
+                    ObjectBuilder r;
+                    r.set("row", static_cast<double>(tc.image_runs[i].row));
+                    r.set("slots",
+                          static_cast<double>(tc.image_runs[i].n_slots));
+                    r.set("hLat", static_cast<double>(tc.image_runs[i].h_lat));
+                    r.set("wLat", static_cast<double>(tc.image_runs[i].w_lat));
+                    return r.build();
+                }));
+            o.set("imageRuns", runs.get());
+        }
+        return o.build();
+    } catch (const std::exception& e) {
+        return ev::throwError(
+            std::string("Pipeline.qwenImage21EncodePromptImages failed: ") +
+            e.what());
+    }
+}
+
+// qwenImage21PrimeEdit(prompt, images, opts?) -> PipelineState.
+//
+// prime() with condition images, without going through generate(): the whole
+// edit path — vision tower, autoencoder, the interleaved joint prefix — runs
+// and hands back a state the caller steps itself. Equivalent to
+// generate({ conditionImages }) up to the denoise loop, which is the point:
+// it is where a research caller reaches in between steps.
+Value qi21PrimeEdit(Value thisVal, std::span<const Value> args) {
+    auto* w = qi21Pipeline(thisVal);
+    if (!w) return notQi21("qwenImage21PrimeEdit");
+    if (!w->weights_loaded) {
+        return ev::throwError(
+            "Pipeline.qwenImage21PrimeEdit: call loadWeights() first");
+    }
+    if (args.empty() || !ev::isString(args[0])) {
+        return ev::throwTypeError(
+            "Pipeline.qwenImage21PrimeEdit(prompt, images, opts?): prompt "
+            "string required");
+    }
+    ev::Persistent self(thisVal);
+    std::string prompt = ev::toUtf8(args[0]);
+
+    // The options object carries everything else; the `images` argument wins
+    // over any conditionImages inside it.
+    Value optsVal = args.size() >= 3 ? args[2] : ev::undefined();
+    auto opts = parseGenerateOptions(optsVal);
+    if (args.size() >= 2 && !ev::isUndefined(args[1]) && !ev::isNull(args[1])) {
+        auto images = readConditionImages(args[1]);
+        if (!images.empty()) opts.condition_images = std::move(images);
+        // Condition images with no explicit canvas mean "derive it from the
+        // last image's aspect" — the same rule generate() follows.
+        if (!ev::isObject(optsVal) ||
+            !ev::isNumber(ev::getProperty(optsVal, "width")) ||
+            !ev::isNumber(ev::getProperty(optsVal, "height"))) {
+            opts.width = 0;
+            opts.height = 0;
+        }
+    }
+    if (opts.condition_images.empty()) {
+        return ev::throwTypeError(
+            "Pipeline.qwenImage21PrimeEdit: pass at least one condition "
+            "image — prime() is the text-only entry point");
+    }
+
+    try {
+        resolveDerivedSize(*w->pipeline, opts);
+        auto sw = std::make_unique<PipelineStateWrapper>();
+        sw->opts = opts;
+        sw->state = w->pipeline->prime(prompt, opts);
+        Value st = g_pipelineStateClass.createInstance(std::move(sw));
+        return attachPipelineToState(st, self.get());
+    } catch (const std::exception& e) {
+        return ev::throwError(
+            std::string("Pipeline.qwenImage21PrimeEdit failed: ") + e.what());
+    }
+}
+
 // qwenImage21PrimeFromText(embeds, mask, opts?, uncondEmbeds?, uncondMask?)
 //   -> PipelineState. Prime from caller-supplied (n, 4096) rows instead of a
 // prompt string. `mask` may be null (all rows valid). Omit the uncond pair to
@@ -687,6 +854,8 @@ void decoratePipelineQwenImage21Proto(ObjectBuilder& proto) {
     proto.def("qwenImage21NumLayers", 0, qi21NumLayers);
     proto.def("qwenImage21TextHiddenDim", 0, qi21TextHiddenDim);
     proto.def("qwenImage21EncodePrompt", 1, qi21EncodePrompt);
+    proto.def("qwenImage21EncodePromptImages", 3, qi21EncodePromptImages);
+    proto.def("qwenImage21PrimeEdit", 3, qi21PrimeEdit);
     proto.def("qwenImage21PrimeFromText", 5, qi21PrimeFromText);
     proto.def("qwenImage21TextRows", 1, qi21TextRows);
     proto.def("qwenImage21SetTextRows", 2, qi21SetTextRows);

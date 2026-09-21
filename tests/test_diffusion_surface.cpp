@@ -52,7 +52,8 @@ const char* const kPipelineMethods[] = {
     "qwenImage21SetGateMask", "qwenImage21SetNormOutScaleDelta",
     "qwenImage21CaptureGates", "qwenImage21Gates", "qwenImage21HiddenSize",
     "qwenImage21NumLayers", "qwenImage21TextHiddenDim",
-    "qwenImage21EncodePrompt", "qwenImage21PrimeFromText",
+    "qwenImage21EncodePrompt", "qwenImage21EncodePromptImages",
+    "qwenImage21PrimeEdit", "qwenImage21PrimeFromText",
     "qwenImage21TextRows", "qwenImage21SetTextRows",
     "qwenImage21ScalePrefixKv", "qwenImage21ResetCache",
     "qwenImage21EncodeImage", "qwenImage21Decode",
@@ -126,6 +127,7 @@ void brodiffusionTestRestoredSurface() {
         {"qwenImage21SetModDelta", 4}, {"qwenImage21SetGateScale", 6},
         {"qwenImage21SetGateDelta", 4},
         {"qwenImage21PrimeFromText", 5}, {"qwenImage21Decode", 3},
+        {"qwenImage21EncodePromptImages", 3}, {"qwenImage21PrimeEdit", 3},
     };
     for (const auto& a : kArity) {
         ev::Persistent fn(ev::getProperty(pipeProto.get(), a.name));
