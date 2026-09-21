@@ -84,7 +84,15 @@ void JitSite::disable(const char* why) {
     disabled_ = true;
     bindings_.clear();
     recent_ = -1;
-    std::fprintf(stderr, "[brodiffusion] jit fusion unavailable at '%s' (%s); using eager path\n",
+    // One report per process. A backend the compiler has no fused form for —
+    // the CPU trace compiler has no broadcast operands at all — would
+    // otherwise print the same sentence once for every site in the model.
+    static std::atomic<bool> reported{false};
+    bool expected = false;
+    if (!reported.compare_exchange_strong(expected, true)) return;
+    std::fprintf(stderr,
+                 "[brodiffusion] jit fusion unavailable at '%s' (%s); using the eager "
+                 "path here and at any other site that hits the same wall\n",
                  name_, why ? why : "unknown");
     std::fflush(stderr);
 }
