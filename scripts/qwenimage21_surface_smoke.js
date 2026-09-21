@@ -23,6 +23,21 @@
 //      changes the image with no re-extraction.
 //   7. the VAE seam round-trips: encodeImage -> decode reconstructs the render.
 //   8. the text encoder can be released and the pipeline still steps.
+//   9. every hook is a LIST: Add/Clear/Count, two bindings over disjoint block
+//      ranges, and Set as "replace the list with one entry".
+//  10. the post-tanh gate delta, which has unit authority over channels the
+//      pre-tanh mod delta cannot reach.
+//  11. gate masks name their sublayer: attn-only, mlp-only and both are three
+//      different pictures over the same region.
+//  12. the four gate multipliers are independent: attn on the image rows is
+//      not attn on both row sets, and only the txt half re-extracts.
+//  13. the prefix KV dial is idempotent and takes a per-row weight — per-token
+//      prompt weighting on the cache, with no re-encode.
+//  14. the prefix cache slots: save, blend, clear.
+//  15. the prompt memo: prime() works on an already-encoded prompt after the
+//      text encoder is gone, and names the prompt when it cannot.
+//  16. the edit bindings: encodePromptImages / primeEdit / conditionImages.
+//  17. a wrong-length gate mask throws, naming the length it wanted.
 //
 // Every difference is reported as pixel MSE against the baseline, and every
 // MSE is checked finite and > 0. PNGs land in OUT_DIR for visual judgement.
@@ -251,6 +266,15 @@ console.log('\n[6] prefix KV attenuation, mid-denoise, deep layers');
   const m = mse(base.data, img.data);
   console.log('  prefix-KV vs base MSE = ' + m.toFixed(3));
   check(isFinite(m) && m > 0, 'attenuating the cached prefix V changes the image');
+
+  // Clear it. The dial is a model hook now, not cache content, so leaving it
+  // armed steers every later section — which is the point of the change, and
+  // exactly what this script used to get away with when the same call was an
+  // in-place multiply that the next prime() threw away.
+  pipe.qwenImage21ClearPrefixKvScales();
+  check(pipe.qwenImage21PrefixKvScaleCount() === 0, 'the dial is cleared');
+  check(mse(base.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'clearing the dial restores baseline');
 }
 
 // ── 7. the VAE seam ────────────────────────────────────────────────────────
@@ -308,6 +332,428 @@ console.log('\n[8] releasing the 8.5 GiB text encoder');
   const back = pipe.generate(PROMPT, GEN);
   check(mse(base.data, back.data) === 0,
         'a reloaded encoder reproduces the baseline exactly');
+}
+
+// ── 9. every hook is a list ────────────────────────────────────────────────
+//
+// The single-slot surface is what the research round ran out of first: a
+// second SetGateScale replaced the first, so nothing could scale the shallow
+// blocks and delta the deep ones in the same generation.
+
+console.log('\n[9] the binding lists: Add / Clear / Count');
+{
+  check(pipe.qwenImage21GateScaleCount() === 0, 'the gate-scale list starts empty');
+  check(pipe.qwenImage21ModDeltaCount() === 0, 'the mod-delta list starts empty');
+  check(pipe.qwenImage21GateDeltaCount() === 0, 'the gate-delta list starts empty');
+  check(pipe.qwenImage21GateMaskCount() === 0, 'the gate-mask list starts empty');
+  check(pipe.qwenImage21PrefixKvScaleCount() === 0, 'the prefix-kv list starts empty');
+
+  // Two bindings over DISJOINT halves of the stack, which the old surface
+  // could not hold at once.
+  const s0 = pipe.qwenImage21AddGateScale(0.85, 1.0, 1.0, 1.0, 0, 16);
+  const s1 = pipe.qwenImage21AddGateScale(1.0, 1.15, 1.0, 1.0, 16, 32);
+  check(s0 === 0 && s1 === 1, 'Add returns ascending slot indices');
+  check(pipe.qwenImage21GateScaleCount() === 2, 'both bindings are armed');
+  const two = timed('two-binding render', () => pipe.generate(PROMPT, GEN));
+  png('qi21_two_scales.png', two);
+  const mTwo = mse(base.data, two.data);
+  console.log('  two disjoint gate scales vs base MSE = ' + mTwo.toFixed(3));
+  check(isFinite(mTwo) && mTwo > 0, 'two disjoint gate scales change the image');
+
+  // Only the shallow one: a different picture, which is what proves the deep
+  // binding was doing something of its own.
+  pipe.qwenImage21ClearGateScales();
+  check(pipe.qwenImage21GateScaleCount() === 0, 'Clear empties the list');
+  pipe.qwenImage21AddGateScale(0.85, 1.0, 1.0, 1.0, 0, 16);
+  const one = pipe.generate(PROMPT, GEN);
+  const mOne = mse(two.data, one.data);
+  console.log('  shallow-only vs both MSE = ' + mOne.toFixed(3));
+  check(isFinite(mOne) && mOne > 0, 'the deep binding contributed');
+
+  // Set is Add-after-Clear.
+  pipe.qwenImage21SetGateScale(0.85, 1.0, 1.0, 1.0, 0, 16);
+  check(pipe.qwenImage21GateScaleCount() === 1, 'Set replaces the list');
+  check(mse(one.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'Set is exactly Add after Clear');
+
+  pipe.qwenImage21ClearGateScales();
+  check(mse(base.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'clearing the list restores baseline');
+}
+
+// ── 10. the post-tanh gate delta ───────────────────────────────────────────
+//
+// 74% of gate2's channels sit where tanh'(g) < 0.05, so a pre-tanh mod delta
+// has almost no authority over them. This adds AFTER the tanh.
+
+console.log('\n[10] post-tanh gate delta, blocks [16, 32)');
+{
+  const d = { rows: 1, cols: 2 * H, data: new Float32Array(2 * H) };
+  for (let i = 0; i < H; i++) d.data[i] = 0.02;            // attn half
+  pipe.qwenImage21SetGateDelta(d, 16, 32, 'target');
+  check(pipe.qwenImage21GateDeltaCount() === 1, 'the gate delta is armed');
+  const img = timed('gate-delta render', () => pipe.generate(PROMPT, GEN));
+  png('qi21_gatedelta.png', img);
+  const m = mse(base.data, img.data);
+  console.log('  gate-delta (+0.02 attn) vs base MSE = ' + m.toFixed(3));
+  check(isFinite(m) && m > 0, 'a post-tanh gate delta changes the image');
+
+  // The mlp half is a separate axis.
+  const d2 = { rows: 1, cols: 2 * H, data: new Float32Array(2 * H) };
+  for (let i = H; i < 2 * H; i++) d2.data[i] = 0.02;       // mlp half
+  pipe.qwenImage21SetGateDelta(d2, 16, 32, 'target');
+  const img2 = pipe.generate(PROMPT, GEN);
+  const m2 = mse(img.data, img2.data);
+  console.log('  attn-half vs mlp-half MSE = ' + m2.toFixed(3));
+  check(isFinite(m2) && m2 > 0, 'the attn and mlp halves are separate axes');
+
+  pipe.qwenImage21ClearGateDeltas();
+  check(mse(base.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'clearing the gate delta restores baseline');
+}
+
+// ── the joint-sequence geometry every mask depends on ──────────────────────
+//
+// A mask addresses the WHOLE joint sequence: text rows first, then the image
+// tokens row-major. At 512x512 that is a 32x32 token grid, one token per
+// 16x16 px, so the token covering pixel (px, py) is at
+//     textRows + (py >> 4) * 32 + (px >> 4)
+
+const GRID = GEN.width / 16;                      // 32 at 512
+const IMG_LEN = GRID * GRID;                      // 1024
+const TEXT_ROWS = (() => {
+  pipe.prime(PROMPT, GEN);
+  return pipe.qwenImage21TextRows().rows;
+})();
+const JOINT = TEXT_ROWS + IMG_LEN;
+console.log('\njoint sequence: ' + TEXT_ROWS + ' text rows + ' + IMG_LEN +
+            ' image tokens (' + GRID + 'x' + GRID + ') = ' + JOINT);
+
+// A mask that damps the left half of the image and leaves the text alone.
+function leftHalfMask(value) {
+  const m = { rows: JOINT, cols: 1, data: new Float32Array(JOINT) };
+  m.data.fill(1.0);
+  for (let y = 0; y < GRID; y++) {
+    for (let x = 0; x < GRID / 2; x++) {
+      m.data[TEXT_ROWS + y * GRID + x] = value;
+    }
+  }
+  return m;
+}
+
+// ── 11. gate masks name their sublayer ─────────────────────────────────────
+
+console.log('\n[11] gate mask per sublayer, left half, blocks [12, 32)');
+{
+  const mask = leftHalfMask(0.5);
+  const shots = {};
+  for (const which of ['both', 'attn', 'mlp']) {
+    pipe.qwenImage21SetGateMask(mask, 12, 32, which);
+    check(pipe.qwenImage21GateMaskCount() === 1, 'the ' + which + ' mask is armed');
+    shots[which] = timed('mask render (' + which + ')',
+                         () => pipe.generate(PROMPT, GEN));
+    png('qi21_mask_' + which + '.png', shots[which]);
+    const m = mse(base.data, shots[which].data);
+    console.log('  mask ' + which + ' vs base MSE = ' + m.toFixed(3));
+    check(isFinite(m) && m > 0, "a '" + which + "' mask changes the image");
+  }
+  const mAB = mse(shots.attn.data, shots.mlp.data);
+  const mAO = mse(shots.attn.data, shots.both.data);
+  console.log('  attn vs mlp MSE = ' + mAB.toFixed(3) +
+              ', attn vs both MSE = ' + mAO.toFixed(3));
+  check(mAB > 0, 'the attn and mlp halves are different pictures');
+  check(mAO > 0, "'attn' is not the blunt 'both'");
+
+  // 'both' is exactly 'attn' and 'mlp' armed together.
+  pipe.qwenImage21ClearGateMasks();
+  pipe.qwenImage21AddGateMask(mask, 12, 32, 'attn');
+  pipe.qwenImage21AddGateMask(mask, 12, 32, 'mlp');
+  check(pipe.qwenImage21GateMaskCount() === 2, 'two masks, one per sublayer');
+  check(mse(shots.both.data, pipe.generate(PROMPT, GEN).data) === 0,
+        "'both' is bit-identically 'attn' + 'mlp'");
+
+  pipe.qwenImage21ClearGateMasks();
+  check(mse(base.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'clearing the masks restores baseline');
+}
+
+// ── 12. the four independent gate multipliers ──────────────────────────────
+
+console.log('\n[12] four gate multipliers, blocks [16, 32)');
+{
+  // The rank-1 form IS the four products.
+  pipe.qwenImage21SetGateScale(1.2, 1.0, 1.1, 0.9, 16, 32);
+  const viaProduct = timed('rank-1 render', () => pipe.generate(PROMPT, GEN));
+  pipe.qwenImage21SetGateScaleRows(1.2 * 1.1, 1.2 * 0.9, 1.0 * 1.1, 1.0 * 0.9,
+                                   16, 32);
+  check(mse(viaProduct.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'the rank-1 form is four multipliers spelled out');
+
+  // The thing the product cannot say: the attention gate on the IMAGE rows.
+  pipe.qwenImage21SetGateScaleRows(1.0, 1.25, 1.0, 1.0, 16, 32);
+  const imgOnly = timed('attn.img render', () => pipe.generate(PROMPT, GEN));
+  png('qi21_attn_img.png', imgOnly);
+  pipe.qwenImage21SetGateScale(1.25, 1.0, 1.0, 1.0, 16, 32);   // both row sets
+  const bothRows = pipe.generate(PROMPT, GEN);
+  const mIT = mse(imgOnly.data, bothRows.data);
+  console.log('  attn.img vs attn.both MSE = ' + mIT.toFixed(3));
+  check(isFinite(mIT) && mIT > 0,
+        'attn on the image rows is not attn on both row sets');
+
+  // The txt half alone is a third picture again.
+  pipe.qwenImage21SetGateScaleRows(1.25, 1.0, 1.0, 1.0, 16, 32);
+  const txtOnly = pipe.generate(PROMPT, GEN);
+  const mTI = mse(txtOnly.data, imgOnly.data);
+  console.log('  attn.txt vs attn.img MSE = ' + mTI.toFixed(3));
+  check(isFinite(mTI) && mTI > 0, 'the txt and img row sets are separate axes');
+
+  // ...and they compose: txt-only plus img-only is the binding that sets both.
+  pipe.qwenImage21ClearGateScales();
+  pipe.qwenImage21AddGateScaleRows(1.25, 1.0, 1.0, 1.0, 16, 32);
+  pipe.qwenImage21AddGateScaleRows(1.0, 1.25, 1.0, 1.0, 16, 32);
+  const composed = pipe.generate(PROMPT, GEN);
+  pipe.qwenImage21SetGateScaleRows(1.25, 1.25, 1.0, 1.0, 16, 32);
+  check(mse(composed.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'the four axes compose exactly');
+
+  pipe.qwenImage21ClearGateScales();
+  check(mse(base.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'clearing restores baseline');
+}
+
+// ── 13. the prefix KV dial, per row ────────────────────────────────────────
+
+console.log('\n[13] prefix KV: idempotent, and weighted per row');
+{
+  function stepAll(arm) {
+    const st = pipe.prime(PROMPT, GEN);
+    if (arm) arm();
+    for (let i = 0; i < GEN.steps; i++) st.stepOnce();
+    return st.decode();
+  }
+
+  pipe.qwenImage21ScalePrefixKv(16, NL, 1.0, 0.5);
+  const once = timed('prefix-kv render', () => stepAll());
+  png('qi21_prefixkv_rows_base.png', once);
+  const mOnce = mse(base.data, once.data);
+  console.log('  prefix-kv 0.5 vs base MSE = ' + mOnce.toFixed(3));
+  check(isFinite(mOnce) && mOnce > 0, 'the prefix-KV dial changes the image');
+
+  // IDEMPOTENT: arming it again is the same picture. The old in-place
+  // version squared here, so it could not be used from generate() at all.
+  pipe.qwenImage21ScalePrefixKv(16, NL, 1.0, 0.5);
+  check(mse(once.data, stepAll().data) === 0,
+        'setting the same dial twice is bit-identical');
+
+  // A whole generate() loop honours it too — the in-place version compounded
+  // once per step and blew the image out.
+  const viaGenerate = pipe.generate(PROMPT, GEN);
+  check(mse(once.data, viaGenerate.data) === 0,
+        'generate() and a manual step loop agree under the dial');
+
+  // An all-ones row weight IS the broadcast.
+  const allRows = { rows: TEXT_ROWS, cols: 1, data: new Float32Array(TEXT_ROWS) };
+  allRows.data.fill(1.0);
+  pipe.qwenImage21ScalePrefixKv(16, NL, 1.0, 0.5, allRows);
+  check(mse(once.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'an all-ones row weight is the broadcast it generalises');
+
+  // ...and an all-zeros one is the identity.
+  const noRows = { rows: TEXT_ROWS, cols: 1, data: new Float32Array(TEXT_ROWS) };
+  pipe.qwenImage21ScalePrefixKv(16, NL, 1.0, 0.5, noRows);
+  check(mse(base.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'an all-zeros row weight is the identity');
+
+  // Per-token prompt weighting: attenuate only the last third of the rows.
+  const tail = { rows: TEXT_ROWS, cols: 1, data: new Float32Array(TEXT_ROWS) };
+  for (let i = Math.floor((2 * TEXT_ROWS) / 3); i < TEXT_ROWS; i++) tail.data[i] = 1.0;
+  pipe.qwenImage21ScalePrefixKv(16, NL, 1.0, 0.5, tail);
+  const weighted = timed('row-weighted render', () => pipe.generate(PROMPT, GEN));
+  png('qi21_prefixkv_tail.png', weighted);
+  const mW = mse(once.data, weighted.data);
+  console.log('  tail-only vs all-rows MSE = ' + mW.toFixed(3) +
+              ', tail-only vs base MSE = ' + mse(base.data, weighted.data).toFixed(3));
+  check(isFinite(mW) && mW > 0, 'a per-row weight selects which rows are damped');
+
+  // A wrong-length row weight throws rather than scaling the wrong rows.
+  let threw = false, why = '';
+  try {
+    const bad = { rows: TEXT_ROWS + 3, cols: 1,
+                  data: new Float32Array(TEXT_ROWS + 3) };
+    bad.data.fill(1.0);
+    pipe.qwenImage21ScalePrefixKv(16, NL, 1.0, 0.5, bad);
+    pipe.generate(PROMPT, GEN);
+  } catch (e) { threw = true; why = String(e); }
+  check(threw, 'a wrong-length row weight throws');
+  console.log('  ' + why);
+
+  pipe.qwenImage21ClearPrefixKvScales();
+  check(mse(base.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'clearing the dial restores baseline');
+}
+
+// ── 14. the prefix cache slots ─────────────────────────────────────────────
+//
+// After the extract step the cache IS the conditioning, so mixing two of them
+// is a prompt interpolation that costs no re-encode. The two must share a
+// layout, which in practice means two prompts that tokenize to the same
+// length — so the second prompt here is the first with words swapped.
+
+console.log('\n[14] prefix cache slots: save, blend, clear');
+{
+  const ALT = 'a lighthouse on a rocky coast at sunrise, gentle clouds';
+  check(pipe.qwenImage21PrefixSlots() >= 2, 'there are at least two slots');
+  check(!pipe.qwenImage21PrefixSlotValid(0), 'slot 0 starts empty');
+
+  // Prime the alternative prompt, extract, and park the cache in slot 0.
+  const altState = pipe.prime(ALT, GEN);
+  altState.stepOnce();                      // the extract step
+  pipe.qwenImage21SavePrefixCache(0);
+  check(pipe.qwenImage21PrefixSlotValid(0), 'slot 0 holds a cache');
+
+  const altRows = pipe.qwenImage21TextRows().rows;
+  console.log('  alt prompt is ' + altRows + ' text rows (base ' + TEXT_ROWS + ')');
+  if (altRows !== TEXT_ROWS) {
+    console.log('  skipping the blend: the two prompts tokenize differently');
+    check(true, 'blend skipped (layouts differ)');
+  } else {
+    const st = pipe.prime(PROMPT, GEN);
+    st.stepOnce();                          // extract the base prompt
+    pipe.qwenImage21BlendPrefixCache(0, 0.5);
+    for (let i = 1; i < GEN.steps; i++) st.stepOnce();
+    const img = png('qi21_blend_half.png', st.decode());
+    const m = mse(base.data, img.data);
+    console.log('  50% blended prefix vs base MSE = ' + m.toFixed(3));
+    check(isFinite(m) && m > 0, 'blending the prefix cache changes the image');
+
+    // alpha = 0 is a no-op on the live cache.
+    const st0 = pipe.prime(PROMPT, GEN);
+    st0.stepOnce();
+    pipe.qwenImage21BlendPrefixCache(0, 0.0);
+    for (let i = 1; i < GEN.steps; i++) st0.stepOnce();
+    check(mse(base.data, st0.decode().data) === 0, 'alpha = 0 changes nothing');
+  }
+
+  pipe.qwenImage21ClearPrefixSlots();
+  check(!pipe.qwenImage21PrefixSlotValid(0), 'clearing drops the saved cache');
+}
+
+// ── 15. the prompt memo ────────────────────────────────────────────────────
+//
+// prime() used to throw for ANY prompt once the text encoder was released,
+// including one it had just encoded — so the 8.5 GiB saving cost you the
+// ability to re-prime the prompt you were studying.
+
+console.log('\n[15] the prompt memo survives releasing the text encoder');
+{
+  if (!pipe.qwenImage21TextEncoderResident()) {
+    pipe.qwenImage21ReloadTextEncoder(MODEL_DIR, '', { quantizeWeights: true });
+  }
+  pipe.qwenImage21ClearPromptMemo();
+  check(pipe.qwenImage21MemoizedPrompts().length === 0, 'the memo starts empty');
+
+  pipe.generate(PROMPT, GEN);               // fills the memo
+  const memo = pipe.qwenImage21MemoizedPrompts();
+  console.log('  memoized: ' + JSON.stringify(memo));
+  check(memo.indexOf(PROMPT) >= 0, 'the generated prompt is memoized');
+
+  pipe.qwenImage21ReleaseTextEncoder();
+  check(!pipe.qwenImage21TextEncoderResident(), 'the encoder is released');
+
+  // The whole point: re-prime the SAME prompt with no encoder resident.
+  const st = pipe.prime(PROMPT, GEN);
+  for (let i = 0; i < GEN.steps; i++) st.stepOnce();
+  check(mse(base.data, st.decode().data) === 0,
+        'a memoized prompt re-primes identically with no encoder');
+
+  // An unknown prompt throws, and the message names it.
+  let threw = false, why = '';
+  const UNKNOWN = 'a prompt this pipeline has never encoded';
+  try { pipe.prime(UNKNOWN, GEN); } catch (e) { threw = true; why = String(e); }
+  check(threw, 'an unmemoized prompt still throws');
+  check(why.indexOf(UNKNOWN) >= 0, 'the error names the prompt it cannot encode');
+  console.log('  ' + why);
+
+  pipe.qwenImage21ReloadTextEncoder(MODEL_DIR, '', { quantizeWeights: true });
+}
+
+// ── 16. the edit bindings ──────────────────────────────────────────────────
+//
+// A condition image enters as prefix rows, modulated from t = 0 like the text
+// is — so it is cached with the text and every image-side hook above applies
+// to a generation driven by it.
+
+console.log('\n[16] condition images: encodePromptImages / primeEdit / generate');
+{
+  const W = base.width, Hpx = base.height;
+  const plane = Hpx * W;
+  const chw = new Float32Array(3 * plane);
+  for (let i = 0; i < plane; i++) {
+    for (let c = 0; c < 3; c++) chw[c * plane + i] = base.data[4 * i + c] / 255;
+  }
+  const condition = { pixels: chw, height: Hpx, width: W, channels: 3 };
+  const EDIT = 'the same lighthouse, in heavy fog';
+
+  // Returns a record, not a bare tensor: { embeds, mask, ids, dropIdx,
+  // imagePadMask, imageRuns }. imagePadMask marks the condition-image slots
+  // inside the joint prefix, which is what a mask over a conditioned
+  // generation has to line up with.
+  const taps = timed('encodePromptImages', () =>
+    pipe.qwenImage21EncodePromptImages(EDIT, [condition]));
+  const emb = taps.embeds;
+  console.log('  prompt+image rows = ' + emb.rows + 'x' + emb.cols +
+              ', image runs = ' + JSON.stringify(taps.imageRuns));
+  check(emb.rows > TEXT_ROWS, 'the image run adds rows to the prefix');
+  check(emb.cols === TH, 'the rows are text-hidden wide');
+
+  const edited = timed('conditionImages generate', () =>
+    pipe.generate(EDIT, Object.assign({}, GEN, {
+      conditionImages: [condition],
+      outputResolution: [GEN.width, GEN.height],
+    })));
+  png('qi21_edit.png', edited);
+  const mE = mse(base.data, edited.data);
+  console.log('  edited vs base MSE = ' + mE.toFixed(3));
+  check(isFinite(mE) && mE > 0, 'a condition image changes the render');
+
+  // The same edit without the condition image is a different picture, which
+  // is what shows the image was doing the work rather than the prompt.
+  const textOnly = pipe.generate(EDIT, GEN);
+  const mT = mse(edited.data, textOnly.data);
+  console.log('  with vs without the condition image MSE = ' + mT.toFixed(3));
+  check(isFinite(mT) && mT > 0, 'the condition image drives the render');
+
+  // An image-side hook applies to an image-conditioned generation too.
+  pipe.qwenImage21SetGateScaleRows(1.0, 1.2, 1.0, 1.0, 16, 32);
+  const hooked = pipe.generate(EDIT, Object.assign({}, GEN, {
+    conditionImages: [condition],
+    outputResolution: [GEN.width, GEN.height],
+  }));
+  const mH = mse(edited.data, hooked.data);
+  console.log('  image-conditioned + attn.img MSE = ' + mH.toFixed(3));
+  check(isFinite(mH) && mH > 0, 'an image-side hook steers an edit');
+  pipe.qwenImage21ClearGateScales();
+}
+
+// ── 17. a wrong-length mask throws ─────────────────────────────────────────
+//
+// It used to be a silent no-op: the hook armed only when the length matched,
+// so an all-zero mask written at img_len instead of textRows + img_len
+// rendered the baseline to the pixel and read as "this surface does nothing".
+
+console.log('\n[17] a wrong-length gate mask throws');
+{
+  const bad = { rows: IMG_LEN, cols: 1, data: new Float32Array(IMG_LEN) };
+  pipe.qwenImage21SetGateMask(bad, 0, NL, 'both');
+  let threw = false, why = '';
+  try { pipe.generate(PROMPT, GEN); } catch (e) { threw = true; why = String(e); }
+  check(threw, 'a mask of img_len rows throws instead of doing nothing');
+  check(why.indexOf(String(JOINT)) >= 0, 'the message names the joint length');
+  console.log('  ' + why);
+
+  pipe.qwenImage21ClearGateMasks();
+  check(mse(base.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'clearing the bad mask restores baseline');
 }
 
 console.log('\n' + (failures === 0
