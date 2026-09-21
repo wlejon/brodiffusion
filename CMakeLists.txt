@@ -220,6 +220,7 @@ target_sources(brodiffusion PRIVATE
     src/qwenimage21_text.cpp
     src/cond_control.cpp
     src/detail/safetensors_dir.cpp
+    src/detail/jit_fusion.cpp
     src/lora.cpp
     src/pipeline.cpp
     src/pipeline_detail.cpp

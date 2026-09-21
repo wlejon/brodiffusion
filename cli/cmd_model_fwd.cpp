@@ -590,16 +590,21 @@ int run_qi21_fwd(int argc, char** argv) {
     const char* seqs = arg_after(argc, argv, "--seq");
     const char* steps_s = arg_after(argc, argv, "--steps");
     const char* bench_s = arg_after(argc, argv, "--bench");
-    bool quantize = false, no_cache = false;
+    bool quantize = false, no_cache = false, synthetic = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--quantize") == 0) quantize = true;
         if (std::strcmp(argv[i], "--no-cache") == 0) no_cache = true;
+        if (std::strcmp(argv[i], "--synthetic") == 0) synthetic = true;
     }
-    if (!wdir || !lp || !ep || !op || !ts || !hps || !wps || !seqs) {
+    // --synthetic makes its own inputs, so the parity files and the dump are
+    // all optional: it exists for step timing, where what the tensors contain
+    // is irrelevant and only their shape is.
+    const bool need_io = !synthetic;
+    if (!wdir || !ts || !hps || !wps || !seqs || (need_io && (!lp || !ep || !op))) {
         std::fprintf(stderr,
             "qi21-fwd: need --weights-dir --latent --embeds --out --t --hp "
             "--wp --seq [--config F] [--steps N] [--out2 F] [--t2 T] "
-            "[--quantize] [--no-cache]\n");
+            "[--quantize] [--no-cache] [--synthetic] [--bench N]\n");
         return 2;
     }
     const int hp = std::atoi(hps), wp = std::atoi(wps);
@@ -635,8 +640,29 @@ int run_qi21_fwd(int argc, char** argv) {
     }
 
     const int img_len = hp * wp;
-    auto lat_h = load_latent_f32(lp, img_len * cfg.in_channels);
-    auto emb_h = load_latent_f32(ep, text_seq * cfg.context_in_dim);
+    // A deterministic unit-ish spread, from a splitmix64 stream so the same
+    // command always denoises the same tensor and two builds are comparable.
+    auto synth = [](std::size_t n, uint64_t seed) {
+        std::vector<float> v(n);
+        uint64_t s = seed;
+        for (std::size_t i = 0; i < n; ++i) {
+            s += 0x9e3779b97f4a7c15ull;
+            uint64_t z = s;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+            z ^= z >> 31;
+            v[i] = static_cast<float>(static_cast<int64_t>(z >> 40) - 8388608) /
+                   8388608.0f;
+        }
+        return v;
+    };
+    auto lat_h = synthetic
+                     ? synth(static_cast<std::size_t>(img_len) * cfg.in_channels, 1)
+                     : load_latent_f32(lp, img_len * cfg.in_channels);
+    auto emb_h =
+        synthetic
+            ? synth(static_cast<std::size_t>(text_seq) * cfg.context_in_dim, 2)
+            : load_latent_f32(ep, text_seq * cfg.context_in_dim);
     brotensor::Tensor lat =
         brotensor::Tensor::from_host(lat_h.data(), img_len, cfg.in_channels)
             .to(brotensor::default_device());
@@ -665,7 +691,12 @@ int run_qi21_fwd(int argc, char** argv) {
 
     brotensor::Tensor out;
     model.forward(lat, hp, wp, txt, t, cache_ptr, out);
-    dump(op, out);
+    if (op) {
+        dump(op, out);
+    } else {
+        brotensor::sync_all();
+        std::printf("qi21-fwd: velocity (%d,%d)\n", out.rows, out.cols);
+    }
 
     if (steps >= 2) {
         if (!op2) {

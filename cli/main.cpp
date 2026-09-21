@@ -7,6 +7,7 @@
 
 #include "commands.h"
 
+#include "brodiffusion/detail/jit_fusion.h"
 #include "brodiffusion/pipeline.h"
 #include "brodiffusion/version.h"
 
@@ -116,6 +117,10 @@ int usage() {
         "                   load the T5-XXL text encoder, encode <text>, run a\n"
         "                   forward pass, and print output stats. --quantize\n"
         "                   loads it as INT8 (W8A16); --max-length defaults 128.\n"
+        "\n"
+        "  --no-jit         disable every trace-JIT fusion site and run the\n"
+        "                   eager op sequences instead (same as setting\n"
+        "                   BRODIFFUSION_JIT=0). Accepted by every subcommand.\n"
         "\n"
         "Writes an RGB PNG via broimage.\n",
         brodiffusion::version_string());
@@ -270,6 +275,15 @@ int dispatch(const char* name, int (*fn)(int, char**), int argc, char** argv) {
 
 int main(int argc, char** argv) {
     if (argc < 2) return usage();
+
+    // --no-jit is global rather than per-subcommand: it turns off every trace-
+    // JIT fusion site at once, so a before/after comparison is one flag on an
+    // otherwise identical command line. Equivalent to BRODIFFUSION_JIT=0.
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--no-jit") == 0) {
+            brodiffusion::detail::set_jit_enabled(false);
+        }
+    }
 
     if (std::strcmp(argv[1], "--version") == 0 ||
         std::strcmp(argv[1], "-v") == 0) {
