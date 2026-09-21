@@ -38,6 +38,10 @@
 //      text encoder is gone, and names the prompt when it cannot.
 //  16. the edit bindings: encodePromptImages / primeEdit / conditionImages.
 //  17. a wrong-length gate mask throws, naming the length it wanted.
+//  18. the between-step control schedule: a flat alpha reproduces the
+//      prime-time setControl render to the pixel, a late-only alpha does not,
+//      an explicit direction schedules the same as a bank name, two half
+//      schedules sum to one whole, and a re-extract is priced at 512 and 1024.
 //
 // Every difference is reported as pixel MSE against the baseline, and every
 // MSE is checked finite and > 0. PNGs land in OUT_DIR for visual judgement.
@@ -754,6 +758,158 @@ console.log('\n[17] a wrong-length gate mask throws');
   pipe.qwenImage21ClearGateMasks();
   check(mse(base.data, pipe.generate(PROMPT, GEN).data) === 0,
         'clearing the bad mask restores baseline');
+}
+
+// ── 18. the between-step control schedule ──────────────────────────────────
+//
+// The conditioning axes are the only surface on this model with real steering
+// authority, and until now they landed once, before step 0. A schedule
+// re-aims one per step by rebuilding the text rows from the PRIMED embedding
+// plus that step's alpha, which is why a flat schedule has to be pixel-exact
+// against the static desk: the arithmetic is the same arithmetic.
+
+console.log('\n[18] between-step control schedule');
+{
+  // The same diff-of-means recipe as [4], rebuilt here so the section stands
+  // on its own (a schedule is the first thing a reader will want to copy).
+  const SCENES = [
+    'a harbour at dusk',
+    'a kitchen table with fruit',
+    'a city street after rain',
+  ];
+  const warm = new Float64Array(TH);
+  const cold = new Float64Array(TH);
+  function accum(prompt, sink) {
+    const e = pipe.encodeConditioning(prompt);
+    for (let r = 0; r < e.rows; r++) {
+      for (let c = 0; c < TH; c++) sink[c] += e.data[r * e.cols + c] / e.rows;
+    }
+  }
+  timed('6 conditioning encodes', () => {
+    for (const s of SCENES) {
+      accum(s + ', warm golden light', warm);
+      accum(s + ', cold blue light', cold);
+    }
+  });
+  const dir = new Float32Array(TH);
+  let norm = 0;
+  for (let c = 0; c < TH; c++) {
+    dir[c] = (warm[c] - cold[c]) / SCENES.length;
+    norm += dir[c] * dir[c];
+  }
+  norm = Math.sqrt(norm);
+  for (let c = 0; c < TH; c++) dir[c] /= norm;
+
+  const AXIS = 'schedWarmth';
+  const A = 3.0;
+  const flat = new Float32Array(GEN.steps);
+  for (let i = 0; i < GEN.steps; i++) flat[i] = A;
+
+  // (a) the static reference: the axis applied once, at prime time.
+  pipe.setControlVector(AXIS, dir, A, norm);
+  const statImg = png('qi21_sched_static.png', timed('static-axis render',
+    () => pipe.generate(PROMPT, GEN)));
+  const mStat = mse(base.data, statImg.data);
+  console.log('  static axis vs base MSE = ' + mStat.toFixed(3));
+  check(isFinite(mStat) && mStat > 0, 'the static axis moves the image');
+
+  // The axis stays in the bank at weight 0, so the schedule below resolves it
+  // by name while the prime-time seam contributes nothing.
+  pipe.setControl(AXIS, 0);
+  check(mse(base.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'weight 0 is the baseline again');
+
+  // (b) the same axis as a FLAT schedule over every step.
+  check(pipe.qwenImage21ControlScheduleCount() === 0, 'no schedule armed yet');
+  const slot = pipe.qwenImage21SetControlSchedule(AXIS, flat, 0, GEN.steps);
+  check(slot === 0, 'Set returns slot 0');
+  check(pipe.qwenImage21ControlScheduleCount() === 1, 'one schedule armed');
+  const flatImg = png('qi21_sched_flat.png', timed('flat-schedule render',
+    () => pipe.generate(PROMPT, GEN)));
+  const mFlat = mse(statImg.data, flatImg.data);
+  console.log('  flat schedule vs prime-time setControl MSE = ' + mFlat);
+  check(mFlat === 0,
+        'alpha = ' + A + ' on every step reproduces the prime-time render');
+
+  // (c) the same alpha on the LAST HALF only is a different picture — which
+  //     is the whole point, and the thing the static seam cannot express.
+  const late = new Float32Array(GEN.steps);
+  for (let i = GEN.steps >> 1; i < GEN.steps; i++) late[i] = A;
+  pipe.qwenImage21SetControlSchedule(AXIS, late, 0, GEN.steps);
+  const lateImg = png('qi21_sched_late.png', timed('late-only render',
+    () => pipe.generate(PROMPT, GEN)));
+  const mLate = mse(statImg.data, lateImg.data);
+  const mLateBase = mse(base.data, lateImg.data);
+  console.log('  late-only vs flat MSE = ' + mLate.toFixed(3) +
+              ', vs base MSE = ' + mLateBase.toFixed(3));
+  check(isFinite(mLate) && mLate > 0, 'a late-only schedule is not the static render');
+  check(isFinite(mLateBase) && mLateBase > 0, 'a late-only schedule still moves the image');
+
+  // (d) an all-zero schedule renders the baseline: the rows go back, they do
+  //     not stick at whatever the last nonzero step installed.
+  const zero = new Float32Array(GEN.steps);
+  pipe.qwenImage21SetControlSchedule(AXIS, zero, 0, GEN.steps);
+  check(mse(base.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'an all-zero schedule is the baseline');
+
+  // (e) the explicit-direction form: the same Float32Array in place of the
+  //     name, with the axis scale as the trailing argument. For the research
+  //     that is a diff-of-means axis that is in no bank.
+  pipe.qwenImage21SetControlSchedule(dir, flat, 0, GEN.steps, norm);
+  const dirImg = pipe.generate(PROMPT, GEN);
+  console.log('  explicit direction vs bank name MSE = ' + mse(statImg.data, dirImg.data));
+  check(mse(statImg.data, dirImg.data) === 0,
+        'an explicit direction schedules identically to the bank axis');
+
+  // (f) schedules compose: two half-amplitude slots sum to the whole.
+  const half = new Float32Array(GEN.steps);
+  for (let i = 0; i < GEN.steps; i++) half[i] = A / 2;
+  pipe.qwenImage21ClearControlSchedules();
+  check(pipe.qwenImage21AddControlSchedule(AXIS, half, 0, GEN.steps) === 0,
+        'Add returns slot 0');
+  check(pipe.qwenImage21AddControlSchedule(AXIS, half, 0, GEN.steps) === 1,
+        'Add returns slot 1');
+  check(pipe.qwenImage21ControlScheduleCount() === 2, 'two slots armed');
+  const sumImg = pipe.generate(PROMPT, GEN);
+  console.log('  two half schedules vs one whole MSE = ' + mse(statImg.data, sumImg.data));
+  check(mse(statImg.data, sumImg.data) === 0, 'two halves sum to the whole');
+
+  // (g) clearing restores the baseline for good.
+  pipe.qwenImage21ClearControlSchedules();
+  check(pipe.qwenImage21ControlScheduleCount() === 0, 'the list is empty');
+  pipe.removeControl(AXIS);
+  check(mse(base.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'clearing the schedule restores baseline');
+
+  // (h) what a re-extract costs. A schedule whose alpha MOVES every step
+  //     rebuilds the rows and drops the prefix cache every step; a flat one
+  //     rebuilds once. The difference in per-step wall time IS the
+  //     re-extract, measured rather than asserted.
+  function perStepMs(gen, alphas) {
+    pipe.qwenImage21ClearControlSchedules();
+    if (alphas) pipe.qwenImage21SetControlSchedule(dir, alphas, 0, gen.steps, norm);
+    const st = pipe.prime(PROMPT, gen);
+    st.stepOnce();                       // step 0 extracts either way
+    const t0 = Date.now();
+    for (let i = 1; i < gen.steps; i++) st.stepOnce();
+    return (Date.now() - t0) / (gen.steps - 1);
+  }
+  for (const gen of [GEN, Object.assign({}, GEN, { width: 1024, height: 1024 })]) {
+    const moving = new Float32Array(gen.steps);
+    for (let i = 0; i < gen.steps; i++) moving[i] = A * (i + 1) / gen.steps;
+    const flatMs = perStepMs(gen, flat);
+    const moveMs = perStepMs(gen, moving);
+    console.log('  ' + gen.width + '^2: ' + flatMs.toFixed(1) +
+                ' ms/step flat, ' + moveMs.toFixed(1) +
+                ' ms/step re-extracting -> ' + (moveMs - flatMs).toFixed(1) +
+                ' ms per re-extract');
+    check(isFinite(flatMs) && isFinite(moveMs) && moveMs > 0,
+          gen.width + '^2 schedule timings are finite');
+  }
+
+  pipe.qwenImage21ClearControlSchedules();
+  check(mse(base.data, pipe.generate(PROMPT, GEN).data) === 0,
+        'the card is back at baseline after the timing runs');
 }
 
 console.log('\n' + (failures === 0
