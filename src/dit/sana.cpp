@@ -43,6 +43,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace brodiffusion::dit {
@@ -705,8 +706,13 @@ void SanaDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
     if (cdt != bt::Dtype::FP32) { bt::cast(freq_, freq_cd_, cdt); tin = &freq_cd_; }
     lin_(te_l1_, *tin, emb_);
     bt::silu_forward(emb_, emb_);
-    lin_(te_l2_, emb_, emb_);
-    emb_ = emb_.clone();                         // timesteps_emb (1, D)
+    // NOT in place: linear_2 reads the whole (1, D) row for every output
+    // column, so aliasing its input and output lets the writes overtake the
+    // reads. The result is a timestep embedding that differs run to run —
+    // which is the whole conditioning of the step, so the image changes
+    // wholesale. Write into a second buffer and swap.
+    lin_(te_l2_, emb_, emb_out_);
+    std::swap(emb_, emb_out_);                   // timesteps_emb (1, D)
 
     // Sana-Sprint: SanaCombinedTimestepGuidanceEmbeddings adds an embedded
     // guidance scalar. conditioning = timesteps_emb + guidance_emb becomes the
@@ -722,7 +728,8 @@ void SanaDenoiser::forward(const bt::Tensor& latent, int H_lat, int W_lat,
         }
         lin_(ge_l1_, *gin, gemb_);
         bt::silu_forward(gemb_, gemb_);
-        lin_(ge_l2_, gemb_, gemb_);
+        lin_(ge_l2_, gemb_, gemb_out_);           // see the te_l2_ note above
+        std::swap(gemb_, gemb_out_);
         bt::add_inplace(emb_, gemb_);             // conditioning (embedded_timestep)
     }
 

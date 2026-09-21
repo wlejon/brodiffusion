@@ -193,6 +193,13 @@ private:
     brotensor::Tensor gemb_, cond_;            // guidance embedding + sum (Sprint)
     brotensor::Tensor qn_, kn_;                // qk-norm transpose scratch (Sprint)
     brotensor::Tensor emb_, emb_silu_, temb6_; // embedded timestep + AdaLN row
+    // Destination of the SECOND linear of each embedder MLP. A matmul reads
+    // every element of its input to produce each output element, so it cannot
+    // run in place: with one buffer serving as both operands, the tiles that
+    // write the row race the tiles still reading it and the embedding comes
+    // out different from one call to the next. These give those two matmuls a
+    // distinct output, swapped into place afterwards so nothing reallocates.
+    brotensor::Tensor emb_out_, gemb_out_;
     brotensor::Tensor mod_row_, ln_, mod_;     // modulation / layernorm
     brotensor::Tensor gated_, sub_out_;        // gate * sublayer, sub-layer out
     // self-attention
