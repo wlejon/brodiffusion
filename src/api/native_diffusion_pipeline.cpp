@@ -14,13 +14,198 @@
 #include <brolm/tokenizer.h>
 #include <brotensor/runtime.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <variant>
 
 namespace brodiffusion::api {
+
+// ---------------------------------------------------------------------------
+// Pipeline lifecycle tracking
+// ---------------------------------------------------------------------------
+
+static std::mutex g_pipelineRegMtx;
+static std::vector<PipelineWrapper*> g_activePipelines;
+
+PipelineWrapper::PipelineWrapper() {
+    std::lock_guard<std::mutex> lock(g_pipelineRegMtx);
+    g_activePipelines.push_back(this);
+}
+
+PipelineWrapper::~PipelineWrapper() {
+    std::lock_guard<std::mutex> lock(g_pipelineRegMtx);
+    auto it = std::find(g_activePipelines.begin(), g_activePipelines.end(), this);
+    if (it != g_activePipelines.end()) g_activePipelines.erase(it);
+}
+
+// ---------------------------------------------------------------------------
+// Diffusion async-job machine
+// ---------------------------------------------------------------------------
+
+struct DiffusionWork {
+    std::atomic<bool> cancel{false};
+    std::atomic<bool> finished{false};
+    std::vector<float> nchw;
+    int height = 0, width = 0;
+    bool includeFp32 = false, cancelled = false;
+    std::string error;
+};
+
+struct DiffusionJob {
+    std::shared_ptr<DiffusionWork> work;
+    std::thread th;
+    ev::Persistent onDone, pipelineRef;
+    PipelineWrapper* pw = nullptr;
+    ~DiffusionJob() { if (th.joinable()) th.join(); }
+};
+
+static thread_local std::vector<std::unique_ptr<DiffusionJob>> s_diffusionJobs;
+static thread_local std::mutex s_diffusionJobsMtx;
+
+static void cancelJobsForPipeline(PipelineWrapper* pw) {
+    if (pw) pw->cancel_requested.store(true, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(s_diffusionJobsMtx);
+    for (auto& job : s_diffusionJobs) {
+        if (!pw || job->pw == pw) job->work->cancel.store(true, std::memory_order_release);
+    }
+}
+
+static void cancelAllDiffusionJobs() {
+    {
+        std::lock_guard<std::mutex> lock(g_pipelineRegMtx);
+        for (auto* pw : g_activePipelines) if (pw) pw->cancel_requested.store(true, std::memory_order_relaxed);
+    }
+    std::lock_guard<std::mutex> lock(s_diffusionJobsMtx);
+    for (auto& job : s_diffusionJobs) job->work->cancel.store(true, std::memory_order_release);
+}
+
+void tickDiffusionAsync() {
+    std::vector<std::unique_ptr<DiffusionJob>> finished;
+    {
+        std::lock_guard<std::mutex> lock(s_diffusionJobsMtx);
+        for (auto it = s_diffusionJobs.begin(); it != s_diffusionJobs.end();) {
+            if ((*it)->work->finished.load(std::memory_order_acquire)) {
+                finished.push_back(std::move(*it));
+                it = s_diffusionJobs.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto& job : finished) {
+        if (job->th.joinable()) job->th.join();
+        const bool cancelled = job->work->cancelled || job->work->cancel.load(std::memory_order_acquire);
+        const std::string& err = job->work->error;
+
+        ev::Persistent info(ev::createObject());
+        {
+            ObjectBuilder b(info.get());
+            b.set("cancelled", ev::fromBool(cancelled));
+            if (!err.empty()) b.set("error", ev::fromUtf8(err));
+            info.set(b.get());
+        }
+
+        ev::Persistent result(ev::null());
+        if (!cancelled && err.empty() && !job->work->nchw.empty()) {
+            result.set(makeImageResult(job->work->nchw, job->work->height, job->work->width, job->work->includeFp32));
+        } else if (cancelled) {
+            ObjectBuilder b;
+            b.set("cancelled", true);
+            result.set(b.build());
+        }
+
+        Value onDone = job->onDone.get();
+        if (ev::isFunction(onDone)) {
+            const Value args[2] = {result.get(), info.get()};
+            ev::CallResult r = ev::call(onDone, ev::undefined(), std::span<const Value>(args, 2));
+            (void)r;
+        }
+
+        job->onDone.set(ev::undefined());
+        job->pipelineRef.set(ev::undefined());
+    }
+}
+
+void shutdownDiffusionAsync() {
+    std::vector<std::unique_ptr<DiffusionJob>> all;
+    {
+        std::lock_guard<std::mutex> lock(s_diffusionJobsMtx);
+        all.swap(s_diffusionJobs);
+    }
+    for (auto& job : all) {
+        job->work->cancel.store(true, std::memory_order_release);
+        if (job->th.joinable()) job->th.join();
+        job->onDone.set(ev::undefined());
+        job->pipelineRef.set(ev::undefined());
+    }
+}
+
+static Value dispatchGenerateAsync(Value thisVal, PipelineWrapper* w, std::string prompt,
+                                  brodiffusion::pipeline::GenerateOptions opts,
+                                  bool includeFp32, Value onDoneVal) {
+    auto work = std::make_shared<DiffusionWork>();
+    work->height = opts.height;
+    work->width = opts.width;
+    work->includeFp32 = includeFp32;
+
+    auto job = std::make_unique<DiffusionJob>();
+    job->work = work;
+    job->pw = w;
+    job->pipelineRef = ev::Persistent(thisVal);
+    if (ev::isFunction(onDoneVal)) {
+        job->onDone = ev::Persistent(onDoneVal);
+    }
+
+    w->cancel_requested.store(false, std::memory_order_relaxed);
+
+    job->th = std::thread([work, w, prompt = std::move(prompt), opts = std::move(opts)]() mutable {
+        try {
+            opts.should_cancel = [w, work]() {
+                return w->cancel_requested.load(std::memory_order_relaxed) ||
+                       work->cancel.load(std::memory_order_relaxed);
+            };
+            work->nchw = w->pipeline->generate(prompt, opts);
+        } catch (const brodiffusion::pipeline::GenerateCancelled&) {
+            work->cancelled = true;
+        } catch (const std::exception& e) {
+            work->error = e.what();
+        } catch (...) {
+            work->error = "unknown error in generate";
+        }
+        work->finished.store(true, std::memory_order_release);
+    });
+
+    {
+        std::lock_guard<std::mutex> lock(s_diffusionJobsMtx);
+        s_diffusionJobs.push_back(std::move(job));
+    }
+
+    ObjectBuilder h;
+    h.def("cancel", 0, [work, w](Value, std::span<const Value>) -> Value {
+        work->cancel.store(true, std::memory_order_release);
+        if (w) w->cancel_requested.store(true, std::memory_order_relaxed);
+        return ev::undefined();
+    });
+    h.accessor("done", [work](Value, std::span<const Value>) -> Value {
+        return ev::fromBool(work->finished.load(std::memory_order_acquire));
+    }, nullptr);
+    h.def("wait", 0, [work](Value, std::span<const Value>) -> Value {
+        while (!work->finished.load(std::memory_order_acquire)) {
+            tickDiffusionAsync();
+            if (work->finished.load(std::memory_order_acquire)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        tickDiffusionAsync();
+        return ev::undefined();
+    });
+    return h.build();
+}
 
 namespace {
 
@@ -38,6 +223,13 @@ Value pipelineGenerate(Value thisVal, std::span<const Value> args) {
     const bool includeFp32 = propBool(opt.get(), "includeFp32");
     auto opts = parseGenerateOptions(opt.get());
 
+    Value onDoneVal = ev::isObject(opt.get()) ? ev::getProperty(opt.get(), "onDone") : ev::undefined();
+    const bool isAsync = ev::isFunction(onDoneVal) || propBool(opt.get(), "async");
+
+    if (isAsync) {
+        return dispatchGenerateAsync(thisVal, w, std::move(prompt), std::move(opts), includeFp32, onDoneVal);
+    }
+
     try {
         w->cancel_requested.store(false, std::memory_order_relaxed);
         opts.should_cancel = [w]() {
@@ -54,13 +246,31 @@ Value pipelineGenerate(Value thisVal, std::span<const Value> args) {
     }
 }
 
+Value pipelineGenerateAsync(Value thisVal, std::span<const Value> args) {
+    auto* w = unwrapPipeline(thisVal);
+    if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.generateAsync: not a loaded Pipeline");
+    if (!w->weights_loaded) return ev::throwError("Pipeline.generateAsync: call loadWeights() first");
+    if (args.empty() || !ev::isString(args[0])) {
+        return ev::throwTypeError("Pipeline.generateAsync(prompt, opts?): string prompt required");
+    }
+
+    std::string prompt = ev::toUtf8(args[0]);
+    Value optVal = args.size() > 1 ? args[1] : ev::undefined();
+    ev::Persistent opt(optVal);
+    const bool includeFp32 = propBool(opt.get(), "includeFp32");
+    auto opts = parseGenerateOptions(opt.get());
+    Value onDoneVal = ev::isObject(opt.get()) ? ev::getProperty(opt.get(), "onDone") : ev::undefined();
+
+    return dispatchGenerateAsync(thisVal, w, std::move(prompt), std::move(opts), includeFp32, onDoneVal);
+}
+
 Value pipelineTextToImage(Value thisVal, std::span<const Value> args) {
     return pipelineGenerate(thisVal, args);
 }
 
 // Shared body of imageToImage()/inpaint(): both are generate() with the init
 // (and mask) image path forced on top of the caller's opts.
-Value generateWithImages(PipelineWrapper* w, const std::string& label,
+Value generateWithImages(Value thisVal, PipelineWrapper* w, const std::string& label,
                          const std::string& prompt, Value optVal,
                          const std::string& initPath, const std::string& maskPath) {
     ev::Persistent opt(optVal);
@@ -68,6 +278,13 @@ Value generateWithImages(PipelineWrapper* w, const std::string& label,
     auto opts = parseGenerateOptions(opt.get());
     opts.init_image_path = initPath;
     if (!maskPath.empty()) opts.mask_image_path = maskPath;
+
+    Value onDoneVal = ev::isObject(opt.get()) ? ev::getProperty(opt.get(), "onDone") : ev::undefined();
+    const bool isAsync = ev::isFunction(onDoneVal) || propBool(opt.get(), "async");
+
+    if (isAsync) {
+        return dispatchGenerateAsync(thisVal, w, prompt, std::move(opts), includeFp32, onDoneVal);
+    }
 
     try {
         w->cancel_requested.store(false, std::memory_order_relaxed);
@@ -91,7 +308,7 @@ Value pipelineImageToImage(Value thisVal, std::span<const Value> args) {
     if (args.size() < 2 || !ev::isString(args[0]) || !ev::isString(args[1])) {
         return ev::throwTypeError("Pipeline.imageToImage(imagePath, prompt, opts?): string imagePath and prompt required");
     }
-    return generateWithImages(w, "Pipeline.imageToImage", ev::toUtf8(args[1]),
+    return generateWithImages(thisVal, w, "Pipeline.imageToImage", ev::toUtf8(args[1]),
                               args.size() > 2 ? args[2] : ev::undefined(),
                               ev::toUtf8(args[0]), std::string());
 }
@@ -102,7 +319,7 @@ Value pipelineInpaint(Value thisVal, std::span<const Value> args) {
     if (args.size() < 3 || !ev::isString(args[0]) || !ev::isString(args[1]) || !ev::isString(args[2])) {
         return ev::throwTypeError("Pipeline.inpaint(imagePath, maskPath, prompt, opts?): string imagePath, maskPath, prompt required");
     }
-    return generateWithImages(w, "Pipeline.inpaint", ev::toUtf8(args[2]),
+    return generateWithImages(thisVal, w, "Pipeline.inpaint", ev::toUtf8(args[2]),
                               args.size() > 3 ? args[3] : ev::undefined(),
                               ev::toUtf8(args[0]), ev::toUtf8(args[1]));
 }
@@ -451,7 +668,17 @@ Value pipelineStepOnce(Value thisVal, std::span<const Value> args) {
     const std::vector<const brotensor::Tensor*>* biasPtr = haveBias ? &ptrs : nullptr;
 
     try {
+        if (w->cancel_requested.load(std::memory_order_relaxed)) {
+            ObjectBuilder b;
+            b.set("cancelled", true);
+            return b.build();
+        }
         w->pipeline->step_once(sw->state, sw->opts, tracePtr, biasPtr);
+        if (w->cancel_requested.load(std::memory_order_relaxed)) {
+            ObjectBuilder b;
+            b.set("cancelled", true);
+            return b.build();
+        }
         bool hasMore = sw->state.step_index < sw->state.n_steps;
         if (wantTrace) {
             ObjectBuilder res;
@@ -506,12 +733,13 @@ Value pipelineDispose(Value thisVal, std::span<const Value>) {
 Value pipelineCancel(Value thisVal, std::span<const Value>) {
     auto* w = unwrapPipeline(thisVal);
     if (!w) return ev::throwTypeError("Pipeline.cancel: not a Pipeline");
-    w->cancel_requested.store(true, std::memory_order_relaxed);
+    cancelJobsForPipeline(w);
     return ev::undefined();
 }
 
 void decoratePipeline(ObjectBuilder& proto) {
     proto.def("generate", 2, pipelineGenerate);
+    proto.def("generateAsync", 2, pipelineGenerateAsync);
     proto.def("textToImage", 2, pipelineTextToImage);
     proto.def("imageToImage", 3, pipelineImageToImage);
     proto.def("inpaint", 4, pipelineInpaint);
@@ -532,6 +760,10 @@ void decoratePipeline(ObjectBuilder& proto) {
     proto.def("decode", 1, pipelineDecode);
     proto.def("dispose", 0, pipelineDispose);
     proto.def("cancel", 0, pipelineCancel);
+    proto.def("tick", 0, [](Value, std::span<const Value>) -> Value {
+        tickDiffusionAsync();
+        return ev::undefined();
+    });
 
     // Conditioning-control + identity anchor, and the Krea 2 research hooks.
     decoratePipelineControlProto(proto);
@@ -698,19 +930,33 @@ Value makeDiffusionNamespace() {
         }
     });
 
+    diff.def("tick", 0, [](Value, std::span<const Value>) -> Value {
+        tickDiffusionAsync();
+        return ev::undefined();
+    });
+
     diff.def("cancel", 0, [](Value, std::span<const Value> args) -> Value {
         if (!args.empty()) {
             if (auto* w = unwrapPipeline(args[0])) {
-                w->cancel_requested.store(true, std::memory_order_relaxed);
+                cancelJobsForPipeline(w);
                 return ev::undefined();
             }
             if (unwrapPipelineState(args[0])) {
                 Value p = ev::getProperty(args[0], "__pipeline");
                 if (auto* pw = unwrapPipeline(p)) {
-                    pw->cancel_requested.store(true, std::memory_order_relaxed);
+                    cancelJobsForPipeline(pw);
                     return ev::undefined();
                 }
             }
+            if (ev::isObject(args[0])) {
+                Value cFn = ev::getProperty(args[0], "cancel");
+                if (ev::isFunction(cFn)) {
+                    ev::call(cFn, args[0], {});
+                    return ev::undefined();
+                }
+            }
+        } else {
+            cancelAllDiffusionJobs();
         }
         return ev::undefined();
     });

@@ -79,6 +79,13 @@ int main() {
     assert(!cancelRes.thrown);
     assert(ev::isUndefined(cancelRes.value));
 
+    // Test diffusion tick
+    auto diffTick = ev::getProperty(diff, "tick");
+    assert(ev::isObject(diffTick));
+    auto tickRes = ev::call(diffTick, diff, {});
+    assert(!tickRes.thrown);
+    assert(ev::isUndefined(tickRes.value));
+
     // Check bro.triposplat
     auto tsp = ev::getProperty(g.value, "triposplat");
     assert(ev::isObject(tsp));
@@ -169,6 +176,26 @@ int main() {
         std::string stepErr = ev::toUtf8(badStep.value);
         assert(stepErr.find("state required") != std::string::npos);
         std::cout << "  Pipeline.prototype.stepOnce validates arguments: " << stepErr << std::endl;
+
+        // Test Pipeline.generateAsync validation
+        auto genAsyncFn = ev::getProperty(pipeRes.value, "generateAsync");
+        assert(ev::isObject(genAsyncFn));
+        auto badGen = ev::call(genAsyncFn, pipeRes.value, {});
+        assert(badGen.thrown);
+
+        // Test Pipeline.cancel
+        auto pipeCancelFn = ev::getProperty(pipeRes.value, "cancel");
+        assert(ev::isObject(pipeCancelFn));
+        auto pCancelRes = ev::call(pipeCancelFn, pipeRes.value, {});
+        assert(!pCancelRes.thrown);
+        assert(ev::isUndefined(pCancelRes.value));
+
+        // Test Pipeline.tick
+        auto pipeTickFn = ev::getProperty(pipeRes.value, "tick");
+        assert(ev::isObject(pipeTickFn));
+        auto pTickRes = ev::call(pipeTickFn, pipeRes.value, {});
+        assert(!pTickRes.thrown);
+        assert(ev::isUndefined(pTickRes.value));
 
         std::filesystem::remove(vp);
         std::filesystem::remove(mp);

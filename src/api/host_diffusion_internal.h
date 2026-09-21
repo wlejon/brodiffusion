@@ -45,6 +45,9 @@ struct PipelineWrapper {
     bool weights_loaded = false;
     std::string scheduler_name;
     std::atomic<bool> cancel_requested{false};
+
+    PipelineWrapper();
+    ~PipelineWrapper();
 };
 
 struct PipelineStateWrapper {
