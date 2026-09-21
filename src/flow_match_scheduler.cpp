@@ -153,9 +153,15 @@ void FlowMatch::step(const bt::Tensor& v,
             static_cast<char*>(d_sigma_dev_.data) +
                 static_cast<std::size_t>(step_index) * sizeof(float),
             1, 1, bt::Dtype::FP32);
-        if (detail::try_fused(jit_euler_, {sample.data, v.data, ds.data}, [&] {
-                sample += v * ds;
-            })) {
+        // The extent is part of the binding: `sample` and `v` are per-run
+        // allocations, so two generations at different resolutions in one
+        // process can land on the same pair of addresses with different
+        // element counts.
+        if (detail::try_fused(
+                jit_euler_,
+                {sample.data, v.data, ds.data,
+                 detail::token_of_extent(static_cast<std::size_t>(sample.size()))},
+                [&] { sample += v * ds; })) {
             return;
         }
     }

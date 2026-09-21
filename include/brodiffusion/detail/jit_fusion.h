@@ -83,10 +83,23 @@ private:
 
 // `tokens` identifies the binding: the compiled kernel is replayed only when
 // every token matches. List every buffer the expression touches — a stale
-// pointer would otherwise replay the kernel against freed memory — and also
-// any literal the tracer bakes into the code as an immediate, since replay
-// would otherwise silently reuse the old constant. `token_of(float)` turns
-// one of those into a token.
+// pointer would otherwise replay the kernel against freed memory — the
+// SHAPE it was traced at (see token_of_extent above), and any literal the
+// tracer bakes into the code as an immediate, since replay would otherwise
+// silently reuse the old constant. `token_of(float)` turns one of those into
+// a token.
+// A site's buffers are usually per-call allocations, so the pool hands the
+// same addresses to differently-shaped tensors from one call to the next.
+// Addresses alone therefore do NOT identify a binding: list the SHAPE the
+// expression was traced at too, or a kernel compiled for one length gets
+// replayed against another. Tagged with the low two bits set and shifted by
+// two, so an extent can collide with neither a (4-byte aligned) buffer
+// address nor a token_of(float) constant.
+inline const void* token_of_extent(std::size_t n) {
+    return reinterpret_cast<const void*>(
+        (static_cast<std::uintptr_t>(n) << 2) | 3u);
+}
+
 inline const void* token_of(float f) {
     std::uint32_t bits = 0;
     std::memcpy(&bits, &f, sizeof(bits));

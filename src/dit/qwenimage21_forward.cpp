@@ -71,11 +71,25 @@ bt::Tensor headnorm(const bt::Tensor& X, const bt::Tensor& gain, float eps,
 // dst = LN(src) * (1 + scale). Eager is layernorm + modulate: two kernels,
 // two reads and two writes of (L, hidden). Fused it is one of each, and the
 // normalized intermediate never exists.
+// Every site's identity includes its ROW COUNT, not just its buffers.
+// Buffers here are per-forward allocations, so the pool hands the same
+// addresses back to differently-shaped tensors from one forward to the next;
+// with addresses alone, a trace compiled for one length gets replayed against
+// the other. The swiglu site is where that bit: its operands are
+// (Lq, mlp_hidden), and Lq is prefix_len + img_len on a prefill but img_len
+// on a cached step — so a prefill could replay the shorter kernel and leave
+// the text rows holding the previous step's activations, which then went
+// into the prefix KV cache.
+const void* rows_token(const bt::Tensor& t) {
+    return detail::token_of_extent(static_cast<std::size_t>(t.rows));
+}
+
 bool fuse_norm_modulate(detail::JitSite& site, const bt::Tensor& src,
                         const bt::Tensor& scale, const bt::Tensor& shift,
                         bt::Tensor& dst, float eps) {
     return detail::try_fused(
-        site, {src.data, scale.data, shift.data, dst.data}, [&] {
+        site,
+        {src.data, scale.data, shift.data, dst.data, rows_token(src)}, [&] {
             // One expression, no named intermediates: every traced temporary
             // stays alive to the semicolon, so no two DAG nodes can land on
             // the same freed device buffer.
@@ -93,7 +107,8 @@ bool fuse_gated_residual(detail::JitSite& site, bt::Tensor& x,
                          const bt::Tensor& gate, const bt::Tensor& y,
                          const bt::Tensor* mask) {
     const void* mp = mask ? mask->data : nullptr;
-    return detail::try_fused(site, {x.data, gate.data, y.data, mp}, [&] {
+    return detail::try_fused(site, {x.data, gate.data, y.data, mp,
+                                    rows_token(x)}, [&] {
         if (mask) {
             x += gate * y * (*mask);
         } else {
@@ -386,16 +401,20 @@ void QwenImage21Transformer2DModel::forward_joint(
                                    const bt::Tensor& y, const bt::Tensor* mask,
                                    detail::JitSite& site_pre,
                                    detail::JitSite& site_post) {
+        // `m` is the slice of the (Lq, hidden) mask covering exactly these
+        // rows — not the whole mask. Passing the whole one multiplied a
+        // 24-row scratch by a 29-row operand and threw out of the eager
+        // path, which is only reachable when the JIT is unavailable.
         auto eager = [&](const bt::Tensor& g, const bt::Tensor& src,
-                         bt::Tensor& d, int rows) {
+                         bt::Tensor& d, const bt::Tensor* m, int rows) {
             bt::Tensor gv = row_view(gated, 0, rows);
             bt::broadcast_mul(src, g, gv);
-            if (mask) bt::mul_inplace(gv, *mask);
+            if (m) bt::mul_inplace(gv, *m);
             bt::add_inplace(d, gv);
         };
         if (mod_split <= 0) {
             if (fuse_gated_residual(site_post, dst, g_post, y, mask)) return;
-            eager(g_post, y, dst, Lq);
+            eager(g_post, y, dst, mask, Lq);
             return;
         }
         bt::Tensor d0 = row_view(dst, 0, mod_split);
@@ -409,10 +428,10 @@ void QwenImage21Transformer2DModel::forward_joint(
             m1 = row_view(*mask, mod_split, Lq - mod_split);
         }
         if (!fuse_gated_residual(site_pre, d0, g_pre, y0, mask ? &m0 : nullptr)) {
-            eager(g_pre, y0, d0, mod_split);
+            eager(g_pre, y0, d0, mask ? &m0 : nullptr, mod_split);
         }
         if (!fuse_gated_residual(site_post, d1, g_post, y1, mask ? &m1 : nullptr)) {
-            eager(g_post, y1, d1, Lq - mod_split);
+            eager(g_post, y1, d1, mask ? &m1 : nullptr, Lq - mod_split);
         }
     };
 
@@ -543,7 +562,8 @@ void QwenImage21Transformer2DModel::forward_joint(
         lin_into_(b.mlp_gate, xm, mlp_g);
         lin_into_(b.mlp_proj, xm, mlp_p);
         // g = silu(g) * p: one kernel rather than silu then multiply.
-        if (!detail::try_fused(jit_.swiglu, {mlp_g.data, mlp_p.data}, [&] {
+        if (!detail::try_fused(jit_.swiglu,
+                               {mlp_g.data, mlp_p.data, rows_token(mlp_g)}, [&] {
                 bt::store(mlp_g, bt::silu(mlp_g) * mlp_p);
             })) {
             bt::silu_forward(mlp_g, mlp_g);
