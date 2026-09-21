@@ -184,20 +184,47 @@ void QwenImage21Transformer2DModel::set_norm_out_scale_delta(
 
 // ─── gate scale ────────────────────────────────────────────────────────────
 
+int QwenImage21Transformer2DModel::add_gate_scale_rows(float attn_txt,
+                                                       float attn_img,
+                                                       float mlp_txt,
+                                                       float mlp_img,
+                                                       int block_lo,
+                                                       int block_hi) {
+    QwenImage21GateScaleBinding b;
+    b.attn_txt = attn_txt;
+    b.attn_img = attn_img;
+    b.mlp_txt  = mlp_txt;
+    b.mlp_img  = mlp_img;
+    b.block_lo = block_lo;
+    b.block_hi = block_hi;
+    gate_scales_.push_back(b);
+    return static_cast<int>(gate_scales_.size()) - 1;
+}
+
+void QwenImage21Transformer2DModel::set_gate_scale_rows(float attn_txt,
+                                                        float attn_img,
+                                                        float mlp_txt,
+                                                        float mlp_img,
+                                                        int block_lo,
+                                                        int block_hi) {
+    gate_scales_.clear();
+    const bool identity = attn_txt == 1.0f && attn_img == 1.0f &&
+                          mlp_txt == 1.0f && mlp_img == 1.0f;
+    if (identity || empty_range(block_lo, block_hi)) return;
+    add_gate_scale_rows(attn_txt, attn_img, mlp_txt, mlp_img, block_lo,
+                        block_hi);
+}
+
+// The rank-1 sugar: (attn, mlp) x (txt, img) -> the four independent
+// multipliers. Exactly what the old single-product hook did, spelled out.
 int QwenImage21Transformer2DModel::add_gate_scale(float attn_scale,
                                                   float mlp_scale,
                                                   float txt_scale,
                                                   float img_scale,
                                                   int block_lo, int block_hi) {
-    QwenImage21GateScaleBinding b;
-    b.attn_scale = attn_scale;
-    b.mlp_scale  = mlp_scale;
-    b.txt_scale  = txt_scale;
-    b.img_scale  = img_scale;
-    b.block_lo = block_lo;
-    b.block_hi = block_hi;
-    gate_scales_.push_back(b);
-    return static_cast<int>(gate_scales_.size()) - 1;
+    return add_gate_scale_rows(attn_scale * txt_scale, attn_scale * img_scale,
+                               mlp_scale * txt_scale, mlp_scale * img_scale,
+                               block_lo, block_hi);
 }
 
 void QwenImage21Transformer2DModel::set_gate_scale(float attn_scale,
@@ -206,12 +233,9 @@ void QwenImage21Transformer2DModel::set_gate_scale(float attn_scale,
                                                    float img_scale,
                                                    int block_lo,
                                                    int block_hi) {
-    gate_scales_.clear();
-    const bool identity = attn_scale == 1.0f && mlp_scale == 1.0f &&
-                          txt_scale == 1.0f && img_scale == 1.0f;
-    if (identity || empty_range(block_lo, block_hi)) return;
-    add_gate_scale(attn_scale, mlp_scale, txt_scale, img_scale, block_lo,
-                   block_hi);
+    set_gate_scale_rows(attn_scale * txt_scale, attn_scale * img_scale,
+                        mlp_scale * txt_scale, mlp_scale * img_scale, block_lo,
+                        block_hi);
 }
 
 void QwenImage21Transformer2DModel::set_gate_scales(
@@ -219,8 +243,8 @@ void QwenImage21Transformer2DModel::set_gate_scales(
     gate_scales_.clear();
     for (const auto& b : list) {
         if (empty_range(b.block_lo, b.block_hi)) continue;
-        add_gate_scale(b.attn_scale, b.mlp_scale, b.txt_scale, b.img_scale,
-                       b.block_lo, b.block_hi);
+        add_gate_scale_rows(b.attn_txt, b.attn_img, b.mlp_txt, b.mlp_img,
+                            b.block_lo, b.block_hi);
     }
 }
 
@@ -288,8 +312,9 @@ void QwenImage21Transformer2DModel::clear_gate_deltas() {
 
 // ─── gate mask ─────────────────────────────────────────────────────────────
 
-int QwenImage21Transformer2DModel::add_gate_mask(const bt::Tensor& mask,
-                                                 int block_lo, int block_hi) {
+int QwenImage21Transformer2DModel::add_gate_mask(
+    const bt::Tensor& mask, int block_lo, int block_hi,
+    QwenImage21GateSublayer which) {
     if (mask.size() == 0) {
         fail("add_gate_mask: an empty mask arms nothing — use "
              "clear_gate_masks()");
@@ -309,16 +334,18 @@ int QwenImage21Transformer2DModel::add_gate_mask(const bt::Tensor& mask,
     b.mask = std::move(m);
     b.block_lo = block_lo;
     b.block_hi = block_hi;
+    b.which = which;
     gate_masks_.push_back(std::move(b));
     gate_mask_host_.push_back(std::move(host));
     return static_cast<int>(gate_masks_.size()) - 1;
 }
 
-void QwenImage21Transformer2DModel::set_gate_mask(const bt::Tensor& mask,
-                                                  int block_lo, int block_hi) {
+void QwenImage21Transformer2DModel::set_gate_mask(
+    const bt::Tensor& mask, int block_lo, int block_hi,
+    QwenImage21GateSublayer which) {
     clear_gate_masks();
     if (mask.size() == 0 || empty_range(block_lo, block_hi)) return;
-    add_gate_mask(mask, block_lo, block_hi);
+    add_gate_mask(mask, block_lo, block_hi, which);
 }
 
 void QwenImage21Transformer2DModel::set_gate_masks(
@@ -326,14 +353,16 @@ void QwenImage21Transformer2DModel::set_gate_masks(
     clear_gate_masks();
     for (const auto& b : list) {
         if (b.mask.size() == 0 || empty_range(b.block_lo, b.block_hi)) continue;
-        add_gate_mask(b.mask, b.block_lo, b.block_hi);
+        add_gate_mask(b.mask, b.block_lo, b.block_hi, b.which);
     }
 }
 
 void QwenImage21Transformer2DModel::clear_gate_masks() {
     gate_masks_.clear();
     gate_mask_host_.clear();
-    mask_host_.clear();   // force the per-coverage compositions to rebuild
+    // Force the per-coverage compositions to rebuild.
+    mask_host_attn_.clear();
+    mask_host_mlp_.clear();
 }
 
 // ─── prefix KV attenuation ─────────────────────────────────────────────────
@@ -342,65 +371,141 @@ void QwenImage21Transformer2DModel::clear_gate_masks() {
 // only cost is one scale over the (prefix_len, hidden) rows it copies out of
 // the cache — and only for the layers whose factor is not 1.
 
-namespace {
+void QwenImage21Transformer2DModel::compose_prefix_scales_() {
+    prefix_k_scale_.clear();
+    prefix_v_scale_.clear();
+    prefix_k_row_.clear();
+    prefix_v_row_.clear();
+    prefix_row_len_ = 0;
+    const int n = cfg_.num_layers;
+    if (prefix_kv_scales_.empty() || n <= 0) return;
 
-void compose_prefix_scales(const std::vector<QwenImage21PrefixKvBinding>& list,
-                           int num_layers, std::vector<float>& k_out,
-                           std::vector<float>& v_out) {
-    k_out.clear();
-    v_out.clear();
-    if (list.empty() || num_layers <= 0) return;
-    k_out.assign(static_cast<std::size_t>(num_layers), 1.0f);
-    v_out.assign(static_cast<std::size_t>(num_layers), 1.0f);
+    // One row length for the whole list, so a mismatch is caught once, here,
+    // rather than per layer in the forward.
+    for (const auto& b : prefix_kv_scales_) {
+        if (b.row_scale.size() == 0) continue;
+        const int len = static_cast<int>(b.row_scale.size());
+        if (prefix_row_len_ != 0 && prefix_row_len_ != len) {
+            fail("prefix KV row scales disagree on length (" +
+                 std::to_string(prefix_row_len_) + " vs " +
+                 std::to_string(len) +
+                 ") — every row_scale addresses the same prefix");
+        }
+        prefix_row_len_ = len;
+    }
+
+    const auto nl = static_cast<std::size_t>(n);
+    prefix_k_scale_.assign(nl, 1.0f);
+    prefix_v_scale_.assign(nl, 1.0f);
+    if (prefix_row_len_ > 0) {
+        prefix_k_row_.assign(nl, std::vector<float>());
+        prefix_v_row_.assign(nl, std::vector<float>());
+    }
     bool any = false;
-    for (const auto& b : list) {
+    for (const auto& b : prefix_kv_scales_) {
         const int lo = b.layer_lo < 0 ? 0 : b.layer_lo;
-        const int hi = b.layer_hi > num_layers ? num_layers : b.layer_hi;
+        const int hi = b.layer_hi > n ? n : b.layer_hi;
+        std::vector<float> rows;
+        if (b.row_scale.size() > 0) {
+            bt::Tensor r32 = b.row_scale;
+            if (b.row_scale.dtype != bt::Dtype::FP32) {
+                bt::cast(b.row_scale, r32, bt::Dtype::FP32);
+            }
+            bt::sync_all();
+            rows = r32.to(bt::Device::CPU).to_host_vector();
+        }
         for (int i = lo; i < hi; ++i) {
-            k_out[static_cast<std::size_t>(i)] *= b.k_scale;
-            v_out[static_cast<std::size_t>(i)] *= b.v_scale;
+            const auto ix = static_cast<std::size_t>(i);
             if (b.k_scale != 1.0f || b.v_scale != 1.0f) any = true;
+            if (rows.empty()) {
+                prefix_k_scale_[ix] *= b.k_scale;
+                prefix_v_scale_[ix] *= b.v_scale;
+                continue;
+            }
+            // row_scale is a per-row WEIGHT on this binding's scales, not a
+            // second multiplier: row r is scaled by
+            //     1 + row_scale[r] * (k_scale - 1)
+            // so an all-ones vector reproduces the broadcast exactly (which
+            // is what "row_scale empty = all rows" has to mean), a 0 leaves
+            // that row untouched, and anything between fades it in.
+            any = true;
+            auto& kr = prefix_k_row_[ix];
+            auto& vr = prefix_v_row_[ix];
+            if (kr.empty()) {
+                kr.assign(static_cast<std::size_t>(prefix_row_len_), 1.0f);
+                vr.assign(static_cast<std::size_t>(prefix_row_len_), 1.0f);
+            }
+            for (std::size_t r = 0; r < rows.size(); ++r) {
+                kr[r] *= 1.0f + rows[r] * (b.k_scale - 1.0f);
+                vr[r] *= 1.0f + rows[r] * (b.v_scale - 1.0f);
+            }
         }
     }
     if (!any) {   // an all-identity list costs the forward nothing
-        k_out.clear();
-        v_out.clear();
+        prefix_k_scale_.clear();
+        prefix_v_scale_.clear();
+        prefix_k_row_.clear();
+        prefix_v_row_.clear();
+        prefix_row_len_ = 0;
+        return;
+    }
+    // Fold the scalars into the row vectors where there is one, so the
+    // forward applies exactly one operand per layer.
+    for (std::size_t i = 0; i < prefix_k_row_.size(); ++i) {
+        if (prefix_k_row_[i].empty()) continue;
+        for (float& f : prefix_k_row_[i]) f *= prefix_k_scale_[i];
+        for (float& f : prefix_v_row_[i]) f *= prefix_v_scale_[i];
     }
 }
 
-}  // namespace
+void QwenImage21Transformer2DModel::expand_prefix_rows_(
+    const std::vector<float>& rows, int n_rows, int cols, bt::Tensor& dst) {
+    const auto dev = bt::default_device();
+    const bt::Dtype dt = compute_dtype();
+    if (gate_ones_row_.rows != 1 || gate_ones_row_.cols != cols ||
+        gate_ones_row_.dtype != dt) {
+        gate_ones_row_ = bt::Tensor::zeros_on(dev, 1, cols, dt);
+        bt::add_scalar_inplace(gate_ones_row_, 1.0f);
+    }
+    bt::Tensor col = bt::Tensor::from_host(rows.data(), n_rows, 1).to(dev);
+    if (col.dtype != dt) {
+        bt::Tensor t;
+        bt::cast(col, t, dt);
+        col = std::move(t);
+    }
+    bt::matmul(col, gate_ones_row_, dst);
+}
 
-int QwenImage21Transformer2DModel::add_prefix_kv_scale(int layer_lo,
-                                                       int layer_hi,
-                                                       float k_scale,
-                                                       float v_scale) {
+int QwenImage21Transformer2DModel::add_prefix_kv_scale(
+    int layer_lo, int layer_hi, float k_scale, float v_scale,
+    const bt::Tensor& row_scale) {
     QwenImage21PrefixKvBinding b;
     b.layer_lo = layer_lo;
     b.layer_hi = layer_hi;
     b.k_scale = k_scale;
     b.v_scale = v_scale;
-    prefix_kv_scales_.push_back(b);
-    compose_prefix_scales(prefix_kv_scales_, cfg_.num_layers, prefix_k_scale_,
-                          prefix_v_scale_);
+    b.row_scale = row_scale;
+    prefix_kv_scales_.push_back(std::move(b));
+    compose_prefix_scales_();
     return static_cast<int>(prefix_kv_scales_.size()) - 1;
 }
 
-void QwenImage21Transformer2DModel::set_prefix_kv_scale(int layer_lo,
-                                                        int layer_hi,
-                                                        float k_scale,
-                                                        float v_scale) {
+void QwenImage21Transformer2DModel::set_prefix_kv_scale(
+    int layer_lo, int layer_hi, float k_scale, float v_scale,
+    const bt::Tensor& row_scale) {
     prefix_kv_scales_.clear();
-    if (!empty_range(layer_lo, layer_hi) &&
-        (k_scale != 1.0f || v_scale != 1.0f)) {
+    const bool identity =
+        k_scale == 1.0f && v_scale == 1.0f && row_scale.size() == 0;
+    if (!empty_range(layer_lo, layer_hi) && !identity) {
         QwenImage21PrefixKvBinding b;
         b.layer_lo = layer_lo;
         b.layer_hi = layer_hi;
         b.k_scale = k_scale;
         b.v_scale = v_scale;
-        prefix_kv_scales_.push_back(b);
+        b.row_scale = row_scale;
+        prefix_kv_scales_.push_back(std::move(b));
     }
-    compose_prefix_scales(prefix_kv_scales_, cfg_.num_layers, prefix_k_scale_,
-                          prefix_v_scale_);
+    compose_prefix_scales_();
 }
 
 void QwenImage21Transformer2DModel::set_prefix_kv_scales(
@@ -410,14 +515,16 @@ void QwenImage21Transformer2DModel::set_prefix_kv_scales(
         if (empty_range(b.layer_lo, b.layer_hi)) continue;
         prefix_kv_scales_.push_back(b);
     }
-    compose_prefix_scales(prefix_kv_scales_, cfg_.num_layers, prefix_k_scale_,
-                          prefix_v_scale_);
+    compose_prefix_scales_();
 }
 
 void QwenImage21Transformer2DModel::clear_prefix_kv_scales() {
     prefix_kv_scales_.clear();
     prefix_k_scale_.clear();
     prefix_v_scale_.clear();
+    prefix_k_row_.clear();
+    prefix_v_row_.clear();
+    prefix_row_len_ = 0;
 }
 
 // ─── capture ───────────────────────────────────────────────────────────────
@@ -503,19 +610,18 @@ void QwenImage21Transformer2DModel::resolve_coverage_() {
 
 void QwenImage21Transformer2DModel::fold_gate_hooks_(const BlockCoverage& cov,
                                                      Modulation& m) {
-    // The composed scale factors. attn/mlp pick the sublayer, txt/img the row
-    // class, and the two are orthogonal — so each of the four gate rows gets
-    // the product of one sublayer factor and one row-class factor.
-    float sa = 1.0f, sm = 1.0f, st = 1.0f, si = 1.0f;
+    // The composed scale factors: one per (sublayer, row set), each the
+    // product of the covering bindings' factor for that pair. Independent by
+    // construction — moving the image side cannot disturb the prefix side,
+    // which is what keeps an image-row sweep off the re-extract path.
+    float f1_0 = 1.0f, f1_t = 1.0f, f2_0 = 1.0f, f2_t = 1.0f;
     for (int j : cov.gate_scales) {
         const auto& b = gate_scales_[static_cast<std::size_t>(j)];
-        sa *= b.attn_scale;
-        sm *= b.mlp_scale;
-        st *= b.txt_scale;
-        si *= b.img_scale;
+        f1_0 *= b.attn_txt;
+        f1_t *= b.attn_img;
+        f2_0 *= b.mlp_txt;
+        f2_t *= b.mlp_img;
     }
-    const float f1_t = sa * si, f2_t = sm * si;
-    const float f1_0 = sa * st, f2_0 = sm * st;
     if (f1_t != 1.0f) bt::scale_inplace(m.gate1_t, f1_t);
     if (f2_t != 1.0f) bt::scale_inplace(m.gate2_t, f2_t);
     if (f1_0 != 1.0f) bt::scale_inplace(m.gate1_0, f1_0);

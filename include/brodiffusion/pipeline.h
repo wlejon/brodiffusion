@@ -738,14 +738,27 @@ public:
     // pairs exclusively with the FlowMatch scheduler.
     float qi21_step_timestep(const PipelineState& state) const;
 
-    // Post-tanh gate dials over blocks [block_lo, block_hi): attn/mlp pick
-    // the sublayer, txt/img pick the row class. All four at 1 clears.
+    // Post-tanh gate dials over blocks [block_lo, block_hi). The rank-1
+    // sugar: attn/mlp pick the sublayer, txt/img the row class, and the
+    // binding holds their four products. All four at 1 clears.
     void qi21_set_gate_scale(float attn_scale, float mlp_scale,
                              float txt_scale, float img_scale, int block_lo,
                              int block_hi);
     int  qi21_add_gate_scale(float attn_scale, float mlp_scale,
                              float txt_scale, float img_scale, int block_lo,
                              int block_hi);
+
+    // The four multipliers, one per (sublayer x row set), set independently.
+    // The rank-1 form cannot say "attention gate on the IMAGE rows only":
+    // raising attn_scale raises the prefix product too, which re-extracts
+    // the cache (+13%/step). attn_img alone leaves the prefix at 1, so the
+    // cache and every armed prefix edit stay live.
+    void qi21_set_gate_scale_rows(float attn_txt, float attn_img,
+                                  float mlp_txt, float mlp_img, int block_lo,
+                                  int block_hi);
+    int  qi21_add_gate_scale_rows(float attn_txt, float attn_img,
+                                  float mlp_txt, float mlp_img, int block_lo,
+                                  int block_hi);
     void qi21_clear_gate_scales();
     int  qi21_gate_scale_count() const;
 
@@ -768,11 +781,20 @@ public:
     int  qi21_gate_delta_count() const;
 
     // Per-token gate mask over blocks [block_lo, block_hi); `mask` holds
-    // prefix_len + img_len values in joint forward order. Empty clears.
+    // prefix_len + img_len values in joint forward order. Empty clears. A
+    // mask whose length is not the joint length THROWS on the next forward.
+    //
+    // `which` picks the sublayer the mask scales. Masking both is the blunt
+    // form: the MLP half drags a late-step edit's retention from 100%+ down
+    // to ~30%, so "restyle this region at step 6" wants Attn.
     void qi21_set_gate_mask(const brotensor::Tensor& mask, int block_lo,
-                            int block_hi);
+                            int block_hi,
+                            dit::QwenImage21GateSublayer which =
+                                dit::QwenImage21GateSublayer::Both);
     int  qi21_add_gate_mask(const brotensor::Tensor& mask, int block_lo,
-                            int block_hi);
+                            int block_hi,
+                            dit::QwenImage21GateSublayer which =
+                                dit::QwenImage21GateSublayer::Both);
     void qi21_clear_gate_masks();
     int  qi21_gate_mask_count() const;
 
@@ -810,10 +832,20 @@ public:
     // cache reset. (It used to multiply the live cache in place, which
     // compounded across steps and made it unusable from generate() at all.)
     // 1/1 over the full layer range clears; it needs no step to have run.
+    //
+    // `row_scale`, when non-empty, holds one WEIGHT per PREFIX ROW saying
+    // how much of k_scale/v_scale that row gets:
+    //     k_row[r] = 1 + row_scale[r] * (k_scale - 1)
+    // All ones is the broadcast, all zeros the identity. That is per-token
+    // prompt weighting over the cache, with no re-encode. Its length must
+    // equal the cached prefix length or the next forward throws. Empty =
+    // every row, i.e. the broadcast.
     void qi21_scale_prefix_kv(int layer_lo, int layer_hi, float k_scale,
-                              float v_scale);
+                              float v_scale,
+                              const brotensor::Tensor& row_scale = {});
     int  qi21_add_prefix_kv_scale(int layer_lo, int layer_hi, float k_scale,
-                                  float v_scale);
+                                  float v_scale,
+                                  const brotensor::Tensor& row_scale = {});
     void qi21_clear_prefix_kv_scales();
     int  qi21_prefix_kv_scale_count() const;
 

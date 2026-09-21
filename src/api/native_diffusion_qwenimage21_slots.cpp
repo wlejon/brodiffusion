@@ -135,6 +135,54 @@ Value qi21AddGateScale(Value thisVal, std::span<const Value> args) {
     }
 }
 
+// qwenImage21SetGateScaleRows(attnTxt, attnImg, mlpTxt, mlpImg, blockLo,
+//                             blockHi)
+// qwenImage21AddGateScaleRows(...) -> slot index.
+//
+// The four multipliers set INDEPENDENTLY instead of as the rank-1
+// attn/mlp x txt/img product. The product cannot express "the attention gate
+// on the image rows only": raising attnScale raises the prefix's product
+// too, which re-extracts the cache (+13%/step). attnImg alone leaves the
+// prefix at 1, so the cache — and every armed qwenImage21ScalePrefixKv
+// edit — stays live.
+Value qi21GateScaleRows(Value thisVal, std::span<const Value> args,
+                        bool add, const char* who) {
+    auto* w = qi21Pipeline(thisVal);
+    if (!w) return notQi21(who);
+    if (args.size() < 6) {
+        return ev::throwTypeError(
+            std::string("Pipeline.") + who +
+            "(attnTxt, attnImg, mlpTxt, mlpImg, blockLo, blockHi): six "
+            "arguments required");
+    }
+    const float at = static_cast<float>(ev::toDouble(args[0]));
+    const float ai = static_cast<float>(ev::toDouble(args[1]));
+    const float mt = static_cast<float>(ev::toDouble(args[2]));
+    const float mi = static_cast<float>(ev::toDouble(args[3]));
+    const int lo = i32At(args, 4), hi = i32At(args, 5);
+    try {
+        if (!add) {
+            w->pipeline->qi21_set_gate_scale_rows(at, ai, mt, mi, lo, hi);
+            return ev::undefined();
+        }
+        return ev::fromDouble(static_cast<double>(
+            w->pipeline->qi21_add_gate_scale_rows(at, ai, mt, mi, lo, hi)));
+    } catch (const std::exception& e) {
+        return ev::throwError(std::string("Pipeline.") + who + " failed: " +
+                              e.what());
+    }
+}
+
+Value qi21SetGateScaleRows(Value thisVal, std::span<const Value> args) {
+    return qi21GateScaleRows(thisVal, args, /*add=*/false,
+                             "qwenImage21SetGateScaleRows");
+}
+
+Value qi21AddGateScaleRows(Value thisVal, std::span<const Value> args) {
+    return qi21GateScaleRows(thisVal, args, /*add=*/true,
+                             "qwenImage21AddGateScaleRows");
+}
+
 Value qi21ClearGateScales(Value thisVal, std::span<const Value>) {
     auto* w = qi21Pipeline(thisVal);
     if (!w) return notQi21("qwenImage21ClearGateScales");
@@ -226,28 +274,37 @@ Value qi21GateDeltaCount(Value thisVal, std::span<const Value>) {
 
 // ── gate mask ──────────────────────────────────────────────────────────────
 
-// qwenImage21AddGateMask(mask, blockLo, blockHi) -> slot index.
-// Masks covering the same block MULTIPLY elementwise, so two masks are an
-// intersection of what they keep.
+// qwenImage21AddGateMask(mask, blockLo, blockHi,
+//                        which?: 'both' | 'attn' | 'mlp') -> slot index.
+// Masks covering the same block AND the same sublayer MULTIPLY elementwise,
+// so two masks are an intersection of what they keep. An 'attn' mask and an
+// 'mlp' mask over the same blocks are independent: that is how you keep a
+// region's attention wide open while damping its MLP.
 Value qi21AddGateMask(Value thisVal, std::span<const Value> args) {
     auto* w = qi21Pipeline(thisVal);
     if (!w) return notQi21("qwenImage21AddGateMask");
     brotensor::Tensor mask;
     if (args.empty() || !ev::isObject(args[0]) || !tensorFromJs(args[0], mask)) {
         return ev::throwTypeError(
-            "Pipeline.qwenImage21AddGateMask(mask, blockLo, blockHi): mask "
-            "must be {rows,cols,data} — use qwenImage21ClearGateMasks() to "
-            "clear");
+            "Pipeline.qwenImage21AddGateMask(mask, blockLo, blockHi, which?): "
+            "mask must be {rows,cols,data} — use qwenImage21ClearGateMasks() "
+            "to clear");
     }
     if (args.size() < 3 || !ev::isNumber(args[1]) || !ev::isNumber(args[2])) {
         return ev::throwTypeError(
-            "Pipeline.qwenImage21AddGateMask(mask, blockLo, blockHi): integer "
-            "range required");
+            "Pipeline.qwenImage21AddGateMask(mask, blockLo, blockHi, which?): "
+            "integer range required");
+    }
+    brodiffusion::dit::QwenImage21GateSublayer which{};
+    if (!readGateSublayer(args.size() > 3 ? args[3] : ev::undefined(), which)) {
+        return ev::throwTypeError(
+            "Pipeline.qwenImage21AddGateMask: which must be 'both', 'attn' "
+            "or 'mlp'");
     }
     try {
         return ev::fromDouble(static_cast<double>(
             w->pipeline->qi21_add_gate_mask(mask, i32At(args, 1),
-                                            i32At(args, 2))));
+                                            i32At(args, 2), which)));
     } catch (const std::exception& e) {
         return ev::throwError(
             std::string("Pipeline.qwenImage21AddGateMask failed: ") + e.what());
@@ -282,54 +339,65 @@ Value qi21GateMaskCount(Value thisVal, std::span<const Value>) {
 
 // ── the prefix KV dial ─────────────────────────────────────────────────────
 
-// qwenImage21ScalePrefixKv(layerLo, layerHi, kScale, vScale) — replace the
+// qwenImage21ScalePrefixKv(layerLo, layerHi, kScale, vScale,
+//                          rowMask?: {rows,cols,data} | null) — replace the
 // scale list with this one binding. Idempotent set-semantics: the factor is
 // applied where the cached prefix is READ, so calling this twice with the
 // same value is the same as calling it once, it works through generate(),
 // and it survives a cache reset. 1/1 over the full range clears.
-Value qi21ScalePrefixKv(Value thisVal, std::span<const Value> args) {
+//
+// rowMask, when given, holds ONE WEIGHT per prefix row saying how much of
+// kScale/vScale that row gets — k_row[r] = 1 + rowMask[r] * (kScale - 1) —
+// so all ones is the broadcast and all zeros the identity. That is per-token
+// prompt weighting over the cache, with no re-encode: 1 on one phrase's rows
+// and 0 on the rest attenuates only that phrase. Its length must equal
+// qwenImage21TextRows()'s row count plus any condition-image rows, or the
+// next step throws. null/omitted = every row.
+Value qi21PrefixKvScale(Value thisVal, std::span<const Value> args, bool add,
+                        const char* who) {
     auto* w = qi21Pipeline(thisVal);
-    if (!w) return notQi21("qwenImage21ScalePrefixKv");
+    if (!w) return notQi21(who);
     if (args.size() < 4 || !ev::isNumber(args[0]) || !ev::isNumber(args[1]) ||
         !ev::isNumber(args[2]) || !ev::isNumber(args[3])) {
         return ev::throwTypeError(
-            "Pipeline.qwenImage21ScalePrefixKv(layerLo, layerHi, kScale, "
-            "vScale): numeric args required");
+            std::string("Pipeline.") + who +
+            "(layerLo, layerHi, kScale, vScale, rowMask?): numeric args "
+            "required");
     }
+    brotensor::Tensor rows;
+    if (args.size() > 4 && ev::isObject(args[4])) {
+        if (!tensorFromJs(args[4], rows)) {
+            return ev::throwTypeError(
+                std::string("Pipeline.") + who +
+                ": rowMask must be {rows,cols,data} or null");
+        }
+    }
+    const int lo = i32At(args, 0), hi = i32At(args, 1);
+    const float ks = static_cast<float>(ev::toDouble(args[2]));
+    const float vs = static_cast<float>(ev::toDouble(args[3]));
     try {
-        w->pipeline->qi21_scale_prefix_kv(
-            i32At(args, 0), i32At(args, 1),
-            static_cast<float>(ev::toDouble(args[2])),
-            static_cast<float>(ev::toDouble(args[3])));
-        return ev::undefined();
+        if (!add) {
+            w->pipeline->qi21_scale_prefix_kv(lo, hi, ks, vs, rows);
+            return ev::undefined();
+        }
+        return ev::fromDouble(static_cast<double>(
+            w->pipeline->qi21_add_prefix_kv_scale(lo, hi, ks, vs, rows)));
     } catch (const std::exception& e) {
-        return ev::throwError(
-            std::string("Pipeline.qwenImage21ScalePrefixKv failed: ") + e.what());
+        return ev::throwError(std::string("Pipeline.") + who + " failed: " +
+                              e.what());
     }
 }
 
-// qwenImage21AddPrefixKvScale(layerLo, layerHi, kScale, vScale) -> slot index.
-// Bindings covering the same layer MULTIPLY.
+Value qi21ScalePrefixKv(Value thisVal, std::span<const Value> args) {
+    return qi21PrefixKvScale(thisVal, args, /*add=*/false,
+                             "qwenImage21ScalePrefixKv");
+}
+
+// qwenImage21AddPrefixKvScale(layerLo, layerHi, kScale, vScale, rowMask?)
+// -> slot index. Bindings covering the same layer MULTIPLY.
 Value qi21AddPrefixKvScale(Value thisVal, std::span<const Value> args) {
-    auto* w = qi21Pipeline(thisVal);
-    if (!w) return notQi21("qwenImage21AddPrefixKvScale");
-    if (args.size() < 4 || !ev::isNumber(args[0]) || !ev::isNumber(args[1]) ||
-        !ev::isNumber(args[2]) || !ev::isNumber(args[3])) {
-        return ev::throwTypeError(
-            "Pipeline.qwenImage21AddPrefixKvScale(layerLo, layerHi, kScale, "
-            "vScale): numeric args required");
-    }
-    try {
-        return ev::fromDouble(static_cast<double>(
-            w->pipeline->qi21_add_prefix_kv_scale(
-                i32At(args, 0), i32At(args, 1),
-                static_cast<float>(ev::toDouble(args[2])),
-                static_cast<float>(ev::toDouble(args[3])))));
-    } catch (const std::exception& e) {
-        return ev::throwError(
-            std::string("Pipeline.qwenImage21AddPrefixKvScale failed: ") +
-            e.what());
-    }
+    return qi21PrefixKvScale(thisVal, args, /*add=*/true,
+                             "qwenImage21AddPrefixKvScale");
 }
 
 Value qi21ClearPrefixKvScales(Value thisVal, std::span<const Value>) {
@@ -523,6 +591,8 @@ void decoratePipelineQwenImage21SlotsProto(ObjectBuilder& proto) {
     proto.def("qwenImage21ModDeltaCount", 0, qi21ModDeltaCount);
 
     proto.def("qwenImage21AddGateScale", 6, qi21AddGateScale);
+    proto.def("qwenImage21SetGateScaleRows", 6, qi21SetGateScaleRows);
+    proto.def("qwenImage21AddGateScaleRows", 6, qi21AddGateScaleRows);
     proto.def("qwenImage21ClearGateScales", 0, qi21ClearGateScales);
     proto.def("qwenImage21GateScaleCount", 0, qi21GateScaleCount);
 
@@ -530,12 +600,12 @@ void decoratePipelineQwenImage21SlotsProto(ObjectBuilder& proto) {
     proto.def("qwenImage21ClearGateDeltas", 0, qi21ClearGateDeltas);
     proto.def("qwenImage21GateDeltaCount", 0, qi21GateDeltaCount);
 
-    proto.def("qwenImage21AddGateMask", 3, qi21AddGateMask);
+    proto.def("qwenImage21AddGateMask", 4, qi21AddGateMask);
     proto.def("qwenImage21ClearGateMasks", 0, qi21ClearGateMasks);
     proto.def("qwenImage21GateMaskCount", 0, qi21GateMaskCount);
 
-    proto.def("qwenImage21ScalePrefixKv", 4, qi21ScalePrefixKv);
-    proto.def("qwenImage21AddPrefixKvScale", 4, qi21AddPrefixKvScale);
+    proto.def("qwenImage21ScalePrefixKv", 5, qi21ScalePrefixKv);
+    proto.def("qwenImage21AddPrefixKvScale", 5, qi21AddPrefixKvScale);
     proto.def("qwenImage21ClearPrefixKvScales", 0, qi21ClearPrefixKvScales);
     proto.def("qwenImage21PrefixKvScaleCount", 0, qi21PrefixKvScaleCount);
 

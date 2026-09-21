@@ -87,6 +87,18 @@ inline bd::dit::QwenImage21ModTarget mod_target(int target, const char* who) {
                              "QI_MOD_TARGET/PREFIX/BOTH");
 }
 
+// QI_GATE_* -> the enum, or a throw naming the caller.
+inline bd::dit::QwenImage21GateSublayer gate_sublayer(int which,
+                                                      const char* who) {
+    using GS = bd::dit::QwenImage21GateSublayer;
+    if (which == QI_GATE_BOTH) return GS::Both;
+    if (which == QI_GATE_ATTN) return GS::Attn;
+    if (which == QI_GATE_MLP)  return GS::Mlp;
+    throw std::runtime_error(std::string(who) +
+                             ": which must be one of "
+                             "QI_GATE_BOTH/ATTN/MLP");
+}
+
 }  // namespace qi_capi
 
 struct qi_ctx {

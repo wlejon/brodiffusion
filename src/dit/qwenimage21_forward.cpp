@@ -443,42 +443,64 @@ void QwenImage21Transformer2DModel::forward_joint(
     // The product is composed on host (L floats) and uploaded once: cheaper
     // than a chain of device multiplies, and it gives gate capture the same
     // composed values without a readback.
-    mask_full_.resize(coverages_.size());
-    mask_host_.assign(coverages_.size(), std::vector<float>());
-    bool any_mask = false;
+    //
+    // A mask whose length is not the joint length is an ERROR, not a skip.
+    // The old silent skip meant an all-zero mask written at img_len instead
+    // of prefix_len + img_len rendered the baseline to the pixel, and a study
+    // reported "this surface does nothing".
+    for (const auto& b : gate_masks_) {
+        if (b.mask.size() == static_cast<std::size_t>(L)) continue;
+        fail("set_gate_mask: the mask holds " +
+             std::to_string(b.mask.size()) + " values but this forward's "
+             "joint sequence is " + std::to_string(L) + " rows (" +
+             std::to_string(prefix_len) + " prefix + " +
+             std::to_string(img_len) + " image). A mask addresses the WHOLE "
+             "joint sequence, text rows first.");
+    }
+    mask_full_attn_.resize(coverages_.size());
+    mask_full_mlp_.resize(coverages_.size());
+    mask_host_attn_.assign(coverages_.size(), std::vector<float>());
+    mask_host_mlp_.assign(coverages_.size(), std::vector<float>());
+    bool ones_built = false;
     for (std::size_t c = 0; c < coverages_.size(); ++c) {
-        std::vector<float>* host = nullptr;
-        for (int j : coverages_[c].gate_masks) {
-            const auto ix = static_cast<std::size_t>(j);
-            if (gate_masks_[ix].mask.size() != static_cast<std::size_t>(L)) {
-                continue;   // a mask built for another joint length
-            }
-            if (host == nullptr) {
-                host = &mask_host_[c];
-                host->assign(static_cast<std::size_t>(L), 1.0f);
-            }
-            const std::vector<float>& src = gate_mask_host_[ix];
+        // Compose one product per sublayer: a Both mask lands in both, an
+        // Attn / Mlp mask in one. Composed on host (L floats), so the
+        // capture sink gets the same values without a readback.
+        auto fold = [&](std::vector<float>& host, const std::vector<float>& src) {
+            if (host.empty()) host.assign(static_cast<std::size_t>(L), 1.0f);
             for (int r = 0; r < L; ++r) {
-                (*host)[static_cast<std::size_t>(r)] *=
+                host[static_cast<std::size_t>(r)] *=
                     src[static_cast<std::size_t>(r)];
             }
+        };
+        for (int j : coverages_[c].gate_masks) {
+            const auto ix = static_cast<std::size_t>(j);
+            const std::vector<float>& src = gate_mask_host_[ix];
+            const QwenImage21GateSublayer w = gate_masks_[ix].which;
+            if (w != QwenImage21GateSublayer::Mlp)  fold(mask_host_attn_[c], src);
+            if (w != QwenImage21GateSublayer::Attn) fold(mask_host_mlp_[c], src);
         }
-        if (host == nullptr) continue;
-        if (!any_mask) {
-            if (gate_ones_row_.rows != 1 || gate_ones_row_.cols != H ||
-                gate_ones_row_.dtype != dt) {
-                gate_ones_row_ = bt::Tensor::zeros_on(dev, 1, H, dt);
-                bt::add_scalar_inplace(gate_ones_row_, 1.0f);
+        auto expand = [&](const std::vector<float>& host, bt::Tensor& dst) {
+            if (host.empty()) return;
+            if (!ones_built) {
+                if (gate_ones_row_.rows != 1 || gate_ones_row_.cols != H ||
+                    gate_ones_row_.dtype != dt) {
+                    gate_ones_row_ = bt::Tensor::zeros_on(dev, 1, H, dt);
+                    bt::add_scalar_inplace(gate_ones_row_, 1.0f);
+                }
+                ones_built = true;
             }
-            any_mask = true;
-        }
-        bt::Tensor col = bt::Tensor::from_host(host->data(), L, 1).to(dev);
-        if (col.dtype != dt) {
-            bt::Tensor t;
-            bt::cast(col, t, dt);
-            col = std::move(t);
-        }
-        bt::matmul(row_view(col, rope_off, Lq), gate_ones_row_, mask_full_[c]);
+            bt::Tensor col =
+                bt::Tensor::from_host(host.data(), L, 1).to(dev);
+            if (col.dtype != dt) {
+                bt::Tensor t;
+                bt::cast(col, t, dt);
+                col = std::move(t);
+            }
+            bt::matmul(row_view(col, rope_off, Lq), gate_ones_row_, dst);
+        };
+        expand(mask_host_attn_[c], mask_full_attn_[c]);
+        expand(mask_host_mlp_[c], mask_full_mlp_[c]);
     }
     // Research hook (capture_gates): rows = blocks, cols = the FULL joint
     // sequence, so the layout is stable whether the step extracted or decoded.
@@ -503,17 +525,21 @@ void QwenImage21Transformer2DModel::forward_joint(
         const bt::Tensor& g1_t = M.gate1_t;
         const bt::Tensor& g2_0 = M.gate2_0;
         const bt::Tensor& g2_t = M.gate2_t;
-        const std::vector<float>& mhost = mask_host_[vi];
-        const bool gmask = !mhost.empty();
+        // One composed mask per sublayer: a mask can name attn, mlp or both.
+        const std::vector<float>& mhost_a = mask_host_attn_[vi];
+        const bool gmask_a = !mhost_a.empty();
+        const bool gmask_m = !mask_host_mlp_[vi].empty();
 
         if (gate_sink_ != nullptr) {
+            // The capture reports the ATTENTION gate, so it reads the attn
+            // mask — an mlp-only mask correctly leaves it untouched.
             float* dst = gate_sink_->data() +
                          static_cast<std::size_t>(i) * static_cast<std::size_t>(L);
             for (int r = 0; r < prefix_len; ++r) dst[r] = M.mean_g1_0;
             for (int r = prefix_len; r < L; ++r) dst[r] = M.mean_g1_t;
-            if (gmask) {
+            if (gmask_a) {
                 for (int r = 0; r < L; ++r) {
-                    dst[r] *= mhost[static_cast<std::size_t>(r)];
+                    dst[r] *= mhost_a[static_cast<std::size_t>(r)];
                 }
             }
         }
@@ -557,15 +583,36 @@ void QwenImage21Transformer2DModel::forward_joint(
             // re-extract.
             if (!prefix_k_scale_.empty()) {
                 const auto li = static_cast<std::size_t>(i);
-                const float ks = prefix_k_scale_[li];
-                const float vs = prefix_v_scale_[li];
-                if (ks != 1.0f) {
+                const bool per_row =
+                    !prefix_k_row_.empty() && !prefix_k_row_[li].empty();
+                if (per_row) {
+                    // Per-token prompt weighting: the scalars are already
+                    // folded into the row vector, so this is one operand.
+                    if (prefix_row_len_ != prefix_len) {
+                        fail("set_prefix_kv_scale: the row scale holds " +
+                             std::to_string(prefix_row_len_) +
+                             " values but the cached prefix is " +
+                             std::to_string(prefix_len) + " rows");
+                    }
                     bt::Tensor kp = row_view(k_full_, 0, prefix_len);
-                    bt::scale_inplace(kp, ks);
-                }
-                if (vs != 1.0f) {
                     bt::Tensor vp = row_view(v_full_, 0, prefix_len);
-                    bt::scale_inplace(vp, vs);
+                    expand_prefix_rows_(prefix_k_row_[li], prefix_len, H,
+                                        prefix_row_full_k_);
+                    expand_prefix_rows_(prefix_v_row_[li], prefix_len, H,
+                                        prefix_row_full_v_);
+                    bt::mul_inplace(kp, prefix_row_full_k_);
+                    bt::mul_inplace(vp, prefix_row_full_v_);
+                } else {
+                    const float ks = prefix_k_scale_[li];
+                    const float vs = prefix_v_scale_[li];
+                    if (ks != 1.0f) {
+                        bt::Tensor kp = row_view(k_full_, 0, prefix_len);
+                        bt::scale_inplace(kp, ks);
+                    }
+                    if (vs != 1.0f) {
+                        bt::Tensor vp = row_view(v_full_, 0, prefix_len);
+                        bt::scale_inplace(vp, vs);
+                    }
                 }
             }
             bt::copy_d2d(kr, 0, k_full_, prefix_len * H, img_len * H);
@@ -602,7 +649,7 @@ void QwenImage21Transformer2DModel::forward_joint(
 
         lin_into_(b.to_out, attn_cat, ao);
         gated_residual_rows(x, g1_0, g1_t, ao,
-                            gmask ? &mask_full_[vi] : nullptr,
+                            gmask_a ? &mask_full_attn_[vi] : nullptr,
                             jit_.attn_gate_pre, jit_.attn_gate_post);
 
         // ── SwiGLU feed-forward ──────────────────────────────────────────
@@ -620,7 +667,7 @@ void QwenImage21Transformer2DModel::forward_joint(
         }
         lin_into_(b.mlp_out, mlp_g, mo);
         gated_residual_rows(x, g2_0, g2_t, mo,
-                            gmask ? &mask_full_[vi] : nullptr,
+                            gmask_m ? &mask_full_mlp_[vi] : nullptr,
                             jit_.mlp_gate_pre, jit_.mlp_gate_post);
     }
 

@@ -129,14 +129,17 @@ void Pipeline::qi21_sync_prefix_state_() {
     }
     const bool mask_armed = !model.gate_masks().empty();
     // A scalar signature of what the PREFIX rows' gates are multiplied by.
+    // The four multipliers are independent, so only the two *_txt ones touch
+    // the prefix: an attn.img or mlp.img sweep — the common per-step dial —
+    // leaves this at 1 and never re-extracts, which is exactly what the
+    // rank-1 attn x txt/img product could not express.
     // Per-block resolution does not matter here: any change to the product
     // means some block's prefix gate moved, and a re-extract is the answer
-    // either way. A pure img_scale sweep — the common per-step dial — leaves
-    // it at 1 and costs nothing.
+    // either way.
     float pa = 1.0f, pm = 1.0f;
     for (const auto& b : model.gate_scales()) {
-        pa *= b.attn_scale * b.txt_scale;
-        pm *= b.mlp_scale * b.txt_scale;
+        pa *= b.attn_txt;
+        pm *= b.mlp_txt;
     }
 
     const bool changed = mod_prefix || qi21_mod_delta_hits_prefix_ ||
@@ -218,6 +221,26 @@ int Pipeline::qi21_add_gate_scale(float attn_scale, float mlp_scale,
     return slot;
 }
 
+void Pipeline::qi21_set_gate_scale_rows(float attn_txt, float attn_img,
+                                        float mlp_txt, float mlp_img,
+                                        int block_lo, int block_hi) {
+    qi21_model(model_class_, denoiser_, "qi21_set_gate_scale_rows")
+        .set_gate_scale_rows(attn_txt, attn_img, mlp_txt, mlp_img, block_lo,
+                             block_hi);
+    qi21_sync_prefix_state_();
+}
+
+int Pipeline::qi21_add_gate_scale_rows(float attn_txt, float attn_img,
+                                       float mlp_txt, float mlp_img,
+                                       int block_lo, int block_hi) {
+    const int slot =
+        qi21_model(model_class_, denoiser_, "qi21_add_gate_scale_rows")
+            .add_gate_scale_rows(attn_txt, attn_img, mlp_txt, mlp_img,
+                                 block_lo, block_hi);
+    qi21_sync_prefix_state_();
+    return slot;
+}
+
 void Pipeline::qi21_clear_gate_scales() {
     qi21_model(model_class_, denoiser_, "qi21_clear_gate_scales")
         .clear_gate_scales();
@@ -260,16 +283,18 @@ int Pipeline::qi21_gate_delta_count() const {
 }
 
 void Pipeline::qi21_set_gate_mask(const bt::Tensor& mask, int block_lo,
-                                  int block_hi) {
+                                  int block_hi,
+                                  dit::QwenImage21GateSublayer which) {
     qi21_model(model_class_, denoiser_, "qi21_set_gate_mask")
-        .set_gate_mask(mask, block_lo, block_hi);
+        .set_gate_mask(mask, block_lo, block_hi, which);
     qi21_sync_prefix_state_();
 }
 
 int Pipeline::qi21_add_gate_mask(const bt::Tensor& mask, int block_lo,
-                                 int block_hi) {
+                                 int block_hi,
+                                 dit::QwenImage21GateSublayer which) {
     const int slot = qi21_model(model_class_, denoiser_, "qi21_add_gate_mask")
-                         .add_gate_mask(mask, block_lo, block_hi);
+                         .add_gate_mask(mask, block_lo, block_hi, which);
     qi21_sync_prefix_state_();
     return slot;
 }

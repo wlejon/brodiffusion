@@ -62,6 +62,28 @@ inline bool readModTarget(Value v,
     return false;
 }
 
+// "both" (default) / "attn" / "mlp", or the equivalent 0 / 1 / 2. Names the
+// sublayer a gate mask scales.
+inline bool readGateSublayer(Value v,
+                             brodiffusion::dit::QwenImage21GateSublayer& out) {
+    using GS = brodiffusion::dit::QwenImage21GateSublayer;
+    out = GS::Both;
+    if (ev::isUndefined(v) || ev::isNull(v)) return true;
+    if (ev::isNumber(v)) {
+        const int n = static_cast<int>(ev::toDouble(v));
+        if (n == 0) { out = GS::Both; return true; }
+        if (n == 1) { out = GS::Attn; return true; }
+        if (n == 2) { out = GS::Mlp;  return true; }
+        return false;
+    }
+    if (!ev::isString(v)) return false;
+    const std::string s = ev::toUtf8(v);
+    if (s == "both") { out = GS::Both; return true; }
+    if (s == "attn") { out = GS::Attn; return true; }
+    if (s == "mlp")  { out = GS::Mlp;  return true; }
+    return false;
+}
+
 // The multi-slot half of the surface, defined in the _slots translation unit.
 void decoratePipelineQwenImage21SlotsProto(ObjectBuilder& proto);
 

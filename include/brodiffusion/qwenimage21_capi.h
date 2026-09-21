@@ -85,6 +85,16 @@ enum {
     QI_MOD_BOTH   = 2
 };
 
+/* Which sublayer's gated residual a qi_set_gate_mask scales. Masking both is
+ * the blunt form: the MLP half drags a late-step edit's retention from 100%+
+ * of its step-0 effect down to ~30%, so "restyle this region at step 6"
+ * wants QI_GATE_ATTN. */
+enum {
+    QI_GATE_BOTH = 0,
+    QI_GATE_ATTN = 1,
+    QI_GATE_MLP  = 2
+};
+
 /* Message for the most recent failure on this thread ("" if none). */
 QI_API const char* qi_last_error(void);
 
@@ -222,6 +232,20 @@ QI_API int qi_set_gate_scale(qi_ctx* c, float attn_scale, float mlp_scale,
 QI_API int qi_add_gate_scale(qi_ctx* c, float attn_scale, float mlp_scale,
                              float txt_scale, float img_scale, int block_lo,
                              int block_hi);
+
+/* The same four dials, set INDEPENDENTLY instead of as the rank-1 product
+ * above: one multiplier per (sublayer x row set). The rank-1 form cannot say
+ * "the attention gate, on the image rows only" — raising attn_scale raises
+ * the prefix product too, which re-extracts the cache (+13%/step) and used
+ * to discard a live qi_scale_prefix_kv edit. attn_img alone leaves the
+ * prefix product at 1, so nothing re-extracts. Only attn_txt / mlp_txt need
+ * qi_reset_cache(); it is issued for you. */
+QI_API int qi_set_gate_scale_rows(qi_ctx* c, float attn_txt, float attn_img,
+                                  float mlp_txt, float mlp_img, int block_lo,
+                                  int block_hi);
+QI_API int qi_add_gate_scale_rows(qi_ctx* c, float attn_txt, float attn_img,
+                                  float mlp_txt, float mlp_img, int block_lo,
+                                  int block_hi);
 QI_API int qi_clear_gate_scales(qi_ctx* c);
 QI_API int qi_gate_scale_count(qi_ctx* c);
 
@@ -240,15 +264,17 @@ QI_API int qi_add_gate_delta(qi_ctx* c, const float* delta, int block_lo,
 QI_API int qi_clear_gate_deltas(qi_ctx* c);
 QI_API int qi_gate_delta_count(qi_ctx* c);
 
-/* Per-token gate mask: both sublayers' gated residual for row r of blocks
- * [block_lo, block_hi) is multiplied by mask[r], after the tanh and after any
- * qi_set_gate_scale. `n` must equal the forward's n_txt + h_lat*w_lat; a
- * forward with a different joint length skips the mask. NULL clears. Needs
- * qi_reset_cache() for its prefix half to land. */
+/* Per-token gate mask: the gated residual of the sublayer(s) named by `which`
+ * (QI_GATE_*) for row r of blocks [block_lo, block_hi) is multiplied by
+ * mask[r], after the tanh and after any qi_set_gate_scale. `n` must equal the
+ * forward's n_txt + h_lat*w_lat; a forward with a different joint length now
+ * FAILS with the expected length in qi_last_error() rather than silently
+ * doing nothing. NULL clears. Needs qi_reset_cache() for its prefix half to
+ * land; it is issued for you. */
 QI_API int qi_set_gate_mask(qi_ctx* c, const float* mask, int64_t n,
-                            int block_lo, int block_hi);
+                            int block_lo, int block_hi, int which);
 QI_API int qi_add_gate_mask(qi_ctx* c, const float* mask, int64_t n,
-                            int block_lo, int block_hi);
+                            int block_lo, int block_hi, int which);
 QI_API int qi_clear_gate_masks(qi_ctx* c);
 QI_API int qi_gate_mask_count(qi_ctx* c);
 
@@ -281,11 +307,22 @@ QI_API int     qi_get_gates(qi_ctx* c, float* out);
  * factor is applied where a cached forward READS the cache, so setting it
  * twice means the same thing as setting it once, it works through a whole
  * step loop, and it survives qi_reset_cache(). It needs nothing to have been
- * extracted first, and 1/1 over the full layer range clears it. */
+ * extracted first, and 1/1 over the full layer range clears it.
+ *
+ * row_scale, when non-NULL, holds `n_rows` WEIGHTS — one per PREFIX ROW —
+ * saying how much of k_scale/v_scale each row gets:
+ *     k_row[r] = 1 + row_scale[r] * (k_scale - 1)
+ * All ones is the broadcast, all zeros the identity. That is per-token
+ * prompt weighting over the cache with no re-encode: set 1 on one phrase's
+ * rows and 0 on the rest, and only that phrase is attenuated. n_rows must
+ * equal the cached prefix length or the next qi_forward fails.
+ * row_scale == NULL (n_rows ignored) is every row. */
 QI_API int qi_scale_prefix_kv(qi_ctx* c, int layer_lo, int layer_hi,
-                              float k_scale, float v_scale);
+                              float k_scale, float v_scale,
+                              const float* row_scale, int64_t n_rows);
 QI_API int qi_add_prefix_kv_scale(qi_ctx* c, int layer_lo, int layer_hi,
-                                  float k_scale, float v_scale);
+                                  float k_scale, float v_scale,
+                                  const float* row_scale, int64_t n_rows);
 QI_API int qi_clear_prefix_kv_scales(qi_ctx* c);
 QI_API int qi_prefix_kv_scale_count(qi_ctx* c);
 

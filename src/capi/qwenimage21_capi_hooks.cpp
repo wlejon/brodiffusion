@@ -28,6 +28,7 @@ namespace bt = ::brotensor;
 
 using qi_capi::download_fp32;
 using qi_capi::guarded;
+using qi_capi::gate_sublayer;
 using qi_capi::mod_target;
 
 extern "C" {
@@ -119,6 +120,28 @@ int qi_add_gate_scale(qi_ctx* c, float attn_scale, float mlp_scale,
     return rc == 0 ? slot : -1;
 }
 
+int qi_set_gate_scale_rows(qi_ctx* c, float attn_txt, float attn_img,
+                           float mlp_txt, float mlp_img, int block_lo,
+                           int block_hi) {
+    return guarded([&] {
+        c->need_dit("qi_set_gate_scale_rows")
+            .set_gate_scale_rows(attn_txt, attn_img, mlp_txt, mlp_img,
+                                 block_lo, block_hi);
+    });
+}
+
+int qi_add_gate_scale_rows(qi_ctx* c, float attn_txt, float attn_img,
+                           float mlp_txt, float mlp_img, int block_lo,
+                           int block_hi) {
+    int slot = -1;
+    const int rc = guarded([&] {
+        slot = c->need_dit("qi_add_gate_scale_rows")
+                   .add_gate_scale_rows(attn_txt, attn_img, mlp_txt, mlp_img,
+                                        block_lo, block_hi);
+    });
+    return rc == 0 ? slot : -1;
+}
+
 int qi_clear_gate_scales(qi_ctx* c) {
     return guarded([&] {
         c->need_dit("qi_clear_gate_scales").clear_gate_scales();
@@ -186,31 +209,33 @@ int qi_gate_delta_count(qi_ctx* c) {
 // ── gate mask ──────────────────────────────────────────────────────────────
 
 int qi_set_gate_mask(qi_ctx* c, const float* mask, int64_t n, int block_lo,
-                     int block_hi) {
+                     int block_hi, int which) {
     return guarded([&] {
         auto& dit = c->need_dit("qi_set_gate_mask");
+        const auto w = gate_sublayer(which, "qi_set_gate_mask");
         if (!mask) {
-            dit.set_gate_mask(bt::Tensor(), 0, 0);
+            dit.set_gate_mask(bt::Tensor(), 0, 0, w);
             return;
         }
         bt::Tensor m = bt::Tensor::from_host(mask, static_cast<int>(n), 1)
                            .to(bt::default_device());
-        dit.set_gate_mask(m, block_lo, block_hi);
+        dit.set_gate_mask(m, block_lo, block_hi, w);
     });
 }
 
 int qi_add_gate_mask(qi_ctx* c, const float* mask, int64_t n, int block_lo,
-                     int block_hi) {
+                     int block_hi, int which) {
     int slot = -1;
     const int rc = guarded([&] {
         auto& dit = c->need_dit("qi_add_gate_mask");
+        const auto w = gate_sublayer(which, "qi_add_gate_mask");
         if (!mask) {
             throw std::runtime_error("qi_add_gate_mask: mask is NULL — use "
                                      "qi_clear_gate_masks() to clear");
         }
         bt::Tensor m = bt::Tensor::from_host(mask, static_cast<int>(n), 1)
                            .to(bt::default_device());
-        slot = dit.add_gate_mask(m, block_lo, block_hi);
+        slot = dit.add_gate_mask(m, block_lo, block_hi, w);
     });
     return rc == 0 ? slot : -1;
 }
@@ -276,20 +301,38 @@ int qi_get_gates(qi_ctx* c, float* out) {
 // forward is legitimate — and, unlike the old in-place version, arming it
 // twice with the same value means the same thing as arming it once.
 
+namespace {
+
+// row_scale == NULL -> an empty tensor, which means "uniform over all rows".
+bt::Tensor prefix_rows(const float* row_scale, int64_t n_rows) {
+    if (!row_scale) return bt::Tensor();
+    if (n_rows <= 0) {
+        throw std::runtime_error("qi_scale_prefix_kv: row_scale is non-NULL "
+                                 "but n_rows is not positive");
+    }
+    return bt::Tensor::from_host(row_scale, static_cast<int>(n_rows), 1)
+        .to(bt::default_device());
+}
+
+}  // namespace
+
 int qi_scale_prefix_kv(qi_ctx* c, int layer_lo, int layer_hi, float k_scale,
-                       float v_scale) {
+                       float v_scale, const float* row_scale, int64_t n_rows) {
     return guarded([&] {
         c->need_dit("qi_scale_prefix_kv")
-            .set_prefix_kv_scale(layer_lo, layer_hi, k_scale, v_scale);
+            .set_prefix_kv_scale(layer_lo, layer_hi, k_scale, v_scale,
+                                 prefix_rows(row_scale, n_rows));
     });
 }
 
 int qi_add_prefix_kv_scale(qi_ctx* c, int layer_lo, int layer_hi,
-                           float k_scale, float v_scale) {
+                           float k_scale, float v_scale,
+                           const float* row_scale, int64_t n_rows) {
     int slot = -1;
     const int rc = guarded([&] {
         slot = c->need_dit("qi_add_prefix_kv_scale")
-                   .add_prefix_kv_scale(layer_lo, layer_hi, k_scale, v_scale);
+                   .add_prefix_kv_scale(layer_lo, layer_hi, k_scale, v_scale,
+                                        prefix_rows(row_scale, n_rows));
     });
     return rc == 0 ? slot : -1;
 }

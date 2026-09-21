@@ -62,6 +62,7 @@ const char* const kPipelineMethods[] = {
     "qwenImage21ModDeltaCount",
     "qwenImage21AddGateScale", "qwenImage21ClearGateScales",
     "qwenImage21GateScaleCount",
+    "qwenImage21SetGateScaleRows", "qwenImage21AddGateScaleRows",
     "qwenImage21AddGateDelta", "qwenImage21ClearGateDeltas",
     "qwenImage21GateDeltaCount",
     "qwenImage21AddGateMask", "qwenImage21ClearGateMasks",
@@ -145,8 +146,10 @@ void brodiffusionTestRestoredSurface() {
         {"qwenImage21PrimeFromText", 5}, {"qwenImage21Decode", 3},
         {"qwenImage21EncodePromptImages", 3}, {"qwenImage21PrimeEdit", 3},
         {"qwenImage21AddModDelta", 4}, {"qwenImage21AddGateScale", 6},
-        {"qwenImage21AddGateDelta", 4}, {"qwenImage21AddGateMask", 3},
-        {"qwenImage21AddPrefixKvScale", 4},
+        {"qwenImage21AddGateDelta", 4}, {"qwenImage21AddGateMask", 4},
+        {"qwenImage21AddPrefixKvScale", 5},
+        {"qwenImage21SetGateScaleRows", 6}, {"qwenImage21AddGateScaleRows", 6},
+        {"qwenImage21SetGateMask", 4}, {"qwenImage21ScalePrefixKv", 5},
         {"qwenImage21SavePrefixCache", 1}, {"qwenImage21BlendPrefixCache", 2},
     };
     for (const auto& a : kArity) {

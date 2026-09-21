@@ -22,6 +22,23 @@
 //   5. The prefix-KV scale is an idempotent dial: setting it twice equals
 //      setting it once (the old in-place version squared), it survives a
 //      cache reset and re-extract, and a per-layer list composes.
+//   6. The four gate multipliers are INDEPENDENT: the rank-1 attn x txt/img
+//      product is exactly the sugar that spells four of them out, and
+//      "attention gate, image rows only" — which the product cannot say — is
+//      a different picture from "attention gate, both row sets".
+//   7. A prefix-affecting change re-extracts the cache AND re-applies every
+//      armed prefix edit. This is the one the research round lost work to: a
+//      txt-side gate scale used to invalidate the cache and silently discard
+//      a live ScalePrefixKv.
+//   8. A gate mask names its sublayer. Masking 'both' is bit-identical to
+//      masking 'attn' and 'mlp' with the same vector, and each half on its
+//      own is a different picture from either.
+//   9. A gate mask whose length is not the joint sequence length THROWS,
+//      naming the length it wanted. It used to be a silent no-op, which is
+//      how a whole study concluded "this surface does nothing".
+//  10. The prefix-KV row scale is the scalar generalised: a uniform row
+//      vector is bit-identical to the scalar it repeats, and a non-uniform
+//      one is a different picture.
 //
 // Runs against the same synthetic checkpoint as test_qwenimage21_dit.cpp
 // (qwenimage21_fixture.h): 2 blocks, 2 heads of 64, context 128.
@@ -42,6 +59,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <string>
 #include <system_error>
 #include <vector>
 
@@ -401,6 +419,229 @@ void test_prefix_kv_dial(Rig& r) {
     r.clear_all();
 }
 
+// ── 6. Four independent gate multipliers ──────────────────────────────────
+void test_gate_scale_rows(Rig& r) {
+    r.clear_all();
+    const std::vector<float> base = r.run();
+
+    // The rank-1 form IS the sugar: attn x txt/img, mlp x txt/img.
+    r.model.set_gate_scale(1.25f, 0.75f, 1.5f, 0.5f, 0, r.cfg.num_layers);
+    const std::vector<float> via_product = r.run();
+    r.model.set_gate_scale_rows(1.25f * 1.5f, 1.25f * 0.5f, 0.75f * 1.5f,
+                                0.75f * 0.5f, 0, r.cfg.num_layers);
+    CHECK(via_product == r.run());   // bit-identical
+    std::printf("qi21_slots: rank-1 gate scale is four multipliers\n");
+
+    // The thing the product cannot express: the attention gate on the IMAGE
+    // rows alone. Under the product, raising attn raises the prefix's factor
+    // too — so these two are different pictures, and only the second leaves
+    // the prefix rows at 1.
+    r.model.set_gate_scale(1.5f, 1.0f, 1.0f, 1.0f, 0, r.cfg.num_layers);
+    const std::vector<float> attn_both_rows = r.run();
+    r.model.set_gate_scale_rows(1.0f, 1.5f, 1.0f, 1.0f, 0, r.cfg.num_layers);
+    const std::vector<float> attn_img_only = r.run();
+    CHECK(rel_maxdiff(attn_both_rows, attn_img_only) > 1e-4);
+    CHECK(rel_maxdiff(base, attn_img_only) > 1e-4);
+
+    // ...and the mirror image: txt rows alone moves the picture too (the
+    // text rows feed every image row through attention), and differently.
+    r.model.set_gate_scale_rows(1.5f, 1.0f, 1.0f, 1.0f, 0, r.cfg.num_layers);
+    const std::vector<float> attn_txt_only = r.run();
+    CHECK(rel_maxdiff(attn_txt_only, attn_img_only) > 1e-4);
+
+    // The four axes are separable: txt-only composed with img-only is the
+    // binding that sets both.
+    r.model.clear_gate_scales();
+    r.model.add_gate_scale_rows(1.5f, 1.0f, 1.0f, 1.0f, 0, r.cfg.num_layers);
+    r.model.add_gate_scale_rows(1.0f, 1.5f, 1.0f, 1.0f, 0, r.cfg.num_layers);
+    const std::vector<float> composed = r.run();
+    r.model.set_gate_scale_rows(1.5f, 1.5f, 1.0f, 1.0f, 0, r.cfg.num_layers);
+    CHECK(composed == r.run());
+
+    // Identity on all four reads as cleared and restores baseline exactly.
+    r.model.set_gate_scale_rows(1.0f, 1.0f, 1.0f, 1.0f, 0, r.cfg.num_layers);
+    CHECK(r.model.gate_scales().empty());
+    CHECK(base == r.run());
+
+    r.clear_all();
+}
+
+// ── 7. A prefix-affecting change re-applies every armed prefix edit ────────
+//
+// The coordinator's case, spelled out: arm the prefix-KV dial, then move a
+// TXT-side gate scale — which is prefix-affecting, so the cache has to be
+// dropped and re-extracted. After the re-extract the dial must still be in
+// force. The old in-place ScalePrefixKv was multiplied INTO the cache, so a
+// re-extract silently threw the edit away and the study's numbers were
+// measuring an unedited prefix.
+void test_prefix_edit_survives_reextract(Rig& r) {
+    r.clear_all();
+
+    qd::QwenImage21PrefixCache c;
+    r.model.set_prefix_kv_scale(0, r.cfg.num_layers, 1.0f, 0.5f);
+    r.run_cached(c, 0.7f);                      // extract under the dial
+    const std::vector<float> dialled = r.run_cached(c, 0.4f);
+
+    // A txt-side gate scale: prefix-affecting, so the cache is now stale.
+    r.model.set_gate_scale_rows(1.3f, 1.0f, 1.0f, 1.0f, 0, r.cfg.num_layers);
+    c.reset();
+    r.run_cached(c, 0.7f);                      // re-extract
+    const std::vector<float> after = r.run_cached(c, 0.4f);
+    CHECK(rel_maxdiff(dialled, after) > 1e-5);  // the gate scale landed
+
+    // ...and the dial is STILL applied: dropping it now moves the picture.
+    r.model.clear_prefix_kv_scales();
+    const std::vector<float> without = r.run_cached(c, 0.4f);
+    CHECK(rel_maxdiff(after, without) > 1e-4);
+    std::printf("qi21_slots: prefix edit survives a prefix-side re-extract\n");
+
+    // Re-arming reproduces it exactly — nothing about the cache changed.
+    r.model.set_prefix_kv_scale(0, r.cfg.num_layers, 1.0f, 0.5f);
+    CHECK(after == r.run_cached(c, 0.4f));
+
+    r.clear_all();
+}
+
+// ── 8 + 9. Per-sublayer gate masks ────────────────────────────────────────
+void test_gate_mask_sublayer(Rig& r) {
+    r.clear_all();
+    const std::vector<float> base = r.run();
+
+    // A mask that damps the second half of the image rows.
+    std::vector<float> host(static_cast<std::size_t>(r.L()), 1.0f);
+    for (int i = r.text_seq + r.img_len() / 2; i < r.L(); ++i) {
+        host[static_cast<std::size_t>(i)] = 0.4f;
+    }
+    const bt::Tensor mask = bdtest::bd_upload(host, r.L(), 1);
+
+    r.model.set_gate_mask(mask, 0, r.cfg.num_layers,
+                          qd::QwenImage21GateSublayer::Both);
+    const std::vector<float> both = r.run();
+    CHECK(rel_maxdiff(base, both) > 1e-4);
+
+    r.model.set_gate_mask(mask, 0, r.cfg.num_layers,
+                          qd::QwenImage21GateSublayer::Attn);
+    const std::vector<float> attn = r.run();
+    r.model.set_gate_mask(mask, 0, r.cfg.num_layers,
+                          qd::QwenImage21GateSublayer::Mlp);
+    const std::vector<float> mlp = r.run();
+
+    // Each half is its own picture, and neither is the blunt form. This is
+    // the whole point: the MLP half is what drags a late-step edit's
+    // retention down, so "restyle this region" wants the attn half alone.
+    CHECK(rel_maxdiff(attn, mlp) > 1e-4);
+    CHECK(rel_maxdiff(attn, both) > 1e-4);
+    CHECK(rel_maxdiff(mlp, both) > 1e-4);
+
+    // 'both' is exactly 'attn' and 'mlp' armed together.
+    r.model.clear_gate_masks();
+    r.model.add_gate_mask(mask, 0, r.cfg.num_layers,
+                          qd::QwenImage21GateSublayer::Attn);
+    r.model.add_gate_mask(mask, 0, r.cfg.num_layers,
+                          qd::QwenImage21GateSublayer::Mlp);
+    CHECK(both == r.run());
+    std::printf("qi21_slots: 'both' == 'attn' + 'mlp' bit-for-bit\n");
+
+    // Two masks on the SAME sublayer multiply; one on each do not interfere.
+    r.model.clear_gate_masks();
+    r.model.add_gate_mask(mask, 0, r.cfg.num_layers,
+                          qd::QwenImage21GateSublayer::Attn);
+    r.model.add_gate_mask(mask, 0, r.cfg.num_layers,
+                          qd::QwenImage21GateSublayer::Attn);
+    const std::vector<float> squared = r.run();
+    CHECK(rel_maxdiff(attn, squared) > 1e-5);
+
+    // 9. A wrong-length mask THROWS, and says what it wanted. The silent
+    // no-op it replaces is how an all-zero mask written at img_len instead
+    // of prefix_len + img_len read as "this surface does nothing".
+    r.model.clear_gate_masks();
+    const bt::Tensor short_mask = bdtest::bd_upload(
+        std::vector<float>(static_cast<std::size_t>(r.img_len()), 0.0f),
+        r.img_len(), 1);
+    r.model.set_gate_mask(short_mask, 0, r.cfg.num_layers,
+                          qd::QwenImage21GateSublayer::Both);
+    bool threw = false;
+    std::string msg;
+    try {
+        r.run();
+    } catch (const std::exception& e) {
+        threw = true;
+        msg = e.what();
+    }
+    CHECK(threw);
+    CHECK(msg.find(std::to_string(r.L())) != std::string::npos);
+    CHECK(msg.find(std::to_string(r.img_len())) != std::string::npos);
+    std::printf("qi21_slots: short mask throws: %s\n", msg.c_str());
+
+    r.clear_all();
+    CHECK(base == r.run());
+}
+
+// ── 10. The per-row prefix-KV scale ───────────────────────────────────────
+void test_prefix_kv_rows(Rig& r) {
+    r.clear_all();
+
+    qd::QwenImage21PrefixCache c;
+    r.run_cached(c, 0.7f);                     // extract
+    const std::vector<float> plain = r.run_cached(c, 0.4f);
+
+    // row_scale is a per-row WEIGHT on the scales, so an all-ones vector is
+    // the broadcast it replaces — bit for bit. That is what makes
+    // "row_scale empty = all rows" literally true rather than nearly true.
+    r.model.set_prefix_kv_scale(0, r.cfg.num_layers, 1.0f, 0.5f);
+    const std::vector<float> scalar = r.run_cached(c, 0.4f);
+    const bt::Tensor all_rows = bdtest::bd_upload(
+        std::vector<float>(static_cast<std::size_t>(r.text_seq), 1.0f),
+        r.text_seq, 1);
+    r.model.set_prefix_kv_scale(0, r.cfg.num_layers, 1.0f, 0.5f, all_rows);
+    CHECK(rel_maxdiff(scalar, r.run_cached(c, 0.4f)) < 1e-6);
+    std::printf("qi21_slots: an all-ones row scale is the broadcast\n");
+
+    // ...and an all-ZEROS one is the identity: no row is selected.
+    const bt::Tensor no_rows = bdtest::bd_upload(
+        std::vector<float>(static_cast<std::size_t>(r.text_seq), 0.0f),
+        r.text_seq, 1);
+    r.model.set_prefix_kv_scale(0, r.cfg.num_layers, 1.0f, 0.5f, no_rows);
+    CHECK(rel_maxdiff(plain, r.run_cached(c, 0.4f)) < 1e-6);
+
+    // Per-token prompt weighting: apply the 0.5 to the last three rows only.
+    std::vector<float> rows(static_cast<std::size_t>(r.text_seq), 1.0f);
+    rows[0] = 0.0f;
+    rows[1] = 0.0f;
+    r.model.set_prefix_kv_scale(0, r.cfg.num_layers, 1.0f, 0.5f,
+                                bdtest::bd_upload(rows, r.text_seq, 1));
+    const std::vector<float> weighted = r.run_cached(c, 0.4f);
+    CHECK(rel_maxdiff(scalar, weighted) > 1e-4);
+    CHECK(rel_maxdiff(plain, weighted) > 1e-4);
+
+    // A partial weight interpolates: 0.5 at weight 0.5 is 0.75 at weight 1.
+    r.model.set_prefix_kv_scale(
+        0, r.cfg.num_layers, 1.0f, 0.5f,
+        bdtest::bd_upload(
+            std::vector<float>(static_cast<std::size_t>(r.text_seq), 0.5f),
+            r.text_seq, 1));
+    const std::vector<float> half_weight = r.run_cached(c, 0.4f);
+    r.model.set_prefix_kv_scale(0, r.cfg.num_layers, 1.0f, 0.75f);
+    CHECK(rel_maxdiff(half_weight, r.run_cached(c, 0.4f)) < 1e-6);
+
+    // A wrong-length row vector throws rather than scaling the wrong rows.
+    r.model.set_prefix_kv_scale(
+        0, r.cfg.num_layers, 1.0f, 1.0f,
+        bdtest::bd_upload(
+            std::vector<float>(static_cast<std::size_t>(r.text_seq + 3), 0.5f),
+            r.text_seq + 3, 1));
+    bool threw = false;
+    try { r.run_cached(c, 0.4f); }
+    catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+
+    // The cache stayed pristine through all of it.
+    r.model.clear_prefix_kv_scales();
+    CHECK(plain == r.run_cached(c, 0.4f));
+
+    r.clear_all();
+}
+
 }  // namespace
 
 int main() {
@@ -416,6 +657,10 @@ int main() {
         test_composition(r);
         test_capture_composed(r);
         test_prefix_kv_dial(r);
+        test_gate_scale_rows(r);
+        test_prefix_edit_survives_reextract(r);
+        test_gate_mask_sublayer(r);
+        test_prefix_kv_rows(r);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "qi21_slots: exception: %s\n", e.what());
         return 1;

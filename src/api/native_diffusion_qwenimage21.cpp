@@ -211,8 +211,14 @@ Value qi21ClearGateDelta(Value thisVal, std::span<const Value> args) {
     }
 }
 
-// qwenImage21SetGateMask(mask: {rows,cols,data} | null, blockLo, blockHi) —
-// mask holds (textRows + imgLen) values in joint forward order.
+// qwenImage21SetGateMask(mask: {rows,cols,data} | null, blockLo, blockHi,
+//                        which?: 'both' | 'attn' | 'mlp') —
+// mask holds (textRows + imgLen) values in joint forward order. A mask of any
+// other length throws on the next step, naming the length it wanted.
+//
+// `which` defaults to 'both', which scales the attention AND the MLP gated
+// residual. 'attn' is what a late-step regional edit wants: the MLP half is
+// what drags retention at step 6 from 100%+ of the step-0 effect to ~30%.
 Value qi21SetGateMask(Value thisVal, std::span<const Value> args) {
     auto* w = qi21Pipeline(thisVal);
     if (!w) return notQi21("qwenImage21SetGateMask");
@@ -225,11 +231,18 @@ Value qi21SetGateMask(Value thisVal, std::span<const Value> args) {
     }
     if (args.size() < 3 || !ev::isNumber(args[1]) || !ev::isNumber(args[2])) {
         return ev::throwTypeError(
-            "Pipeline.qwenImage21SetGateMask(mask, blockLo, blockHi): "
+            "Pipeline.qwenImage21SetGateMask(mask, blockLo, blockHi, which?): "
             "integer range required");
     }
+    brodiffusion::dit::QwenImage21GateSublayer which{};
+    if (!readGateSublayer(args.size() > 3 ? args[3] : ev::undefined(), which)) {
+        return ev::throwTypeError(
+            "Pipeline.qwenImage21SetGateMask: which must be 'both', 'attn' "
+            "or 'mlp'");
+    }
     try {
-        w->pipeline->qi21_set_gate_mask(mask, i32At(args, 1), i32At(args, 2));
+        w->pipeline->qi21_set_gate_mask(mask, i32At(args, 1), i32At(args, 2),
+                                        which);
         return ev::undefined();
     } catch (const std::exception& e) {
         return ev::throwError(
@@ -737,7 +750,7 @@ void decoratePipelineQwenImage21Proto(ObjectBuilder& proto) {
     proto.def("qwenImage21SetGateScale", 6, qi21SetGateScale);
     proto.def("qwenImage21SetGateDelta", 4, qi21SetGateDelta);
     proto.def("qwenImage21ClearGateDelta", 0, qi21ClearGateDelta);
-    proto.def("qwenImage21SetGateMask", 3, qi21SetGateMask);
+    proto.def("qwenImage21SetGateMask", 4, qi21SetGateMask);
     proto.def("qwenImage21SetNormOutScaleDelta", 1, qi21SetNormOutScaleDelta);
     proto.def("qwenImage21CaptureGates", 1, qi21CaptureGates);
     proto.def("qwenImage21Gates", 0, qi21Gates);

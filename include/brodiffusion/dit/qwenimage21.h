@@ -154,10 +154,35 @@ struct QwenImage21ModDeltaBinding {
     QwenImage21ModTarget target = QwenImage21ModTarget::Target;
 };
 
-// set_gate_scale / add_gate_scale: scalar multipliers on the post-tanh gates.
+// Which sublayer a gate mask applies to. The mask scales the gated residual,
+// and the two sublayers' gates behave completely differently late in the
+// schedule: the attention gate is the only surface on this model that still
+// has its full authority at step 6 of 8, while the SwiGLU one has spent most
+// of its. A mask that hits both therefore drags the attention half's late
+// authority down with it — which is why "restyle this region at step 6 and
+// redirect nothing" needs Attn.
+enum class QwenImage21GateSublayer {
+    Both = 0,
+    Attn = 1,   // gate1: the attention sublayer's residual
+    Mlp  = 2    // gate2: the SwiGLU sublayer's residual
+};
+
+// set_gate_scale / add_gate_scale: scalar multipliers on the post-tanh gates,
+// ONE PER (sublayer, row set) pair — four independent numbers, not a rank-1
+// product of an (attn, mlp) pair with a (txt, img) pair.
+//
+// The difference matters for the cache. The prefix rows' gates are only ever
+// applied on an extract step, so moving one costs a re-extract (+13% on the
+// step). Under a rank-1 product the only route to "attention gate on the
+// IMAGE rows" — the most useful dial on the model — was to move `attn`,
+// which also moved attn*txt and dropped the cache. With the four independent,
+// an image-side sweep is free and cannot disturb the prefix at all.
+//
+// set_gate_scale()'s (attn, mlp, txt, img) spelling is kept as sugar for the
+// product; set_gate_scale_rows() addresses the four directly.
 struct QwenImage21GateScaleBinding {
-    float attn_scale = 1.0f, mlp_scale = 1.0f;
-    float txt_scale  = 1.0f, img_scale = 1.0f;
+    float attn_txt = 1.0f, attn_img = 1.0f;
+    float mlp_txt  = 1.0f, mlp_img  = 1.0f;
     int block_lo = 0, block_hi = 0;
 };
 
@@ -170,18 +195,35 @@ struct QwenImage21GateDeltaBinding {
 };
 
 // set_gate_mask / add_gate_mask: one value per joint-sequence row, multiplied
-// into both sublayers' gated residual.
+// into the gated residual of the sublayer(s) `which` names.
 struct QwenImage21GateMaskBinding {
     brotensor::Tensor mask;
     int block_lo = 0, block_hi = 0;
+    QwenImage21GateSublayer which = QwenImage21GateSublayer::Both;
 };
 
 // set_prefix_kv_scale / add_prefix_kv_scale: a per-layer attenuation of the
 // CACHED prefix K/V, applied where the cache is read rather than written into
 // it — so it is an idempotent dial (see set_prefix_kv_scales()).
+//
+// `row_scale`, when non-empty, holds one WEIGHT per PREFIX ROW saying how
+// much of this binding's scales that row gets:
+//
+//     k_row[r] = 1 + row_scale[r] * (k_scale - 1)      (and likewise v)
+//
+// so all-ones is exactly the broadcast — which is what "empty = all rows"
+// has to mean — all-zeros is the identity, and anything between fades the
+// scale in. That is per-token prompt weighting, the "(word:1.3)" every image
+// UI ships, done on the cached K/V where the whole generation actually reads
+// the prompt. (The gate mask's text half is not a substitute — scaling a
+// text token's residual updates is not scaling its contribution, because its
+// K/V is dominated by what txt_in and the early blocks wrote before any gate
+// applied.) Its length must equal the prefix length of the cache being read,
+// or the forward throws saying both.
 struct QwenImage21PrefixKvBinding {
     int layer_lo = 0, layer_hi = 0;
     float k_scale = 1.0f, v_scale = 1.0f;
+    brotensor::Tensor row_scale;   // (prefix_len, 1) or empty = all rows
 };
 
 // Per-layer post-RoPE K/V of the joint sequence's prefix, plus the layout it
@@ -347,12 +389,30 @@ public:
     // `txt_scale` scales the gate the PREFIX rows see and `img_scale` the one
     // the TARGET rows see. Scales covering the same block MULTIPLY.
     //
+    // This spelling is the rank-1 sugar: it binds the four independent
+    // multipliers to attn*txt, attn*img, mlp*txt, mlp*img.
+    // set_gate_scale_rows() sets them directly, which is what a caller wants
+    // whenever only the image side should move — under the product, reaching
+    // "attention gate on the image rows" had to move `attn`, which moved the
+    // prefix product too and cost a re-extract.
+    //
     // set_gate_scale() replaces the whole list with this one binding; all four
     // factors at 1, or an empty range, clears it. add_gate_scale() appends.
     void set_gate_scale(float attn_scale, float mlp_scale, float txt_scale,
                         float img_scale, int block_lo, int block_hi);
     int  add_gate_scale(float attn_scale, float mlp_scale, float txt_scale,
                         float img_scale, int block_lo, int block_hi);
+
+    // The four independent multipliers, one per (sublayer, row set):
+    //   attn_txt  gate1 on the t = 0 rows   (text / condition images)
+    //   attn_img  gate1 on the sampled-t rows (the image being generated)
+    //   mlp_txt   gate2 on the t = 0 rows
+    //   mlp_img   gate2 on the sampled-t rows
+    // Only the *_txt pair is prefix-side, so an *_img sweep never re-extracts.
+    void set_gate_scale_rows(float attn_txt, float attn_img, float mlp_txt,
+                             float mlp_img, int block_lo, int block_hi);
+    int  add_gate_scale_rows(float attn_txt, float attn_img, float mlp_txt,
+                             float mlp_img, int block_lo, int block_hi);
     void set_gate_scales(const std::vector<QwenImage21GateScaleBinding>& list);
     void clear_gate_scales();
     const std::vector<QwenImage21GateScaleBinding>& gate_scales() const {
@@ -406,21 +466,32 @@ public:
     }
 
     // Per-token gate mask over blocks [block_lo, block_hi): after the tanh
-    // (and any set_gate_scale / set_gate_delta), both sublayers' gated
-    // residual for row r is
-    // multiplied by mask[r]. `mask` holds prefix_len + hp*wp values in joint
-    // forward order (any device/dtype); a cached step reads only its target
-    // slice. Zeroing a row removes that token's residual updates entirely for
-    // the masked blocks. Masks covering the same block MULTIPLY elementwise.
-    // An empty tensor clears; a forward whose joint length differs from a
-    // mask skips that mask.
+    // (and any set_gate_scale / set_gate_delta), the gated residual of row r
+    // is multiplied by mask[r] for the sublayer(s) `which` names. `mask`
+    // holds prefix_len + hp*wp values in joint forward order (any
+    // device/dtype); a cached step reads only its target slice. Zeroing a row
+    // removes that token's residual updates entirely for the masked blocks.
+    // Masks covering the same block and sublayer MULTIPLY elementwise. An
+    // empty tensor clears.
+    //
+    // `which` is what makes this a usable regional brush late in the
+    // schedule: Attn keeps the one gate that still has authority at step 6
+    // and leaves the SwiGLU half — which does not — alone.
+    //
+    // A forward whose joint length differs from an armed mask THROWS, naming
+    // both lengths. It used to skip the mask silently, and the failure mode
+    // was a study concluding the surface does nothing: an all-zero mask
+    // written at img_len instead of prefix_len + img_len rendered the
+    // baseline, to the pixel.
     //
     // set_gate_mask() replaces the whole list with this one binding;
     // add_gate_mask() appends.
-    void set_gate_mask(const brotensor::Tensor& mask, int block_lo,
-                       int block_hi);
-    int  add_gate_mask(const brotensor::Tensor& mask, int block_lo,
-                       int block_hi);
+    void set_gate_mask(
+        const brotensor::Tensor& mask, int block_lo, int block_hi,
+        QwenImage21GateSublayer which = QwenImage21GateSublayer::Both);
+    int  add_gate_mask(
+        const brotensor::Tensor& mask, int block_lo, int block_hi,
+        QwenImage21GateSublayer which = QwenImage21GateSublayer::Both);
     void set_gate_masks(const std::vector<QwenImage21GateMaskBinding>& list);
     void clear_gate_masks();
     const std::vector<QwenImage21GateMaskBinding>& gate_masks() const {
@@ -444,10 +515,18 @@ public:
     //
     // A scale takes effect on cached steps only: an extract step attends the
     // prefix rows it is computing, not the cache.
+    //
+    // `row_scale`, when non-empty, is one WEIGHT per PREFIX ROW on this
+    // binding's scales: k_row[r] = 1 + row_scale[r] * (k_scale - 1). All
+    // ones is the broadcast, all zeros the identity — per-token prompt
+    // weighting on the K/V the whole generation attends to. Its length must
+    // equal the cache's prefix length or the forward throws saying both.
     void set_prefix_kv_scale(int layer_lo, int layer_hi, float k_scale,
-                             float v_scale);
+                             float v_scale,
+                             const brotensor::Tensor& row_scale = {});
     int  add_prefix_kv_scale(int layer_lo, int layer_hi, float k_scale,
-                             float v_scale);
+                             float v_scale,
+                             const brotensor::Tensor& row_scale = {});
     void set_prefix_kv_scales(
         const std::vector<QwenImage21PrefixKvBinding>& list);
     void clear_prefix_kv_scales();
@@ -572,6 +651,15 @@ private:
     // deltas into m's four gate rows, and (when a capture sink is armed) the
     // resulting attention-gate means.
     void fold_gate_hooks_(const BlockCoverage& cov, Modulation& m);
+    // Compose the armed prefix-KV bindings into the per-layer scalars and
+    // per-row vectors the forward applies. Called on every list change.
+    void compose_prefix_scales_();
+
+    // Rank-1 expansion of a per-row host vector into an (n_rows, cols)
+    // device tensor, so an elementwise multiply can apply it. Used by the
+    // per-row prefix KV dial; `dst` is resized and overwritten.
+    void expand_prefix_rows_(const std::vector<float>& rows, int n_rows,
+                             int cols, brotensor::Tensor& dst);
     // Mean over hidden of a (1, hidden) row, on host.
     float row_mean_(const brotensor::Tensor& row) const;
 
@@ -654,15 +742,23 @@ private:
 
     // Per coverage, the composed per-token mask: the (Lq, hidden) rank-1
     // expansion the fused residual consumes, and the host values capture
-    // reports. Empty tensor = that coverage has no mask.
-    std::vector<brotensor::Tensor> mask_full_;
-    std::vector<std::vector<float>> mask_host_;
-    brotensor::Tensor gate_mask_col_;  // (L, 1) scratch for one composition
+    // reports. One pair per SUBLAYER, because a mask can name one of them.
+    // An empty host vector = that coverage has no mask for that sublayer.
+    std::vector<brotensor::Tensor> mask_full_attn_, mask_full_mlp_;
+    std::vector<std::vector<float>> mask_host_attn_, mask_host_mlp_;
     brotensor::Tensor gate_ones_row_;  // (1, hidden) ones
 
-    // Composed per-layer prefix KV factors, rebuilt whenever the list changes.
-    // Empty = every layer at 1/1.
+    // Composed per-layer prefix KV factors, rebuilt whenever the list
+    // changes. Empty = every layer at 1/1. `prefix_*_row_` holds the composed
+    // per-row vector for each layer (empty = that layer is scalar-only); the
+    // scalars are already folded into it when it is non-empty, and
+    // prefix_row_len_ is the length every non-empty one has.
     std::vector<float> prefix_k_scale_, prefix_v_scale_;
+    std::vector<std::vector<float>> prefix_k_row_, prefix_v_row_;
+    int prefix_row_len_ = 0;
+    // The (prefix_len, hidden) rank-1 expansion of one layer's row vector,
+    // rebuilt per layer that needs one. Two buffers so K and V can differ.
+    brotensor::Tensor prefix_row_full_k_, prefix_row_full_v_;
 
     std::vector<float>* gate_sink_ = nullptr;
 };

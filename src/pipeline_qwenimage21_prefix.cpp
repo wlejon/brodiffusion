@@ -68,18 +68,20 @@ void Pipeline::qi21_reset_cache() {
 }
 
 void Pipeline::qi21_scale_prefix_kv(int layer_lo, int layer_hi, float k_scale,
-                                    float v_scale) {
+                                    float v_scale,
+                                    const bt::Tensor& row_scale) {
     // No "has anything been primed" check any more: the scale is a dial on
     // the model, so arming it before the first step is legitimate and it
     // survives the re-extract that follows a prefix-side hook.
     qi21_model(model_class_, denoiser_, "qi21_scale_prefix_kv")
-        .set_prefix_kv_scale(layer_lo, layer_hi, k_scale, v_scale);
+        .set_prefix_kv_scale(layer_lo, layer_hi, k_scale, v_scale, row_scale);
 }
 
 int Pipeline::qi21_add_prefix_kv_scale(int layer_lo, int layer_hi,
-                                       float k_scale, float v_scale) {
+                                       float k_scale, float v_scale,
+                                       const bt::Tensor& row_scale) {
     return qi21_model(model_class_, denoiser_, "qi21_add_prefix_kv_scale")
-        .add_prefix_kv_scale(layer_lo, layer_hi, k_scale, v_scale);
+        .add_prefix_kv_scale(layer_lo, layer_hi, k_scale, v_scale, row_scale);
 }
 
 void Pipeline::qi21_clear_prefix_kv_scales() {
