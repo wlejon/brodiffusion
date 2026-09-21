@@ -7,18 +7,22 @@
 //     straight delegation, except that Pipeline knows about the prefix KV
 //     cache living on the prepared conditioning and can invalidate it when a
 //     hook touches the prefix side — which the DiT, holding no cache, cannot.
-//   * conditioning entry points (encode_prompt / prime_from_text / the prefix
-//     cache surface / the text rows). These need the Qwen3-VL backbone and
-//     the prepared payload, both of which Pipeline owns.
+//   * conditioning entry points (encode_prompt / prime_from_text). These need
+//     the Qwen3-VL backbone and the prepared payload, both of which Pipeline
+//     owns.
 //   * the image seam and text-encoder residency. The 16x RGBA VAE encoder is
 //     already resident for the image-conditioned paths, and the 8.5 GiB
 //     Qwen3-VL-8B backbone is dead weight during the denoise loop — releasing
 //     it is what makes a BF16 DiT or a bigger canvas fit a 24 GB card.
 //
-// Component loading for the model class lives in pipeline_qwenimage21.cpp;
-// the generation loop itself is the model-agnostic machinery in pipeline.cpp.
+// The prefix KV cache surface (reset / attenuate / save / blend), the text
+// rows and the prompt memo live in pipeline_qwenimage21_prefix.cpp; component
+// loading for the model class in pipeline_qwenimage21.cpp; the generation
+// loop itself is the model-agnostic machinery in pipeline.cpp.
 
 #include "brodiffusion/pipeline.h"
+
+#include "pipeline_detail.h"
 
 #include "brodiffusion/denoiser.h"
 #include "brodiffusion/dit/qwenimage21.h"
@@ -49,28 +53,11 @@ namespace brodiffusion::pipeline {
 
 namespace bt = ::brotensor;
 
+using detail_pipe::fail;
+using detail_pipe::qi21_denoiser;
+using detail_pipe::qi21_model;
+
 namespace {
-
-[[noreturn]] void fail(const std::string& msg) {
-    throw std::runtime_error("pipeline::Pipeline: " + msg);
-}
-
-dit::QwenImage21Denoiser& qi21_denoiser(ModelClass model_class,
-                                        const std::unique_ptr<Denoiser>& d,
-                                        const char* who) {
-    if (model_class != ModelClass::QwenImage21) {
-        fail(std::string(who) + ": Qwen-Image 2.1 only");
-    }
-    auto* den = dynamic_cast<dit::QwenImage21Denoiser*>(d.get());
-    if (!den) fail(std::string(who) + ": no Qwen-Image 2.1 denoiser");
-    return *den;
-}
-
-dit::QwenImage21Transformer2DModel& qi21_model(
-    ModelClass model_class, const std::unique_ptr<Denoiser>& d,
-    const char* who) {
-    return qi21_denoiser(model_class, d, who).model();
-}
 
 // Load the Qwen3-VL language-model subtree into `model` from an override path
 // (a .gguf, or a diffusers safetensors file/dir) or, when empty, from
@@ -120,21 +107,78 @@ void load_qwen3vl_text_weights(brolm::qwen3vl::TextModel& model,
 }  // namespace
 
 // ── DiT hook forwarding ────────────────────────────────────────────────────
+//
+// Every mutation below ends in qi21_sync_prefix_state_(). The prefix (t = 0)
+// rows are only ever computed on an extract step, so a prefix-side hook is
+// invisible until the cache is dropped — and so is CLEARING one, which is why
+// the prefix state is remembered and compared rather than read off the
+// arguments. Reading it off the whole armed LIST, rather than off the binding
+// that just moved, is what keeps add/clear honest: appending a target-side
+// delta to a list that already holds a prefix-side one must not re-extract.
+
+void Pipeline::qi21_sync_prefix_state_() {
+    auto& model = qi21_model(model_class_, denoiser_, "qi21_sync_prefix_state");
+
+    bool mod_prefix = false;
+    for (const auto& b : model.mod_deltas()) {
+        if (b.target != dit::QwenImage21ModTarget::Target) mod_prefix = true;
+    }
+    bool gate_prefix = false;
+    for (const auto& b : model.gate_deltas()) {
+        if (b.target != dit::QwenImage21ModTarget::Target) gate_prefix = true;
+    }
+    const bool mask_armed = !model.gate_masks().empty();
+    // A scalar signature of what the PREFIX rows' gates are multiplied by.
+    // Per-block resolution does not matter here: any change to the product
+    // means some block's prefix gate moved, and a re-extract is the answer
+    // either way. A pure img_scale sweep — the common per-step dial — leaves
+    // it at 1 and costs nothing.
+    float pa = 1.0f, pm = 1.0f;
+    for (const auto& b : model.gate_scales()) {
+        pa *= b.attn_scale * b.txt_scale;
+        pm *= b.mlp_scale * b.txt_scale;
+    }
+
+    const bool changed = mod_prefix || qi21_mod_delta_hits_prefix_ ||
+                         gate_prefix || qi21_gate_delta_hits_prefix_ ||
+                         mask_armed || qi21_gate_mask_armed_ ||
+                         pa != qi21_prefix_gate_attn_ ||
+                         pm != qi21_prefix_gate_mlp_;
+    qi21_mod_delta_hits_prefix_  = mod_prefix;
+    qi21_gate_delta_hits_prefix_ = gate_prefix;
+    qi21_gate_mask_armed_        = mask_armed;
+    qi21_prefix_gate_attn_       = pa;
+    qi21_prefix_gate_mlp_        = pm;
+    if (changed) qi21_reset_cache();
+}
 
 void Pipeline::qi21_set_mod_delta(const bt::Tensor& delta, int block_lo,
                                   int block_hi,
                                   dit::QwenImage21ModTarget target) {
     qi21_model(model_class_, denoiser_, "qi21_set_mod_delta")
         .set_mod_delta(delta, block_lo, block_hi, target);
-    // The prefix (t = 0) rows are only computed on an extract step, so a
-    // prefix-side delta is invisible until the cache is dropped. Do it for
-    // the caller — the failure mode otherwise is a hook that silently does
-    // nothing for the rest of the generation. Clearing one needs the same
-    // treatment, hence the remembered flag.
-    const bool hits_prefix = delta.size() > 0 && block_hi > block_lo &&
-                             target != dit::QwenImage21ModTarget::Target;
-    if (hits_prefix || qi21_mod_delta_hits_prefix_) qi21_reset_cache();
-    qi21_mod_delta_hits_prefix_ = hits_prefix;
+    qi21_sync_prefix_state_();
+}
+
+int Pipeline::qi21_add_mod_delta(const bt::Tensor& delta, int block_lo,
+                                 int block_hi,
+                                 dit::QwenImage21ModTarget target) {
+    const int slot = qi21_model(model_class_, denoiser_, "qi21_add_mod_delta")
+                         .add_mod_delta(delta, block_lo, block_hi, target);
+    qi21_sync_prefix_state_();
+    return slot;
+}
+
+void Pipeline::qi21_clear_mod_deltas() {
+    qi21_model(model_class_, denoiser_, "qi21_clear_mod_deltas")
+        .clear_mod_deltas();
+    qi21_sync_prefix_state_();
+}
+
+int Pipeline::qi21_mod_delta_count() const {
+    return static_cast<int>(
+        qi21_model(model_class_, denoiser_, "qi21_mod_delta_count")
+            .mod_deltas().size());
 }
 
 void Pipeline::qi21_time_mod(float timestep, bt::Tensor& temb_out,
@@ -161,18 +205,29 @@ void Pipeline::qi21_set_gate_scale(float attn_scale, float mlp_scale,
     qi21_model(model_class_, denoiser_, "qi21_set_gate_scale")
         .set_gate_scale(attn_scale, mlp_scale, txt_scale, img_scale, block_lo,
                         block_hi);
-    // The prefix gate only ever fires on an extract step, so a change to the
-    // factors the PREFIX rows see needs the cache re-extracted to land —
-    // while a pure img_scale sweep (the common per-step dial) must not pay
-    // for a re-extract.
-    const bool ranged = block_hi > block_lo;
-    const float pa = ranged ? attn_scale * txt_scale : 1.0f;
-    const float pm = ranged ? mlp_scale  * txt_scale : 1.0f;
-    if (pa != qi21_prefix_gate_attn_ || pm != qi21_prefix_gate_mlp_) {
-        qi21_reset_cache();
-        qi21_prefix_gate_attn_ = pa;
-        qi21_prefix_gate_mlp_  = pm;
-    }
+    qi21_sync_prefix_state_();
+}
+
+int Pipeline::qi21_add_gate_scale(float attn_scale, float mlp_scale,
+                                  float txt_scale, float img_scale,
+                                  int block_lo, int block_hi) {
+    const int slot = qi21_model(model_class_, denoiser_, "qi21_add_gate_scale")
+                         .add_gate_scale(attn_scale, mlp_scale, txt_scale,
+                                         img_scale, block_lo, block_hi);
+    qi21_sync_prefix_state_();
+    return slot;
+}
+
+void Pipeline::qi21_clear_gate_scales() {
+    qi21_model(model_class_, denoiser_, "qi21_clear_gate_scales")
+        .clear_gate_scales();
+    qi21_sync_prefix_state_();
+}
+
+int Pipeline::qi21_gate_scale_count() const {
+    return static_cast<int>(
+        qi21_model(model_class_, denoiser_, "qi21_gate_scale_count")
+            .gate_scales().size());
 }
 
 void Pipeline::qi21_set_gate_delta(const bt::Tensor& delta, int block_lo,
@@ -180,24 +235,55 @@ void Pipeline::qi21_set_gate_delta(const bt::Tensor& delta, int block_lo,
                                    dit::QwenImage21ModTarget target) {
     qi21_model(model_class_, denoiser_, "qi21_set_gate_delta")
         .set_gate_delta(delta, block_lo, block_hi, target);
-    // Same prefix-cache rule as qi21_set_mod_delta(): the t = 0 gate is only
-    // ever applied on an extract step, so arming OR clearing a prefix-side
-    // delta needs the cache dropped for the change to land.
-    const bool hits_prefix = delta.size() > 0 && block_hi > block_lo &&
-                             target != dit::QwenImage21ModTarget::Target;
-    if (hits_prefix || qi21_gate_delta_hits_prefix_) qi21_reset_cache();
-    qi21_gate_delta_hits_prefix_ = hits_prefix;
+    qi21_sync_prefix_state_();
+}
+
+int Pipeline::qi21_add_gate_delta(const bt::Tensor& delta, int block_lo,
+                                  int block_hi,
+                                  dit::QwenImage21ModTarget target) {
+    const int slot = qi21_model(model_class_, denoiser_, "qi21_add_gate_delta")
+                         .add_gate_delta(delta, block_lo, block_hi, target);
+    qi21_sync_prefix_state_();
+    return slot;
+}
+
+void Pipeline::qi21_clear_gate_deltas() {
+    qi21_model(model_class_, denoiser_, "qi21_clear_gate_deltas")
+        .clear_gate_deltas();
+    qi21_sync_prefix_state_();
+}
+
+int Pipeline::qi21_gate_delta_count() const {
+    return static_cast<int>(
+        qi21_model(model_class_, denoiser_, "qi21_gate_delta_count")
+            .gate_deltas().size());
 }
 
 void Pipeline::qi21_set_gate_mask(const bt::Tensor& mask, int block_lo,
                                   int block_hi) {
     qi21_model(model_class_, denoiser_, "qi21_set_gate_mask")
         .set_gate_mask(mask, block_lo, block_hi);
-    // A mask spans the joint sequence, so its prefix half is in the same
-    // position as a prefix-side delta: only an extract step applies it.
-    const bool armed = mask.size() > 0 && block_hi > block_lo;
-    if (armed || qi21_gate_mask_armed_) qi21_reset_cache();
-    qi21_gate_mask_armed_ = armed;
+    qi21_sync_prefix_state_();
+}
+
+int Pipeline::qi21_add_gate_mask(const bt::Tensor& mask, int block_lo,
+                                 int block_hi) {
+    const int slot = qi21_model(model_class_, denoiser_, "qi21_add_gate_mask")
+                         .add_gate_mask(mask, block_lo, block_hi);
+    qi21_sync_prefix_state_();
+    return slot;
+}
+
+void Pipeline::qi21_clear_gate_masks() {
+    qi21_model(model_class_, denoiser_, "qi21_clear_gate_masks")
+        .clear_gate_masks();
+    qi21_sync_prefix_state_();
+}
+
+int Pipeline::qi21_gate_mask_count() const {
+    return static_cast<int>(
+        qi21_model(model_class_, denoiser_, "qi21_gate_mask_count")
+            .gate_masks().size());
 }
 
 void Pipeline::qi21_capture_gates(bool enable) {
@@ -242,68 +328,6 @@ int Pipeline::qi21_latent_channels() const {
         .config().latent_channels();
 }
 
-// ── prefix cache surface ───────────────────────────────────────────────────
-
-void Pipeline::qi21_reset_cache() {
-    if (model_class_ != ModelClass::QwenImage21) return;
-    auto prepared = last_prepared_.lock();
-    if (!prepared) return;   // nothing primed, or the state was dropped
-    auto& den = qi21_denoiser(model_class_, denoiser_, "qi21_reset_cache");
-    den.reset_cache(*prepared);
-}
-
-void Pipeline::qi21_scale_prefix_kv(int layer_lo, int layer_hi, float k_scale,
-                                    float v_scale) {
-    auto& den = qi21_denoiser(model_class_, denoiser_, "qi21_scale_prefix_kv");
-    auto prepared = last_prepared_.lock();
-    if (!prepared) {
-        fail("qi21_scale_prefix_kv: nothing primed — call prime() (and run at "
-             "least one step, so the prefix has been extracted) first");
-    }
-    auto& cache = den.prefix_cache(*prepared, /*uncond=*/false);
-    if (!cache.valid()) {
-        fail("qi21_scale_prefix_kv: the prefix has not been extracted yet — "
-             "run one step first");
-    }
-    cache.scale_kv(layer_lo, layer_hi, k_scale, v_scale);
-    if (den.has_uncond(*prepared)) {
-        auto& ucache = den.prefix_cache(*prepared, /*uncond=*/true);
-        if (ucache.valid()) ucache.scale_kv(layer_lo, layer_hi, k_scale, v_scale);
-    }
-}
-
-bt::Tensor Pipeline::qi21_text_rows(bool uncond) const {
-    // text_rows() is a mutable accessor on the denoiser; this const overload
-    // hands back a copy, which is what a reader wants anyway.
-    auto& den = qi21_denoiser(model_class_, denoiser_, "qi21_text_rows");
-    auto prepared = last_prepared_.lock();
-    if (!prepared) fail("qi21_text_rows: nothing primed — call prime() first");
-    return den.text_rows(*prepared, uncond);
-}
-
-void Pipeline::qi21_set_text_rows(const bt::Tensor& rows, bool uncond) {
-    auto& den = qi21_denoiser(model_class_, denoiser_, "qi21_set_text_rows");
-    auto prepared = last_prepared_.lock();
-    if (!prepared) {
-        fail("qi21_set_text_rows: nothing primed — call prime() first");
-    }
-    bt::Tensor& dst = den.text_rows(*prepared, uncond);
-    const int H = den.config().hidden_size();
-    if (rows.cols != H || rows.rows <= 0) {
-        fail("qi21_set_text_rows: rows must be (n, qi21_hidden_size())");
-    }
-    bt::Tensor src = rows.to(bt::default_device());
-    if (src.dtype != den.compute_dtype()) {
-        bt::Tensor t;
-        bt::cast(src, t, den.compute_dtype());
-        src = std::move(t);
-    }
-    dst = std::move(src);
-    // The joint sequence's text half just changed; the cached prefix K/V
-    // describe the old one.
-    den.reset_cache(*prepared);
-}
-
 // ── conditioning entry points ──────────────────────────────────────────────
 
 qwenimage21::TextConditioning Pipeline::qi21_encode_prompt(
@@ -311,11 +335,10 @@ qwenimage21::TextConditioning Pipeline::qi21_encode_prompt(
     if (model_class_ != ModelClass::QwenImage21) {
         fail("qi21_encode_prompt: Qwen-Image 2.1 only");
     }
-    if (!qwen3vl_model_ || !qwen3vl_tokenizer_) {
-        fail("qi21_encode_prompt: no Qwen3-VL text encoder (released?)");
-    }
-    return qwenimage21::encode_prompt(*qwen3vl_tokenizer_, *qwen3vl_model_,
-                                      std::string(prompt));
+    // Through the memo, so that encoding a prompt here is exactly what makes
+    // it primeable after the backbone is released — which is the recipe:
+    // encode everything you will need, release, then prime freely.
+    return qi21_encode_or_memo_(std::string(prompt));
 }
 
 PipelineState Pipeline::qi21_prime_from_text(const bt::Tensor& embeds,

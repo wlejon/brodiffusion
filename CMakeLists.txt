@@ -234,6 +234,7 @@ target_sources(brodiffusion PRIVATE
     src/pipeline_qwenimage21.cpp
     src/pipeline_qwenimage21_edit.cpp
     src/pipeline_qwenimage21_hooks.cpp
+    src/pipeline_qwenimage21_prefix.cpp
     src/image_io.cpp
     src/fused.cpp
     src/optim.cpp
@@ -348,7 +349,9 @@ endif()
 # --- Qwen-Image 2.1 research C API (qwenimage21_capi.dll) ---
 option(BRODIFFUSION_QWENIMAGE21_CAPI "Build the Qwen-Image 2.1 research C API DLL" ${PROJECT_IS_TOP_LEVEL})
 if(BRODIFFUSION_QWENIMAGE21_CAPI)
-    add_library(qwenimage21_capi SHARED src/capi/qwenimage21_capi.cpp)
+    add_library(qwenimage21_capi SHARED
+        src/capi/qwenimage21_capi.cpp
+        src/capi/qwenimage21_capi_hooks.cpp)
     target_link_libraries(qwenimage21_capi PRIVATE brodiffusion)
     target_compile_definitions(qwenimage21_capi PRIVATE QI_CAPI_BUILD)
 endif()

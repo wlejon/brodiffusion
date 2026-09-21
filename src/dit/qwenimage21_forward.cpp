@@ -286,12 +286,11 @@ void QwenImage21Transformer2DModel::forward_joint(
     const int Lq = cached_mode ? img_len : L;
 
     // ── timestep embedding + shared modulation ───────────────────────────
-    // `mod_d` is the set_mod_delta() variant; blocks inside the hook's range
-    // read it instead of `mod`. Built once, not per block — the modulation is
-    // four (1, hidden) rows.
-    Modulation mod, mod_d;
-    bool has_mod_delta = false;
-    build_modulation_(timestep, mod, &mod_d, &has_mod_delta);
+    // Fills mods_ with one finished Modulation per distinct hook coverage and
+    // block_variant_ with each block's index into it. Built once, not per
+    // block — the modulation is four (1, hidden) rows, and every armed
+    // binding is already folded into them.
+    build_modulation_(timestep);
 
     // Rows [0, prefix_len) of THIS forward's query block carry the t = 0
     // modulation; the rest carry the sampled t. A cached step runs target rows
@@ -435,21 +434,51 @@ void QwenImage21Transformer2DModel::forward_joint(
         }
     };
 
-    // Research hook (set_gate_mask): the rank-1 (Lq, hidden) expansion of the
-    // active slice of the per-token mask, built once here and reused by every
-    // block inside the hook's range. A cached step reads the mask's TARGET
-    // slice — the prefix rows it describes are not being recomputed.
-    const bool mask_on =
-        gate_mask_.size() == static_cast<std::size_t>(L) &&
-        gate_mask_hi_ > gate_mask_lo_;
-    if (mask_on) {
-        if (gate_ones_row_.rows != 1 || gate_ones_row_.cols != H ||
-            gate_ones_row_.dtype != dt) {
-            gate_ones_row_ = bt::Tensor::zeros_on(dev, 1, H, dt);
-            bt::add_scalar_inplace(gate_ones_row_, 1.0f);
+    // Research hook (set_gate_mask / add_gate_mask): one rank-1 (Lq, hidden)
+    // expansion per COVERAGE — the elementwise product of every mask whose
+    // range covers that group of blocks — built once here and reused by every
+    // block in the group. A cached step reads the masks' TARGET slice, since
+    // the prefix rows they describe are not being recomputed.
+    //
+    // The product is composed on host (L floats) and uploaded once: cheaper
+    // than a chain of device multiplies, and it gives gate capture the same
+    // composed values without a readback.
+    mask_full_.resize(coverages_.size());
+    mask_host_.assign(coverages_.size(), std::vector<float>());
+    bool any_mask = false;
+    for (std::size_t c = 0; c < coverages_.size(); ++c) {
+        std::vector<float>* host = nullptr;
+        for (int j : coverages_[c].gate_masks) {
+            const auto ix = static_cast<std::size_t>(j);
+            if (gate_masks_[ix].mask.size() != static_cast<std::size_t>(L)) {
+                continue;   // a mask built for another joint length
+            }
+            if (host == nullptr) {
+                host = &mask_host_[c];
+                host->assign(static_cast<std::size_t>(L), 1.0f);
+            }
+            const std::vector<float>& src = gate_mask_host_[ix];
+            for (int r = 0; r < L; ++r) {
+                (*host)[static_cast<std::size_t>(r)] *=
+                    src[static_cast<std::size_t>(r)];
+            }
         }
-        const bt::Tensor mcol = row_view(gate_mask_, rope_off, Lq);
-        bt::matmul(mcol, gate_ones_row_, gate_mask_full_);
+        if (host == nullptr) continue;
+        if (!any_mask) {
+            if (gate_ones_row_.rows != 1 || gate_ones_row_.cols != H ||
+                gate_ones_row_.dtype != dt) {
+                gate_ones_row_ = bt::Tensor::zeros_on(dev, 1, H, dt);
+                bt::add_scalar_inplace(gate_ones_row_, 1.0f);
+            }
+            any_mask = true;
+        }
+        bt::Tensor col = bt::Tensor::from_host(host->data(), L, 1).to(dev);
+        if (col.dtype != dt) {
+            bt::Tensor t;
+            bt::cast(col, t, dt);
+            col = std::move(t);
+        }
+        bt::matmul(row_view(col, rope_off, Lq), gate_ones_row_, mask_full_[c]);
     }
     // Research hook (capture_gates): rows = blocks, cols = the FULL joint
     // sequence, so the layout is stable whether the step extracted or decoded.
@@ -462,44 +491,29 @@ void QwenImage21Transformer2DModel::forward_joint(
     for (int i = 0; i < cfg_.num_layers; ++i) {
         const Block& b = blocks_[static_cast<std::size_t>(i)];
 
-        // Which modulation this block reads (set_mod_delta), and whether its
-        // gates carry the set_gate_scale factors / the set_gate_mask.
-        const Modulation& M =
-            (has_mod_delta && i >= mod_delta_lo_ && i < mod_delta_hi_) ? mod_d
-                                                                      : mod;
-        const bool gscale = M.scaled && i >= gate_lo_ && i < gate_hi_;
-        // set_gate_delta: one more finished (1, hidden) gate row per
-        // sublayer, chosen here. The residual sites downstream see exactly
-        // the operand they always saw, so folding the delta in costs no
-        // extra pass over the (Lq, hidden) activations.
-        const bool gdelta =
-            M.deltaed && i >= gate_delta_lo_ && i < gate_delta_hi_;
-        const bt::Tensor& g1_0 =
-            gdelta ? (gscale ? M.gsd1_0 : M.gd1_0)
-                   : (gscale ? M.gs1_0 : M.gate1_0);
-        const bt::Tensor& g1_t =
-            gdelta ? (gscale ? M.gsd1_t : M.gd1_t)
-                   : (gscale ? M.gs1_t : M.gate1_t);
-        const bt::Tensor& g2_0 =
-            gdelta ? (gscale ? M.gsd2_0 : M.gd2_0)
-                   : (gscale ? M.gs2_0 : M.gate2_0);
-        const bt::Tensor& g2_t =
-            gdelta ? (gscale ? M.gsd2_t : M.gd2_t)
-                   : (gscale ? M.gs2_t : M.gate2_t);
-        const bool gmask = mask_on && i >= gate_mask_lo_ && i < gate_mask_hi_;
+        // Which modulation this block reads. Every armed binding covering it
+        // — modulation deltas, gate scales, post-tanh gate deltas — is
+        // already folded into these four rows, so the residual sites
+        // downstream see exactly the operand they always saw and the block
+        // loop costs nothing per binding.
+        const std::size_t vi =
+            static_cast<std::size_t>(block_variant_[static_cast<std::size_t>(i)]);
+        const Modulation& M = mods_[vi];
+        const bt::Tensor& g1_0 = M.gate1_0;
+        const bt::Tensor& g1_t = M.gate1_t;
+        const bt::Tensor& g2_0 = M.gate2_0;
+        const bt::Tensor& g2_t = M.gate2_t;
+        const std::vector<float>& mhost = mask_host_[vi];
+        const bool gmask = !mhost.empty();
 
         if (gate_sink_ != nullptr) {
             float* dst = gate_sink_->data() +
                          static_cast<std::size_t>(i) * static_cast<std::size_t>(L);
-            const float gp = gdelta ? (gscale ? M.mean_gsd1_0 : M.mean_gd1_0)
-                                    : (gscale ? M.mean_gs1_0 : M.mean_g1_0);
-            const float gt = gdelta ? (gscale ? M.mean_gsd1_t : M.mean_gd1_t)
-                                    : (gscale ? M.mean_gs1_t : M.mean_g1_t);
-            for (int r = 0; r < prefix_len; ++r) dst[r] = gp;
-            for (int r = prefix_len; r < L; ++r) dst[r] = gt;
-            if (gmask && gate_mask_host_.size() == static_cast<std::size_t>(L)) {
+            for (int r = 0; r < prefix_len; ++r) dst[r] = M.mean_g1_0;
+            for (int r = prefix_len; r < L; ++r) dst[r] = M.mean_g1_t;
+            if (gmask) {
                 for (int r = 0; r < L; ++r) {
-                    dst[r] *= gate_mask_host_[static_cast<std::size_t>(r)];
+                    dst[r] *= mhost[static_cast<std::size_t>(r)];
                 }
             }
         }
@@ -535,6 +549,25 @@ void QwenImage21Transformer2DModel::forward_joint(
                          prefix_len * H);
             bt::copy_d2d(cache->v_[static_cast<std::size_t>(i)], 0, v_full_, 0,
                          prefix_len * H);
+            // Research hook (set_prefix_kv_scale): the composed per-layer
+            // attenuation, applied to the copy the attention will read rather
+            // than to the cache itself. That is what makes the dial
+            // idempotent — the cache stays pristine, so setting the same
+            // scale twice means the same thing, and the scale survives a
+            // re-extract.
+            if (!prefix_k_scale_.empty()) {
+                const auto li = static_cast<std::size_t>(i);
+                const float ks = prefix_k_scale_[li];
+                const float vs = prefix_v_scale_[li];
+                if (ks != 1.0f) {
+                    bt::Tensor kp = row_view(k_full_, 0, prefix_len);
+                    bt::scale_inplace(kp, ks);
+                }
+                if (vs != 1.0f) {
+                    bt::Tensor vp = row_view(v_full_, 0, prefix_len);
+                    bt::scale_inplace(vp, vs);
+                }
+            }
             bt::copy_d2d(kr, 0, k_full_, prefix_len * H, img_len * H);
             bt::copy_d2d(v, 0, v_full_, prefix_len * H, img_len * H);
             bt::flash_attention_forward(qr, k_full_, v_full_, nullptr, nh,
@@ -569,7 +602,7 @@ void QwenImage21Transformer2DModel::forward_joint(
 
         lin_into_(b.to_out, attn_cat, ao);
         gated_residual_rows(x, g1_0, g1_t, ao,
-                            gmask ? &gate_mask_full_ : nullptr,
+                            gmask ? &mask_full_[vi] : nullptr,
                             jit_.attn_gate_pre, jit_.attn_gate_post);
 
         // ── SwiGLU feed-forward ──────────────────────────────────────────
@@ -587,19 +620,23 @@ void QwenImage21Transformer2DModel::forward_joint(
         }
         lin_into_(b.mlp_out, mlp_g, mo);
         gated_residual_rows(x, g2_0, g2_t, mo,
-                            gmask ? &gate_mask_full_ : nullptr,
+                            gmask ? &mask_full_[vi] : nullptr,
                             jit_.mlp_gate_pre, jit_.mlp_gate_post);
     }
 
     // ── norm_out / proj_out over the target rows only ────────────────────
+    // norm_out is not a ranged hook: its scale comes from the time embedding
+    // and set_norm_out_scale_delta(), neither of which a block range touches,
+    // so every variant carries the same row and the first one will do.
+    const bt::Tensor& final_scale = mods_.front().final_scale;
     bt::Tensor tgt = row_view(x, cached_mode ? 0 : prefix_len, img_len);
     bt::Tensor fnm;
     detail::resize_like(fnm, img_len, H, dt, dev);
-    if (!fuse_norm_modulate(jit_.final_norm, tgt, mod.final_scale, zero_shift_,
+    if (!fuse_norm_modulate(jit_.final_norm, tgt, final_scale, zero_shift_,
                             fnm, cfg_.eps)) {
         bt::Tensor fn;
         layernorm_(tgt, fn);
-        bt::modulate(fn, mod.final_scale, zero_shift_, fnm);
+        bt::modulate(fn, final_scale, zero_shift_, fnm);
     }
     out = lin_(proj_out_, fnm);          // (img_len, out_channels)
     bt::sync_all();

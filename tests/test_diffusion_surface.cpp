@@ -56,6 +56,22 @@ const char* const kPipelineMethods[] = {
     "qwenImage21PrimeEdit", "qwenImage21PrimeFromText",
     "qwenImage21TextRows", "qwenImage21SetTextRows",
     "qwenImage21ScalePrefixKv", "qwenImage21ResetCache",
+    // ...and the multi-slot forms of every one of them, the prefix-cache
+    // slots and the prompt memo
+    "qwenImage21AddModDelta", "qwenImage21ClearModDeltas",
+    "qwenImage21ModDeltaCount",
+    "qwenImage21AddGateScale", "qwenImage21ClearGateScales",
+    "qwenImage21GateScaleCount",
+    "qwenImage21AddGateDelta", "qwenImage21ClearGateDeltas",
+    "qwenImage21GateDeltaCount",
+    "qwenImage21AddGateMask", "qwenImage21ClearGateMasks",
+    "qwenImage21GateMaskCount",
+    "qwenImage21AddPrefixKvScale", "qwenImage21ClearPrefixKvScales",
+    "qwenImage21PrefixKvScaleCount",
+    "qwenImage21SavePrefixCache", "qwenImage21BlendPrefixCache",
+    "qwenImage21ClearPrefixSlots", "qwenImage21PrefixSlots",
+    "qwenImage21PrefixSlotValid",
+    "qwenImage21MemoizedPrompts", "qwenImage21ClearPromptMemo",
     "qwenImage21EncodeImage", "qwenImage21Decode",
     "qwenImage21ReleaseTextEncoder", "qwenImage21TextEncoderResident",
     "qwenImage21ReloadTextEncoder",
@@ -128,6 +144,10 @@ void brodiffusionTestRestoredSurface() {
         {"qwenImage21SetGateDelta", 4},
         {"qwenImage21PrimeFromText", 5}, {"qwenImage21Decode", 3},
         {"qwenImage21EncodePromptImages", 3}, {"qwenImage21PrimeEdit", 3},
+        {"qwenImage21AddModDelta", 4}, {"qwenImage21AddGateScale", 6},
+        {"qwenImage21AddGateDelta", 4}, {"qwenImage21AddGateMask", 3},
+        {"qwenImage21AddPrefixKvScale", 4},
+        {"qwenImage21SavePrefixCache", 1}, {"qwenImage21BlendPrefixCache", 2},
     };
     for (const auto& a : kArity) {
         ev::Persistent fn(ev::getProperty(pipeProto.get(), a.name));

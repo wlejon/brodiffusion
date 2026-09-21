@@ -90,6 +90,12 @@ brodiffusion_add_test(brodiffusion_test_qwenimage21_dit test_qwenimage21_dit.cpp
 target_compile_definitions(brodiffusion_test_qwenimage21_dit PRIVATE
     BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
 
+# The multi-slot binding lists and the idempotent prefix-KV dial, over the
+# same synthetic checkpoint (qwenimage21_fixture.h). Pure CPU/GPU maths, no
+# weights needed, so it always runs.
+brodiffusion_add_test(brodiffusion_test_qwenimage21_slots
+                      test_qwenimage21_slots.cpp)
+
 # Sana Linear DiT (SanaTransformer2DModel) denoiser smoke test. Gated entirely
 # on the real Sana 0.6B transformer checkpoint under weights/sana-600m/transformer
 # (skips cleanly when absent — no compact synthetic fixture for this DiT).

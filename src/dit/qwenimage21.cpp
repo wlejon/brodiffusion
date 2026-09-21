@@ -345,8 +345,8 @@ void QwenImage21Transformer2DModel::encode_text(
 // ─── timestep embedding + shared modulation ────────────────────────────────
 
 void QwenImage21Transformer2DModel::build_modulation_(
-    float timestep, Modulation& m, Modulation* m_delta, bool* has_delta,
-    bt::Tensor* raw_temb, bt::Tensor* raw_mod) {
+    float timestep, bool build_variants, bt::Tensor* raw_temb,
+    bt::Tensor* raw_mod) {
     const bt::Dtype dt = flux_compute_dtype();
     const bt::Device dev = bt::default_device();
 
@@ -376,36 +376,51 @@ void QwenImage21Transformer2DModel::build_modulation_(
 
     if (raw_temb) *raw_temb = temb;
     if (raw_mod)  *raw_mod  = mod;
+    if (!build_variants) return;
 
-    chunk_modulation_(mod, final_all, m);
-
-    // Research hook (set_mod_delta): a second, deltaed copy of the shared
-    // modulation for the blocks inside the hook's range. The delta lands on
-    // the raw output, so it passes through the gates' tanh like the base
-    // value does.
-    if (m_delta != nullptr && has_delta != nullptr) *has_delta = false;
-    if (m_delta != nullptr && has_delta != nullptr && mod_delta_.size() > 0 &&
-        mod_delta_hi_ > mod_delta_lo_) {
-        bt::Tensor mod2 = mod.clone();
-        const bool do_target =
-            mod_delta_target_ != QwenImage21ModTarget::Prefix;
-        const bool do_prefix =
-            mod_delta_target_ != QwenImage21ModTarget::Target;
-        if (do_target) {
-            bt::Tensor r0 = qi21::row_view(mod2, 0, 1);
-            bt::add_inplace(r0, mod_delta_);
+    // ── the per-block variants ───────────────────────────────────────────
+    //
+    // Group the blocks by which bindings cover them, then build ONE finished
+    // modulation per group. A group whose mod-delta list is non-empty gets a
+    // deltaed copy of the raw output (the delta lands before the gates' tanh,
+    // so it passes through it like the base value does); every group then has
+    // its composed gate scale and post-tanh gate delta folded into its gate
+    // rows. With nothing armed there is exactly one group and this is the old
+    // single-modulation path.
+    resolve_coverage_();
+    mods_.resize(coverages_.size());
+    bt::Tensor mod2;
+    for (std::size_t c = 0; c < coverages_.size(); ++c) {
+        const BlockCoverage& cov = coverages_[c];
+        const bt::Tensor* src = &mod;
+        if (!cov.mod_deltas.empty()) {
+            // A scratch copy, reused across groups so the pool hands back one
+            // buffer rather than one per group.
+            detail::resize_like(mod2, mod.rows, mod.cols, mod.dtype, dev);
+            bt::copy_d2d(mod, 0, mod2, 0, static_cast<int>(mod.size()));
+            for (int j : cov.mod_deltas) {
+                const auto& b = mod_deltas_[static_cast<std::size_t>(j)];
+                const bool do_target = b.target != QwenImage21ModTarget::Prefix;
+                const bool do_prefix = b.target != QwenImage21ModTarget::Target;
+                if (do_target) {
+                    bt::Tensor r0 = qi21::row_view(mod2, 0, 1);
+                    bt::add_inplace(r0, b.delta);
+                }
+                if (do_prefix && n_rows == 2) {
+                    bt::Tensor r1 = qi21::row_view(mod2, 1, 1);
+                    bt::add_inplace(r1, b.delta);
+                } else if (do_prefix && n_rows == 1 && !do_target) {
+                    // causal_condition disabled: there is only the sampled
+                    // row and every token reads it, so a Prefix-only delta is
+                    // that row's delta.
+                    bt::Tensor r0 = qi21::row_view(mod2, 0, 1);
+                    bt::add_inplace(r0, b.delta);
+                }
+            }
+            src = &mod2;
         }
-        if (do_prefix && n_rows == 2) {
-            bt::Tensor r1 = qi21::row_view(mod2, 1, 1);
-            bt::add_inplace(r1, mod_delta_);
-        } else if (do_prefix && n_rows == 1 && !do_target) {
-            // causal_condition disabled: there is only the sampled row, and
-            // every token reads it — a Prefix-only delta is that row's delta.
-            bt::Tensor r0 = qi21::row_view(mod2, 0, 1);
-            bt::add_inplace(r0, mod_delta_);
-        }
-        chunk_modulation_(mod2, final_all, *m_delta);
-        *has_delta = true;
+        chunk_modulation_(*src, final_all, mods_[c]);
+        fold_gate_hooks_(cov, mods_[c]);
     }
 }
 
@@ -437,18 +452,24 @@ void QwenImage21Transformer2DModel::chunk_modulation_(
         bt::tanh_forward(m.gate1_0, m.gate1_0);
         bt::tanh_forward(m.gate2_0, m.gate2_0);
     } else {
-        // causal_condition disabled: every token reads the sampled row.
-        m.scale1_0 = m.scale1_t; m.gate1_0 = m.gate1_t;
-        m.scale2_0 = m.scale2_t; m.gate2_0 = m.gate2_t;
+        // causal_condition disabled: every token reads the sampled row. Copy
+        // rather than assign — the prefix and target rows carry their own
+        // gate scale factors, so they must stay separate buffers, and a
+        // reused buffer keeps the JIT sites' bindings alive.
+        auto dup = [&](const bt::Tensor& s, bt::Tensor& d) {
+            detail::resize_like(d, 1, H, dt, dev);
+            bt::copy_d2d(s, 0, d, 0, H);
+        };
+        dup(m.scale1_t, m.scale1_0);
+        dup(m.gate1_t,  m.gate1_0);
+        dup(m.scale2_t, m.scale2_0);
+        dup(m.gate2_t,  m.gate2_0);
     }
 
     detail::resize_like(m.final_scale, 1, H, dt, dev);
     bt::copy_d2d(final_all, 0, m.final_scale, 0, H);
     // Research hook (set_norm_out_scale_delta).
     if (norm_out_delta_.size() > 0) bt::add_inplace(m.final_scale, norm_out_delta_);
-
-    m.scaled = false;
-    scale_gates_(m);
 }
 
 }  // namespace brodiffusion::dit

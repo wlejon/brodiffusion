@@ -12,8 +12,13 @@
 // prefix-side hook is armed or cleared, so nothing in JS has to think about
 // it — except qwenImage21ResetCache(), which is exposed for the case where a
 // caller edits conditioning out of band.
+//
+// This file holds the single-binding hook forms, the conditioning entry
+// points, the VAE seam and text-encoder residency. The multi-slot
+// Add/Clear/Count forms, the prefix KV dial with its saved slots, the text
+// rows and the prompt memo are in native_diffusion_qwenimage21_slots.cpp.
 
-#include "host_diffusion_internal.h"
+#include "native_diffusion_qwenimage21_detail.h"
 
 #include <cstddef>
 #include <stdexcept>
@@ -23,25 +28,6 @@
 namespace brodiffusion::api {
 
 namespace {
-
-// Every qwenImage21* method is QwenImage21-only. Returns null and leaves a
-// TypeError pending (via the caller's return) when `thisVal` is not a loaded
-// Qwen-Image 2.1 Pipeline.
-PipelineWrapper* qi21Pipeline(Value thisVal) {
-    auto* w = unwrapPipeline(thisVal);
-    if (!w || !w->pipeline) return nullptr;
-    if (w->pipeline->config().model_class !=
-        brodiffusion::ModelClass::QwenImage21) {
-        return nullptr;
-    }
-    return w;
-}
-
-Value notQi21(const char* method) {
-    return ev::throwTypeError(
-        std::string("Pipeline.") + method +
-        ": not a loaded Qwen-Image 2.1 Pipeline");
-}
 
 // A (rows, cols) JS tensor object over a host FP32 slice.
 Value tensorFromHost(const float* data, int rows, int cols) {
@@ -64,26 +50,6 @@ Value makeInt32Array(const std::vector<int>& v) {
                      v.size() * sizeof(int)));
     }
     return arr;
-}
-
-// "target" (default) / "prefix" / "both", or the equivalent 0 / 1 / 2.
-bool readModTarget(Value v, brodiffusion::dit::QwenImage21ModTarget& out) {
-    using MT = brodiffusion::dit::QwenImage21ModTarget;
-    out = MT::Target;
-    if (ev::isUndefined(v) || ev::isNull(v)) return true;
-    if (ev::isNumber(v)) {
-        const int n = static_cast<int>(ev::toDouble(v));
-        if (n == 0) { out = MT::Target; return true; }
-        if (n == 1) { out = MT::Prefix; return true; }
-        if (n == 2) { out = MT::Both;   return true; }
-        return false;
-    }
-    if (!ev::isString(v)) return false;
-    const std::string s = ev::toUtf8(v);
-    if (s == "target") { out = MT::Target; return true; }
-    if (s == "prefix") { out = MT::Prefix; return true; }
-    if (s == "both")   { out = MT::Both;   return true; }
-    return false;
 }
 
 // qwenImage21SetModDelta(delta: {rows,cols,data} | null, blockLo, blockHi,
@@ -633,81 +599,6 @@ Value qi21PrimeFromText(Value thisVal, std::span<const Value> args) {
     }
 }
 
-// qwenImage21TextRows(uncond?) -> { rows, cols, data } — the prepared
-// (nValid, hidden) text rows of the most recent prime(), i.e. the joint
-// sequence's text half after txt_in.
-Value qi21TextRows(Value thisVal, std::span<const Value> args) {
-    auto* w = qi21Pipeline(thisVal);
-    if (!w) return notQi21("qwenImage21TextRows");
-    const bool uncond = !args.empty() && ev::toBool(args[0]);
-    try {
-        return tensorToJs(w->pipeline->qi21_text_rows(uncond));
-    } catch (const std::exception& e) {
-        return ev::throwError(
-            std::string("Pipeline.qwenImage21TextRows failed: ") + e.what());
-    }
-}
-
-// qwenImage21SetTextRows(rows, uncond?) — replace them; the prefix KV cache
-// is reset so the change lands on the next step.
-Value qi21SetTextRows(Value thisVal, std::span<const Value> args) {
-    auto* w = qi21Pipeline(thisVal);
-    if (!w) return notQi21("qwenImage21SetTextRows");
-    brotensor::Tensor rows;
-    if (args.empty() || !tensorFromJs(args[0], rows)) {
-        return ev::throwTypeError(
-            "Pipeline.qwenImage21SetTextRows(rows, uncond?): rows must be "
-            "{rows,cols,data}");
-    }
-    const bool uncond = args.size() >= 2 && ev::toBool(args[1]);
-    try {
-        w->pipeline->qi21_set_text_rows(rows, uncond);
-        return ev::undefined();
-    } catch (const std::exception& e) {
-        return ev::throwError(
-            std::string("Pipeline.qwenImage21SetTextRows failed: ") + e.what());
-    }
-}
-
-// qwenImage21ScalePrefixKv(layerLo, layerHi, kScale, vScale) — attenuate the
-// live prefix KV cache for a layer range. Takes effect on the next step with
-// no re-extraction; requires at least one step to have run.
-Value qi21ScalePrefixKv(Value thisVal, std::span<const Value> args) {
-    auto* w = qi21Pipeline(thisVal);
-    if (!w) return notQi21("qwenImage21ScalePrefixKv");
-    if (args.size() < 4 || !ev::isNumber(args[0]) || !ev::isNumber(args[1]) ||
-        !ev::isNumber(args[2]) || !ev::isNumber(args[3])) {
-        return ev::throwTypeError(
-            "Pipeline.qwenImage21ScalePrefixKv(layerLo, layerHi, kScale, "
-            "vScale): numeric args required");
-    }
-    try {
-        w->pipeline->qi21_scale_prefix_kv(
-            i32At(args, 0), i32At(args, 1),
-            static_cast<float>(ev::toDouble(args[2])),
-            static_cast<float>(ev::toDouble(args[3])));
-        return ev::undefined();
-    } catch (const std::exception& e) {
-        return ev::throwError(
-            std::string("Pipeline.qwenImage21ScalePrefixKv failed: ") + e.what());
-    }
-}
-
-// qwenImage21ResetCache() — drop the live prefix KV cache so the next step
-// re-extracts. The hooks do this themselves; call it after editing
-// conditioning out of band.
-Value qi21ResetCache(Value thisVal, std::span<const Value>) {
-    auto* w = qi21Pipeline(thisVal);
-    if (!w) return notQi21("qwenImage21ResetCache");
-    try {
-        w->pipeline->qi21_reset_cache();
-        return ev::undefined();
-    } catch (const std::exception& e) {
-        return ev::throwError(
-            std::string("Pipeline.qwenImage21ResetCache failed: ") + e.what());
-    }
-}
-
 // qwenImage21EncodeImage(pixels, H, W) -> { rows, cols, data, hLat, wLat } —
 // `pixels` is a Float32Array of length 3*H*W, CHW in [0,1]; H and W must be
 // multiples of 16. The result is a pipeline-scale latent, ready for
@@ -857,15 +748,14 @@ void decoratePipelineQwenImage21Proto(ObjectBuilder& proto) {
     proto.def("qwenImage21EncodePromptImages", 3, qi21EncodePromptImages);
     proto.def("qwenImage21PrimeEdit", 3, qi21PrimeEdit);
     proto.def("qwenImage21PrimeFromText", 5, qi21PrimeFromText);
-    proto.def("qwenImage21TextRows", 1, qi21TextRows);
-    proto.def("qwenImage21SetTextRows", 2, qi21SetTextRows);
-    proto.def("qwenImage21ScalePrefixKv", 4, qi21ScalePrefixKv);
-    proto.def("qwenImage21ResetCache", 0, qi21ResetCache);
     proto.def("qwenImage21EncodeImage", 3, qi21EncodeImage);
     proto.def("qwenImage21Decode", 3, qi21Decode);
     proto.def("qwenImage21ReleaseTextEncoder", 0, qi21ReleaseTextEncoder);
     proto.def("qwenImage21TextEncoderResident", 0, qi21TextEncoderResident);
     proto.def("qwenImage21ReloadTextEncoder", 3, qi21ReloadTextEncoder);
+    // The multi-slot Add/Clear/Count forms, the prefix KV dial and its saved
+    // slots, the text rows and the prompt memo.
+    decoratePipelineQwenImage21SlotsProto(proto);
 }
 
 } // namespace brodiffusion::api

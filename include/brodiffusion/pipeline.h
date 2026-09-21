@@ -46,6 +46,8 @@
 
 #include "brotensor/tensor.h"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -701,6 +703,14 @@ public:
     //     rather than a layer stack, so the control-axis machinery
     //     (cond_control(), loadControlDictionary / setControlVector) applies
     //     to it directly, before prepare(), exactly as it does for Sana.
+    //
+    // Every ranged hook holds an ORDERED LIST of bindings: qi21_set_* replaces
+    // the list with one entry (or clears it), qi21_add_* appends, and
+    // qi21_clear_* empties it. All the bindings in a list apply to the same
+    // generation, composing per block the way each hook's semantics imply —
+    // see dit/qwenimage21.h. Whether the cache needs re-extracting is decided
+    // over the WHOLE list, so adding a prefix-side binding to a target-side
+    // list resets the cache exactly once.
 
     // Modulation delta on blocks [block_lo, block_hi); `delta` is
     // (1, 4*qi21_hidden_size()) or empty to clear. `target` picks the target
@@ -710,6 +720,12 @@ public:
                             int block_hi,
                             dit::QwenImage21ModTarget target =
                                 dit::QwenImage21ModTarget::Target);
+    int  qi21_add_mod_delta(const brotensor::Tensor& delta, int block_lo,
+                            int block_hi,
+                            dit::QwenImage21ModTarget target =
+                                dit::QwenImage21ModTarget::Target);
+    void qi21_clear_mod_deltas();
+    int  qi21_mod_delta_count() const;
 
     // Timestep readout at `timestep` — the SAME 0..1000-scale value
     // qi21_step_timestep() returns and step_once() consumes; the flow-time
@@ -727,6 +743,11 @@ public:
     void qi21_set_gate_scale(float attn_scale, float mlp_scale,
                              float txt_scale, float img_scale, int block_lo,
                              int block_hi);
+    int  qi21_add_gate_scale(float attn_scale, float mlp_scale,
+                             float txt_scale, float img_scale, int block_lo,
+                             int block_hi);
+    void qi21_clear_gate_scales();
+    int  qi21_gate_scale_count() const;
 
     // Post-tanh gate delta over blocks [block_lo, block_hi): `delta` is
     // (1, 2*qi21_hidden_size()) laid out [attn, mlp], added to the effective
@@ -739,11 +760,21 @@ public:
                              int block_hi,
                              dit::QwenImage21ModTarget target =
                                  dit::QwenImage21ModTarget::Target);
+    int  qi21_add_gate_delta(const brotensor::Tensor& delta, int block_lo,
+                             int block_hi,
+                             dit::QwenImage21ModTarget target =
+                                 dit::QwenImage21ModTarget::Target);
+    void qi21_clear_gate_deltas();
+    int  qi21_gate_delta_count() const;
 
     // Per-token gate mask over blocks [block_lo, block_hi); `mask` holds
     // prefix_len + img_len values in joint forward order. Empty clears.
     void qi21_set_gate_mask(const brotensor::Tensor& mask, int block_lo,
                             int block_hi);
+    int  qi21_add_gate_mask(const brotensor::Tensor& mask, int block_lo,
+                            int block_hi);
+    void qi21_clear_gate_masks();
+    int  qi21_gate_mask_count() const;
 
     // Gate activity capture; qi21_gates() reads back the most recent step,
     // row-major (qi21_num_layers(), prefix_len + img_len).
@@ -768,11 +799,51 @@ public:
     // primed yet (or the state that owned it has been destroyed).
     void qi21_reset_cache();
 
-    // Attenuate the live prefix cache's K/V for layers [layer_lo, layer_hi).
-    // Applies to the cond branch, and to the uncond branch when one was
-    // prepared. Takes effect on the very next step, with no re-extraction.
+    // Attenuate the cached prefix K/V for layers [layer_lo, layer_hi): the
+    // cached K of those layers is multiplied by k_scale and the V by v_scale
+    // wherever a cached step reads them. Takes effect on the very next step,
+    // with no re-extraction.
+    //
+    // This is an idempotent DIAL, not an operation on the cache: calling it
+    // twice with the same value means the same thing as calling it once, it
+    // behaves through generate() like every other hook, and it survives a
+    // cache reset. (It used to multiply the live cache in place, which
+    // compounded across steps and made it unusable from generate() at all.)
+    // 1/1 over the full layer range clears; it needs no step to have run.
     void qi21_scale_prefix_kv(int layer_lo, int layer_hi, float k_scale,
                               float v_scale);
+    int  qi21_add_prefix_kv_scale(int layer_lo, int layer_hi, float k_scale,
+                                  float v_scale);
+    void qi21_clear_prefix_kv_scales();
+    int  qi21_prefix_kv_scale_count() const;
+
+    // ── prefix cache slots ────────────────────────────────────────────────
+    //
+    // N deep copies of an extracted prefix, so the conditioning of prompt A
+    // can be mixed into the live conditioning of prompt B without either one
+    // being re-encoded. The blend is on the post-RoPE K/V of the joint
+    // sequence's prefix — one level BELOW the text rows, and two below the
+    // text encoder, which may be released by then.
+    //
+    // Both branches (cond and uncond) are saved and blended together, so a
+    // CFG generation stays coherent. The layouts must match: same prefix
+    // length, same target grid, same layer count — in practice two prompts
+    // that tokenize to the same length. A mismatch throws.
+    static constexpr int kQi21PrefixSlots = 4;
+
+    // Copy the live extracted prefix into `slot`. Throws when nothing has
+    // been primed, or when the prefix has not been extracted yet (run one
+    // step first).
+    void qi21_save_prefix_cache(int slot);
+    // Blend the live prefix towards the saved one:
+    //     k = (1-alpha)*k + alpha*saved.k     (and likewise v)
+    // alpha 0 is a no-op, 1 replaces the live prefix wholesale.
+    void qi21_blend_prefix_cache(int slot, float alpha);
+    // Drop every saved slot. They hold real VRAM (prefix_len * hidden * 2 per
+    // layer per branch), so a long-running session should.
+    void qi21_clear_prefix_slots();
+    // Whether `slot` currently holds an extracted prefix.
+    bool qi21_prefix_slot_valid(int slot) const;
 
     // Read / replace the prepared text rows — txt_in's (n_valid, hidden)
     // output, the joint sequence's text half. The setter resets the prefix
@@ -789,6 +860,24 @@ public:
     // prime() builds internally and the space control axes are minted in
     // (encode_conditioning() returns its `embeds`).
     qwenimage21::TextConditioning qi21_encode_prompt(std::string_view prompt);
+
+    // ── the prompt memo ───────────────────────────────────────────────────
+    //
+    // The last K prompts this pipeline encoded, kept as prompt -> rows. It is
+    // what lets prime(prompt) / generate(prompt) work after
+    // qi21_release_text_encoder(): releasing the 8.5 GiB backbone used to
+    // throw for EVERY prompt, cached embeddings or not, which forced a
+    // research loop to hand-roll encode / release / prime_from_text. Now a
+    // prompt that has already been encoded primes with the encoder gone, and
+    // one that has not throws an error naming it.
+    //
+    // Filled by qi21_encode_prompt() and by every prime()/generate() that
+    // encoded — including the negative prompt, so a CFG generation replays
+    // whole. Bounded and least-recently-used: the rows are ~n*4096 floats
+    // each, which is a few MB, so the memo is cheap but not free.
+    static constexpr std::size_t kQi21PromptMemo = 8;
+    std::vector<std::string> qi21_memoized_prompts() const;
+    void qi21_clear_prompt_memo();
 
     // Prime a step-wise generation from caller-supplied (n, 4096) rows
     // instead of encoding a prompt — the analogue of krea_prime_from_taps().
@@ -1022,6 +1111,39 @@ private:
     bool  qi21_gate_mask_armed_        = false;
     float qi21_prefix_gate_attn_      = 1.0f;
     float qi21_prefix_gate_mlp_       = 1.0f;
+    // Re-read the whole armed state and drop the cache if the prefix side of
+    // it changed. Called after every hook mutation, so a list edit is judged
+    // as a list rather than as the one binding that moved.
+    void qi21_sync_prefix_state_();
+
+    // The prefix cache slots. One pair per slot because a CFG generation has
+    // two branches whose prompts differ; `uncond_valid` says whether the
+    // saved branch pair carried one.
+    struct Qi21PrefixSlot {
+        dit::QwenImage21PrefixCache cond;
+        dit::QwenImage21PrefixCache uncond;
+        bool uncond_valid = false;
+    };
+    std::array<Qi21PrefixSlot, kQi21PrefixSlots> qi21_prefix_slots_;
+
+    // The prompt memo, most recently encoded FIRST. A plain vector: K is 8,
+    // so a linear scan is faster than any map and the eviction order is the
+    // vector's own.
+    struct Qi21PromptMemo {
+        std::string prompt;
+        qwenimage21::TextConditioning cond;
+    };
+    std::vector<Qi21PromptMemo> qi21_prompt_memo_;
+    // Remember `prompt`'s rows, evicting the least recently used. A re-encode
+    // of a memoized prompt moves it to the front.
+    void qi21_memo_put_(const std::string& prompt,
+                        const qwenimage21::TextConditioning& tc);
+    // The memoized rows for `prompt`, or nullptr. Moves the hit to the front.
+    const qwenimage21::TextConditioning* qi21_memo_get_(
+        const std::string& prompt);
+    // Encode `prompt`, or serve it from the memo when the backbone has been
+    // released. Throws an error NAMING the prompt when neither is possible.
+    qwenimage21::TextConditioning qi21_encode_or_memo_(const std::string& prompt);
 
     // Working buffers reused across step_once() calls. The current latent
     // lives on PipelineState, not here.

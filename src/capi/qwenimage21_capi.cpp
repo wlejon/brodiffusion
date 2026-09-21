@@ -12,68 +12,28 @@
 // otherwise. That mirrors what QwenImage21Denoiser does per CFG branch, so a
 // ctypes caller driving the step loop by hand gets the same 1.1x-ish per-step
 // saving the Pipeline does without managing anything.
+//
+// This file holds the context, the components, encoding, qi_forward, the VAE
+// and the utilities; the research hooks and the prefix-cache surface are in
+// qwenimage21_capi_hooks.cpp, over the shared qwenimage21_capi_detail.h.
 
-#include "brodiffusion/qwenimage21_capi.h"
+#include "qwenimage21_capi_detail.h"
 
 #include "brodiffusion/detail/safetensors_dir.h"
-#include "brodiffusion/dit/qwenimage21.h"
 #include "brodiffusion/image_io.h"
-#include "brodiffusion/model_config.h"
-#include "brodiffusion/qwenimage21_text.h"
-#include "brodiffusion/vae_qwenimage21.h"
 
-#include "brolm/qwen3vl_text.h"
-#include "brolm/qwen3vl_tokenizer.h"
-
-#include "brotensor/ops.h"
-#include "brotensor/runtime.h"
 #include "brotensor/safetensors.h"
-#include "brotensor/tensor.h"
 
-#include <array>
-#include <cstring>
-#include <exception>
 #include <filesystem>
 #include <memory>
-#include <optional>
-#include <stdexcept>
-#include <string>
-#include <vector>
 
 namespace bt = brotensor;
 namespace bd = brodiffusion;
 
+using qi_capi::download_fp32;
+using qi_capi::guarded;
+
 namespace {
-
-thread_local std::string g_last_error;
-
-void set_error(const std::string& m) { g_last_error = m; }
-
-// Run `fn` with the exception wall: 0 on success, -1 with the message stored.
-template <typename Fn>
-int guarded(Fn&& fn) {
-    try {
-        fn();
-        return 0;
-    } catch (const std::exception& e) {
-        set_error(e.what());
-        return -1;
-    } catch (...) {
-        set_error("unknown error");
-        return -1;
-    }
-}
-
-// Download any-dtype tensor as FP32 into a caller buffer.
-void download_fp32(const bt::Tensor& t, float* dst) {
-    bt::Tensor f32;
-    if (t.dtype != bt::Dtype::FP32) bt::cast(t, f32, bt::Dtype::FP32);
-    else f32 = t;
-    bt::sync_all();
-    bt::Tensor host = f32.to(bt::Device::CPU);
-    std::memcpy(dst, host.data,
-                sizeof(float) * static_cast<std::size_t>(host.size()));
-}
 
 // The diffusers packaging of Qwen-Image 2.1 ships the backbone as
 // "model.language_model.*"; a standalone Qwen3-VL checkpoint drops the
@@ -92,34 +52,9 @@ std::string lm_prefix(const std::vector<const bt::safetensors::File*>& shards) {
 
 }  // namespace
 
-struct qi_ctx {
-    bd::ModelConfig mc;
-    std::optional<brolm::qwen3vl::Tokenizer> tokenizer;
-    std::optional<brolm::qwen3vl::TextModel> te;
-    std::optional<bd::dit::QwenImage21Transformer2DModel> dit;
-    std::optional<bd::vae_qwenimage21::Decoder> vae;
-    std::optional<bd::vae_qwenimage21::Encoder> vae_enc;
-
-    std::optional<brolm::qwen3vl::VisionTower> vision;
-
-    // Most recent qi_encode_prompt / qi_encode_prompt_images result.
-    bd::qwenimage21::TextConditioning prompt;
-    bool have_prompt = false;
-
-    // Condition latents armed by qi_set_condition_latents, plus the prefix
-    // segments the parked prompt's image runs imply. Empty = text-to-image.
-    bd::dit::QwenImage21EditPrefix edit;
-
-    // The live prefix KV cache and its saved snapshots.
-    bd::dit::QwenImage21PrefixCache cache;
-    std::array<bd::dit::QwenImage21PrefixCache, QI_PREFIX_SLOTS> slots;
-
-    std::vector<float> gates;   // capture sink for qi_capture_gates
-};
-
 extern "C" {
 
-const char* qi_last_error(void) { return g_last_error.c_str(); }
+const char* qi_last_error(void) { return qi_capi::last_error().c_str(); }
 
 qi_ctx* qi_open(const char* model_dir, int components, int quantize) {
     qi_ctx* c = nullptr;
@@ -499,186 +434,6 @@ int qi_forward(qi_ctx* c, const float* latent, int h_lat, int w_lat,
                               c->edit.empty() ? nullptr : &c->edit.cond_latents,
                               segments, timestep, &c->cache, v);
         download_fp32(v, out);
-    });
-}
-
-int qi_reset_cache(qi_ctx* c) {
-    return guarded([&] { c->cache.reset(); });
-}
-
-int qi_set_mod_delta(qi_ctx* c, const float* delta, int block_lo,
-                     int block_hi, int target) {
-    return guarded([&] {
-        if (!c->dit) {
-            throw std::runtime_error("qi_set_mod_delta: DiT not loaded "
-                                     "(open with QI_LOAD_DIT)");
-        }
-        using MT = bd::dit::QwenImage21ModTarget;
-        MT mt = MT::Target;
-        if (target == QI_MOD_PREFIX) mt = MT::Prefix;
-        else if (target == QI_MOD_BOTH) mt = MT::Both;
-        else if (target != QI_MOD_TARGET) {
-            throw std::runtime_error("qi_set_mod_delta: target must be one of "
-                                     "QI_MOD_TARGET/PREFIX/BOTH");
-        }
-        if (!delta) {
-            c->dit->set_mod_delta(bt::Tensor(), 0, 0, mt);
-            return;
-        }
-        const int h = c->mc.qwenimage21.transformer.hidden_size();
-        bt::Tensor d = bt::Tensor::from_host(delta, 1, 4 * h)
-                           .to(bt::default_device());
-        c->dit->set_mod_delta(d, block_lo, block_hi, mt);
-    });
-}
-
-int qi_time_mod(qi_ctx* c, float timestep, float* temb_out, float* mod_out) {
-    return guarded([&] {
-        if (!c->dit) {
-            throw std::runtime_error("qi_time_mod: DiT not loaded "
-                                     "(open with QI_LOAD_DIT)");
-        }
-        bt::Tensor temb, mod;
-        c->dit->compute_time_mod(timestep, temb, mod);
-        if (temb_out) download_fp32(temb, temb_out);
-        if (mod_out)  download_fp32(mod, mod_out);
-    });
-}
-
-int qi_set_gate_scale(qi_ctx* c, float attn_scale, float mlp_scale,
-                      float txt_scale, float img_scale, int block_lo,
-                      int block_hi) {
-    return guarded([&] {
-        if (!c->dit) {
-            throw std::runtime_error("qi_set_gate_scale: DiT not loaded "
-                                     "(open with QI_LOAD_DIT)");
-        }
-        c->dit->set_gate_scale(attn_scale, mlp_scale, txt_scale, img_scale,
-                               block_lo, block_hi);
-    });
-}
-
-int qi_set_gate_delta(qi_ctx* c, const float* delta, int block_lo,
-                      int block_hi, int target) {
-    return guarded([&] {
-        if (!c->dit) {
-            throw std::runtime_error("qi_set_gate_delta: DiT not loaded "
-                                     "(open with QI_LOAD_DIT)");
-        }
-        using MT = bd::dit::QwenImage21ModTarget;
-        MT mt = MT::Target;
-        if (target == QI_MOD_PREFIX) mt = MT::Prefix;
-        else if (target == QI_MOD_BOTH) mt = MT::Both;
-        else if (target != QI_MOD_TARGET) {
-            throw std::runtime_error("qi_set_gate_delta: target must be one of "
-                                     "QI_MOD_TARGET/PREFIX/BOTH");
-        }
-        if (!delta) {
-            c->dit->set_gate_delta(bt::Tensor(), 0, 0, mt);
-            return;
-        }
-        const int h = c->mc.qwenimage21.transformer.hidden_size();
-        bt::Tensor d = bt::Tensor::from_host(delta, 1, 2 * h)
-                           .to(bt::default_device());
-        c->dit->set_gate_delta(d, block_lo, block_hi, mt);
-    });
-}
-
-int qi_set_gate_mask(qi_ctx* c, const float* mask, int64_t n, int block_lo,
-                     int block_hi) {
-    return guarded([&] {
-        if (!c->dit) {
-            throw std::runtime_error("qi_set_gate_mask: DiT not loaded "
-                                     "(open with QI_LOAD_DIT)");
-        }
-        if (!mask) {
-            c->dit->set_gate_mask(bt::Tensor(), 0, 0);
-            return;
-        }
-        bt::Tensor m = bt::Tensor::from_host(mask, static_cast<int>(n), 1)
-                           .to(bt::default_device());
-        c->dit->set_gate_mask(m, block_lo, block_hi);
-    });
-}
-
-int qi_set_norm_out_scale_delta(qi_ctx* c, const float* delta) {
-    return guarded([&] {
-        if (!c->dit) {
-            throw std::runtime_error("qi_set_norm_out_scale_delta: DiT not "
-                                     "loaded (open with QI_LOAD_DIT)");
-        }
-        if (!delta) {
-            c->dit->set_norm_out_scale_delta(bt::Tensor());
-            return;
-        }
-        const int h = c->mc.qwenimage21.transformer.hidden_size();
-        bt::Tensor d = bt::Tensor::from_host(delta, 1, h)
-                           .to(bt::default_device());
-        c->dit->set_norm_out_scale_delta(d);
-    });
-}
-
-int qi_capture_gates(qi_ctx* c, int enable) {
-    return guarded([&] {
-        if (!c->dit) {
-            throw std::runtime_error("qi_capture_gates: DiT not loaded "
-                                     "(open with QI_LOAD_DIT)");
-        }
-        c->dit->capture_gates(enable ? &c->gates : nullptr);
-        if (!enable) c->gates.clear();
-    });
-}
-
-int64_t qi_gates_size(qi_ctx* c) {
-    return static_cast<int64_t>(c->gates.size());
-}
-
-int qi_get_gates(qi_ctx* c, float* out) {
-    return guarded([&] {
-        if (c->gates.empty()) {
-            throw std::runtime_error("qi_get_gates: nothing captured");
-        }
-        if (!out) throw std::runtime_error("qi_get_gates: out is NULL");
-        std::memcpy(out, c->gates.data(), c->gates.size() * sizeof(float));
-    });
-}
-
-// ── prefix KV cache surface ────────────────────────────────────────────────
-
-int qi_scale_prefix_kv(qi_ctx* c, int layer_lo, int layer_hi, float k_scale,
-                       float v_scale) {
-    return guarded([&] {
-        if (!c->cache.valid()) {
-            throw std::runtime_error("qi_scale_prefix_kv: nothing extracted "
-                                     "yet — run one qi_forward first");
-        }
-        c->cache.scale_kv(layer_lo, layer_hi, k_scale, v_scale);
-    });
-}
-
-int qi_save_prefix(qi_ctx* c, int slot) {
-    return guarded([&] {
-        if (slot < 0 || slot >= QI_PREFIX_SLOTS) {
-            throw std::runtime_error("qi_save_prefix: slot out of range");
-        }
-        if (!c->cache.valid()) {
-            throw std::runtime_error("qi_save_prefix: nothing extracted yet — "
-                                     "run one qi_forward first");
-        }
-        c->slots[static_cast<std::size_t>(slot)] = c->cache;
-    });
-}
-
-int qi_blend_prefix(qi_ctx* c, int slot, float alpha) {
-    return guarded([&] {
-        if (slot < 0 || slot >= QI_PREFIX_SLOTS) {
-            throw std::runtime_error("qi_blend_prefix: slot out of range");
-        }
-        if (!c->cache.valid()) {
-            throw std::runtime_error("qi_blend_prefix: nothing extracted yet — "
-                                     "run one qi_forward first");
-        }
-        c->cache.blend_from(c->slots[static_cast<std::size_t>(slot)], alpha);
     });
 }
 

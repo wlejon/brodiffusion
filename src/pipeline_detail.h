@@ -13,13 +13,16 @@
 //   pipeline_decode.cpp      VAE routing and the generate() convenience loop
 //   pipeline_krea2.cpp       Krea 2 loading + research hooks
 //   pipeline_qwenimage21.cpp          Qwen-Image 2.1 loading
+//   pipeline_qwenimage21_edit.cpp     Qwen-Image 2.1 image-conditioned priming
 //   pipeline_qwenimage21_hooks.cpp    Qwen-Image 2.1 research hooks
+//   pipeline_qwenimage21_prefix.cpp   Qwen-Image 2.1 prefix cache + prompt memo
 //
 // These were the anonymous-namespace helpers of a single 2000-line
 // pipeline.cpp; splitting that file is what made them need a home of their
 // own. Nothing here is public API — the header is not installed.
 
 #include "brodiffusion/denoiser.h"
+#include "brodiffusion/dit/qwenimage21.h"
 #include "brodiffusion/dpm_solver.h"
 #include "brodiffusion/flow_match_scheduler.h"
 #include "brodiffusion/lcm_scheduler.h"
@@ -46,6 +49,27 @@ namespace detail_pipe {
 
 [[noreturn]] inline void fail(const std::string& msg) {
     throw std::runtime_error("pipeline::Pipeline: " + msg);
+}
+
+// The Qwen-Image 2.1 denoiser / transformer behind the Denoiser interface, or
+// a throw naming the caller. Shared by the two qi21 translation units: the
+// research hooks in pipeline_qwenimage21_hooks.cpp and the prefix-cache
+// surface in pipeline_qwenimage21_prefix.cpp.
+inline dit::QwenImage21Denoiser& qi21_denoiser(
+    ModelClass model_class, const std::unique_ptr<Denoiser>& d,
+    const char* who) {
+    if (model_class != ModelClass::QwenImage21) {
+        fail(std::string(who) + ": Qwen-Image 2.1 only");
+    }
+    auto* den = dynamic_cast<dit::QwenImage21Denoiser*>(d.get());
+    if (!den) fail(std::string(who) + ": no Qwen-Image 2.1 denoiser");
+    return *den;
+}
+
+inline dit::QwenImage21Transformer2DModel& qi21_model(
+    ModelClass model_class, const std::unique_ptr<Denoiser>& d,
+    const char* who) {
+    return qi21_denoiser(model_class, d, who).model();
 }
 
 using SchedulerVariant =

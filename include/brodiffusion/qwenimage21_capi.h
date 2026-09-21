@@ -35,6 +35,20 @@
  *   - Functions return 0 on success, -1 on failure (qi_last_error() has the
  *     message; per-thread). Functions that return a count return -1 on failure.
  *   - One qi_ctx per model dir; not thread-safe (drive from one thread).
+ *
+ * Multi-slot hooks. Every ranged hook below holds an ORDERED LIST of
+ * bindings, all of which apply to the same forward:
+ *
+ *     qi_set_*    replace the list with this one binding. A NULL tensor, an
+ *                 identity scale or an empty range clears it instead.
+ *     qi_add_*    append a binding; returns its index, or -1.
+ *     qi_clear_*  empty the list.
+ *     qi_*_count  how many bindings are armed.
+ *
+ * For a block covered by several, deltas ADD and scales / masks MULTIPLY. The
+ * composition happens at bind time — the model folds every covering binding
+ * into one finished (1, hidden) row per distinct coverage over the 32 blocks —
+ * so an arbitrary number of bindings costs the forward nothing per token.
  */
 
 #include <stdint.h>
@@ -185,6 +199,10 @@ QI_API int qi_reset_cache(qi_ctx* c);
  * QI_MOD_BOTH delta needs qi_reset_cache() to take effect. */
 QI_API int qi_set_mod_delta(qi_ctx* c, const float* delta, int block_lo,
                             int block_hi, int target);
+QI_API int qi_add_mod_delta(qi_ctx* c, const float* delta, int block_lo,
+                            int block_hi, int target);
+QI_API int qi_clear_mod_deltas(qi_ctx* c);
+QI_API int qi_mod_delta_count(qi_ctx* c);
 
 /* Timestep readout, no image forward, at flow time `timestep`:
  *   temb_out: (2 * hidden_size)     row 0 = the sampled t, row 1 = t = 0
@@ -201,6 +219,11 @@ QI_API int qi_time_mod(qi_ctx* c, float timestep, float* temb_out,
 QI_API int qi_set_gate_scale(qi_ctx* c, float attn_scale, float mlp_scale,
                              float txt_scale, float img_scale, int block_lo,
                              int block_hi);
+QI_API int qi_add_gate_scale(qi_ctx* c, float attn_scale, float mlp_scale,
+                             float txt_scale, float img_scale, int block_lo,
+                             int block_hi);
+QI_API int qi_clear_gate_scales(qi_ctx* c);
+QI_API int qi_gate_scale_count(qi_ctx* c);
 
 /* Post-tanh gate delta: add delta (2 * hidden_size, laid out [attn, mlp]) to
  * the EFFECTIVE gate of blocks [block_lo, block_hi) on the row named by
@@ -212,6 +235,10 @@ QI_API int qi_set_gate_scale(qi_ctx* c, float attn_scale, float mlp_scale,
  * qi_reset_cache() to take effect. */
 QI_API int qi_set_gate_delta(qi_ctx* c, const float* delta, int block_lo,
                              int block_hi, int target);
+QI_API int qi_add_gate_delta(qi_ctx* c, const float* delta, int block_lo,
+                             int block_hi, int target);
+QI_API int qi_clear_gate_deltas(qi_ctx* c);
+QI_API int qi_gate_delta_count(qi_ctx* c);
 
 /* Per-token gate mask: both sublayers' gated residual for row r of blocks
  * [block_lo, block_hi) is multiplied by mask[r], after the tanh and after any
@@ -220,6 +247,10 @@ QI_API int qi_set_gate_delta(qi_ctx* c, const float* delta, int block_lo,
  * qi_reset_cache() for its prefix half to land. */
 QI_API int qi_set_gate_mask(qi_ctx* c, const float* mask, int64_t n,
                             int block_lo, int block_hi);
+QI_API int qi_add_gate_mask(qi_ctx* c, const float* mask, int64_t n,
+                            int block_lo, int block_hi);
+QI_API int qi_clear_gate_masks(qi_ctx* c);
+QI_API int qi_gate_mask_count(qi_ctx* c);
 
 /* norm_out scale delta: add delta (hidden_size) to the final adaptive scale
  * the target rows pass through before proj_out. NULL clears. */
@@ -239,23 +270,37 @@ QI_API int     qi_get_gates(qi_ctx* c, float* out);
 /* ── prefix KV cache surface (QI_LOAD_DIT) ─────────────────────────────────
  * After the extract step the cache IS the conditioning as far as every later
  * forward is concerned, so attenuating or mixing it steers generation without
- * re-encoding anything. Both operations apply to the LIVE cache and take
- * effect on the very next qi_forward, with no re-extraction. */
+ * re-encoding anything. Both take effect on the very next qi_forward, with no
+ * re-extraction. */
 
 /* Multiply the cached K of layers [layer_lo, layer_hi) by k_scale and V by
  * v_scale. Attenuating V alone fades the prefix's contribution while leaving
- * the attention pattern it induces intact; K alone flattens that pattern. */
+ * the attention pattern it induces intact; K alone flattens that pattern.
+ *
+ * This is an idempotent DIAL on the model, not a multiply into the cache: the
+ * factor is applied where a cached forward READS the cache, so setting it
+ * twice means the same thing as setting it once, it works through a whole
+ * step loop, and it survives qi_reset_cache(). It needs nothing to have been
+ * extracted first, and 1/1 over the full layer range clears it. */
 QI_API int qi_scale_prefix_kv(qi_ctx* c, int layer_lo, int layer_hi,
                               float k_scale, float v_scale);
+QI_API int qi_add_prefix_kv_scale(qi_ctx* c, int layer_lo, int layer_hi,
+                                  float k_scale, float v_scale);
+QI_API int qi_clear_prefix_kv_scales(qi_ctx* c);
+QI_API int qi_prefix_kv_scale_count(qi_ctx* c);
 
 /* Copy the live cache into slot `slot` (0..QI_PREFIX_SLOTS-1), and blend the
  * live cache towards a saved one:
  *     k = (1-alpha)*k + alpha*saved.k     (and likewise v)
  * The two must share a layout — same prefix length and target grid — which in
- * practice means two prompts that tokenize to the same length. */
+ * practice means two prompts that tokenize to the same length.
+ * qi_clear_prefix_slots drops every saved cache and trims the allocator; they
+ * hold real VRAM. qi_prefix_slot_valid returns 1/0 and never fails. */
 enum { QI_PREFIX_SLOTS = 4 };
 QI_API int qi_save_prefix(qi_ctx* c, int slot);
 QI_API int qi_blend_prefix(qi_ctx* c, int slot, float alpha);
+QI_API int qi_clear_prefix_slots(qi_ctx* c);
+QI_API int qi_prefix_slot_valid(qi_ctx* c, int slot);
 
 /* ── VAE (QI_LOAD_VAE) ─────────────────────────────────────────────────────
  * Both halves are loaded together — the encoder is ~200 MB against the DiT's

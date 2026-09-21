@@ -129,6 +129,61 @@ enum class QwenImage21ModTarget {
     Both   = 2
 };
 
+// ─── the research hooks, as ORDERED LISTS of bindings ───────────────────────
+//
+// Every in-network hook holds a list, not one configuration. All the bindings
+// in a list apply to the same forward; for a given block the bindings whose
+// range covers it compose the way each hook's semantics imply — deltas ADD,
+// scales and masks MULTIPLY.
+//
+// The composition happens at BIND time, not per token. The modulation is four
+// (1, hidden) rows shared by all 32 blocks, so the model folds every covering
+// binding into one finished gate / scale row per distinct coverage pattern
+// and the fused gated-residual kernel still consumes a single operand — an
+// arbitrary number of armed bindings costs one extra (1, hidden) row each,
+// never a second pass over the (L, hidden) activations.
+//
+// The single-binding set_*() calls remain, as sugar for "replace the list
+// with this one entry" (or, given an empty tensor / an empty range, "clear").
+
+// set_mod_delta / add_mod_delta: (1, 4*hidden) on the pre-chunk
+// [scale1, gate1, scale2, gate2] modulation output, before the gates' tanh.
+struct QwenImage21ModDeltaBinding {
+    brotensor::Tensor delta;
+    int block_lo = 0, block_hi = 0;
+    QwenImage21ModTarget target = QwenImage21ModTarget::Target;
+};
+
+// set_gate_scale / add_gate_scale: scalar multipliers on the post-tanh gates.
+struct QwenImage21GateScaleBinding {
+    float attn_scale = 1.0f, mlp_scale = 1.0f;
+    float txt_scale  = 1.0f, img_scale = 1.0f;
+    int block_lo = 0, block_hi = 0;
+};
+
+// set_gate_delta / add_gate_delta: (1, 2*hidden) laid out [attn, mlp], added
+// to the effective gate AFTER the tanh and after every gate scale.
+struct QwenImage21GateDeltaBinding {
+    brotensor::Tensor delta;
+    int block_lo = 0, block_hi = 0;
+    QwenImage21ModTarget target = QwenImage21ModTarget::Target;
+};
+
+// set_gate_mask / add_gate_mask: one value per joint-sequence row, multiplied
+// into both sublayers' gated residual.
+struct QwenImage21GateMaskBinding {
+    brotensor::Tensor mask;
+    int block_lo = 0, block_hi = 0;
+};
+
+// set_prefix_kv_scale / add_prefix_kv_scale: a per-layer attenuation of the
+// CACHED prefix K/V, applied where the cache is read rather than written into
+// it — so it is an idempotent dial (see set_prefix_kv_scales()).
+struct QwenImage21PrefixKvBinding {
+    int layer_lo = 0, layer_hi = 0;
+    float k_scale = 1.0f, v_scale = 1.0f;
+};
+
 // Per-layer post-RoPE K/V of the joint sequence's prefix, plus the layout it
 // was extracted for. Owned by the caller (the Denoiser keeps one per CFG
 // branch); reset() drops it so the next forward re-extracts.
@@ -244,19 +299,38 @@ public:
     // differences: there is ONE modulation vector for all 32 blocks (so a
     // block range is realised by computing a second, deltaed copy of it), and
     // the prefix and target rows read DIFFERENT rows of it.
+    //
+    // Each hook holds an ORDERED LIST of bindings (see the QwenImage21*Binding
+    // structs above); a block reads the composition of every binding whose
+    // range covers it. The model resolves the lists into one finished
+    // modulation per distinct coverage pattern at the top of each forward, so
+    // a block loop with twelve bindings armed runs exactly the kernels a block
+    // loop with one does.
 
     // Modulation delta (the AdaLN seam): add `delta` (1, 4*hidden_size, any
     // device/dtype) to the shared modulation OUTPUT — the pre-chunk vector
     // laid out [scale1, gate1, scale2, gate2] — for blocks
     // [block_lo, block_hi), on the row named by `target`. The delta lands
     // BEFORE the gates' tanh, so a gate component saturates rather than
-    // running away. An empty tensor clears the hook.
+    // running away. Deltas covering the same block ADD.
+    //
+    // set_mod_delta() replaces the whole list with this one binding; an empty
+    // tensor or an empty range clears it. add_mod_delta() appends and returns
+    // the new binding's index.
     //
     // See QwenImage21ModTarget: a Prefix / Both delta only takes effect on an
     // extract step, so reset the prefix cache after arming one.
     void set_mod_delta(const brotensor::Tensor& delta, int block_lo,
                        int block_hi,
                        QwenImage21ModTarget target = QwenImage21ModTarget::Target);
+    int  add_mod_delta(const brotensor::Tensor& delta, int block_lo,
+                       int block_hi,
+                       QwenImage21ModTarget target = QwenImage21ModTarget::Target);
+    void set_mod_deltas(const std::vector<QwenImage21ModDeltaBinding>& list);
+    void clear_mod_deltas();
+    const std::vector<QwenImage21ModDeltaBinding>& mod_deltas() const {
+        return mod_deltas_;
+    }
 
     // Timestep-embedding readout at flow time `timestep`, no image forward.
     //   temb_out: (2, hidden_size) FP32 — row 0 the sampled t, row 1 t = 0.
@@ -271,9 +345,19 @@ public:
     // blocks [block_lo, block_hi). `attn_scale` scales gate1 (the attention
     // sublayer), `mlp_scale` gate2 (the SwiGLU sublayer); orthogonally,
     // `txt_scale` scales the gate the PREFIX rows see and `img_scale` the one
-    // the TARGET rows see. All four at 1 clears the hook.
+    // the TARGET rows see. Scales covering the same block MULTIPLY.
+    //
+    // set_gate_scale() replaces the whole list with this one binding; all four
+    // factors at 1, or an empty range, clears it. add_gate_scale() appends.
     void set_gate_scale(float attn_scale, float mlp_scale, float txt_scale,
                         float img_scale, int block_lo, int block_hi);
+    int  add_gate_scale(float attn_scale, float mlp_scale, float txt_scale,
+                        float img_scale, int block_lo, int block_hi);
+    void set_gate_scales(const std::vector<QwenImage21GateScaleBinding>& list);
+    void clear_gate_scales();
+    const std::vector<QwenImage21GateScaleBinding>& gate_scales() const {
+        return gate_scales_;
+    }
 
     // Gate delta: add `delta` (1, 2*hidden_size, laid out [attn, mlp], any
     // device/dtype) to the EFFECTIVE gate of blocks [block_lo, block_hi) —
@@ -284,7 +368,11 @@ public:
     // `target` picks the row class the delta lands on, exactly as
     // set_mod_delta()'s does: Target is the sampled-t row (the image being
     // generated), Prefix the t = 0 row (text and condition-image tokens).
-    // An empty tensor clears the hook.
+    // Deltas covering the same block ADD, and they are applied after every
+    // covering gate scale has multiplied the tanh.
+    //
+    // set_gate_delta() replaces the whole list with this one binding; an empty
+    // tensor or an empty range clears it. add_gate_delta() appends.
     //
     // Why this exists next to set_mod_delta(). That hook adds BEFORE the
     // tanh, so its authority over a gate channel is tanh'(g) — and the
@@ -307,6 +395,15 @@ public:
                         int block_hi,
                         QwenImage21ModTarget target =
                             QwenImage21ModTarget::Target);
+    int  add_gate_delta(const brotensor::Tensor& delta, int block_lo,
+                        int block_hi,
+                        QwenImage21ModTarget target =
+                            QwenImage21ModTarget::Target);
+    void set_gate_deltas(const std::vector<QwenImage21GateDeltaBinding>& list);
+    void clear_gate_deltas();
+    const std::vector<QwenImage21GateDeltaBinding>& gate_deltas() const {
+        return gate_deltas_;
+    }
 
     // Per-token gate mask over blocks [block_lo, block_hi): after the tanh
     // (and any set_gate_scale / set_gate_delta), both sublayers' gated
@@ -314,10 +411,49 @@ public:
     // multiplied by mask[r]. `mask` holds prefix_len + hp*wp values in joint
     // forward order (any device/dtype); a cached step reads only its target
     // slice. Zeroing a row removes that token's residual updates entirely for
-    // the masked blocks. An empty tensor clears; a forward whose joint length
-    // differs from the mask skips it.
+    // the masked blocks. Masks covering the same block MULTIPLY elementwise.
+    // An empty tensor clears; a forward whose joint length differs from a
+    // mask skips that mask.
+    //
+    // set_gate_mask() replaces the whole list with this one binding;
+    // add_gate_mask() appends.
     void set_gate_mask(const brotensor::Tensor& mask, int block_lo,
                        int block_hi);
+    int  add_gate_mask(const brotensor::Tensor& mask, int block_lo,
+                       int block_hi);
+    void set_gate_masks(const std::vector<QwenImage21GateMaskBinding>& list);
+    void clear_gate_masks();
+    const std::vector<QwenImage21GateMaskBinding>& gate_masks() const {
+        return gate_masks_;
+    }
+
+    // Prefix KV attenuation: multiply the CACHED prefix K of layers
+    // [layer_lo, layer_hi) by `k_scale` and V by `v_scale` wherever a cached
+    // forward reads them. Bindings covering the same layer MULTIPLY.
+    //
+    // Why this is a model hook rather than an operation on the cache. The
+    // obvious implementation — scale the cache in place — is cumulative: the
+    // dial compounds every time it is set, so it cannot be used through a
+    // generate() loop at all, and repeated calls never mean the same thing
+    // twice. Applying the composed per-layer factor at the point the cached
+    // rows are copied into the attention's K/V instead makes it an ordinary
+    // idempotent dial, costs one pass over the (prefix_len, hidden) prefix
+    // per layer (against the whole joint attention), and needs no second copy
+    // of the cache. It also survives a cache reset, because it describes what
+    // the model does with a prefix, not what is in one.
+    //
+    // A scale takes effect on cached steps only: an extract step attends the
+    // prefix rows it is computing, not the cache.
+    void set_prefix_kv_scale(int layer_lo, int layer_hi, float k_scale,
+                             float v_scale);
+    int  add_prefix_kv_scale(int layer_lo, int layer_hi, float k_scale,
+                             float v_scale);
+    void set_prefix_kv_scales(
+        const std::vector<QwenImage21PrefixKvBinding>& list);
+    void clear_prefix_kv_scales();
+    const std::vector<QwenImage21PrefixKvBinding>& prefix_kv_scales() const {
+        return prefix_kv_scales_;
+    }
 
     // Gate activity capture: when `sink` is non-null, every subsequent
     // forward overwrites it with the per-row mean EFFECTIVE attention gate of
@@ -366,36 +502,36 @@ private:
         Linear mlp_gate, mlp_proj, mlp_out;    // img_mlp.{gate_layer,proj,out}
     };
 
-    // The four (1, hidden) modulation rows a forward runs on, plus the
-    // norm_out scale — computed once per forward and shared by every block.
-    // `_t` is the sampled timestep's row, `_0` the t = 0 row that text and
-    // condition-image tokens use under causal_condition.
+    // The four (1, hidden) modulation rows a block runs on, plus the norm_out
+    // scale. `_t` is the sampled timestep's row, `_0` the t = 0 row that text
+    // and condition-image tokens use under causal_condition.
+    //
+    // Every hook is already FOLDED IN: the gates carry their composed scale
+    // factor and their composed post-tanh delta, so a block reads one finished
+    // row per sublayer per row class and the fused gated-residual kernel keeps
+    // its single gate operand however many bindings are armed. A forward
+    // builds one of these per distinct hook COVERAGE — with nothing armed
+    // that is one; with the research controller's dial vector armed it is two
+    // or three; it is bounded by the block count either way.
     struct Modulation {
         brotensor::Tensor scale1_t, gate1_t, scale2_t, gate2_t;
         brotensor::Tensor scale1_0, gate1_0, scale2_0, gate2_0;
         brotensor::Tensor final_scale;   // norm_out, target rows (t)
-        // set_gate_scale variants of the four gates, built once per forward
-        // and used by the blocks inside [gate_lo_, gate_hi_). Valid only when
-        // `scaled` is true.
-        brotensor::Tensor gs1_t, gs2_t, gs1_0, gs2_0;
-        bool scaled = false;
-        // set_gate_delta variants, for the blocks inside [gate_delta_lo_,
-        // gate_delta_hi_). `gd*` is the plain gate plus the delta and `gsd*`
-        // the set_gate_scale-scaled gate plus the delta, so a block covered
-        // by both hooks still reads ONE (1, hidden) row and the fused
-        // gated-residual kernel keeps its single gate operand. Valid only
-        // when `deltaed` is true; the `gsd*` half additionally requires
-        // `scaled`.
-        brotensor::Tensor gd1_t, gd2_t, gd1_0, gd2_0;
-        brotensor::Tensor gsd1_t, gsd2_t, gsd1_0, gsd2_0;
-        bool deltaed = false;
-        // Mean over hidden of each attention gate, for capture_gates(). One
-        // per variant: plain, scaled, deltaed, scaled-and-deltaed, each in
-        // (target row, prefix row) order.
+        // Mean over hidden of the effective attention gate of each row class,
+        // for capture_gates(). Only filled when a sink is armed — the
+        // readback is a device sync.
         float mean_g1_t = 0.0f, mean_g1_0 = 0.0f;
-        float mean_gs1_t = 0.0f, mean_gs1_0 = 0.0f;
-        float mean_gd1_t = 0.0f, mean_gd1_0 = 0.0f;
-        float mean_gsd1_t = 0.0f, mean_gsd1_0 = 0.0f;
+    };
+
+    // One block's resolved hook coverage: which bindings of each list cover
+    // it. Blocks with identical coverage share a Modulation.
+    struct BlockCoverage {
+        std::vector<int> mod_deltas, gate_scales, gate_deltas, gate_masks;
+        bool operator==(const BlockCoverage& o) const {
+            return mod_deltas == o.mod_deltas &&
+                   gate_scales == o.gate_scales &&
+                   gate_deltas == o.gate_deltas && gate_masks == o.gate_masks;
+        }
     };
 
     void load_impl_(const std::vector<const brotensor::safetensors::File*>& shards,
@@ -415,26 +551,27 @@ private:
     // Non-affine LayerNorm (eps = cfg_.eps) over (L, hidden).
     void layernorm_(const brotensor::Tensor& X, brotensor::Tensor& Y);
 
-    // Timestep embedding + shared modulation chunks, for flow time
-    // `timestep`. When `m_delta` is non-null and a set_mod_delta() hook is
-    // armed, it additionally receives the deltaed variant and *has_delta is
-    // set — blocks inside the delta's range use that one. `raw_mod` /
-    // `raw_temb`, when non-null, receive the (n_rows, 4*hidden) modulation
-    // output and the (n_rows, hidden) time embedding before any chunking,
-    // which is what compute_time_mod() reads back.
-    void build_modulation_(float timestep, Modulation& m,
-                           Modulation* m_delta = nullptr,
-                           bool* has_delta = nullptr,
+    // Timestep embedding + the per-block modulation variants, for flow time
+    // `timestep`. Fills mods_ with one Modulation per distinct hook coverage
+    // and block_variant_ with each block's index into it — so the block loop
+    // is a lookup, not a composition. `raw_mod` / `raw_temb`, when non-null,
+    // receive the (n_rows, 4*hidden) modulation output and the (n_rows,
+    // hidden) time embedding before any chunking, which is what
+    // compute_time_mod() reads back.
+    void build_modulation_(float timestep, bool build_variants = true,
                            brotensor::Tensor* raw_temb = nullptr,
                            brotensor::Tensor* raw_mod = nullptr);
+    // Resolve the armed binding lists into per-block coverage. Fills
+    // block_coverage_ and returns the number of distinct coverages.
+    void resolve_coverage_();
     // Slice one (n_rows, 4*hidden) modulation output into the per-sublayer
     // rows, applying tanh to the gates and the norm_out scale delta.
     void chunk_modulation_(const brotensor::Tensor& mod,
                            const brotensor::Tensor& final_all, Modulation& m);
-    // Fill m's gs* / gd* / gsd* variants from its gates under the
-    // set_gate_scale factors and the set_gate_delta rows, and (when a
-    // capture sink is armed) the per-variant attention-gate means.
-    void scale_gates_(Modulation& m);
+    // Fold one coverage's composed gate scale factors and post-tanh gate
+    // deltas into m's four gate rows, and (when a capture sink is armed) the
+    // resulting attention-gate means.
+    void fold_gate_hooks_(const BlockCoverage& cov, Modulation& m);
     // Mean over hidden of a (1, hidden) row, on host.
     float row_mean_(const brotensor::Tensor& row) const;
 
@@ -488,30 +625,44 @@ private:
     JitSites jit_;
 
     // ── research-hook state ───────────────────────────────────────────────
-    brotensor::Tensor mod_delta_;      // (1, 4*hidden) compute dtype; empty = off
-    int mod_delta_lo_ = 0, mod_delta_hi_ = 0;
-    QwenImage21ModTarget mod_delta_target_ = QwenImage21ModTarget::Target;
+    //
+    // The armed binding lists. A binding's tensors are held at the compute
+    // dtype on the default device; a gate delta is kept pre-split into its
+    // [attn] and [mlp] halves so folding it costs no slicing per forward, and
+    // a gate mask keeps a host copy so gate capture can report the masked
+    // value without a readback.
+    std::vector<QwenImage21ModDeltaBinding>  mod_deltas_;
+    std::vector<QwenImage21GateScaleBinding> gate_scales_;
+    std::vector<QwenImage21GateDeltaBinding> gate_deltas_;
+    std::vector<QwenImage21GateMaskBinding>  gate_masks_;
+    std::vector<QwenImage21PrefixKvBinding>  prefix_kv_scales_;
+
+    // Per gate-delta binding, its (1, hidden) halves.
+    std::vector<brotensor::Tensor> gate_delta_attn_, gate_delta_mlp_;
+    // Per gate-mask binding, its values on host, for gate capture.
+    std::vector<std::vector<float>> gate_mask_host_;
 
     brotensor::Tensor norm_out_delta_; // (1, hidden) compute dtype; empty = off
 
-    float gate_attn_scale_ = 1.0f, gate_mlp_scale_ = 1.0f;
-    float gate_txt_scale_  = 1.0f, gate_img_scale_ = 1.0f;
-    int gate_lo_ = 0, gate_hi_ = 0;
+    // Resolved once per forward by resolve_coverage_() / build_modulation_().
+    // `mods_` holds one Modulation per distinct coverage and lives on the
+    // model so its (1, hidden) rows keep their addresses across forwards — a
+    // JIT site's binding is keyed on the gate operand's address.
+    std::vector<BlockCoverage> coverages_;     // one per distinct coverage
+    std::vector<int> block_variant_;           // block -> coverages_ index
+    std::vector<Modulation> mods_;             // one per coverage
 
-    // set_gate_delta: the two (1, hidden) halves of the caller's
-    // (1, 2*hidden) row, kept split so adding them costs no slicing per
-    // forward. Empty = off.
-    brotensor::Tensor gate_delta_attn_, gate_delta_mlp_;
-    int gate_delta_lo_ = 0, gate_delta_hi_ = 0;
-    QwenImage21ModTarget gate_delta_target_ = QwenImage21ModTarget::Target;
-
-    brotensor::Tensor gate_mask_;      // (L, 1) compute dtype; empty = off
-    std::vector<float> gate_mask_host_;  // the same values, for gate capture
-    int gate_mask_lo_ = 0, gate_mask_hi_ = 0;
-    // (Lq, hidden) rank-1 expansion of the active mask slice, built once per
-    // forward and reused by every masked block.
-    brotensor::Tensor gate_mask_full_;
+    // Per coverage, the composed per-token mask: the (Lq, hidden) rank-1
+    // expansion the fused residual consumes, and the host values capture
+    // reports. Empty tensor = that coverage has no mask.
+    std::vector<brotensor::Tensor> mask_full_;
+    std::vector<std::vector<float>> mask_host_;
+    brotensor::Tensor gate_mask_col_;  // (L, 1) scratch for one composition
     brotensor::Tensor gate_ones_row_;  // (1, hidden) ones
+
+    // Composed per-layer prefix KV factors, rebuilt whenever the list changes.
+    // Empty = every layer at 1/1.
+    std::vector<float> prefix_k_scale_, prefix_v_scale_;
 
     std::vector<float>* gate_sink_ = nullptr;
 };

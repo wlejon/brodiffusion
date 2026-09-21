@@ -1,25 +1,33 @@
 // QwenImage21Transformer2DModel — the research control surface.
 //
 // The setters that arm the hooks (modulation delta, gate scale / mask / gate
-// capture, norm_out scale delta), the time-mod readout, the two small helpers
-// the forward uses to realise them, and the prefix KV cache's own research
-// operations. The forward itself lives in qwenimage21_forward.cpp; the
-// loader and the shared modulation path in qwenimage21.cpp.
+// delta, prefix-KV attenuation, norm_out scale delta), the coverage resolver
+// and gate folder the forward runs on, the time-mod readout, and the prefix
+// KV cache's own research operations. The forward itself lives in
+// qwenimage21_forward.cpp; the loader and the shared modulation path in
+// qwenimage21.cpp.
 //
-// Two facts about Qwen-Image 2.1 shape everything here.
+// Three facts about Qwen-Image 2.1 shape everything here.
 //
 //   1. ONE modulation vector drives all 32 blocks. A hook that is supposed to
 //      apply to a BLOCK RANGE therefore cannot mutate the modulation in
 //      place — it builds a SECOND copy (built once per forward, not once per
 //      block: the cost is four (1, 4*hidden) rows) that the blocks inside the
-//      range read instead. That is what build_modulation_'s `m_delta` output
-//      is.
+//      range read instead.
 //   2. Prefix and target rows read DIFFERENT rows of that vector (t = 0 vs
 //      the sampled t) under causal_condition. So a delta can address one or
 //      the other, and the gate dials have separate prefix / target factors.
 //      The catch is the prefix KV cache: prefix rows are computed on the
 //      extract step only, so a prefix-side change is invisible until the
 //      cache is reset. Every doc comment that can say so, does.
+//   3. Every hook holds an ORDERED LIST of bindings. Resolving the lists is a
+//      per-forward step, not a per-block one: resolve_coverage_() groups the
+//      32 blocks by which bindings cover them — in practice one, two or three
+//      groups — and each group gets ONE finished modulation whose gate rows
+//      already carry the composed scale factor and the composed post-tanh
+//      delta. The block loop is then a lookup, the fused gated-residual
+//      kernel keeps its single gate operand, and the activations are still
+//      read exactly once per sublayer however many bindings are armed.
 
 #include "brodiffusion/dit/qwenimage21.h"
 
@@ -59,6 +67,10 @@ bt::Tensor to_compute(const bt::Tensor& src) {
     }
     return d;
 }
+
+// A binding whose range is empty can never cover a block, so an empty range
+// is the same thing as "not armed" everywhere below.
+bool empty_range(int lo, int hi) { return hi <= lo; }
 
 }  // namespace
 
@@ -111,31 +123,48 @@ void QwenImage21PrefixCache::blend_from(const QwenImage21PrefixCache& other,
     bt::sync_all();
 }
 
-// ─── hook setters ──────────────────────────────────────────────────────────
+// ─── modulation delta ──────────────────────────────────────────────────────
+
+int QwenImage21Transformer2DModel::add_mod_delta(const bt::Tensor& delta,
+                                                 int block_lo, int block_hi,
+                                                 QwenImage21ModTarget target) {
+    const int H = cfg_.hidden_size();
+    if (static_cast<std::int64_t>(delta.size()) !=
+        static_cast<std::int64_t>(4) * H) {
+        fail("add_mod_delta: delta must have 4*hidden_size elements "
+             "(the [scale1, gate1, scale2, gate2] modulation output)");
+    }
+    QwenImage21ModDeltaBinding b;
+    b.delta = to_compute(delta);
+    b.delta.rows = 1;
+    b.delta.cols = 4 * H;
+    b.block_lo = block_lo;
+    b.block_hi = block_hi;
+    b.target = target;
+    mod_deltas_.push_back(std::move(b));
+    return static_cast<int>(mod_deltas_.size()) - 1;
+}
 
 void QwenImage21Transformer2DModel::set_mod_delta(const bt::Tensor& delta,
                                                   int block_lo, int block_hi,
                                                   QwenImage21ModTarget target) {
-    if (delta.size() == 0) {
-        mod_delta_ = bt::Tensor();
-        mod_delta_lo_ = mod_delta_hi_ = 0;
-        mod_delta_target_ = QwenImage21ModTarget::Target;
-        return;
-    }
-    const int H = cfg_.hidden_size();
-    if (static_cast<std::int64_t>(delta.size()) !=
-        static_cast<std::int64_t>(4) * H) {
-        fail("set_mod_delta: delta must have 4*hidden_size elements "
-             "(the [scale1, gate1, scale2, gate2] modulation output)");
-    }
-    bt::Tensor d = to_compute(delta);
-    d.rows = 1;
-    d.cols = 4 * H;
-    mod_delta_ = std::move(d);
-    mod_delta_lo_ = block_lo;
-    mod_delta_hi_ = block_hi;
-    mod_delta_target_ = target;
+    mod_deltas_.clear();
+    if (delta.size() == 0 || empty_range(block_lo, block_hi)) return;
+    add_mod_delta(delta, block_lo, block_hi, target);
 }
+
+void QwenImage21Transformer2DModel::set_mod_deltas(
+    const std::vector<QwenImage21ModDeltaBinding>& list) {
+    mod_deltas_.clear();
+    for (const auto& b : list) {
+        if (b.delta.size() == 0 || empty_range(b.block_lo, b.block_hi)) continue;
+        add_mod_delta(b.delta, b.block_lo, b.block_hi, b.target);
+    }
+}
+
+void QwenImage21Transformer2DModel::clear_mod_deltas() { mod_deltas_.clear(); }
+
+// ─── norm_out scale delta (the one single-valued hook: it is not ranged) ───
 
 void QwenImage21Transformer2DModel::set_norm_out_scale_delta(
     const bt::Tensor& delta) {
@@ -153,34 +182,61 @@ void QwenImage21Transformer2DModel::set_norm_out_scale_delta(
     norm_out_delta_ = std::move(d);
 }
 
+// ─── gate scale ────────────────────────────────────────────────────────────
+
+int QwenImage21Transformer2DModel::add_gate_scale(float attn_scale,
+                                                  float mlp_scale,
+                                                  float txt_scale,
+                                                  float img_scale,
+                                                  int block_lo, int block_hi) {
+    QwenImage21GateScaleBinding b;
+    b.attn_scale = attn_scale;
+    b.mlp_scale  = mlp_scale;
+    b.txt_scale  = txt_scale;
+    b.img_scale  = img_scale;
+    b.block_lo = block_lo;
+    b.block_hi = block_hi;
+    gate_scales_.push_back(b);
+    return static_cast<int>(gate_scales_.size()) - 1;
+}
+
 void QwenImage21Transformer2DModel::set_gate_scale(float attn_scale,
                                                    float mlp_scale,
                                                    float txt_scale,
                                                    float img_scale,
                                                    int block_lo,
                                                    int block_hi) {
-    gate_attn_scale_ = attn_scale;
-    gate_mlp_scale_  = mlp_scale;
-    gate_txt_scale_  = txt_scale;
-    gate_img_scale_  = img_scale;
-    gate_lo_ = block_lo;
-    gate_hi_ = block_hi;
+    gate_scales_.clear();
+    const bool identity = attn_scale == 1.0f && mlp_scale == 1.0f &&
+                          txt_scale == 1.0f && img_scale == 1.0f;
+    if (identity || empty_range(block_lo, block_hi)) return;
+    add_gate_scale(attn_scale, mlp_scale, txt_scale, img_scale, block_lo,
+                   block_hi);
 }
 
-void QwenImage21Transformer2DModel::set_gate_delta(const bt::Tensor& delta,
-                                                    int block_lo, int block_hi,
-                                                    QwenImage21ModTarget target) {
-    if (delta.size() == 0) {
-        gate_delta_attn_ = bt::Tensor();
-        gate_delta_mlp_  = bt::Tensor();
-        gate_delta_lo_ = gate_delta_hi_ = 0;
-        gate_delta_target_ = QwenImage21ModTarget::Target;
-        return;
+void QwenImage21Transformer2DModel::set_gate_scales(
+    const std::vector<QwenImage21GateScaleBinding>& list) {
+    gate_scales_.clear();
+    for (const auto& b : list) {
+        if (empty_range(b.block_lo, b.block_hi)) continue;
+        add_gate_scale(b.attn_scale, b.mlp_scale, b.txt_scale, b.img_scale,
+                       b.block_lo, b.block_hi);
     }
+}
+
+void QwenImage21Transformer2DModel::clear_gate_scales() {
+    gate_scales_.clear();
+}
+
+// ─── gate delta ────────────────────────────────────────────────────────────
+
+int QwenImage21Transformer2DModel::add_gate_delta(const bt::Tensor& delta,
+                                                  int block_lo, int block_hi,
+                                                  QwenImage21ModTarget target) {
     const int H = cfg_.hidden_size();
     if (static_cast<std::int64_t>(delta.size()) !=
         static_cast<std::int64_t>(2) * H) {
-        fail("set_gate_delta: delta must have 2*hidden_size elements "
+        fail("add_gate_delta: delta must have 2*hidden_size elements "
              "(the [attn, mlp] post-tanh gate pair)");
     }
     // Split once here rather than slicing per forward: the two halves are
@@ -190,38 +246,181 @@ void QwenImage21Transformer2DModel::set_gate_delta(const bt::Tensor& delta,
     d.cols = 2 * H;
     const bt::Dtype dt = flux_compute_dtype();
     const bt::Device dev = bt::default_device();
-    detail::resize_like(gate_delta_attn_, 1, H, dt, dev);
-    detail::resize_like(gate_delta_mlp_, 1, H, dt, dev);
-    bt::copy_d2d(d, 0, gate_delta_attn_, 0, H);
-    bt::copy_d2d(d, H, gate_delta_mlp_, 0, H);
-    gate_delta_lo_ = block_lo;
-    gate_delta_hi_ = block_hi;
-    gate_delta_target_ = target;
+    bt::Tensor attn, mlp;
+    detail::resize_like(attn, 1, H, dt, dev);
+    detail::resize_like(mlp, 1, H, dt, dev);
+    bt::copy_d2d(d, 0, attn, 0, H);
+    bt::copy_d2d(d, H, mlp, 0, H);
+
+    QwenImage21GateDeltaBinding b;
+    b.delta = std::move(d);
+    b.block_lo = block_lo;
+    b.block_hi = block_hi;
+    b.target = target;
+    gate_deltas_.push_back(std::move(b));
+    gate_delta_attn_.push_back(std::move(attn));
+    gate_delta_mlp_.push_back(std::move(mlp));
+    return static_cast<int>(gate_deltas_.size()) - 1;
 }
 
-void QwenImage21Transformer2DModel::set_gate_mask(const bt::Tensor& mask,
-                                                  int block_lo, int block_hi) {
-    if (mask.size() == 0) {
-        gate_mask_ = bt::Tensor();
-        gate_mask_host_.clear();
-        gate_mask_full_ = bt::Tensor();
-        gate_mask_lo_ = gate_mask_hi_ = 0;
-        return;
+void QwenImage21Transformer2DModel::set_gate_delta(
+    const bt::Tensor& delta, int block_lo, int block_hi,
+    QwenImage21ModTarget target) {
+    clear_gate_deltas();
+    if (delta.size() == 0 || empty_range(block_lo, block_hi)) return;
+    add_gate_delta(delta, block_lo, block_hi, target);
+}
+
+void QwenImage21Transformer2DModel::set_gate_deltas(
+    const std::vector<QwenImage21GateDeltaBinding>& list) {
+    clear_gate_deltas();
+    for (const auto& b : list) {
+        if (b.delta.size() == 0 || empty_range(b.block_lo, b.block_hi)) continue;
+        add_gate_delta(b.delta, b.block_lo, b.block_hi, b.target);
     }
+}
+
+void QwenImage21Transformer2DModel::clear_gate_deltas() {
+    gate_deltas_.clear();
+    gate_delta_attn_.clear();
+    gate_delta_mlp_.clear();
+}
+
+// ─── gate mask ─────────────────────────────────────────────────────────────
+
+int QwenImage21Transformer2DModel::add_gate_mask(const bt::Tensor& mask,
+                                                 int block_lo, int block_hi) {
+    if (mask.size() == 0) {
+        fail("add_gate_mask: an empty mask arms nothing — use "
+             "clear_gate_masks()");
+    }
+    std::vector<float> host;
     {   // keep a host copy so gate capture can report the masked value
         bt::Tensor m32 = mask;
         if (mask.dtype != bt::Dtype::FP32) bt::cast(mask, m32, bt::Dtype::FP32);
         bt::sync_all();
-        gate_mask_host_ = m32.to(bt::Device::CPU).to_host_vector();
+        host = m32.to(bt::Device::CPU).to_host_vector();
     }
     bt::Tensor m = to_compute(mask);
     m.rows = static_cast<int>(m.size());
     m.cols = 1;
-    gate_mask_ = std::move(m);
-    gate_mask_full_ = bt::Tensor();   // rebuilt on the next forward
-    gate_mask_lo_ = block_lo;
-    gate_mask_hi_ = block_hi;
+
+    QwenImage21GateMaskBinding b;
+    b.mask = std::move(m);
+    b.block_lo = block_lo;
+    b.block_hi = block_hi;
+    gate_masks_.push_back(std::move(b));
+    gate_mask_host_.push_back(std::move(host));
+    return static_cast<int>(gate_masks_.size()) - 1;
 }
+
+void QwenImage21Transformer2DModel::set_gate_mask(const bt::Tensor& mask,
+                                                  int block_lo, int block_hi) {
+    clear_gate_masks();
+    if (mask.size() == 0 || empty_range(block_lo, block_hi)) return;
+    add_gate_mask(mask, block_lo, block_hi);
+}
+
+void QwenImage21Transformer2DModel::set_gate_masks(
+    const std::vector<QwenImage21GateMaskBinding>& list) {
+    clear_gate_masks();
+    for (const auto& b : list) {
+        if (b.mask.size() == 0 || empty_range(b.block_lo, b.block_hi)) continue;
+        add_gate_mask(b.mask, b.block_lo, b.block_hi);
+    }
+}
+
+void QwenImage21Transformer2DModel::clear_gate_masks() {
+    gate_masks_.clear();
+    gate_mask_host_.clear();
+    mask_host_.clear();   // force the per-coverage compositions to rebuild
+}
+
+// ─── prefix KV attenuation ─────────────────────────────────────────────────
+//
+// Composed into a per-layer factor pair here, at bind time, so the forward's
+// only cost is one scale over the (prefix_len, hidden) rows it copies out of
+// the cache — and only for the layers whose factor is not 1.
+
+namespace {
+
+void compose_prefix_scales(const std::vector<QwenImage21PrefixKvBinding>& list,
+                           int num_layers, std::vector<float>& k_out,
+                           std::vector<float>& v_out) {
+    k_out.clear();
+    v_out.clear();
+    if (list.empty() || num_layers <= 0) return;
+    k_out.assign(static_cast<std::size_t>(num_layers), 1.0f);
+    v_out.assign(static_cast<std::size_t>(num_layers), 1.0f);
+    bool any = false;
+    for (const auto& b : list) {
+        const int lo = b.layer_lo < 0 ? 0 : b.layer_lo;
+        const int hi = b.layer_hi > num_layers ? num_layers : b.layer_hi;
+        for (int i = lo; i < hi; ++i) {
+            k_out[static_cast<std::size_t>(i)] *= b.k_scale;
+            v_out[static_cast<std::size_t>(i)] *= b.v_scale;
+            if (b.k_scale != 1.0f || b.v_scale != 1.0f) any = true;
+        }
+    }
+    if (!any) {   // an all-identity list costs the forward nothing
+        k_out.clear();
+        v_out.clear();
+    }
+}
+
+}  // namespace
+
+int QwenImage21Transformer2DModel::add_prefix_kv_scale(int layer_lo,
+                                                       int layer_hi,
+                                                       float k_scale,
+                                                       float v_scale) {
+    QwenImage21PrefixKvBinding b;
+    b.layer_lo = layer_lo;
+    b.layer_hi = layer_hi;
+    b.k_scale = k_scale;
+    b.v_scale = v_scale;
+    prefix_kv_scales_.push_back(b);
+    compose_prefix_scales(prefix_kv_scales_, cfg_.num_layers, prefix_k_scale_,
+                          prefix_v_scale_);
+    return static_cast<int>(prefix_kv_scales_.size()) - 1;
+}
+
+void QwenImage21Transformer2DModel::set_prefix_kv_scale(int layer_lo,
+                                                        int layer_hi,
+                                                        float k_scale,
+                                                        float v_scale) {
+    prefix_kv_scales_.clear();
+    if (!empty_range(layer_lo, layer_hi) &&
+        (k_scale != 1.0f || v_scale != 1.0f)) {
+        QwenImage21PrefixKvBinding b;
+        b.layer_lo = layer_lo;
+        b.layer_hi = layer_hi;
+        b.k_scale = k_scale;
+        b.v_scale = v_scale;
+        prefix_kv_scales_.push_back(b);
+    }
+    compose_prefix_scales(prefix_kv_scales_, cfg_.num_layers, prefix_k_scale_,
+                          prefix_v_scale_);
+}
+
+void QwenImage21Transformer2DModel::set_prefix_kv_scales(
+    const std::vector<QwenImage21PrefixKvBinding>& list) {
+    prefix_kv_scales_.clear();
+    for (const auto& b : list) {
+        if (empty_range(b.layer_lo, b.layer_hi)) continue;
+        prefix_kv_scales_.push_back(b);
+    }
+    compose_prefix_scales(prefix_kv_scales_, cfg_.num_layers, prefix_k_scale_,
+                          prefix_v_scale_);
+}
+
+void QwenImage21Transformer2DModel::clear_prefix_kv_scales() {
+    prefix_kv_scales_.clear();
+    prefix_k_scale_.clear();
+    prefix_v_scale_.clear();
+}
+
+// ─── capture ───────────────────────────────────────────────────────────────
 
 void QwenImage21Transformer2DModel::capture_gates(std::vector<float>* sink) {
     gate_sink_ = sink;
@@ -233,9 +432,10 @@ void QwenImage21Transformer2DModel::compute_time_mod(float timestep,
                                                      bt::Tensor& temb_out,
                                                      bt::Tensor& mod_out) {
     if (!loaded_) fail("compute_time_mod: weights not loaded");
-    Modulation m;
     bt::Tensor temb, mod;
-    build_modulation_(timestep, m, nullptr, nullptr, &temb, &mod);
+    // The raw rows only — no hook resolution, so a readout never disturbs the
+    // variants the next forward will replay against.
+    build_modulation_(timestep, /*build_variants=*/false, &temb, &mod);
     if (temb.dtype != bt::Dtype::FP32) bt::cast(temb, temb_out, bt::Dtype::FP32);
     else temb_out = temb;
     if (mod.dtype != bt::Dtype::FP32) bt::cast(mod, mod_out, bt::Dtype::FP32);
@@ -256,78 +456,93 @@ float QwenImage21Transformer2DModel::row_mean_(const bt::Tensor& row) const {
     return static_cast<float>(acc / static_cast<double>(h.size()));
 }
 
-void QwenImage21Transformer2DModel::scale_gates_(Modulation& m) {
-    const bool active = gate_hi_ > gate_lo_ &&
-                        (gate_attn_scale_ != 1.0f || gate_mlp_scale_ != 1.0f ||
-                         gate_txt_scale_ != 1.0f || gate_img_scale_ != 1.0f);
-    const bool delta_on =
-        gate_delta_hi_ > gate_delta_lo_ && gate_delta_attn_.size() > 0;
+void QwenImage21Transformer2DModel::resolve_coverage_() {
+    const int n = cfg_.num_layers;
+    coverages_.clear();
+    block_variant_.assign(static_cast<std::size_t>(n < 0 ? 0 : n), 0);
+
+    auto cover = [](int i, int lo, int hi) { return i >= lo && i < hi; };
+    BlockCoverage cov;
+    for (int i = 0; i < n; ++i) {
+        cov.mod_deltas.clear();
+        cov.gate_scales.clear();
+        cov.gate_deltas.clear();
+        cov.gate_masks.clear();
+        for (std::size_t j = 0; j < mod_deltas_.size(); ++j) {
+            if (cover(i, mod_deltas_[j].block_lo, mod_deltas_[j].block_hi)) {
+                cov.mod_deltas.push_back(static_cast<int>(j));
+            }
+        }
+        for (std::size_t j = 0; j < gate_scales_.size(); ++j) {
+            if (cover(i, gate_scales_[j].block_lo, gate_scales_[j].block_hi)) {
+                cov.gate_scales.push_back(static_cast<int>(j));
+            }
+        }
+        for (std::size_t j = 0; j < gate_deltas_.size(); ++j) {
+            if (cover(i, gate_deltas_[j].block_lo, gate_deltas_[j].block_hi)) {
+                cov.gate_deltas.push_back(static_cast<int>(j));
+            }
+        }
+        for (std::size_t j = 0; j < gate_masks_.size(); ++j) {
+            if (cover(i, gate_masks_[j].block_lo, gate_masks_[j].block_hi)) {
+                cov.gate_masks.push_back(static_cast<int>(j));
+            }
+        }
+        int found = -1;
+        for (std::size_t k = 0; k < coverages_.size(); ++k) {
+            if (coverages_[k] == cov) { found = static_cast<int>(k); break; }
+        }
+        if (found < 0) {
+            coverages_.push_back(cov);
+            found = static_cast<int>(coverages_.size()) - 1;
+        }
+        block_variant_[static_cast<std::size_t>(i)] = found;
+    }
+    if (coverages_.empty()) coverages_.emplace_back();   // a 0-block model
+}
+
+void QwenImage21Transformer2DModel::fold_gate_hooks_(const BlockCoverage& cov,
+                                                     Modulation& m) {
+    // The composed scale factors. attn/mlp pick the sublayer, txt/img the row
+    // class, and the two are orthogonal — so each of the four gate rows gets
+    // the product of one sublayer factor and one row-class factor.
+    float sa = 1.0f, sm = 1.0f, st = 1.0f, si = 1.0f;
+    for (int j : cov.gate_scales) {
+        const auto& b = gate_scales_[static_cast<std::size_t>(j)];
+        sa *= b.attn_scale;
+        sm *= b.mlp_scale;
+        st *= b.txt_scale;
+        si *= b.img_scale;
+    }
+    const float f1_t = sa * si, f2_t = sm * si;
+    const float f1_0 = sa * st, f2_0 = sm * st;
+    if (f1_t != 1.0f) bt::scale_inplace(m.gate1_t, f1_t);
+    if (f2_t != 1.0f) bt::scale_inplace(m.gate2_t, f2_t);
+    if (f1_0 != 1.0f) bt::scale_inplace(m.gate1_0, f1_0);
+    if (f2_0 != 1.0f) bt::scale_inplace(m.gate2_0, f2_0);
+
+    // The composed post-tanh deltas, added on top of the scaled gates:
+    //     g_eff = (prod of scales) * tanh(gate) + (sum of deltas)
+    for (int j : cov.gate_deltas) {
+        const auto ix = static_cast<std::size_t>(j);
+        const auto& b = gate_deltas_[ix];
+        if (b.target != QwenImage21ModTarget::Prefix) {
+            bt::add_inplace(m.gate1_t, gate_delta_attn_[ix]);
+            bt::add_inplace(m.gate2_t, gate_delta_mlp_[ix]);
+        }
+        if (b.target != QwenImage21ModTarget::Target) {
+            bt::add_inplace(m.gate1_0, gate_delta_attn_[ix]);
+            bt::add_inplace(m.gate2_0, gate_delta_mlp_[ix]);
+        }
+    }
+
     // Gate means are only read back when a capture sink is armed — the
-    // readback is a device sync, so it must not run on the hot path.
+    // readback is a device sync, so it must not run on the hot path. Reading
+    // the FOLDED rows is both simpler and exact: there is no arithmetic
+    // reconstruction of what the composition did.
     if (gate_sink_ != nullptr) {
         m.mean_g1_t = row_mean_(m.gate1_t);
         m.mean_g1_0 = row_mean_(m.gate1_0);
-    }
-    if (active) {
-        m.gs1_t = m.gate1_t.clone();
-        m.gs2_t = m.gate2_t.clone();
-        m.gs1_0 = m.gate1_0.clone();
-        m.gs2_0 = m.gate2_0.clone();
-        bt::scale_inplace(m.gs1_t, gate_attn_scale_ * gate_img_scale_);
-        bt::scale_inplace(m.gs2_t, gate_mlp_scale_  * gate_img_scale_);
-        bt::scale_inplace(m.gs1_0, gate_attn_scale_ * gate_txt_scale_);
-        bt::scale_inplace(m.gs2_0, gate_mlp_scale_  * gate_txt_scale_);
-        m.scaled = true;
-        if (gate_sink_ != nullptr) {
-            m.mean_gs1_t = m.mean_g1_t * gate_attn_scale_ * gate_img_scale_;
-            m.mean_gs1_0 = m.mean_g1_0 * gate_attn_scale_ * gate_txt_scale_;
-        }
-    } else {
-        m.scaled = false;
-        m.mean_gs1_t = m.mean_g1_t;
-        m.mean_gs1_0 = m.mean_g1_0;
-    }
-
-    m.deltaed = false;
-    if (!delta_on) return;
-
-    // The deltaed variants. Built from the base gates AND (when a block is
-    // covered by both hooks) from the scaled ones, so the forward picks one
-    // finished row per block instead of composing two operands per residual.
-    const bool hit_t = gate_delta_target_ != QwenImage21ModTarget::Prefix;
-    const bool hit_0 = gate_delta_target_ != QwenImage21ModTarget::Target;
-    auto build = [&](const bt::Tensor& g1_t, const bt::Tensor& g2_t,
-                     const bt::Tensor& g1_0, const bt::Tensor& g2_0,
-                     bt::Tensor& d1_t, bt::Tensor& d2_t, bt::Tensor& d1_0,
-                     bt::Tensor& d2_0) {
-        d1_t = g1_t.clone();
-        d2_t = g2_t.clone();
-        d1_0 = g1_0.clone();
-        d2_0 = g2_0.clone();
-        if (hit_t) {
-            bt::add_inplace(d1_t, gate_delta_attn_);
-            bt::add_inplace(d2_t, gate_delta_mlp_);
-        }
-        if (hit_0) {
-            bt::add_inplace(d1_0, gate_delta_attn_);
-            bt::add_inplace(d2_0, gate_delta_mlp_);
-        }
-    };
-    build(m.gate1_t, m.gate2_t, m.gate1_0, m.gate2_0, m.gd1_t, m.gd2_t,
-          m.gd1_0, m.gd2_0);
-    if (m.scaled) {
-        build(m.gs1_t, m.gs2_t, m.gs1_0, m.gs2_0, m.gsd1_t, m.gsd2_t,
-              m.gsd1_0, m.gsd2_0);
-    }
-    m.deltaed = true;
-    if (gate_sink_ != nullptr) {
-        // The delta's contribution to the mean is the mean of the delta row,
-        // which is constant across blocks — one readback, not one per block.
-        const float da = row_mean_(gate_delta_attn_);
-        m.mean_gd1_t  = m.mean_g1_t  + (hit_t ? da : 0.0f);
-        m.mean_gd1_0  = m.mean_g1_0  + (hit_0 ? da : 0.0f);
-        m.mean_gsd1_t = m.mean_gs1_t + (hit_t ? da : 0.0f);
-        m.mean_gsd1_0 = m.mean_gs1_0 + (hit_0 ? da : 0.0f);
     }
 }
 

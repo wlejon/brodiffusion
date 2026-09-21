@@ -507,15 +507,9 @@ PipelineState Pipeline::prime(std::string_view prompt,
         // The backbone is only needed for the branches this prime actually
         // encodes — qi21_prime_from_text() supplies rows for one or both, and
         // qi21_release_text_encoder() may have freed the 8.5 GiB model in
-        // between. Check per branch rather than up front.
-        const bool need_pos_encode = !qi21_text_override_.has_value();
-        const bool need_neg_encode = do_cfg && !qi21_uncond_text_override_;
-        if ((need_pos_encode || need_neg_encode) &&
-            (!qwen3vl_model_ || !qwen3vl_tokenizer_)) {
-            fail("prime: QwenImage21 pipeline has no Qwen3-VL text encoder "
-                 "(it was released — reload it, or prime from caller-supplied "
-                 "rows with qi21_prime_from_text)");
-        }
+        // between. There is no up-front check: qi21_encode_or_memo_() serves
+        // an already-encoded prompt from the memo with the encoder gone, and
+        // only throws (naming the prompt) for one it has never seen.
         const bool enc_time = std::getenv("BRODIFFUSION_TIME") != nullptr;
         const auto enc_t0 = std::chrono::steady_clock::now();
         // qi21_prime_from_text() parks caller-edited rows here; consume them
@@ -523,9 +517,7 @@ PipelineState Pipeline::prime(std::string_view prompt,
         qwenimage21::TextConditioning pos =
             qi21_text_override_
                 ? std::move(*qi21_text_override_)
-                : qwenimage21::encode_prompt(*qwen3vl_tokenizer_,
-                                             *qwen3vl_model_,
-                                             std::string(prompt));
+                : qi21_encode_or_memo_(std::string(prompt));
         qi21_text_override_.reset();
         conditioning_.text_embeddings      = std::move(pos.embeds);
         conditioning_.text_embeddings_mask = std::move(pos.mask);
@@ -541,9 +533,7 @@ PipelineState Pipeline::prime(std::string_view prompt,
             qwenimage21::TextConditioning neg =
                 qi21_uncond_text_override_
                     ? std::move(*qi21_uncond_text_override_)
-                    : qwenimage21::encode_prompt(
-                          *qwen3vl_tokenizer_, *qwen3vl_model_,
-                          std::string(opts.negative_prompt));
+                    : qi21_encode_or_memo_(opts.negative_prompt);
             conditioning_.uncond_embeddings      = std::move(neg.embeds);
             conditioning_.uncond_embeddings_mask = std::move(neg.mask);
             conditioning_.has_uncond = true;
