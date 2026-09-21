@@ -800,9 +800,13 @@ public:
     int  qi21_gate_mask_count() const;
 
     // Gate activity capture; qi21_gates() reads back the most recent step,
-    // row-major (qi21_num_layers(), prefix_len + img_len).
+    // row-major (qi21_num_layers(), prefix_len + img_len). qi21_gates_mlp()
+    // is the SwiGLU half of the same step, in the same layout — a second
+    // reading, because the two sublayers carry independent gates, scales and
+    // mask compositions.
     void qi21_capture_gates(bool enable);
     std::vector<float> qi21_gates() const;
+    std::vector<float> qi21_gates_mlp() const;
 
     // norm_out scale delta, (1, qi21_hidden_size()) or empty to clear.
     void qi21_set_norm_out_scale_delta(const brotensor::Tensor& delta);
@@ -1181,6 +1185,7 @@ private:
     // qi21_text_override_ is consumed by prime()'s QwenImage21 branch when
     // qi21_prime_from_text() set it.
     std::vector<float> qi21_gate_sink_;
+    std::vector<float> qi21_gate_sink_mlp_;
     std::optional<qwenimage21::TextConditioning> qi21_text_override_;
     std::optional<qwenimage21::TextConditioning> qi21_uncond_text_override_;
     // A weak handle on the conditioning the most recent prime() produced.

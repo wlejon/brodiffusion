@@ -314,10 +314,11 @@ int Pipeline::qi21_gate_mask_count() const {
 void Pipeline::qi21_capture_gates(bool enable) {
     auto& model = qi21_model(model_class_, denoiser_, "qi21_capture_gates");
     if (enable) {
-        model.capture_gates(&qi21_gate_sink_);
+        model.capture_gates(&qi21_gate_sink_, &qi21_gate_sink_mlp_);
     } else {
-        model.capture_gates(nullptr);
+        model.capture_gates(nullptr, nullptr);
         qi21_gate_sink_.clear();
+        qi21_gate_sink_mlp_.clear();
     }
 }
 
@@ -326,6 +327,13 @@ std::vector<float> Pipeline::qi21_gates() const {
         fail("qi21_gates: Qwen-Image 2.1 only");
     }
     return qi21_gate_sink_;
+}
+
+std::vector<float> Pipeline::qi21_gates_mlp() const {
+    if (model_class_ != ModelClass::QwenImage21) {
+        fail("qi21_gates_mlp: Qwen-Image 2.1 only");
+    }
+    return qi21_gate_sink_mlp_;
 }
 
 void Pipeline::qi21_set_norm_out_scale_delta(const bt::Tensor& delta) {

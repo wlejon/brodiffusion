@@ -509,6 +509,11 @@ void QwenImage21Transformer2DModel::forward_joint(
             static_cast<std::size_t>(cfg_.num_layers) * static_cast<std::size_t>(L),
             0.0f);
     }
+    if (gate_sink_mlp_ != nullptr) {
+        gate_sink_mlp_->assign(
+            static_cast<std::size_t>(cfg_.num_layers) * static_cast<std::size_t>(L),
+            0.0f);
+    }
 
     for (int i = 0; i < cfg_.num_layers; ++i) {
         const Block& b = blocks_[static_cast<std::size_t>(i)];
@@ -540,6 +545,21 @@ void QwenImage21Transformer2DModel::forward_joint(
             if (gmask_a) {
                 for (int r = 0; r < L; ++r) {
                     dst[r] *= mhost_a[static_cast<std::size_t>(r)];
+                }
+            }
+        }
+        if (gate_sink_mlp_ != nullptr) {
+            // The SwiGLU half, through the MLP composition of the mask — the
+            // two sublayers are independent multipliers on independent gates,
+            // so this is a second reading of the same block and not a copy.
+            const std::vector<float>& mhost_m = mask_host_mlp_[vi];
+            float* dst = gate_sink_mlp_->data() +
+                         static_cast<std::size_t>(i) * static_cast<std::size_t>(L);
+            for (int r = 0; r < prefix_len; ++r) dst[r] = M.mean_g2_0;
+            for (int r = prefix_len; r < L; ++r) dst[r] = M.mean_g2_t;
+            if (gmask_m) {
+                for (int r = 0; r < L; ++r) {
+                    dst[r] *= mhost_m[static_cast<std::size_t>(r)];
                 }
             }
         }

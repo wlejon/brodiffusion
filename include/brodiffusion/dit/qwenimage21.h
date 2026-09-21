@@ -550,7 +550,15 @@ public:
     // to read the two gate magnitudes against the timestep — not to find
     // per-block structure, of which the architecture has none.
     // nullptr disables. The pointer must outlive captures.
-    void capture_gates(std::vector<float>* sink);
+    //
+    // `mlp_sink`, when non-null, is filled the same way with the effective
+    // SwiGLU gate — the second gated residual of every block, folded from
+    // gate2 and read through the MLP half of the composed mask. The two
+    // sublayers carry different multipliers and different masks, so a strip
+    // drawn from the attention half alone cannot show where an mlp-only edit
+    // landed; that is what this second sink is for.
+    void capture_gates(std::vector<float>* sink,
+                       std::vector<float>* mlp_sink = nullptr);
 
     // norm_out scale delta: add `delta` (1, hidden_size) to the final
     // adaptive scale the target rows pass through on the way to proj_out —
@@ -598,8 +606,10 @@ private:
         brotensor::Tensor final_scale;   // norm_out, target rows (t)
         // Mean over hidden of the effective attention gate of each row class,
         // for capture_gates(). Only filled when a sink is armed — the
-        // readback is a device sync.
+        // readback is a device sync. mean_g2_* are the SwiGLU counterparts,
+        // read only when the mlp sink is armed as well.
         float mean_g1_t = 0.0f, mean_g1_0 = 0.0f;
+        float mean_g2_t = 0.0f, mean_g2_0 = 0.0f;
     };
 
     // One block's resolved hook coverage: which bindings of each list cover
@@ -761,6 +771,7 @@ private:
     brotensor::Tensor prefix_row_full_k_, prefix_row_full_v_;
 
     std::vector<float>* gate_sink_ = nullptr;
+    std::vector<float>* gate_sink_mlp_ = nullptr;
 };
 
 // QwenImage21Denoiser — QwenImage21Transformer2DModel behind brodiffusion's

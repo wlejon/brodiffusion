@@ -310,6 +310,29 @@ Value qi21Gates(Value thisVal, std::span<const Value>) {
     }
 }
 
+// qwenImage21GatesMlp() -> { rows, cols, data } — the SwiGLU half of the same
+// capture, same layout as qwenImage21Gates().
+Value qi21GatesMlp(Value thisVal, std::span<const Value>) {
+    auto* w = qi21Pipeline(thisVal);
+    if (!w) return notQi21("qwenImage21GatesMlp");
+    try {
+        std::vector<float> flat = w->pipeline->qi21_gates_mlp();
+        const int rows = w->pipeline->qi21_num_layers();
+        const int cols =
+            rows > 0 ? static_cast<int>(flat.size() / static_cast<size_t>(rows))
+                     : 0;
+        ObjectBuilder o;
+        o.set("rows", static_cast<double>(rows));
+        o.set("cols", static_cast<double>(cols));
+        ev::Persistent d(makeFloat32Array(flat.data(), flat.size()));
+        o.set("data", d.get());
+        return o.build();
+    } catch (const std::exception& e) {
+        return ev::throwError(
+            std::string("Pipeline.qwenImage21GatesMlp failed: ") + e.what());
+    }
+}
+
 // qwenImage21HiddenSize() -> 4096
 Value qi21HiddenSize(Value thisVal, std::span<const Value>) {
     auto* w = qi21Pipeline(thisVal);
@@ -754,6 +777,7 @@ void decoratePipelineQwenImage21Proto(ObjectBuilder& proto) {
     proto.def("qwenImage21SetNormOutScaleDelta", 1, qi21SetNormOutScaleDelta);
     proto.def("qwenImage21CaptureGates", 1, qi21CaptureGates);
     proto.def("qwenImage21Gates", 0, qi21Gates);
+    proto.def("qwenImage21GatesMlp", 0, qi21GatesMlp);
     proto.def("qwenImage21HiddenSize", 0, qi21HiddenSize);
     proto.def("qwenImage21NumLayers", 0, qi21NumLayers);
     proto.def("qwenImage21TextHiddenDim", 0, qi21TextHiddenDim);

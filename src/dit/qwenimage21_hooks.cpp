@@ -529,8 +529,10 @@ void QwenImage21Transformer2DModel::clear_prefix_kv_scales() {
 
 // ─── capture ───────────────────────────────────────────────────────────────
 
-void QwenImage21Transformer2DModel::capture_gates(std::vector<float>* sink) {
+void QwenImage21Transformer2DModel::capture_gates(std::vector<float>* sink,
+                                                  std::vector<float>* mlp_sink) {
     gate_sink_ = sink;
+    gate_sink_mlp_ = mlp_sink;
 }
 
 // ─── readout ───────────────────────────────────────────────────────────────
@@ -649,6 +651,10 @@ void QwenImage21Transformer2DModel::fold_gate_hooks_(const BlockCoverage& cov,
     if (gate_sink_ != nullptr) {
         m.mean_g1_t = row_mean_(m.gate1_t);
         m.mean_g1_0 = row_mean_(m.gate1_0);
+    }
+    if (gate_sink_mlp_ != nullptr) {
+        m.mean_g2_t = row_mean_(m.gate2_t);
+        m.mean_g2_0 = row_mean_(m.gate2_0);
     }
 }
 
