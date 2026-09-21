@@ -338,9 +338,15 @@ int run_qi21_vae_fwd(int argc, char** argv) {
     const char* op = arg_after(argc, argv, "--out");
     const char* Hs = arg_after(argc, argv, "--H");
     const char* Ws = arg_after(argc, argv, "--W");
-    if (!w || (!lp && !ip) || !op || !Hs || !Ws) {
+    const char* bench_ab_s = arg_after(argc, argv, "--bench-ab");
+    bool synthetic = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--synthetic") == 0) synthetic = true;
+    }
+    if (!w || (!lp && !ip && !synthetic) || (!op && !bench_ab_s) || !Hs || !Ws) {
         std::fprintf(stderr,
-            "qi21-vae-fwd: need --weights (--latent | --image) --out --H --W\n");
+            "qi21-vae-fwd: need --weights (--latent | --image | --synthetic) "
+            "--out --H --W [--bench-ab N]\n");
         return 2;
     }
     const int H = std::atoi(Hs), W = std::atoi(Ws);
@@ -350,14 +356,53 @@ int run_qi21_vae_fwd(int argc, char** argv) {
     vq::Config cfg;
     auto f = st::File::open(w);
     brotensor::Tensor out;
-    if (lp) {
+    if (lp || (synthetic && !ip)) {
         vq::Decoder dec(cfg);
         dec.load_weights(f, "");
-        auto lat_h = load_latent_f32(lp, cfg.z_dim * H * W);
+        const int n = cfg.z_dim * H * W;
+        std::vector<float> lat_h;
+        if (synthetic && !lp) {
+            lat_h.resize(static_cast<std::size_t>(n));
+            std::uint64_t s = 7;
+            for (auto& v : lat_h) {
+                s = s * 6364136223846793005ull + 1442695040888963407ull;
+                v = static_cast<float>(static_cast<std::int32_t>(s >> 33)) /
+                    1073741824.0f;
+            }
+        } else {
+            lat_h = load_latent_f32(lp, n);
+        }
         brotensor::Tensor lat =
-            brotensor::Tensor::from_host(lat_h.data(), 1, cfg.z_dim * H * W)
+            brotensor::Tensor::from_host(lat_h.data(), 1, n)
                 .to(brotensor::default_device());
+        const auto c0 = std::chrono::steady_clock::now();
         dec.decode(lat, H, W, out);
+        brotensor::sync_all();
+        const double cold_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - c0).count();
+        // --bench-ab: the same decode with the trace JIT on and off,
+        // alternating in one process so both see the same clocks.
+        if (bench_ab_s) {
+            const int reps = std::atoi(bench_ab_s);
+            brotensor::sync_all();
+            double best[2] = {0.0, 0.0};
+            for (int i = 0; i < 2 * reps; ++i) {
+                const int which = i & 1;
+                brodiffusion::detail::set_jit_enabled(which == 0);
+                const auto t0 = std::chrono::steady_clock::now();
+                dec.decode(lat, H, W, out);
+                brotensor::sync_all();
+                const double ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0).count();
+                if (i < 2 || ms < best[which]) best[which] = ms;
+            }
+            std::printf("qi21-vae-fwd: decode %dx%d latent -> %dx%d px\n", H, W,
+                        H * 16, W * 16);
+            std::printf("  first decode (cold traces): %.1f ms\n", cold_ms);
+            std::printf("  jit on : %.1f ms\n", best[0]);
+            std::printf("  jit off: %.1f ms\n", best[1]);
+            if (!op) return 0;
+        }
     } else {
         vq::Encoder enc(cfg);
         enc.load_weights(f, "");

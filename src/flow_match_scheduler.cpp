@@ -1,7 +1,9 @@
 #include "brodiffusion/flow_match_scheduler.h"
 #include "brodiffusion/detail/device.h"
 #include "brodiffusion/detail/compute.h"
+#include "brodiffusion/detail/jit_fusion.h"
 
+#include "brotensor/jit/trace.h"
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
 
@@ -98,6 +100,25 @@ void FlowMatch::set_timesteps(int num_inference_steps, int image_seq_len) {
     sigmas_[static_cast<std::size_t>(N)] = 0.0f;
 }
 
+// Uploads sigma[i+1] - sigma[i] for the whole schedule, once, so the Euler
+// step can read its coefficient from device memory. Returns false if there is
+// nothing to upload, in which case the caller uses the eager path.
+bool FlowMatch::device_sigma_deltas_(brotensor::Device dev) const {
+    const int n = static_cast<int>(timesteps_.size());
+    if (n <= 0 || sigmas_.size() < static_cast<std::size_t>(n) + 1) return false;
+    if (d_sigma_dev_.rows == n && d_sigma_dev_.cols == 1 &&
+        d_sigma_dev_.device == dev) {
+        return true;
+    }
+    std::vector<float> d(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        d[static_cast<std::size_t>(i)] = sigmas_[static_cast<std::size_t>(i) + 1] -
+                                         sigmas_[static_cast<std::size_t>(i)];
+    }
+    d_sigma_dev_ = bt::Tensor::from_host_on(dev, d.data(), n, 1);
+    return true;
+}
+
 void FlowMatch::step(const bt::Tensor& v,
                      int step_index,
                      bt::Tensor& sample,
@@ -117,6 +138,27 @@ void FlowMatch::step(const bt::Tensor& v,
     const float sigma_t    = sigmas_[static_cast<std::size_t>(step_index)];
     const float sigma_next = sigmas_[static_cast<std::size_t>(step_index) + 1];
     const float d_sigma    = sigma_next - sigma_t;
+
+    // Fused, this is one kernel over the latent instead of a copy, a scale
+    // and an add, and the scratch buffer is never touched.
+    //
+    // d_sigma goes through a device-resident (1, 1) operand rather than as a
+    // literal, and that is the whole point of the schedule tensor below: the
+    // tracer bakes a float argument into the PTX, which would make every step
+    // of a schedule a separate kernel to compile. As a broadcast operand the
+    // expression compiles once and every step of every image replays it.
+    if (device_sigma_deltas_(sample.device)) {
+        const bt::Tensor ds = bt::Tensor::view(
+            d_sigma_dev_.device,
+            static_cast<char*>(d_sigma_dev_.data) +
+                static_cast<std::size_t>(step_index) * sizeof(float),
+            1, 1, bt::Dtype::FP32);
+        if (detail::try_fused(jit_euler_, {sample.data, v.data, ds.data}, [&] {
+                sample += v * ds;
+            })) {
+            return;
+        }
+    }
 
     // Match the operand dtype, not the global compute dtype: Sana runs the
     // velocity + latent in FP32 even on a GPU backend whose compute_dtype() is

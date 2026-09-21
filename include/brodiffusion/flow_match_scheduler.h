@@ -22,6 +22,7 @@
 // available) at that backend's compute dtype — FP32 on CPU, FP16 on a GPU.
 // Single-batch (N=1) like the rest of the inference path.
 
+#include "brodiffusion/detail/jit_fusion.h"
 #include "brotensor/tensor.h"
 
 #include <cstdint>
@@ -104,6 +105,14 @@ private:
     FlowMatchConfig    cfg_;
     std::vector<float> timesteps_;   // inference order, high -> low (continuous)
     std::vector<float> sigmas_;      // length num_inference_steps + 1, trailing 0
+
+    // The Euler update as one kernel. Mutable because step() is const: the
+    // site caches the compiled trace and the schedule's per-step coefficients
+    // live on the device so the kernel takes them as an operand instead of an
+    // immediate (see FlowMatch::step).
+    mutable detail::JitSite jit_euler_{"flow-match.euler"};
+    mutable brotensor::Tensor d_sigma_dev_;   // (num_steps, 1) FP32
+    bool device_sigma_deltas_(brotensor::Device dev) const;
 };
 
 }  // namespace brodiffusion::scheduler

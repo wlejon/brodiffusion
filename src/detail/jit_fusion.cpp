@@ -33,25 +33,57 @@ void set_jit_enabled(bool on) {
     jit_flag().store(on, std::memory_order_relaxed);
 }
 
-bool JitSite::bound_to(std::initializer_list<const void*> ptrs) const {
-    if (!handle_) return false;
-    if (ptrs_.size() != ptrs.size()) return false;
-    size_t i = 0;
-    for (const void* p : ptrs) {
-        if (ptrs_[i++] != p) return false;
+namespace {
+
+bool same(const std::vector<const void*>& a,
+          std::initializer_list<const void*> b) {
+    if (a.size() != b.size()) return false;
+    std::size_t i = 0;
+    for (const void* p : b) {
+        if (a[i++] != p) return false;
     }
     return true;
 }
 
-void JitSite::bind(brotensor::TraceHandle h, std::initializer_list<const void*> ptrs) {
-    handle_ = std::move(h);
-    ptrs_.assign(ptrs.begin(), ptrs.end());
+}  // namespace
+
+int JitSite::find(std::initializer_list<const void*> tokens) const {
+    // The caller loops over one binding at a time, so the previous hit is
+    // almost always the answer.
+    if (recent_ >= 0 && static_cast<std::size_t>(recent_) < bindings_.size() &&
+        same(bindings_[static_cast<std::size_t>(recent_)].tokens, tokens)) {
+        return recent_;
+    }
+    for (std::size_t i = 0; i < bindings_.size(); ++i) {
+        if (same(bindings_[i].tokens, tokens)) {
+            recent_ = static_cast<int>(i);
+            return recent_;
+        }
+    }
+    return -1;
+}
+
+void JitSite::bind(brotensor::TraceHandle h,
+                   std::initializer_list<const void*> tokens) {
+    Binding entry;
+    entry.tokens.assign(tokens.begin(), tokens.end());
+    entry.handle = std::move(h);
+    if (bindings_.size() < kMaxBindings) {
+        bindings_.push_back(std::move(entry));
+        recent_ = static_cast<int>(bindings_.size()) - 1;
+        return;
+    }
+    // Full: round-robin, so a site that genuinely cycles through more than the
+    // cap degrades to re-tracing rather than growing without bound.
+    bindings_[next_evict_] = std::move(entry);
+    recent_ = static_cast<int>(next_evict_);
+    next_evict_ = (next_evict_ + 1) % kMaxBindings;
 }
 
 void JitSite::disable(const char* why) {
     disabled_ = true;
-    handle_ = brotensor::TraceHandle();
-    ptrs_.clear();
+    bindings_.clear();
+    recent_ = -1;
     std::fprintf(stderr, "[brodiffusion] jit fusion unavailable at '%s' (%s); using eager path\n",
                  name_, why ? why : "unknown");
     std::fflush(stderr);
