@@ -48,6 +48,7 @@ const char* const kPipelineMethods[] = {
     "krea2PrimeFromTaps",
     // Qwen-Image 2.1 research hooks
     "qwenImage21SetModDelta", "qwenImage21TimeMod", "qwenImage21SetGateScale",
+    "qwenImage21SetGateDelta", "qwenImage21ClearGateDelta",
     "qwenImage21SetGateMask", "qwenImage21SetNormOutScaleDelta",
     "qwenImage21CaptureGates", "qwenImage21Gates", "qwenImage21HiddenSize",
     "qwenImage21NumLayers", "qwenImage21TextHiddenDim",
@@ -123,6 +124,7 @@ void brodiffusionTestRestoredSurface() {
         {"generate", 2}, {"prime", 2}, {"setControlVector", 4},
         {"krea2PrimeFromTaps", 5}, {"krea2EncodeImagePrompt", 3},
         {"qwenImage21SetModDelta", 4}, {"qwenImage21SetGateScale", 6},
+        {"qwenImage21SetGateDelta", 4},
         {"qwenImage21PrimeFromText", 5}, {"qwenImage21Decode", 3},
     };
     for (const auto& a : kArity) {

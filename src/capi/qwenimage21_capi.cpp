@@ -344,6 +344,32 @@ int qi_set_gate_scale(qi_ctx* c, float attn_scale, float mlp_scale,
     });
 }
 
+int qi_set_gate_delta(qi_ctx* c, const float* delta, int block_lo,
+                      int block_hi, int target) {
+    return guarded([&] {
+        if (!c->dit) {
+            throw std::runtime_error("qi_set_gate_delta: DiT not loaded "
+                                     "(open with QI_LOAD_DIT)");
+        }
+        using MT = bd::dit::QwenImage21ModTarget;
+        MT mt = MT::Target;
+        if (target == QI_MOD_PREFIX) mt = MT::Prefix;
+        else if (target == QI_MOD_BOTH) mt = MT::Both;
+        else if (target != QI_MOD_TARGET) {
+            throw std::runtime_error("qi_set_gate_delta: target must be one of "
+                                     "QI_MOD_TARGET/PREFIX/BOTH");
+        }
+        if (!delta) {
+            c->dit->set_gate_delta(bt::Tensor(), 0, 0, mt);
+            return;
+        }
+        const int h = c->mc.qwenimage21.transformer.hidden_size();
+        bt::Tensor d = bt::Tensor::from_host(delta, 1, 2 * h)
+                           .to(bt::default_device());
+        c->dit->set_gate_delta(d, block_lo, block_hi, mt);
+    });
+}
+
 int qi_set_gate_mask(qi_ctx* c, const float* mask, int64_t n, int block_lo,
                      int block_hi) {
     return guarded([&] {

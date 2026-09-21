@@ -190,6 +190,61 @@ Value qi21SetGateScale(Value thisVal, std::span<const Value> args) {
     }
 }
 
+// qwenImage21SetGateDelta(delta: {rows,cols,data} | null, blockLo, blockHi,
+//                         target?: 'target' | 'prefix' | 'both')
+// delta is (1, 2*qwenImage21HiddenSize()) laid out [attn, mlp], added to the
+// effective gate AFTER the tanh and after any qwenImage21SetGateScale factor;
+// null/undefined clears. This is the responsive counterpart to
+// qwenImage21SetModDelta's gate chunks, which land pre-tanh where most of
+// gate2's channels are saturated. A prefix-side target resets the live prefix
+// KV cache so the change lands.
+Value qi21SetGateDelta(Value thisVal, std::span<const Value> args) {
+    auto* w = qi21Pipeline(thisVal);
+    if (!w) return notQi21("qwenImage21SetGateDelta");
+    brotensor::Tensor delta;
+    if (!args.empty() && ev::isObject(args[0])) {
+        if (!tensorFromJs(args[0], delta)) {
+            return ev::throwTypeError(
+                "Pipeline.qwenImage21SetGateDelta: delta must be "
+                "{rows,cols,data}");
+        }
+    }
+    if (args.size() < 3 || !ev::isNumber(args[1]) || !ev::isNumber(args[2])) {
+        return ev::throwTypeError(
+            "Pipeline.qwenImage21SetGateDelta(delta, blockLo, blockHi, "
+            "target?): integer range required");
+    }
+    brodiffusion::dit::QwenImage21ModTarget target;
+    if (!readModTarget(argAt(args, 3), target)) {
+        return ev::throwTypeError(
+            "Pipeline.qwenImage21SetGateDelta: target must be "
+            "'target' | 'prefix' | 'both'");
+    }
+    try {
+        w->pipeline->qi21_set_gate_delta(delta, i32At(args, 1), i32At(args, 2),
+                                         target);
+        return ev::undefined();
+    } catch (const std::exception& e) {
+        return ev::throwError(
+            std::string("Pipeline.qwenImage21SetGateDelta failed: ") + e.what());
+    }
+}
+
+// qwenImage21ClearGateDelta() — sugar for passing null over an empty range.
+Value qi21ClearGateDelta(Value thisVal, std::span<const Value> args) {
+    (void)args;
+    auto* w = qi21Pipeline(thisVal);
+    if (!w) return notQi21("qwenImage21ClearGateDelta");
+    try {
+        w->pipeline->qi21_set_gate_delta(brotensor::Tensor(), 0, 0);
+        return ev::undefined();
+    } catch (const std::exception& e) {
+        return ev::throwError(
+            std::string("Pipeline.qwenImage21ClearGateDelta failed: ") +
+            e.what());
+    }
+}
+
 // qwenImage21SetGateMask(mask: {rows,cols,data} | null, blockLo, blockHi) —
 // mask holds (textRows + imgLen) values in joint forward order.
 Value qi21SetGateMask(Value thisVal, std::span<const Value> args) {
@@ -622,6 +677,8 @@ void decoratePipelineQwenImage21Proto(ObjectBuilder& proto) {
     proto.def("qwenImage21SetModDelta", 4, qi21SetModDelta);
     proto.def("qwenImage21TimeMod", 1, qi21TimeMod);
     proto.def("qwenImage21SetGateScale", 6, qi21SetGateScale);
+    proto.def("qwenImage21SetGateDelta", 4, qi21SetGateDelta);
+    proto.def("qwenImage21ClearGateDelta", 0, qi21ClearGateDelta);
     proto.def("qwenImage21SetGateMask", 3, qi21SetGateMask);
     proto.def("qwenImage21SetNormOutScaleDelta", 1, qi21SetNormOutScaleDelta);
     proto.def("qwenImage21CaptureGates", 1, qi21CaptureGates);

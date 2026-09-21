@@ -468,17 +468,33 @@ void QwenImage21Transformer2DModel::forward_joint(
             (has_mod_delta && i >= mod_delta_lo_ && i < mod_delta_hi_) ? mod_d
                                                                       : mod;
         const bool gscale = M.scaled && i >= gate_lo_ && i < gate_hi_;
-        const bt::Tensor& g1_0 = gscale ? M.gs1_0 : M.gate1_0;
-        const bt::Tensor& g1_t = gscale ? M.gs1_t : M.gate1_t;
-        const bt::Tensor& g2_0 = gscale ? M.gs2_0 : M.gate2_0;
-        const bt::Tensor& g2_t = gscale ? M.gs2_t : M.gate2_t;
+        // set_gate_delta: one more finished (1, hidden) gate row per
+        // sublayer, chosen here. The residual sites downstream see exactly
+        // the operand they always saw, so folding the delta in costs no
+        // extra pass over the (Lq, hidden) activations.
+        const bool gdelta =
+            M.deltaed && i >= gate_delta_lo_ && i < gate_delta_hi_;
+        const bt::Tensor& g1_0 =
+            gdelta ? (gscale ? M.gsd1_0 : M.gd1_0)
+                   : (gscale ? M.gs1_0 : M.gate1_0);
+        const bt::Tensor& g1_t =
+            gdelta ? (gscale ? M.gsd1_t : M.gd1_t)
+                   : (gscale ? M.gs1_t : M.gate1_t);
+        const bt::Tensor& g2_0 =
+            gdelta ? (gscale ? M.gsd2_0 : M.gd2_0)
+                   : (gscale ? M.gs2_0 : M.gate2_0);
+        const bt::Tensor& g2_t =
+            gdelta ? (gscale ? M.gsd2_t : M.gd2_t)
+                   : (gscale ? M.gs2_t : M.gate2_t);
         const bool gmask = mask_on && i >= gate_mask_lo_ && i < gate_mask_hi_;
 
         if (gate_sink_ != nullptr) {
             float* dst = gate_sink_->data() +
                          static_cast<std::size_t>(i) * static_cast<std::size_t>(L);
-            const float gp = gscale ? M.mean_gs1_0 : M.mean_g1_0;
-            const float gt = gscale ? M.mean_gs1_t : M.mean_g1_t;
+            const float gp = gdelta ? (gscale ? M.mean_gsd1_0 : M.mean_gd1_0)
+                                    : (gscale ? M.mean_gs1_0 : M.mean_g1_0);
+            const float gt = gdelta ? (gscale ? M.mean_gsd1_t : M.mean_gd1_t)
+                                    : (gscale ? M.mean_gs1_t : M.mean_g1_t);
             for (int r = 0; r < prefix_len; ++r) dst[r] = gp;
             for (int r = prefix_len; r < L; ++r) dst[r] = gt;
             if (gmask && gate_mask_host_.size() == static_cast<std::size_t>(L)) {

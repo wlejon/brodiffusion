@@ -685,6 +685,18 @@ public:
                              float txt_scale, float img_scale, int block_lo,
                              int block_hi);
 
+    // Post-tanh gate delta over blocks [block_lo, block_hi): `delta` is
+    // (1, 2*qi21_hidden_size()) laid out [attn, mlp], added to the effective
+    // gate AFTER the tanh (and after any qi21_set_gate_scale factor). Empty
+    // clears. This is the responsive counterpart to qi21_set_mod_delta()'s
+    // gate chunks, which land before the tanh where most of gate2's channels
+    // are saturated — see dit/qwenimage21.h's set_gate_delta(). A prefix-side
+    // delta resets the live prefix cache so the next step re-extracts.
+    void qi21_set_gate_delta(const brotensor::Tensor& delta, int block_lo,
+                             int block_hi,
+                             dit::QwenImage21ModTarget target =
+                                 dit::QwenImage21ModTarget::Target);
+
     // Per-token gate mask over blocks [block_lo, block_hi); `mask` holds
     // prefix_len + img_len values in joint forward order. Empty clears.
     void qi21_set_gate_mask(const brotensor::Tensor& mask, int block_lo,
@@ -922,8 +934,9 @@ private:
     // Only an extract step applies a prefix-side hook, so the cache has to be
     // dropped both when one is armed AND when one is cleared — the latter is
     // why these are remembered rather than read off the arguments.
-    bool  qi21_mod_delta_hits_prefix_ = false;
-    bool  qi21_gate_mask_armed_       = false;
+    bool  qi21_mod_delta_hits_prefix_  = false;
+    bool  qi21_gate_delta_hits_prefix_ = false;
+    bool  qi21_gate_mask_armed_        = false;
     float qi21_prefix_gate_attn_      = 1.0f;
     float qi21_prefix_gate_mlp_       = 1.0f;
 

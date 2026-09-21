@@ -167,6 +167,38 @@ void QwenImage21Transformer2DModel::set_gate_scale(float attn_scale,
     gate_hi_ = block_hi;
 }
 
+void QwenImage21Transformer2DModel::set_gate_delta(const bt::Tensor& delta,
+                                                    int block_lo, int block_hi,
+                                                    QwenImage21ModTarget target) {
+    if (delta.size() == 0) {
+        gate_delta_attn_ = bt::Tensor();
+        gate_delta_mlp_  = bt::Tensor();
+        gate_delta_lo_ = gate_delta_hi_ = 0;
+        gate_delta_target_ = QwenImage21ModTarget::Target;
+        return;
+    }
+    const int H = cfg_.hidden_size();
+    if (static_cast<std::int64_t>(delta.size()) !=
+        static_cast<std::int64_t>(2) * H) {
+        fail("set_gate_delta: delta must have 2*hidden_size elements "
+             "(the [attn, mlp] post-tanh gate pair)");
+    }
+    // Split once here rather than slicing per forward: the two halves are
+    // added to different rows and each add wants a (1, H) operand.
+    bt::Tensor d = to_compute(delta);
+    d.rows = 1;
+    d.cols = 2 * H;
+    const bt::Dtype dt = flux_compute_dtype();
+    const bt::Device dev = bt::default_device();
+    detail::resize_like(gate_delta_attn_, 1, H, dt, dev);
+    detail::resize_like(gate_delta_mlp_, 1, H, dt, dev);
+    bt::copy_d2d(d, 0, gate_delta_attn_, 0, H);
+    bt::copy_d2d(d, H, gate_delta_mlp_, 0, H);
+    gate_delta_lo_ = block_lo;
+    gate_delta_hi_ = block_hi;
+    gate_delta_target_ = target;
+}
+
 void QwenImage21Transformer2DModel::set_gate_mask(const bt::Tensor& mask,
                                                   int block_lo, int block_hi) {
     if (mask.size() == 0) {
@@ -228,30 +260,74 @@ void QwenImage21Transformer2DModel::scale_gates_(Modulation& m) {
     const bool active = gate_hi_ > gate_lo_ &&
                         (gate_attn_scale_ != 1.0f || gate_mlp_scale_ != 1.0f ||
                          gate_txt_scale_ != 1.0f || gate_img_scale_ != 1.0f);
+    const bool delta_on =
+        gate_delta_hi_ > gate_delta_lo_ && gate_delta_attn_.size() > 0;
     // Gate means are only read back when a capture sink is armed — the
     // readback is a device sync, so it must not run on the hot path.
     if (gate_sink_ != nullptr) {
         m.mean_g1_t = row_mean_(m.gate1_t);
         m.mean_g1_0 = row_mean_(m.gate1_0);
     }
-    if (!active) {
+    if (active) {
+        m.gs1_t = m.gate1_t.clone();
+        m.gs2_t = m.gate2_t.clone();
+        m.gs1_0 = m.gate1_0.clone();
+        m.gs2_0 = m.gate2_0.clone();
+        bt::scale_inplace(m.gs1_t, gate_attn_scale_ * gate_img_scale_);
+        bt::scale_inplace(m.gs2_t, gate_mlp_scale_  * gate_img_scale_);
+        bt::scale_inplace(m.gs1_0, gate_attn_scale_ * gate_txt_scale_);
+        bt::scale_inplace(m.gs2_0, gate_mlp_scale_  * gate_txt_scale_);
+        m.scaled = true;
+        if (gate_sink_ != nullptr) {
+            m.mean_gs1_t = m.mean_g1_t * gate_attn_scale_ * gate_img_scale_;
+            m.mean_gs1_0 = m.mean_g1_0 * gate_attn_scale_ * gate_txt_scale_;
+        }
+    } else {
         m.scaled = false;
         m.mean_gs1_t = m.mean_g1_t;
         m.mean_gs1_0 = m.mean_g1_0;
-        return;
     }
-    m.gs1_t = m.gate1_t.clone();
-    m.gs2_t = m.gate2_t.clone();
-    m.gs1_0 = m.gate1_0.clone();
-    m.gs2_0 = m.gate2_0.clone();
-    bt::scale_inplace(m.gs1_t, gate_attn_scale_ * gate_img_scale_);
-    bt::scale_inplace(m.gs2_t, gate_mlp_scale_  * gate_img_scale_);
-    bt::scale_inplace(m.gs1_0, gate_attn_scale_ * gate_txt_scale_);
-    bt::scale_inplace(m.gs2_0, gate_mlp_scale_  * gate_txt_scale_);
-    m.scaled = true;
+
+    m.deltaed = false;
+    if (!delta_on) return;
+
+    // The deltaed variants. Built from the base gates AND (when a block is
+    // covered by both hooks) from the scaled ones, so the forward picks one
+    // finished row per block instead of composing two operands per residual.
+    const bool hit_t = gate_delta_target_ != QwenImage21ModTarget::Prefix;
+    const bool hit_0 = gate_delta_target_ != QwenImage21ModTarget::Target;
+    auto build = [&](const bt::Tensor& g1_t, const bt::Tensor& g2_t,
+                     const bt::Tensor& g1_0, const bt::Tensor& g2_0,
+                     bt::Tensor& d1_t, bt::Tensor& d2_t, bt::Tensor& d1_0,
+                     bt::Tensor& d2_0) {
+        d1_t = g1_t.clone();
+        d2_t = g2_t.clone();
+        d1_0 = g1_0.clone();
+        d2_0 = g2_0.clone();
+        if (hit_t) {
+            bt::add_inplace(d1_t, gate_delta_attn_);
+            bt::add_inplace(d2_t, gate_delta_mlp_);
+        }
+        if (hit_0) {
+            bt::add_inplace(d1_0, gate_delta_attn_);
+            bt::add_inplace(d2_0, gate_delta_mlp_);
+        }
+    };
+    build(m.gate1_t, m.gate2_t, m.gate1_0, m.gate2_0, m.gd1_t, m.gd2_t,
+          m.gd1_0, m.gd2_0);
+    if (m.scaled) {
+        build(m.gs1_t, m.gs2_t, m.gs1_0, m.gs2_0, m.gsd1_t, m.gsd2_t,
+              m.gsd1_0, m.gsd2_0);
+    }
+    m.deltaed = true;
     if (gate_sink_ != nullptr) {
-        m.mean_gs1_t = m.mean_g1_t * gate_attn_scale_ * gate_img_scale_;
-        m.mean_gs1_0 = m.mean_g1_0 * gate_attn_scale_ * gate_txt_scale_;
+        // The delta's contribution to the mean is the mean of the delta row,
+        // which is constant across blocks — one readback, not one per block.
+        const float da = row_mean_(gate_delta_attn_);
+        m.mean_gd1_t  = m.mean_g1_t  + (hit_t ? da : 0.0f);
+        m.mean_gd1_0  = m.mean_g1_0  + (hit_0 ? da : 0.0f);
+        m.mean_gsd1_t = m.mean_gs1_t + (hit_t ? da : 0.0f);
+        m.mean_gsd1_0 = m.mean_gs1_0 + (hit_0 ? da : 0.0f);
     }
 }
 

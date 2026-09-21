@@ -275,8 +275,42 @@ public:
     void set_gate_scale(float attn_scale, float mlp_scale, float txt_scale,
                         float img_scale, int block_lo, int block_hi);
 
+    // Gate delta: add `delta` (1, 2*hidden_size, laid out [attn, mlp], any
+    // device/dtype) to the EFFECTIVE gate of blocks [block_lo, block_hi) —
+    // the value that multiplies the residual, i.e.
+    //
+    //     g_eff = set_gate_scale_factor * tanh(gate) + delta
+    //
+    // `target` picks the row class the delta lands on, exactly as
+    // set_mod_delta()'s does: Target is the sampled-t row (the image being
+    // generated), Prefix the t = 0 row (text and condition-image tokens).
+    // An empty tensor clears the hook.
+    //
+    // Why this exists next to set_mod_delta(). That hook adds BEFORE the
+    // tanh, so its authority over a gate channel is tanh'(g) — and the
+    // research found 74% of gate2's channels sitting where tanh'(g) < 0.05,
+    // which makes the model's largest modulation chunk its least responsive
+    // dial: a pre-tanh delta of 1.0 moves those channels by under 0.05.
+    // Adding after the tanh gives every channel unit authority, at the cost
+    // of leaving the (-1, 1) range tanh guarantees — which is the point,
+    // since a gate above 1 is not otherwise reachable.
+    //
+    // Cost: nothing per token. The modulation is four (1, hidden) rows shared
+    // by all 32 blocks, so the delta is folded into the gate row once per
+    // forward and the fused gated-residual kernel consumes the combined row
+    // as its gate operand — there is no second pass over the activations.
+    //
+    // Like every prefix-side hook, a Prefix / Both delta only takes effect on
+    // an extract step; Pipeline's qi21_set_gate_delta() resets the cache for
+    // you, a bare DiT caller must reset it itself.
+    void set_gate_delta(const brotensor::Tensor& delta, int block_lo,
+                        int block_hi,
+                        QwenImage21ModTarget target =
+                            QwenImage21ModTarget::Target);
+
     // Per-token gate mask over blocks [block_lo, block_hi): after the tanh
-    // (and any set_gate_scale), both sublayers' gated residual for row r is
+    // (and any set_gate_scale / set_gate_delta), both sublayers' gated
+    // residual for row r is
     // multiplied by mask[r]. `mask` holds prefix_len + hp*wp values in joint
     // forward order (any device/dtype); a cached step reads only its target
     // slice. Zeroing a row removes that token's residual updates entirely for
@@ -289,8 +323,8 @@ public:
     // forward overwrites it with the per-row mean EFFECTIVE attention gate of
     // each block, layout (num_layers, prefix_len + hp*wp) row-major — the
     // value that actually multiplied that row's attention residual, i.e.
-    // mean_d tanh(gate1)[d] times the row's set_gate_scale factor times its
-    // set_gate_mask entry. On a cached step the prefix columns carry the
+    // mean_d (set_gate_scale factor * tanh(gate1)[d] + set_gate_delta[d])
+    // times its set_gate_mask entry. On a cached step the prefix columns carry the
     // values the extract step would have applied (the prefix rows are not
     // recomputed), so the row layout stays stable across a denoise loop.
     //
@@ -345,10 +379,23 @@ private:
         // `scaled` is true.
         brotensor::Tensor gs1_t, gs2_t, gs1_0, gs2_0;
         bool scaled = false;
-        // Mean over hidden of each gate, for capture_gates(). Index order
-        // matches [gate1_t, gate1_0, gs1_t, gs1_0].
+        // set_gate_delta variants, for the blocks inside [gate_delta_lo_,
+        // gate_delta_hi_). `gd*` is the plain gate plus the delta and `gsd*`
+        // the set_gate_scale-scaled gate plus the delta, so a block covered
+        // by both hooks still reads ONE (1, hidden) row and the fused
+        // gated-residual kernel keeps its single gate operand. Valid only
+        // when `deltaed` is true; the `gsd*` half additionally requires
+        // `scaled`.
+        brotensor::Tensor gd1_t, gd2_t, gd1_0, gd2_0;
+        brotensor::Tensor gsd1_t, gsd2_t, gsd1_0, gsd2_0;
+        bool deltaed = false;
+        // Mean over hidden of each attention gate, for capture_gates(). One
+        // per variant: plain, scaled, deltaed, scaled-and-deltaed, each in
+        // (target row, prefix row) order.
         float mean_g1_t = 0.0f, mean_g1_0 = 0.0f;
         float mean_gs1_t = 0.0f, mean_gs1_0 = 0.0f;
+        float mean_gd1_t = 0.0f, mean_gd1_0 = 0.0f;
+        float mean_gsd1_t = 0.0f, mean_gsd1_0 = 0.0f;
     };
 
     void load_impl_(const std::vector<const brotensor::safetensors::File*>& shards,
@@ -384,7 +431,9 @@ private:
     // rows, applying tanh to the gates and the norm_out scale delta.
     void chunk_modulation_(const brotensor::Tensor& mod,
                            const brotensor::Tensor& final_all, Modulation& m);
-    // Fill m's gs* variants from its gates under the set_gate_scale factors.
+    // Fill m's gs* / gd* / gsd* variants from its gates under the
+    // set_gate_scale factors and the set_gate_delta rows, and (when a
+    // capture sink is armed) the per-variant attention-gate means.
     void scale_gates_(Modulation& m);
     // Mean over hidden of a (1, hidden) row, on host.
     float row_mean_(const brotensor::Tensor& row) const;
@@ -448,6 +497,13 @@ private:
     float gate_attn_scale_ = 1.0f, gate_mlp_scale_ = 1.0f;
     float gate_txt_scale_  = 1.0f, gate_img_scale_ = 1.0f;
     int gate_lo_ = 0, gate_hi_ = 0;
+
+    // set_gate_delta: the two (1, hidden) halves of the caller's
+    // (1, 2*hidden) row, kept split so adding them costs no slicing per
+    // forward. Empty = off.
+    brotensor::Tensor gate_delta_attn_, gate_delta_mlp_;
+    int gate_delta_lo_ = 0, gate_delta_hi_ = 0;
+    QwenImage21ModTarget gate_delta_target_ = QwenImage21ModTarget::Target;
 
     brotensor::Tensor gate_mask_;      // (L, 1) compute dtype; empty = off
     std::vector<float> gate_mask_host_;  // the same values, for gate capture

@@ -598,6 +598,130 @@ static void test_hooks() {
         CHECK(rel_maxdiff(base, v_masked) > 1e-4);
     }
 
+    // ── gate delta (post-tanh) ────────────────────────────────────────────
+    //
+    // The hook adds to the EFFECTIVE gate, after the tanh and after any
+    // set_gate_scale factor, which makes the two composable exactly:
+    // zeroing the target rows' gate and then adding back tanh(gate) as a
+    // delta has to land on the unhooked forward.
+    {
+        // An empty delta, and a zero one over every block, are no-ops.
+        model.set_gate_delta(bt::Tensor(), 0, 0);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        CHECK(base == download_any(out));
+        {
+            std::vector<float> z(static_cast<std::size_t>(2) * H, 0.0f);
+            bt::Tensor zd = bdtest::bd_upload(z, 1, 2 * H);
+            model.set_gate_delta(zd, 0, cfg.num_layers,
+                                 qd::QwenImage21ModTarget::Both);
+            model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+            bt::sync_all();
+            CHECK(base == download_any(out));
+            model.set_gate_delta(bt::Tensor(), 0, 0);
+        }
+
+        // Zero gate + delta == the pure gated residual it replaces.
+        // img_scale = 0 zeroes the TARGET rows' gates only, leaving the
+        // prefix (t = 0) side alone; the delta then restores exactly
+        // tanh(gate1) / tanh(gate2) for those rows, read out of
+        // compute_time_mod's raw pre-tanh modulation.
+        bt::Tensor temb, mods;
+        model.compute_time_mod(0.7f, temb, mods);
+        std::vector<float> mh = bdtest::bd_download(mods);
+        std::vector<float> eff(static_cast<std::size_t>(2) * H);
+        for (int j = 0; j < H; ++j) {
+            eff[static_cast<std::size_t>(j)] =
+                std::tanh(mh[static_cast<std::size_t>(H + j)]);          // gate1
+            eff[static_cast<std::size_t>(H + j)] =
+                std::tanh(mh[static_cast<std::size_t>(3 * H + j)]);      // gate2
+        }
+        bt::Tensor effd = bdtest::bd_upload(eff, 1, 2 * H);
+
+        // Without the delta, a zeroed target gate is a very different image.
+        model.set_gate_scale(1.0f, 1.0f, 1.0f, 0.0f, 0, cfg.num_layers);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        const std::vector<float> v_zero = download_any(out);
+        const double d_zero = rel_maxdiff(base, v_zero);
+        CHECK(d_zero > 1e-3);
+
+        model.set_gate_delta(effd, 0, cfg.num_layers,
+                             qd::QwenImage21ModTarget::Target);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        const double d_restored = rel_maxdiff(base, download_any(out));
+        // The restored gate takes a detour the base one does not: device
+        // BF16 -> host FP32 tanh -> device BF16 delta -> added to zero. One
+        // BF16 ulp is ~0.4% and two blocks compound it, so the bar is the
+        // ratio — the restore has to put the output back essentially where
+        // the base forward had it, not reproduce it bit for bit.
+        CHECK(d_restored < 1e-2);
+        CHECK(d_restored < d_zero * 0.05);
+        std::printf("qi21_dit: gate delta restore rel maxdiff %.3e "
+                    "(zero-gate %.3e)\n", d_restored, d_zero);
+        model.set_gate_scale(1.0f, 1.0f, 1.0f, 1.0f, 0, 0);
+        model.set_gate_delta(bt::Tensor(), 0, 0);
+
+        // A nonzero delta on its own moves the output, and a block-range
+        // delta is not a whole-model one.
+        std::vector<float> d(static_cast<std::size_t>(2) * H, 0.2f);
+        bt::Tensor dd = bdtest::bd_upload(d, 1, 2 * H);
+        model.set_gate_delta(dd, 0, cfg.num_layers,
+                             qd::QwenImage21ModTarget::Target);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        const std::vector<float> v_all = download_any(out);
+        CHECK(rel_maxdiff(base, v_all) > 1e-4);
+        model.set_gate_delta(dd, cfg.num_layers - 1, cfg.num_layers,
+                             qd::QwenImage21ModTarget::Target);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        const std::vector<float> v_last = download_any(out);
+        CHECK(rel_maxdiff(base, v_last) > 1e-6);
+        CHECK(rel_maxdiff(v_all, v_last) > 1e-6);
+
+        // Target and Prefix address different rows, so they are different
+        // moves — and a Prefix-side delta changes the prefix K/V an extract
+        // step writes, exactly as a Prefix mod delta does.
+        model.set_gate_delta(dd, 0, cfg.num_layers,
+                             qd::QwenImage21ModTarget::Prefix);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        CHECK(rel_maxdiff(v_all, download_any(out)) > 1e-6);
+        qd::QwenImage21PrefixCache c_pd;
+        bt::Tensor tmp_pd;
+        model.forward(lat, hp, wp, txt, 0.7f, &c_pd, tmp_pd);
+        bt::sync_all();
+        model.set_gate_delta(bt::Tensor(), 0, 0);
+        qd::QwenImage21PrefixCache c_pref;
+        model.forward(lat, hp, wp, txt, 0.7f, &c_pref, tmp_pd);
+        bt::sync_all();
+        bt::Tensor o_a, o_b;
+        model.forward(lat, hp, wp, txt, 0.4f, &c_pd, o_a);
+        model.forward(lat, hp, wp, txt, 0.4f, &c_pref, o_b);
+        bt::sync_all();
+        CHECK(rel_maxdiff(download_any(o_a), download_any(o_b)) > 1e-4);
+
+        // ...and it composes with set_gate_scale rather than replacing it:
+        // scale 0.5 plus delta 0.2 is neither one alone.
+        model.set_gate_delta(dd, 0, cfg.num_layers,
+                             qd::QwenImage21ModTarget::Target);
+        model.set_gate_scale(0.5f, 0.5f, 1.0f, 1.0f, 0, cfg.num_layers);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        const std::vector<float> v_both = download_any(out);
+        CHECK(rel_maxdiff(v_all, v_both) > 1e-6);
+        model.set_gate_delta(bt::Tensor(), 0, 0);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        CHECK(rel_maxdiff(v_both, download_any(out)) > 1e-6);
+        model.set_gate_scale(1.0f, 1.0f, 1.0f, 1.0f, 0, 0);
+        model.forward(lat, hp, wp, txt, 0.7f, nullptr, out);
+        bt::sync_all();
+        CHECK(base == download_any(out));
+    }
+
     // ── gate capture shapes ───────────────────────────────────────────────
     {
         std::vector<float> sink;

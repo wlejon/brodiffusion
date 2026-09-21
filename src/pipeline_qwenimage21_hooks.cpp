@@ -175,6 +175,20 @@ void Pipeline::qi21_set_gate_scale(float attn_scale, float mlp_scale,
     }
 }
 
+void Pipeline::qi21_set_gate_delta(const bt::Tensor& delta, int block_lo,
+                                   int block_hi,
+                                   dit::QwenImage21ModTarget target) {
+    qi21_model(model_class_, denoiser_, "qi21_set_gate_delta")
+        .set_gate_delta(delta, block_lo, block_hi, target);
+    // Same prefix-cache rule as qi21_set_mod_delta(): the t = 0 gate is only
+    // ever applied on an extract step, so arming OR clearing a prefix-side
+    // delta needs the cache dropped for the change to land.
+    const bool hits_prefix = delta.size() > 0 && block_hi > block_lo &&
+                             target != dit::QwenImage21ModTarget::Target;
+    if (hits_prefix || qi21_gate_delta_hits_prefix_) qi21_reset_cache();
+    qi21_gate_delta_hits_prefix_ = hits_prefix;
+}
+
 void Pipeline::qi21_set_gate_mask(const bt::Tensor& mask, int block_lo,
                                   int block_hi) {
     qi21_model(model_class_, denoiser_, "qi21_set_gate_mask")

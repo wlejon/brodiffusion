@@ -157,6 +157,17 @@ QI_API int qi_set_gate_scale(qi_ctx* c, float attn_scale, float mlp_scale,
                              float txt_scale, float img_scale, int block_lo,
                              int block_hi);
 
+/* Post-tanh gate delta: add delta (2 * hidden_size, laid out [attn, mlp]) to
+ * the EFFECTIVE gate of blocks [block_lo, block_hi) on the row named by
+ * `target` (QI_MOD_*), i.e.
+ *     g_eff = qi_set_gate_scale factor * tanh(gate) + delta
+ * Unlike qi_set_mod_delta's gate chunks, which land before the tanh where
+ * most of gate2's channels are saturated, this has unit authority over every
+ * channel. delta == NULL clears. A QI_MOD_PREFIX / QI_MOD_BOTH delta needs
+ * qi_reset_cache() to take effect. */
+QI_API int qi_set_gate_delta(qi_ctx* c, const float* delta, int block_lo,
+                             int block_hi, int target);
+
 /* Per-token gate mask: both sublayers' gated residual for row r of blocks
  * [block_lo, block_hi) is multiplied by mask[r], after the tanh and after any
  * qi_set_gate_scale. `n` must equal the forward's n_txt + h_lat*w_lat; a
