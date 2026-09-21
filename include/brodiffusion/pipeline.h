@@ -167,9 +167,31 @@ struct ControlNetInput {
     float       end_step   = 1.0f;
 };
 
+// One condition image for Qwen-Image 2.1's image-conditioned generation.
+// Either a file path (decoded by broimage) or pixels already in memory —
+// exactly one of the two. In-memory pixels are PLANAR CHW in [0, 1], 3
+// channels (RGB) or 4 (RGBA, alpha preserved for the autoencoder and
+// composited over white for the vision tower).
+//
+// The image is resized before use — see GenerateOptions::output_resolution —
+// so it does not have to arrive at any particular size.
+struct ConditionImage {
+    std::string path;
+    std::vector<float> pixels;
+    int channels = 3;
+    int H = 0;
+    int W = 0;
+};
+
 struct GenerateOptions {
     // Image dimensions in pixels. Latent dims are H/8, W/8. Both must be
     // multiples of 8 and at least 8 (so latent dims are >= 1).
+    //
+    // Qwen-Image 2.1 with condition images accepts 0 for both, meaning
+    // "derive the canvas from the LAST condition image's aspect ratio at
+    // output_resolution" — which is what the reference pipeline does when
+    // height/width are omitted. Every other path still demands a positive
+    // multiple of the autoencoder stride.
     int height = 512;
     int width  = 512;
 
@@ -237,6 +259,27 @@ struct GenerateOptions {
     // black = keep. SD1.5 only; throws on Flux.
     std::string mask_image_path;
 
+    // ── Qwen-Image 2.1 image conditioning (edit / reference image) ────────
+    //
+    // Condition images, in the order the prompt should see them. Each one is
+    // read twice: the Qwen3-VL vision tower turns it into rows of the prompt
+    // stream, and the autoencoder turns it into latent tokens that sit in the
+    // joint sequence ahead of the noise. The target latents are the only
+    // thing the sampler touches — a condition image is context, never
+    // something being denoised, which is what separates this from img2img.
+    //
+    // Empty = plain text-to-image. QwenImage21 only; other model classes
+    // throw. The vision tower must be resident (it is, unless the checkpoint
+    // shipped without one).
+    std::vector<ConditionImage> condition_images;
+
+    // Target side length used both to size the generated canvas (when
+    // height/width are 0) and to resize every condition image, via the
+    // reference's calculate_dimensions(output_resolution², aspect). 1024 is
+    // the reference default; drop it to fit a smaller card. Ignored when
+    // condition_images is empty.
+    int output_resolution = 1024;
+
     // Optional cooperative cancellation, honored by generate() only (the
     // step-wise prime/step_once API leaves pacing to the caller, who can stop
     // looping whenever it likes). Checked once per denoising step and once
@@ -287,8 +330,8 @@ public:
     //                  vision tower (for image-as-prompt).
     //   QwenImage21  — QwenImage21Denoiser (block-causal single-stream DiT) +
     //                  the 16x RGBA Qwen-Image 2.1 VAE (decoder + encoder) +
-    //                  the Qwen3-VL-8B text encoder. No vision tower yet — the
-    //                  image-conditioned edit path is a later chunk.
+    //                  the Qwen3-VL-8B text encoder and its vision tower
+    //                  (which the image-conditioned edit path reads).
     //
     // Owns the Qwen3-VL tokenizer either way. Valid only when cfg.model_class
     // is Krea2 or QwenImage21; no CLIP frontend / KL-VAE (those members stay
@@ -758,6 +801,30 @@ public:
                                        const brotensor::Tensor* uncond_mask,
                                        const GenerateOptions& opts);
 
+    // Encode `prompt` TOGETHER WITH condition images: the same (n, 4096)
+    // Qwen3-VL rows qi21_encode_prompt() returns, except that the template
+    // reserves a run of rows per image and the vision tower's output stands
+    // in their place. The returned conditioning's `image_pad_mask` /
+    // `image_runs` say which rows those are and what latent grid each image
+    // needs — everything a caller has to know to assemble the joint prefix
+    // itself.
+    //
+    // Images are resized with calculate_dimensions(resolution², aspect)
+    // first, so the vision grid and the VAE's latent grid describe the same
+    // picture. Throws when the vision tower is not resident.
+    qwenimage21::TextConditioning qi21_encode_prompt_images(
+        std::string_view prompt,
+        const std::vector<ConditionImage>& images,
+        int output_resolution = 1024);
+
+    // Resolve the output canvas a generation with `opts` will use: (width,
+    // height) verbatim when both are positive, otherwise the size derived
+    // from the LAST condition image's aspect at opts.output_resolution.
+    // prime() applies the same rule; this lets a caller size its own output
+    // buffer without priming first.
+    void qi21_resolve_size(const GenerateOptions& opts, int& width,
+                           int& height);
+
     // ── image seam (the resident 16x RGBA VAE) ────────────────────────────
 
     // Encode RGB pixels into a pipeline-scale latent. `pixels` is FP32 CHW in
@@ -863,18 +930,19 @@ private:
     std::optional<vae_qwenimage::Decoder>    vae_qwen_;
     std::optional<brolm::qwen3vl::TextModel> qwen3vl_model_;
     std::optional<brolm::qwen3vl::Tokenizer> qwen3vl_tokenizer_;
-    // Krea 2's vision tower + image preprocessor config — unused by plain
+    // The Qwen3-VL vision tower + image preprocessor config — unused by plain
     // text prompting, loaded (from the SAME text_encoder shard(s)
-    // qwen3vl_model_ loads) only so krea_encode_image_prompt() can work.
-    // Empty for non-Krea2 pipelines and left unconstructed until
-    // from_model_dir() loads its weights.
+    // qwen3vl_model_ loads) so the image-conditioned paths can work:
+    // krea_encode_image_prompt() for Krea 2, qi21_encode_prompt_images() and
+    // the edit-mode prime for Qwen-Image 2.1. Left unconstructed for every
+    // other model class.
     std::optional<brolm::qwen3vl::VisionTower> qwen3vl_vision_;
     brolm::qwen3vl::PreprocessConfig           qwen3vl_pp_;
 
     // ── Qwen-Image 2.1-only sub-modules ───────────────────────────────────
     // The QwenImage21Denoiser lives in denoiser_; the text frontend reuses
-    // qwen3vl_model_ / qwen3vl_tokenizer_ above (an 8B backbone here, and no
-    // vision tower until the edit path lands). decode() routes to vae_qi21_,
+    // qwen3vl_model_ / qwen3vl_tokenizer_ / qwen3vl_vision_ above (an 8B
+    // backbone here, and its own tower). decode() routes to vae_qi21_,
     // which is the 16x RGBA residual VAE: it emits four planes and decode()
     // drops the alpha one. The encoder is constructed alongside so the
     // image-conditioned paths have it resident; it is loaded from the same
@@ -930,6 +998,21 @@ private:
     // deliberately non-owning: a hook called after the state was dropped is a
     // no-op rather than a dangling write.
     std::weak_ptr<PreparedConditioning> last_prepared_;
+    // The image-conditioned joint prefix for the generation being primed.
+    // prime()'s QwenImage21 branch fills these from opts.condition_images and
+    // the prepare_edit() call a few lines later consumes them; they are
+    // cleared on every prime so a text-only run after an edit run cannot
+    // inherit an image prefix. Not part of PipelineState because the prepared
+    // conditioning already owns its own copy once prepare_edit() has run.
+    dit::QwenImage21EditPrefix qi21_edit_prefix_;
+    dit::QwenImage21EditPrefix qi21_edit_uncond_prefix_;
+    bool qi21_edit_active_ = false;
+    // Decode + resize + VAE-encode every condition image, and describe the
+    // joint prefix each branch's conditioning implies. Fills the three
+    // members above and both branches of `conditioning_`. Lives in
+    // pipeline_qwenimage21_edit.cpp.
+    void qi21_prime_edit_(std::string_view prompt, const GenerateOptions& opts,
+                          bool do_cfg);
     // What the currently-armed Qwen-Image 2.1 hooks do to the PREFIX side.
     // Only an extract step applies a prefix-side hook, so the cache has to be
     // dropped both when one is armed AND when one is cleared — the latter is

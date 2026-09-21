@@ -47,11 +47,20 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     const char* init_path = arg_after(argc, argv, "--init");
     const char* mask_path = arg_after(argc, argv, "--mask");
     const char* strength_s = arg_after(argc, argv, "--strength");
+    const char* outres_s  = arg_after(argc, argv, "--output-resolution");
     bool vae_sample = false;
     bool quantize   = false;
+    // --image <png>, repeatable: condition images for Qwen-Image 2.1's
+    // image-conditioned generation, in the order the prompt should see them.
+    // Distinct from --init: a condition image is context the model reads, not
+    // a latent the sampler starts from and noises.
+    std::vector<const char*> condition_paths;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--vae-sample") == 0) vae_sample = true;
         if (std::strcmp(argv[i], "--quantize-unet") == 0) quantize = true;
+        if (std::strcmp(argv[i], "--image") == 0 && i + 1 < argc) {
+            condition_paths.push_back(argv[++i]);
+        }
     }
 
     if (!prompt || !out_path) {
@@ -138,10 +147,40 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     if (steps_s)  opts.num_inference_steps = std::atoi(steps_s);
     else if (is_flux) opts.num_inference_steps = 4;  // flux-schnell default
     if (cfg_s)    opts.guidance_scale = static_cast<float>(std::atof(cfg_s));
+    // Condition images come before --width/--height so that leaving those off
+    // means "derive the canvas from the last image's aspect", the way the
+    // reference pipeline does.
+    if (!condition_paths.empty()) {
+        if (!is_qi21) {
+            std::fprintf(stderr,
+                "txt2img: --image (condition image) is Qwen-Image 2.1 only; "
+                "use --init for img2img on the other model classes\n");
+            return 2;
+        }
+        for (const char* p : condition_paths) {
+            pl::ConditionImage ci;
+            ci.path = p;
+            opts.condition_images.push_back(std::move(ci));
+        }
+        if (outres_s) opts.output_resolution = std::atoi(outres_s);
+        opts.width  = 0;
+        opts.height = 0;
+    }
     if (width_s)  opts.width  = std::atoi(width_s);
     if (height_s) opts.height = std::atoi(height_s);
     if (seed_s)   opts.seed =
         static_cast<std::uint64_t>(std::strtoull(seed_s, nullptr, 10));
+
+    // Resolve the derived canvas now rather than inside prime(), so --latent-in
+    // sizes its buffer and write_png names its dimensions with the same
+    // numbers the generation will use.
+    if (!opts.condition_images.empty() &&
+        (opts.width <= 0 || opts.height <= 0)) {
+        pipeline.qi21_resolve_size(opts, opts.width, opts.height);
+        std::printf("Condition images: %zu; canvas derived from the last "
+                    "one's aspect: %dx%d\n",
+                    opts.condition_images.size(), opts.width, opts.height);
+    }
 
     // --noise selects the initial-latent RNG ('torch' reproduces a PyTorch
     // reference run's starting latent; default internal).

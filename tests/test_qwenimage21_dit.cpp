@@ -152,7 +152,7 @@ void build_fixture(Builder& b, const qd::QwenImage21Config& c) {
 }
 
 std::vector<float> download_any(const bt::Tensor& t) {
-    if (t.dtype == bt::Dtype::BF16) {
+    if (t.dtype != bt::Dtype::FP32) {
         bt::Tensor f32;
         bt::cast(t, f32, bt::Dtype::FP32);
         return bdtest::bd_download(f32);
@@ -380,6 +380,97 @@ static void test_denoiser() {
                 brodiffusion::Branch::Cond, out);
     bt::sync_all();
     CHECK(out.cols == static_cast<int>(n_lat));
+
+    // ── image-conditioned prefix ──────────────────────────────────────────
+    //
+    // prepare_edit() routes forward() through the same forward_joint() an
+    // edit-mode generation uses. Two things have to hold: the Denoiser's
+    // answer is what a direct forward_joint() on the same inputs gives (so
+    // the wrapper adds a transpose and nothing else), and the prefix cache
+    // still reproduces a full prefill when the prefix contains image rows.
+    {
+        const int ch = 2, cw = 2;
+        std::vector<qd::QwenImage21Segment> segs(3);
+        segs[0].kind = qd::QwenImage21Segment::Kind::Text;
+        segs[0].n_tokens = 2;
+        segs[1].kind = qd::QwenImage21Segment::Kind::Image;
+        segs[1].n_tokens = ch * cw;
+        segs[1].h = ch;
+        segs[1].w = cw;
+        segs[2].kind = qd::QwenImage21Segment::Kind::Text;
+        segs[2].n_tokens = text_seq - 2;
+
+        qd::QwenImage21EditPrefix edit;
+        edit.segments = segs;
+        edit.cond_latents = bdtest::bd_upload(
+            rnd(static_cast<std::size_t>(ch) * cw * cfg.in_channels, 2010),
+            ch * cw, cfg.in_channels);
+
+        brodiffusion::PreparedConditioning eprep =
+            den.prepare_edit(cond, edit, nullptr);
+        bt::Tensor eout;
+        den.forward(latent, H_lat, W_lat, 700.0f, eprep,
+                    brodiffusion::Branch::Cond, eout);
+        bt::sync_all();
+        CHECK(eout.rows == 1);
+        CHECK(eout.cols == static_cast<int>(n_lat));
+        std::vector<float> ev = bdtest::bd_download(eout);
+        int nf = 0;
+        for (float v : ev) if (!std::isfinite(v)) ++nf;
+        CHECK(nf == 0);
+        // The condition image is actually read: the same prompt without it
+        // gives a different velocity.
+        CHECK(rel_maxdiff(v0, ev) > 1e-4);
+
+        // Bit-exact against forward_joint() driven by hand. The Denoiser owns
+        // the (C,HW) <-> (HW,C) transpose and the timestep's /1000, so this
+        // reproduces both and compares the raw token tensor.
+        {
+            bt::Tensor packed;
+            bt::nchw_to_sequence(latent, 1, cfg.in_channels, H_lat, W_lat,
+                                 packed);
+            bt::Tensor& txt_rows = den.text_rows(eprep, /*uncond=*/false);
+            bt::Tensor ref_tok;
+            den.model().forward_joint(packed, H_lat, W_lat, txt_rows,
+                                      &edit.cond_latents, segs, 0.7f, nullptr,
+                                      ref_tok);
+            bt::sync_all();
+            bt::Tensor ref_nchw;
+            bt::sequence_to_nchw(ref_tok, 1, cfg.in_channels, H_lat, W_lat,
+                                 ref_nchw);
+            bt::sync_all();
+            // eout came off a cache-extracting call, which is a full prefill
+            // like this one, so the two are the same arithmetic in the same
+            // order.
+            CHECK(download_any(ref_nchw) == ev);
+        }
+
+        // A cached step over an image-bearing prefix still equals a prefill.
+        den.forward(latent, H_lat, W_lat, 400.0f, eprep,
+                    brodiffusion::Branch::Cond, eout);
+        bt::sync_all();
+        std::vector<float> ecached = bdtest::bd_download(eout);
+        den.reset_cache(eprep);
+        den.forward(latent, H_lat, W_lat, 400.0f, eprep,
+                    brodiffusion::Branch::Cond, eout);
+        bt::sync_all();
+        const double de = rel_maxdiff(bdtest::bd_download(eout), ecached);
+        CHECK(de < 2e-3);
+        std::printf("qi21_dit: edit-prefix cached rel maxdiff %.3e\n", de);
+
+        // A prefix whose text segments do not cover the encoded rows is
+        // rejected at prepare time, where the caller can still see which
+        // count disagreed.
+        bool threw = false;
+        try {
+            qd::QwenImage21EditPrefix bad = edit;
+            bad.segments[2].n_tokens += 1;
+            (void)den.prepare_edit(cond, bad, nullptr);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        CHECK(threw);
+    }
 
     std::error_code ec;
     std::filesystem::remove(path, ec);

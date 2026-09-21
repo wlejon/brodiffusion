@@ -65,6 +65,20 @@ std::string language_model_prefix(
     return "model.language_model.";
 }
 
+// Same probe for the vision tower. Returns nullptr when the shard set carries
+// no tower at all (a text-only text_encoder override), which is not fatal:
+// text-to-image never touches it.
+const char* vision_prefix(
+        const std::vector<const brotensor::safetensors::File*>& shards) {
+    for (const auto* f : shards) {
+        if (f->find("visual.patch_embed.proj.weight")) return "visual.";
+        if (f->find("model.visual.patch_embed.proj.weight")) {
+            return "model.visual.";
+        }
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 Pipeline Pipeline::from_model_dir_qwenimage21_(const std::string& model_dir,
@@ -118,11 +132,21 @@ Pipeline Pipeline::from_model_dir_qwenimage21_(const std::string& model_dir,
     std::vector<const brotensor::safetensors::File*> te_ptrs;
     for (const auto& f : te_files) te_ptrs.push_back(&f);
     check_cancel();
-    // Language model only. The 2.1 checkpoint carries the vision tower too,
-    // but nothing reads it until the edit path lands — and at 8B the backbone
-    // is already the second-largest thing on the card.
     p.qwen3vl_model_->load_weights(te_ptrs, language_model_prefix(te_ptrs));
     t = stamp("Qwen3-VL 8B weights", t);
+
+    check_cancel();
+    // The vision tower rides along in the same shards. It is what turns a
+    // condition image into rows of the prompt stream, so the edit path needs
+    // it resident; at ~1 GB against the backbone's 8.5 it is not what decides
+    // whether a card fits the model. A checkpoint without one still loads —
+    // text-to-image never reads it, and the edit entry points say so.
+    if (const char* vp = vision_prefix(te_ptrs)) {
+        p.qwen3vl_vision_->load_weights(te_ptrs, vp);
+        t = stamp("Qwen3-VL vision tower weights", t);
+    } else {
+        p.qwen3vl_vision_.reset();
+    }
 
     return p;
 }

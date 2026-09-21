@@ -49,4 +49,38 @@ brotensor::Tensor load_mask_as_latent(const std::string& path,
                                       int H_lat, int W_lat,
                                       uint8_t threshold = 128);
 
+// ── host-side RGBA, for the paths that need the pixels twice ──────────────
+//
+// An image-conditioned generation reads the same picture two ways: the
+// vision-language encoder wants RGB with any transparency composited over
+// white, and the autoencoder wants all four channels. Both want it at the
+// same resized geometry. The tensor helpers above bake in a device upload
+// and a channel count, so this is the seam that hands back plain host pixels
+// and lets the caller take the two views it needs.
+struct HostImage {
+    std::vector<float> planes;  // (channels, H, W) planar, values in [0, 1]
+    int channels = 4;
+    int H = 0;
+    int W = 0;
+
+    std::size_t plane_stride() const {
+        return static_cast<std::size_t>(H) * static_cast<std::size_t>(W);
+    }
+};
+
+// Decode `path` into planar RGBA FP32 in [0, 1] at its native size. Throws
+// std::runtime_error on a decode failure or an empty image.
+HostImage load_image_rgba(const std::string& path);
+
+// Resample `src` to (dst_w, dst_h). Lanczos-3, which is the filter PIL's
+// default `Image.resize` uses and therefore what the reference pipeline's
+// condition-image resize does. Both dimensions must be positive.
+HostImage resize_rgba(const HostImage& src, int dst_w, int dst_h);
+
+// RGB view with the alpha composited over WHITE — the copy the Qwen3-VL
+// vision tower is given. The checkpoint was trained that way; the VAE still
+// reads all four channels, so this is a second view, never a replacement.
+// Returns (3, H, W) planar in [0, 1].
+std::vector<float> composite_over_white(const HostImage& img);
+
 }  // namespace brodiffusion

@@ -168,6 +168,8 @@ Pipeline::Pipeline(const PipelineConfig& cfg,
         vae_qi21_.emplace(cfg.qwenimage21.vae);
         vae_qi21_encoder_.emplace(cfg.qwenimage21.vae);
         qwen3vl_model_.emplace(cfg.qwenimage21.text.text);
+        qwen3vl_vision_.emplace(cfg.qwenimage21.text.vision,
+                                cfg.qwenimage21.text.text.hidden_size);
     } else {
         fail("Pipeline: the (cfg, qwen3vl_tok) constructor requires "
              "model_class == Krea2 or QwenImage21");
@@ -241,6 +243,20 @@ PipelineState Pipeline::prime(std::string_view prompt,
     // inpaint / ControlNet) does not apply.
     if (model_class_ == ModelClass::Sana) {
         return prime_sana_(prompt, opts);
+    }
+    // Qwen-Image 2.1 with condition images accepts height/width 0, meaning
+    // "take the canvas from the last condition image's aspect". Resolve it
+    // once here and re-enter with a concrete size, so every check and every
+    // latent-shape computation below sees real dimensions.
+    if (!opts.condition_images.empty() && (opts.height <= 0 || opts.width <= 0)) {
+        GenerateOptions sized = opts;
+        qi21_resolve_size(opts, sized.width, sized.height);
+        return prime(prompt, sized);
+    }
+    if (!opts.condition_images.empty() &&
+        model_class_ != ModelClass::QwenImage21) {
+        fail("prime: condition_images is Qwen-Image 2.1 only — img2img "
+             "(init_image_path) is the seam for the other model classes");
     }
     // Resolution granularity is the autoencoder's stride — 8 for the KL-VAEs,
     // 16 for Qwen-Image 2.1's residual VAE. The reference pipeline silently
@@ -473,6 +489,21 @@ PipelineState Pipeline::prime(std::string_view prompt,
         // mask at batch 1. Guidance is `true_cfg_scale`: at the reference
         // default of 1.0 there is no uncond branch at all, so the negative
         // prompt is only encoded when the caller asks for > 1.
+        //
+        // A generation carries the image prefix only when this prime built
+        // one, so clear it first: a text-only run after an edit run must not
+        // inherit the previous call's condition latents.
+        qi21_edit_active_ = false;
+        qi21_edit_prefix_ = dit::QwenImage21EditPrefix{};
+        qi21_edit_uncond_prefix_ = dit::QwenImage21EditPrefix{};
+        //
+        // The image-conditioned path fills conditioning_ (both branches) and
+        // the prefix descriptions; everything after it — prepare, latent
+        // allocation, the schedule, the denoise loop — is the same code
+        // text-to-image runs.
+        if (!opts.condition_images.empty()) {
+        qi21_prime_edit_(prompt, opts, do_cfg);
+        } else {
         // The backbone is only needed for the branches this prime actually
         // encodes — qi21_prime_from_text() supplies rows for one or both, and
         // qi21_release_text_encoder() may have freed the 8.5 GiB model in
@@ -531,6 +562,7 @@ PipelineState Pipeline::prime(std::string_view prompt,
                              std::chrono::steady_clock::now() - enc_t0).count());
         }
         conditioning_.guidance = 0.0f;
+        }
     } else {
         int content_end = -1;
         encode_prompt_(prompt, conditioning_.text_embeddings, &content_end);
@@ -555,8 +587,18 @@ PipelineState Pipeline::prime(std::string_view prompt,
     // 1b. Pre-process conditioning once per generation (cross-attention K/V
     // projection for the UNet; pre-projected T5 context for Flux). Rides the
     // returned state, shared across all states branched from this prime.
+    // Qwen-Image 2.1's image-conditioned path needs prepare() to be told the
+    // joint prefix the condition images occupy; the model-agnostic
+    // Conditioning has no room for that, so it goes in through the denoiser's
+    // own entry point.
     auto prepared = std::make_shared<PreparedConditioning>(
-        denoiser_->prepare(conditioning_));
+        qi21_edit_active_
+            ? static_cast<dit::QwenImage21Denoiser*>(denoiser_.get())
+                  ->prepare_edit(conditioning_, qi21_edit_prefix_,
+                                 conditioning_.has_uncond
+                                     ? &qi21_edit_uncond_prefix_
+                                     : nullptr)
+            : denoiser_->prepare(conditioning_));
     // Non-owning handle for the Qwen-Image 2.1 prefix-cache hooks, which have
     // to reach into the payload the caller's PipelineState owns.
     last_prepared_ = prepared;

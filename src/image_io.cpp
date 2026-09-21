@@ -9,6 +9,8 @@
 
 #include "brotensor/tensor.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -116,6 +118,84 @@ brotensor::Tensor load_mask_as_latent(const std::string& path,
     return detail::upload_host(mask_f32.data(),
                                /*rows=*/1,
                                /*cols=*/H_lat * W_lat);
+}
+
+HostImage load_image_rgba(const std::string& path) {
+    broimage::Image img;
+    std::string err;
+    if (!broimage::decode_file(path, img, &err)) {
+        throw std::runtime_error("load_image_rgba: decode failed for '" + path +
+                                 "': " + err);
+    }
+    if (img.width <= 0 || img.height <= 0) {
+        throw std::runtime_error("load_image_rgba: empty image '" + path + "'");
+    }
+    HostImage out;
+    out.channels = 4;
+    out.H = img.height;
+    out.W = img.width;
+    const std::size_t n = out.plane_stride();
+    out.planes.resize(4 * n);
+    // decode_file always emits interleaved RGBA8; de-interleave to planes and
+    // scale to [0, 1] in one pass.
+    for (std::size_t p = 0; p < n; ++p) {
+        for (int c = 0; c < 4; ++c) {
+            out.planes[static_cast<std::size_t>(c) * n + p] =
+                static_cast<float>(img.pixels[p * 4 + static_cast<std::size_t>(c)]) *
+                (1.0f / 255.0f);
+        }
+    }
+    return out;
+}
+
+HostImage resize_rgba(const HostImage& src, int dst_w, int dst_h) {
+    if (dst_w <= 0 || dst_h <= 0) {
+        throw std::runtime_error("resize_rgba: dst_w/dst_h must be positive");
+    }
+    if (src.W <= 0 || src.H <= 0 || src.channels <= 0) {
+        throw std::runtime_error("resize_rgba: source image is empty");
+    }
+    if (src.W == dst_w && src.H == dst_h) return src;
+    HostImage out;
+    out.channels = src.channels;
+    out.H = dst_h;
+    out.W = dst_w;
+    out.planes.resize(static_cast<std::size_t>(src.channels) *
+                      out.plane_stride());
+    broimage::resize_chw_f32(src.planes.data(), src.W, src.H, src.channels,
+                             out.planes.data(), dst_w, dst_h,
+                             broimage::Filter::Lanczos3);
+    // Lanczos overshoots at edges; alpha outside [0, 1] would make the
+    // composite below brighten or darken past white, and the VAE reads the
+    // channel directly.
+    for (float& v : out.planes) {
+        if (v < 0.0f) v = 0.0f;
+        if (v > 1.0f) v = 1.0f;
+    }
+    return out;
+}
+
+std::vector<float> composite_over_white(const HostImage& img) {
+    if (img.channels != 3 && img.channels != 4) {
+        throw std::runtime_error("composite_over_white: expected 3 or 4 channels");
+    }
+    const std::size_t n = img.plane_stride();
+    std::vector<float> rgb(3 * n);
+    if (img.channels == 3) {
+        std::copy(img.planes.begin(), img.planes.begin() + 3 * n, rgb.begin());
+        return rgb;
+    }
+    const float* a = img.planes.data() + 3 * n;
+    for (int c = 0; c < 3; ++c) {
+        const float* s = img.planes.data() + static_cast<std::size_t>(c) * n;
+        float* d = rgb.data() + static_cast<std::size_t>(c) * n;
+        for (std::size_t p = 0; p < n; ++p) {
+            // PIL's `white.paste(img, mask=alpha)`: src over an opaque white
+            // backdrop, with the source colour NOT premultiplied.
+            d[p] = s[p] * a[p] + (1.0f - a[p]);
+        }
+    }
+    return rgb;
 }
 
 }  // namespace brodiffusion

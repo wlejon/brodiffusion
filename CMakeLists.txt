@@ -218,6 +218,7 @@ target_sources(brodiffusion PRIVATE
     src/sana_text.cpp
     src/krea2_text.cpp
     src/qwenimage21_text.cpp
+    src/qwenimage21_text_images.cpp
     src/cond_control.cpp
     src/detail/safetensors_dir.cpp
     src/detail/jit_fusion.cpp
@@ -231,6 +232,7 @@ target_sources(brodiffusion PRIVATE
     src/pipeline_step_graph.cpp
     src/pipeline_krea2.cpp
     src/pipeline_qwenimage21.cpp
+    src/pipeline_qwenimage21_edit.cpp
     src/pipeline_qwenimage21_hooks.cpp
     src/image_io.cpp
     src/fused.cpp

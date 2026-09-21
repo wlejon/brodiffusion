@@ -534,6 +534,25 @@ private:
 // `true_cfg_scale` defaults to 1.0 (no CFG). Qwen-Image 2.1 is not a
 // distilled/guidance-embedded model — pass --guidance-scale 1.0 for the
 // reference default and > 1 to actually run both branches.
+// One CFG branch's image-conditioned prefix, as prepare_edit() takes it.
+//
+// `segments` describes the WHOLE joint prefix — the interleaved Text and
+// Image runs the vision-language encoder emitted, in order. Its Text runs
+// consume the branch's (compacted) conditioning rows in order and must sum to
+// their count; its Image runs consume `cond_latents`' rows in order and must
+// sum to that tensor's row count. An empty `segments` means "no condition
+// images", i.e. the plain text-to-image prefix, which is also what a
+// default-constructed value says.
+struct QwenImage21EditPrefix {
+    std::vector<QwenImage21Segment> segments;
+    // (sum of the Image segments' h*w, in_channels) — every condition image's
+    // VAE latent, spatially flattened and concatenated in template order,
+    // already normalised by latents_mean / latents_std.
+    brotensor::Tensor cond_latents;
+
+    bool empty() const { return segments.empty(); }
+};
+
 class QwenImage21Denoiser final : public Denoiser {
 public:
     explicit QwenImage21Denoiser(const QwenImage21Config& cfg);
@@ -553,6 +572,23 @@ public:
         const std::function<bool()>& should_cancel = {});
     void finalize_weights() override {}   // quantisation happens at load
     PreparedConditioning prepare(const Conditioning& cond) override;
+
+    // prepare() for the image-conditioned path: the same text encode, plus a
+    // per-branch description of the joint prefix the condition images
+    // occupy. `uncond_prefix` may be null, in which case the uncond branch
+    // (when `cond` carries one) reuses `cond_prefix` — the usual case, since
+    // the condition images do not change between the two prompts and only
+    // the text run lengths do. Pass an empty QwenImage21EditPrefix for a
+    // branch with no condition images.
+    //
+    // The prepared payload owns the condition latents, so they stay resident
+    // for the whole generation: the prefix is re-read on every extract step
+    // (each reset cache, each resolution change), not just once.
+    PreparedConditioning prepare_edit(const Conditioning& cond,
+                                      const QwenImage21EditPrefix& cond_prefix,
+                                      const QwenImage21EditPrefix* uncond_prefix
+                                          = nullptr);
+
     void forward(const brotensor::Tensor& latent, int H_lat, int W_lat,
                  float timestep, const PreparedConditioning& prepared,
                  Branch branch, brotensor::Tensor& out) override;
