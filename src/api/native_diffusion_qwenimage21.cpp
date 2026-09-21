@@ -597,7 +597,10 @@ Value qi21ReloadTextEncoder(Value thisVal, std::span<const Value> args) {
     const std::string dir = resolveDiffusionPath(ev::toUtf8(args[0]));
     std::string path;
     if (args.size() >= 2 && ev::isString(args[1])) {
-        path = resolveDiffusionPath(ev::toUtf8(args[1]));
+        // "" means the bundled <modelDir>/text_encoder. Resolving it would
+        // turn the empty path into the app root and load that instead.
+        std::string raw = ev::toUtf8(args[1]);
+        if (!raw.empty()) path = resolveDiffusionPath(raw);
     }
     bool quantize = true;
     if (args.size() >= 3 && ev::isObject(args[2])) {
