@@ -14,6 +14,7 @@
 #include "brodiffusion/dit/krea2.h"
 #include "brodiffusion/dit/pixart.h"
 #include "brodiffusion/dit/qwenimage21.h"
+#include "brodiffusion/image_io.h"
 #include "brodiffusion/krea2_text.h"
 #include "brodiffusion/qwenimage21_text.h"
 #include "brodiffusion/vae_qwenimage.h"
@@ -473,14 +474,23 @@ int run_qi21_text_fwd(int argc, char** argv) {
     const char* op = arg_after(argc, argv, "--out");
     const char* mp = arg_after(argc, argv, "--mask-out");
     const char* ip = arg_after(argc, argv, "--ids-out");
+    const char* pp = arg_after(argc, argv, "--pad-out");
     bool quantize = false;
+    // --image <png>, repeatable: condition images, in template order. They are
+    // used AS GIVEN — no resize — so the parity harness controls the pixels
+    // exactly; both sides must be handed the already-resized copies.
+    std::vector<const char*> image_paths;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--quantize") == 0) quantize = true;
+        if (std::strcmp(argv[i], "--image") == 0 && i + 1 < argc) {
+            image_paths.push_back(argv[++i]);
+        }
     }
     if (!wdir || !prompt || !op) {
         std::fprintf(stderr,
             "qi21-text-fwd: need --weights-dir --prompt --out "
-            "[--tokenizer-dir D] [--mask-out F] [--ids-out F] [--quantize]\n");
+            "[--tokenizer-dir D] [--mask-out F] [--ids-out F] [--pad-out F] "
+            "[--image <png>]... [--quantize]\n");
         return 2;
     }
     brotensor::init();
@@ -507,7 +517,51 @@ int run_qi21_text_fwd(int argc, char** argv) {
     model.load_weights(te_ptrs, "model.language_model.");
     brotensor::sync_all();
 
-    auto cond = brodiffusion::qwenimage21::encode_prompt(tok, model, prompt);
+    brodiffusion::qwenimage21::TextConditioning cond;
+    if (image_paths.empty()) {
+        cond = brodiffusion::qwenimage21::encode_prompt(tok, model, prompt);
+    } else {
+        // The vision tower rides in the same shards; probe for the prefix the
+        // packaging used, as the pipeline loader does.
+        const char* vp = nullptr;
+        for (const auto* f : te_ptrs) {
+            if (f->find("visual.patch_embed.proj.weight")) { vp = "visual."; break; }
+            if (f->find("model.visual.patch_embed.proj.weight")) {
+                vp = "model.visual."; break;
+            }
+        }
+        if (vp == nullptr) {
+            std::fprintf(stderr, "qi21-text-fwd: --image given but this "
+                                 "text_encoder ships no vision tower\n");
+            return 2;
+        }
+        brolm::qwen3vl::VisionTower vision(cfg.vision, cfg.text.hidden_size);
+        vision.load_weights(te_ptrs, vp);
+        brotensor::sync_all();
+
+        // The images are used verbatim: the parity harness hands over copies
+        // the reference already resized, so no resampler sits between the two
+        // implementations.
+        std::vector<brodiffusion::HostImage> rgba;
+        std::vector<std::vector<float>> rgb;
+        rgba.reserve(image_paths.size());
+        rgb.reserve(image_paths.size());
+        for (const char* p : image_paths) {
+            rgba.push_back(brodiffusion::load_image_rgba(p));
+            rgb.push_back(brodiffusion::composite_over_white(rgba.back()));
+            std::printf("qi21-text-fwd: condition image %s (%dx%d)\n", p,
+                        rgba.back().W, rgba.back().H);
+        }
+        std::vector<brolm::qwen3vl::ImageInput> inputs(rgb.size());
+        for (std::size_t i = 0; i < rgb.size(); ++i) {
+            inputs[i].pixels = rgb[i].data();
+            inputs[i].H = rgba[i].H;
+            inputs[i].W = rgba[i].W;
+        }
+        brolm::qwen3vl::PreprocessConfig pp;
+        cond = brodiffusion::qwenimage21::encode_prompt_with_images(
+            tok, model, vision, pp, prompt, inputs);
+    }
     brotensor::sync_all();
 
     brotensor::Tensor emb = cond.embeds;
@@ -540,6 +594,23 @@ int run_qi21_text_fwd(int argc, char** argv) {
                 static_cast<std::streamsize>(kept.size() * sizeof(std::int32_t)));
         std::printf("qi21-text-fwd: wrote %zu token ids to %s\n",
                     kept.size(), ip);
+    }
+    if (pp) {
+        // image_pad_mask, one int32 per surviving row. A text-only encode
+        // leaves it empty; write the zeros the reference would have.
+        std::vector<std::int32_t> padm(static_cast<std::size_t>(emb.rows), 0);
+        for (std::size_t i = 0;
+             i < cond.image_pad_mask.size() && i < padm.size(); ++i) {
+            padm[i] = cond.image_pad_mask[i] ? 1 : 0;
+        }
+        std::ofstream f(pp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            throw std::runtime_error(std::string("cannot open --pad-out: ") + pp);
+        }
+        f.write(reinterpret_cast<const char*>(padm.data()),
+                static_cast<std::streamsize>(padm.size() * sizeof(std::int32_t)));
+        std::printf("qi21-text-fwd: wrote %zu image_pad_mask entries to %s\n",
+                    padm.size(), pp);
     }
     return 0;
 }
