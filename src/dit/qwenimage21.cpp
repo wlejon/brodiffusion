@@ -294,6 +294,16 @@ bt::Tensor QwenImage21Transformer2DModel::lin_(const Linear& l,
     return Y;
 }
 
+void QwenImage21Transformer2DModel::lin_into_(const Linear& l,
+                                              const bt::Tensor& X,
+                                              bt::Tensor& Y) {
+    if (l.quantized()) {
+        bt::linear_forward_batched_int8w_fp16(l.W_int8, l.scales, nullptr, X, Y);
+    } else {
+        detail::linear_batched(l.W, nullptr, X, Y);
+    }
+}
+
 void QwenImage21Transformer2DModel::layernorm_(const bt::Tensor& X,
                                                bt::Tensor& Y) {
     // Non-affine LayerNorm, eps = cfg_.eps. brotensor's batched inference

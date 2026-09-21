@@ -9,6 +9,7 @@
 #include "commands.h"
 
 #include "brodiffusion/detail/compute.h"
+#include "brodiffusion/detail/jit_fusion.h"
 #include "brodiffusion/detail/json.h"
 #include "brodiffusion/dit/krea2.h"
 #include "brodiffusion/dit/pixart.h"
@@ -590,6 +591,7 @@ int run_qi21_fwd(int argc, char** argv) {
     const char* seqs = arg_after(argc, argv, "--seq");
     const char* steps_s = arg_after(argc, argv, "--steps");
     const char* bench_s = arg_after(argc, argv, "--bench");
+    const char* bench_ab_s = arg_after(argc, argv, "--bench-ab");
     bool quantize = false, no_cache = false, synthetic = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--quantize") == 0) quantize = true;
@@ -711,26 +713,72 @@ int run_qi21_fwd(int argc, char** argv) {
     // --bench N: N further forwards off the (already extracted) prefix cache,
     // reporting the steady-state per-step cost the denoising loop pays, plus
     // the peak device residency including the cache and activations.
+    // --bench-ab N: the same N steps run with the trace JIT on and with it
+    // off, alternating one step at a time inside a single process. A desktop
+    // GPU that is also driving a display drifts — clocks ramp, another process
+    // grabs the SMs — and two separate runs minutes apart cannot be subtracted
+    // safely. Alternating puts both configurations under the same drift, and
+    // the per-step minimum of each is then comparable.
+    if (bench_ab_s) {
+        const int n = std::atoi(bench_ab_s);
+        const bool was_on = brodiffusion::detail::jit_enabled();
+        brotensor::Tensor bo;
+        for (int i = 0; i < 4; ++i) {   // spin the clocks up before timing
+            model.forward(lat, hp, wp, txt, 0.5f, cache_ptr, bo);
+        }
+        brotensor::sync_all();
+        double best[2] = {0.0, 0.0}, sum[2] = {0.0, 0.0};
+        for (int i = 0; i < 2 * n; ++i) {
+            const int which = i & 1;    // 0 = jit on, 1 = jit off
+            brodiffusion::detail::set_jit_enabled(which == 0);
+            const auto s0 = std::chrono::steady_clock::now();
+            model.forward(lat, hp, wp, txt, 0.5f, cache_ptr, bo);
+            brotensor::sync_all();
+            const double ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - s0).count();
+            sum[which] += ms;
+            if (i < 2 || ms < best[which]) best[which] = ms;
+        }
+        brodiffusion::detail::set_jit_enabled(was_on);
+        std::printf("qi21-fwd: %dx%d %d steps each, interleaved\n", hp, wp, n);
+        std::printf("  jit on : %.1f ms/step min, %.1f mean\n", best[0],
+                    sum[0] / n);
+        std::printf("  jit off: %.1f ms/step min, %.1f mean\n", best[1],
+                    sum[1] / n);
+        std::printf("  delta  : %.1f ms/step (%.1f%% of the eager step)\n",
+                    best[1] - best[0],
+                    100.0 * (best[1] - best[0]) / (best[1] > 0 ? best[1] : 1.0));
+    }
+
     if (bench_s) {
         const int n = std::atoi(bench_s);
         brotensor::Tensor bo;
         model.forward(lat, hp, wp, txt, 0.5f, cache_ptr, bo);   // warm-up
         brotensor::sync_all();
-        const auto t0 = std::chrono::steady_clock::now();
+        // Each step is timed on its own and the MINIMUM reported alongside the
+        // mean. A desktop GPU that is also driving a display hands out
+        // multi-millisecond stalls that land in whichever step is unlucky; the
+        // mean tracks the interference, the min tracks the kernel work, and
+        // it is the kernel work a before/after comparison is about.
+        double best = 0.0, total = 0.0;
         for (int i = 0; i < n; ++i) {
+            const auto s0 = std::chrono::steady_clock::now();
             model.forward(lat, hp, wp, txt, 0.5f, cache_ptr, bo);
+            brotensor::sync_all();
+            const double ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - s0).count();
+            total += ms;
+            if (i == 0 || ms < best) best = ms;
         }
-        brotensor::sync_all();
-        const auto t1 = std::chrono::steady_clock::now();
-        const double ms =
-            std::chrono::duration<double, std::milli>(t1 - t0).count() /
-            (n > 0 ? n : 1);
+        const double mean = total / (n > 0 ? n : 1);
         std::size_t free_now = 0, total_now = 0;
         brotensor::device_mem_info(brotensor::default_device(), free_now,
                                    total_now);
-        std::printf("qi21-fwd: %d cached steps at %dx%d: %.1f ms/step "
-                    "(device %.2f GiB in use)\n",
-                    n, hp, wp, ms,
+        std::printf("qi21-fwd: %d cached steps at %dx%d: %.1f ms/step min, "
+                    "%.1f mean (device %.2f GiB in use)\n",
+                    n, hp, wp, best, mean,
                     (total_now - free_now) / 1073741824.0);
     }
     return 0;

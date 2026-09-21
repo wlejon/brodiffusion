@@ -51,6 +51,7 @@
 // (prediction_type Velocity).
 
 #include "brodiffusion/denoiser.h"
+#include "brodiffusion/detail/jit_fusion.h"
 #include "brotensor/tensor.h"
 
 #include <functional>
@@ -357,6 +358,13 @@ private:
     // One linear at the compute dtype, dispatching dense vs INT8 (W8A16).
     brotensor::Tensor lin_(const Linear& l, const brotensor::Tensor& X);
 
+    // The same linear writing into a caller-owned Y. The block loop uses this
+    // for every activation a JIT site consumes: a trace binds to the buffer
+    // addresses it was compiled against, and a fresh Y per block would move
+    // them 32 times a step and force 32 re-traces.
+    void lin_into_(const Linear& l, const brotensor::Tensor& X,
+                   brotensor::Tensor& Y);
+
     // Non-affine LayerNorm (eps = cfg_.eps) over (L, hidden).
     void layernorm_(const brotensor::Tensor& X, brotensor::Tensor& Y);
 
@@ -409,6 +417,26 @@ private:
     // the layer caches hold the PREFIX only, and these hold the
     // [prefix ; target] concatenation a cached step attends against).
     brotensor::Tensor k_full_, v_full_;
+
+    // Trace-JIT fusion sites. Each holds a compiled kernel for one of the
+    // block's memory-bound seams and replays it for all 32 blocks and every
+    // step; the `_pre` / `_post` pairs are the two modulation row ranges the
+    // t = 0 prefix split creates (a cached step uses only `_post`). They live
+    // on the model rather than in statics so two loaded transformers do not
+    // fight over one binding.
+    struct JitSites {
+        detail::JitSite attn_norm_pre{"qi21.attn.norm_modulate[pre]"};
+        detail::JitSite attn_norm_post{"qi21.attn.norm_modulate"};
+        detail::JitSite mlp_norm_pre{"qi21.mlp.norm_modulate[pre]"};
+        detail::JitSite mlp_norm_post{"qi21.mlp.norm_modulate"};
+        detail::JitSite attn_gate_pre{"qi21.attn.gated_residual[pre]"};
+        detail::JitSite attn_gate_post{"qi21.attn.gated_residual"};
+        detail::JitSite mlp_gate_pre{"qi21.mlp.gated_residual[pre]"};
+        detail::JitSite mlp_gate_post{"qi21.mlp.gated_residual"};
+        detail::JitSite swiglu{"qi21.mlp.swiglu"};
+        detail::JitSite final_norm{"qi21.norm_out"};
+    };
+    JitSites jit_;
 
     // ── research-hook state ───────────────────────────────────────────────
     brotensor::Tensor mod_delta_;      // (1, 4*hidden) compute dtype; empty = off

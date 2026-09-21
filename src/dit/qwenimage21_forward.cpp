@@ -29,7 +29,9 @@
 #include "brodiffusion/dit/common.h"
 #include "brodiffusion/detail/compute.h"
 #include "brodiffusion/detail/device.h"
+#include "brodiffusion/detail/jit_fusion.h"
 
+#include "brotensor/jit/trace.h"
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
@@ -58,6 +60,46 @@ bt::Tensor headnorm(const bt::Tensor& X, const bt::Tensor& gain, float eps,
     normed.rows = L;
     normed.cols = nh * hd;
     return normed;
+}
+
+// ── trace-JIT seams ────────────────────────────────────────────────────────
+//
+// Three places in a block write a whole (L, hidden) activation to HBM only to
+// read it straight back. Each becomes one kernel here, with the eager pair
+// left in place as the fallback try_fused() returns to.
+
+// dst = LN(src) * (1 + scale). Eager is layernorm + modulate: two kernels,
+// two reads and two writes of (L, hidden). Fused it is one of each, and the
+// normalized intermediate never exists.
+bool fuse_norm_modulate(detail::JitSite& site, const bt::Tensor& src,
+                        const bt::Tensor& scale, const bt::Tensor& shift,
+                        bt::Tensor& dst, float eps) {
+    return detail::try_fused(
+        site, {src.data, scale.data, shift.data, dst.data}, [&] {
+            // One expression, no named intermediates: every traced temporary
+            // stays alive to the semicolon, so no two DAG nodes can land on
+            // the same freed device buffer.
+            bt::store(dst, bt::modulate(
+                               bt::layernorm(src, bt::Tensor(), bt::Tensor(), eps),
+                               scale, shift));
+        });
+}
+
+// x += gate * y, with the optional research mask folded in. Eager is a
+// broadcast_mul into a scratch buffer, an optional mul_inplace, and an
+// add_inplace — two or three kernels and a (L, hidden) temporary that the
+// fused form does not need at all.
+bool fuse_gated_residual(detail::JitSite& site, bt::Tensor& x,
+                         const bt::Tensor& gate, const bt::Tensor& y,
+                         const bt::Tensor* mask) {
+    const void* mp = mask ? mask->data : nullptr;
+    return detail::try_fused(site, {x.data, gate.data, y.data, mp}, [&] {
+        if (mask) {
+            x += gate * y * (*mask);
+        } else {
+            x += gate * y;
+        }
+    });
 }
 
 }  // namespace
@@ -294,29 +336,84 @@ void QwenImage21Transformer2DModel::forward_joint(
     detail::resize_like(gated, Lq, H, dt, dev);
     detail::resize_like(attn_cat, Lq, H, dt, dev);
 
-    // Apply a (1, H) scale to rows [0, mod_split) and another to the rest.
-    auto modulate_rows = [&](const bt::Tensor& src, const bt::Tensor& s_pre,
-                             const bt::Tensor& s_post, bt::Tensor& dst) {
+    // The linear outputs a JIT site consumes, hoisted so their addresses hold
+    // for all 32 blocks. They also have to be pinned to the device before the
+    // first linear writes them: a default Tensor is Device::CPU and resize
+    // preserves that, so an unpinned output would allocate on the host.
+    bt::Tensor ao, mlp_g, mlp_p, mo;
+    detail::resize_like(ao, Lq, H, dt, dev);
+    detail::resize_like(mo, Lq, H, dt, dev);
+    detail::resize_like(mlp_g, Lq, cfg_.mlp_hidden_size(), dt, dev);
+    detail::resize_like(mlp_p, Lq, cfg_.mlp_hidden_size(), dt, dev);
+
+    // LN(src) * (1 + scale) into dst, with a (1, H) scale for rows
+    // [0, mod_split) and another for the rest. Fused where the JIT takes it;
+    // otherwise the eager layernorm + modulate pair, which is why `ln` is
+    // only materialised on that branch.
+    auto norm_modulate_rows = [&](const bt::Tensor& src, const bt::Tensor& s_pre,
+                                  const bt::Tensor& s_post, bt::Tensor& dst,
+                                  detail::JitSite& site_pre,
+                                  detail::JitSite& site_post) {
         if (mod_split <= 0) {
-            bt::modulate(src, s_post, zero_shift_, dst);
+            if (fuse_norm_modulate(site_post, src, s_post, zero_shift_, dst,
+                                   cfg_.eps)) {
+                return;
+            }
+            layernorm_(src, ln);
+            bt::modulate(ln, s_post, zero_shift_, dst);
             return;
         }
+        bt::Tensor s0 = row_view(src, 0, mod_split);
         bt::Tensor d0 = row_view(dst, 0, mod_split);
-        bt::modulate(row_view(src, 0, mod_split), s_pre, zero_shift_, d0);
+        bt::Tensor s1 = row_view(src, mod_split, Lq - mod_split);
         bt::Tensor d1 = row_view(dst, mod_split, Lq - mod_split);
-        bt::modulate(row_view(src, mod_split, Lq - mod_split), s_post,
-                     zero_shift_, d1);
+        const bool f0 =
+            fuse_norm_modulate(site_pre, s0, s_pre, zero_shift_, d0, cfg_.eps);
+        const bool f1 =
+            fuse_norm_modulate(site_post, s1, s_post, zero_shift_, d1, cfg_.eps);
+        if (f0 && f1) return;
+        layernorm_(src, ln);
+        if (!f0) bt::modulate(row_view(ln, 0, mod_split), s_pre, zero_shift_, d0);
+        if (!f1) {
+            bt::modulate(row_view(ln, mod_split, Lq - mod_split), s_post,
+                         zero_shift_, d1);
+        }
     };
-    auto gate_rows = [&](const bt::Tensor& src, const bt::Tensor& g_pre,
-                         const bt::Tensor& g_post, bt::Tensor& dst) {
+
+    // x += gate * y (plus the research mask), over the same two row ranges.
+    auto gated_residual_rows = [&](bt::Tensor& dst, const bt::Tensor& g_pre,
+                                   const bt::Tensor& g_post,
+                                   const bt::Tensor& y, const bt::Tensor* mask,
+                                   detail::JitSite& site_pre,
+                                   detail::JitSite& site_post) {
+        auto eager = [&](const bt::Tensor& g, const bt::Tensor& src,
+                         bt::Tensor& d, int rows) {
+            bt::Tensor gv = row_view(gated, 0, rows);
+            bt::broadcast_mul(src, g, gv);
+            if (mask) bt::mul_inplace(gv, *mask);
+            bt::add_inplace(d, gv);
+        };
         if (mod_split <= 0) {
-            bt::broadcast_mul(src, g_post, dst);
+            if (fuse_gated_residual(site_post, dst, g_post, y, mask)) return;
+            eager(g_post, y, dst, Lq);
             return;
         }
         bt::Tensor d0 = row_view(dst, 0, mod_split);
-        bt::broadcast_mul(row_view(src, 0, mod_split), g_pre, d0);
+        bt::Tensor y0 = row_view(y, 0, mod_split);
         bt::Tensor d1 = row_view(dst, mod_split, Lq - mod_split);
-        bt::broadcast_mul(row_view(src, mod_split, Lq - mod_split), g_post, d1);
+        bt::Tensor y1 = row_view(y, mod_split, Lq - mod_split);
+        // The mask is (Lq, H); each range needs its own slice of it.
+        bt::Tensor m0, m1;
+        if (mask) {
+            m0 = row_view(*mask, 0, mod_split);
+            m1 = row_view(*mask, mod_split, Lq - mod_split);
+        }
+        if (!fuse_gated_residual(site_pre, d0, g_pre, y0, mask ? &m0 : nullptr)) {
+            eager(g_pre, y0, d0, mod_split);
+        }
+        if (!fuse_gated_residual(site_post, d1, g_post, y1, mask ? &m1 : nullptr)) {
+            eager(g_post, y1, d1, Lq - mod_split);
+        }
     };
 
     // Research hook (set_gate_mask): the rank-1 (Lq, hidden) expansion of the
@@ -373,8 +470,8 @@ void QwenImage21Transformer2DModel::forward_joint(
         }
 
         // ── attention sublayer ───────────────────────────────────────────
-        layernorm_(x, ln);
-        modulate_rows(ln, M.scale1_0, M.scale1_t, xm);
+        norm_modulate_rows(x, M.scale1_0, M.scale1_t, xm, jit_.attn_norm_pre,
+                           jit_.attn_norm_post);
 
         bt::Tensor q = lin_(b.to_q, xm);
         bt::Tensor k = lin_(b.to_k, xm);
@@ -435,30 +532,39 @@ void QwenImage21Transformer2DModel::forward_joint(
                                         /*causal=*/false, Ot);
         }
 
-        bt::Tensor ao = lin_(b.to_out, attn_cat);
-        gate_rows(ao, g1_0, g1_t, gated);
-        if (gmask) bt::mul_inplace(gated, gate_mask_full_);
-        bt::add_inplace(x, gated);
+        lin_into_(b.to_out, attn_cat, ao);
+        gated_residual_rows(x, g1_0, g1_t, ao,
+                            gmask ? &gate_mask_full_ : nullptr,
+                            jit_.attn_gate_pre, jit_.attn_gate_post);
 
         // ── SwiGLU feed-forward ──────────────────────────────────────────
-        layernorm_(x, ln);
-        modulate_rows(ln, M.scale2_0, M.scale2_t, xm);
-        bt::Tensor g = lin_(b.mlp_gate, xm);
-        bt::silu_forward(g, g);
-        bt::Tensor p = lin_(b.mlp_proj, xm);
-        bt::mul_inplace(g, p);
-        bt::Tensor mo = lin_(b.mlp_out, g);
-        gate_rows(mo, g2_0, g2_t, gated);
-        if (gmask) bt::mul_inplace(gated, gate_mask_full_);
-        bt::add_inplace(x, gated);
+        norm_modulate_rows(x, M.scale2_0, M.scale2_t, xm, jit_.mlp_norm_pre,
+                           jit_.mlp_norm_post);
+        lin_into_(b.mlp_gate, xm, mlp_g);
+        lin_into_(b.mlp_proj, xm, mlp_p);
+        // g = silu(g) * p: one kernel rather than silu then multiply.
+        if (!detail::try_fused(jit_.swiglu, {mlp_g.data, mlp_p.data}, [&] {
+                bt::store(mlp_g, bt::silu(mlp_g) * mlp_p);
+            })) {
+            bt::silu_forward(mlp_g, mlp_g);
+            bt::mul_inplace(mlp_g, mlp_p);
+        }
+        lin_into_(b.mlp_out, mlp_g, mo);
+        gated_residual_rows(x, g2_0, g2_t, mo,
+                            gmask ? &gate_mask_full_ : nullptr,
+                            jit_.mlp_gate_pre, jit_.mlp_gate_post);
     }
 
     // ── norm_out / proj_out over the target rows only ────────────────────
     bt::Tensor tgt = row_view(x, cached_mode ? 0 : prefix_len, img_len);
-    bt::Tensor fn;
-    layernorm_(tgt, fn);
     bt::Tensor fnm;
-    bt::modulate(fn, mod.final_scale, zero_shift_, fnm);
+    detail::resize_like(fnm, img_len, H, dt, dev);
+    if (!fuse_norm_modulate(jit_.final_norm, tgt, mod.final_scale, zero_shift_,
+                            fnm, cfg_.eps)) {
+        bt::Tensor fn;
+        layernorm_(tgt, fn);
+        bt::modulate(fn, mod.final_scale, zero_shift_, fnm);
+    }
     out = lin_(proj_out_, fnm);          // (img_len, out_channels)
     bt::sync_all();
 }
