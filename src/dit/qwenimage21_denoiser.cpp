@@ -225,6 +225,19 @@ bt::Tensor& QwenImage21Denoiser::text_rows(PreparedConditioning& prepared,
     return prep->txt;
 }
 
+void QwenImage21Denoiser::set_text_rows_from_embeds(
+    PreparedConditioning& prepared, const bt::Tensor& embeds,
+    const bt::Tensor& mask, bool uncond) {
+    if (embeds.size() == 0) {
+        fail_den("set_text_rows_from_embeds: embeds is empty");
+    }
+    bt::Tensor& dst = text_rows(prepared, uncond);
+    model_.encode_text(compact_valid_rows(embeds, mask), dst);
+    // The joint sequence's text half just changed; the cached prefix K/V
+    // describe the old one.
+    reset_cache(prepared);
+}
+
 QwenImage21PrefixCache& QwenImage21Denoiser::prefix_cache(
     PreparedConditioning& prepared, bool uncond) {
     auto* prep = dynamic_cast<QwenImage21Prepared*>(prepared.get());

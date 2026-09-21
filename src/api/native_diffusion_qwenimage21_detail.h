@@ -10,6 +10,8 @@
 //                                           forms, the prefix KV dial and
 //                                           its saved slots, the text rows
 //                                           and the prompt memo
+//   native_diffusion_qwenimage21_sched.cpp  the between-step control
+//                                           schedule
 //
 // Not a public header.
 
@@ -86,5 +88,8 @@ inline bool readGateSublayer(Value v,
 
 // The multi-slot half of the surface, defined in the _slots translation unit.
 void decoratePipelineQwenImage21SlotsProto(ObjectBuilder& proto);
+
+// The between-step control schedule, defined in the _sched translation unit.
+void decoratePipelineQwenImage21SchedProto(ObjectBuilder& proto);
 
 }  // namespace brodiffusion::api

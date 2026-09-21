@@ -866,6 +866,22 @@ public:
     // invalidates the matching prefix cache; call reset_cache() after.
     brotensor::Tensor& text_rows(PreparedConditioning& prepared, bool uncond);
 
+    // Re-run txt_in over `embeds` — the raw (L, context_in_dim) vision-
+    // language rows prepare() consumed, with `mask`'s right-padded tail
+    // dropped exactly as prepare() drops it — and install the result as this
+    // branch's text rows, dropping the prefix caches so the next forward
+    // re-extracts. `mask` may be empty (every row valid).
+    //
+    // This is prepare()'s text half on its own, and it exists for the
+    // between-step control schedule: a scheduled axis edits the conditioning
+    // in the ENCODER's space, one projection above the rows text_rows()
+    // exposes, so re-applying it means re-running the projection rather than
+    // writing rows in.
+    void set_text_rows_from_embeds(PreparedConditioning& prepared,
+                                   const brotensor::Tensor& embeds,
+                                   const brotensor::Tensor& mask,
+                                   bool uncond);
+
     // Mutable access to a branch's prefix KV cache — the research seam over
     // the cached text K/V (QwenImage21PrefixCache::scale_kv / blend_from),
     // which after the extract step IS what the target attends to. Throws if

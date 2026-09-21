@@ -216,6 +216,137 @@ void Pipeline::qi21_set_text_rows(const bt::Tensor& rows, bool uncond) {
     den.reset_cache(*prepared);
 }
 
+// ── the between-step control schedule ──────────────────────────────────────
+//
+// See control_schedule.h for the why. The mechanics here are three lines of
+// real work: build a one-shot CondControl for this step's stack, add it to the
+// conditioning the generation was primed with, and push the result back
+// through txt_in. What makes it worth a surface rather than a recipe is the
+// bookkeeping around those lines — resolving a bank name to a direction, only
+// rebuilding when the alpha actually moved (a rebuild costs a prefix
+// re-extract), and putting the primed rows back when the schedule is cleared
+// or leaves its window.
+
+namespace {
+
+brodiffusion::ControlScheduleSlot make_slot(std::string name,
+                                            std::vector<float> dir,
+                                            float scale,
+                                            const std::vector<float>& alpha,
+                                            int lo_step, int hi_step) {
+    brodiffusion::ControlScheduleSlot s;
+    s.name    = std::move(name);
+    s.dir     = std::move(dir);
+    s.scale   = scale;
+    s.alpha   = alpha;
+    s.lo_step = lo_step < 0 ? 0 : lo_step;
+    s.hi_step = hi_step;
+    return s;
+}
+
+}  // namespace
+
+void Pipeline::qi21_rebuild_text_rows_(PreparedConditioning& prepared,
+                                       const CondControl& delta) {
+    auto& den = qi21_denoiser(model_class_, denoiser_,
+                              "qi21_apply_control_step");
+    if (conditioning_.text_embeddings.size() == 0) {
+        fail("qi21_apply_control_step: nothing primed — prime() first");
+    }
+    // A deep copy (brotensor's copy assignment clones): the primed embedding
+    // is the BASE every step rebuilds from, so it must survive the injection.
+    bt::Tensor emb = conditioning_.text_embeddings;
+    // The same call, on the same rows, with the same row policy prime() used
+    // for this model class — which is what makes a flat alpha=1 schedule
+    // reproduce the prime-time setControl render to the pixel.
+    delta.apply(emb, /*row_end=*/-1, /*row_start=*/0);
+    den.set_text_rows_from_embeds(prepared, emb,
+                                  conditioning_.text_embeddings_mask,
+                                  /*uncond=*/false);
+}
+
+int Pipeline::qi21_add_control_schedule(const std::string& name,
+                                        const std::vector<float>& alpha,
+                                        int lo_step, int hi_step) {
+    if (model_class_ != ModelClass::QwenImage21) {
+        fail("qi21_add_control_schedule: Qwen-Image 2.1 only");
+    }
+    if (!cond_control_.loaded()) {
+        fail("qi21_add_control_schedule: no control dictionary loaded — "
+             "load_control_dictionary() (or a setControlVector axis) first, "
+             "or schedule an explicit direction instead");
+    }
+    // Throws naming the axis when it is not in the bank. Runtime axes
+    // registered through set_vector() resolve here too, so a minted
+    // diff-of-means direction can be scheduled by name.
+    std::vector<float> dir = cond_control_.direction(name);
+    const float scale = cond_control_.axis_scale(name);
+    return qi21_ctl_sched_.add(
+        make_slot(name, std::move(dir), scale, alpha, lo_step, hi_step));
+}
+
+int Pipeline::qi21_add_control_schedule_dir(const std::vector<float>& dir,
+                                            float scale,
+                                            const std::vector<float>& alpha,
+                                            int lo_step, int hi_step) {
+    if (model_class_ != ModelClass::QwenImage21) {
+        fail("qi21_add_control_schedule_dir: Qwen-Image 2.1 only");
+    }
+    return qi21_ctl_sched_.add(
+        make_slot(std::string(), dir, scale, alpha, lo_step, hi_step));
+}
+
+int Pipeline::qi21_set_control_schedule(const std::string& name,
+                                        const std::vector<float>& alpha,
+                                        int lo_step, int hi_step) {
+    qi21_ctl_sched_.clear();
+    return qi21_add_control_schedule(name, alpha, lo_step, hi_step);
+}
+
+int Pipeline::qi21_set_control_schedule_dir(const std::vector<float>& dir,
+                                            float scale,
+                                            const std::vector<float>& alpha,
+                                            int lo_step, int hi_step) {
+    qi21_ctl_sched_.clear();
+    return qi21_add_control_schedule_dir(dir, scale, alpha, lo_step, hi_step);
+}
+
+void Pipeline::qi21_clear_control_schedules() {
+    const bool rows_moved = !qi21_ctl_sched_.at_base();
+    qi21_ctl_sched_.clear();
+    qi21_ctl_sched_.reset_applied();
+    if (!rows_moved || model_class_ != ModelClass::QwenImage21) return;
+    // A schedule had already edited a live generation's rows. Clearing the
+    // list must mean the schedule stops, not that its last alpha sticks for
+    // the rest of the denoise, so put the primed rows back.
+    auto prepared = last_prepared_.lock();
+    if (!prepared) return;
+    if (conditioning_.text_embeddings.size() == 0) return;
+    qi21_rebuild_text_rows_(*prepared, CondControl{});
+}
+
+int Pipeline::qi21_control_schedule_count() const {
+    return qi21_ctl_sched_.count();
+}
+
+bool Pipeline::qi21_apply_control_step(PipelineState& state, int step) {
+    if (model_class_ != ModelClass::QwenImage21) return false;
+    // Nothing armed and nothing left over from a schedule that was: the rows
+    // are the primed ones and there is nothing to do. This is the hot path —
+    // every step of every generation runs it.
+    if (qi21_ctl_sched_.empty() && qi21_ctl_sched_.at_base()) return false;
+    if (!state.prepared) return false;
+    CondControl delta;
+    // The prime-time stack budget governs a scheduled stack too: it is a
+    // statement about how far the conditioning may be pushed off its manifold,
+    // and the denoiser cannot tell which seam pushed it.
+    if (!qi21_ctl_sched_.advance(step, cond_control_.budget(), delta)) {
+        return false;
+    }
+    qi21_rebuild_text_rows_(*state.prepared, delta);
+    return true;
+}
+
 // ── the prompt memo ────────────────────────────────────────────────────────
 
 void Pipeline::qi21_memo_put_(const std::string& prompt,

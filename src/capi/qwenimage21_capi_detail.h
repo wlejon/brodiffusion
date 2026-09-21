@@ -17,6 +17,8 @@
 
 #include "brodiffusion/qwenimage21_capi.h"
 
+#include "brodiffusion/cond_control.h"
+#include "brodiffusion/control_schedule.h"
 #include "brodiffusion/dit/qwenimage21.h"
 #include "brodiffusion/model_config.h"
 #include "brodiffusion/qwenimage21_text.h"
@@ -125,6 +127,15 @@ struct qi_ctx {
         slots;
 
     std::vector<float> gates;   // capture sink for qi_capture_gates
+
+    // Conditioning-space control axes and the between-step schedules over
+    // them. `ctl_base` is the (ctl_base_rows, text_hidden_dim) embedding the
+    // last qi_encode_text consumed — the BASE every scheduled step rebuilds
+    // from, kept here because this API has no prime() to capture it at.
+    ::brodiffusion::CondControl     ctl;
+    ::brodiffusion::ControlSchedule ctl_sched;
+    std::vector<float>              ctl_base;
+    int                             ctl_base_rows = 0;
 
     // The DiT, or a throw naming the caller. Every hook needs this line.
     ::brodiffusion::dit::QwenImage21Transformer2DModel& need_dit(

@@ -73,6 +73,10 @@ const char* const kPipelineMethods[] = {
     "qwenImage21ClearPrefixSlots", "qwenImage21PrefixSlots",
     "qwenImage21PrefixSlotValid",
     "qwenImage21MemoizedPrompts", "qwenImage21ClearPromptMemo",
+    // ...and the between-step control schedule
+    "qwenImage21SetControlSchedule", "qwenImage21AddControlSchedule",
+    "qwenImage21ClearControlSchedules", "qwenImage21ControlScheduleCount",
+    "qwenImage21ApplyControlStep",
     "qwenImage21EncodeImage", "qwenImage21Decode",
     "qwenImage21ReleaseTextEncoder", "qwenImage21TextEncoderResident",
     "qwenImage21ReloadTextEncoder",
@@ -151,6 +155,9 @@ void brodiffusionTestRestoredSurface() {
         {"qwenImage21SetGateScaleRows", 6}, {"qwenImage21AddGateScaleRows", 6},
         {"qwenImage21SetGateMask", 4}, {"qwenImage21ScalePrefixKv", 5},
         {"qwenImage21SavePrefixCache", 1}, {"qwenImage21BlendPrefixCache", 2},
+        {"qwenImage21SetControlSchedule", 4},
+        {"qwenImage21AddControlSchedule", 4},
+        {"qwenImage21ApplyControlStep", 2},
     };
     for (const auto& a : kArity) {
         ev::Persistent fn(ev::getProperty(pipeProto.get(), a.name));

@@ -369,6 +369,13 @@ int qi_encode_text(qi_ctx* c, const float* embeds, int n, float* txt_out) {
         c->dit->encode_text(e, txt);
         download_fp32(txt, txt_out);
         rows = txt.rows;
+        // Park the input as the between-step schedule's base. A schedule
+        // rebuilds from the conditioning the run is actually using, and on
+        // this API that is whatever the caller last projected — not a prompt
+        // the context encoded, which may have been edited since.
+        c->ctl_base.assign(embeds, embeds + static_cast<std::size_t>(n) * th);
+        c->ctl_base_rows = n;
+        c->ctl_sched.reset_applied();
     });
     return rc == 0 ? rows : -1;
 }

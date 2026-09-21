@@ -581,6 +581,12 @@ PipelineState Pipeline::prime(std::string_view prompt,
     // joint prefix the condition images occupy; the model-agnostic
     // Conditioning has no room for that, so it goes in through the denoiser's
     // own entry point.
+    // A fresh prime() rebuilds the text rows from the conditioning above, so
+    // whatever a schedule had installed on the last generation is gone. Forget
+    // it, or the first step of this one would decide its stack was already
+    // applied and skip the rebuild.
+    qi21_ctl_sched_.reset_applied();
+
     auto prepared = std::make_shared<PreparedConditioning>(
         qi21_edit_active_
             ? static_cast<dit::QwenImage21Denoiser*>(denoiser_.get())
@@ -726,6 +732,12 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
         step_once_scm_(state, opts);
         return;
     }
+    // Between-step control schedules (Qwen-Image 2.1). Runs BEFORE the
+    // forward so this step sees the rows its alpha asks for, and no-ops in
+    // both the common cases — nothing armed, or an alpha that has not moved
+    // since the last step — so an unscheduled generation pays one comparison.
+    qi21_apply_control_step(state, state.step_index);
+
     const bool is_lcm = std::holds_alternative<scheduler::LCM>(scheduler_);
     const bool do_cfg = cfg_branch_active(model_class_, *denoiser_, is_lcm,
                                           opts.guidance_scale);

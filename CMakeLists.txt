@@ -220,6 +220,7 @@ target_sources(brodiffusion PRIVATE
     src/qwenimage21_text.cpp
     src/qwenimage21_text_images.cpp
     src/cond_control.cpp
+    src/control_schedule.cpp
     src/detail/safetensors_dir.cpp
     src/detail/jit_fusion.cpp
     src/lora.cpp
@@ -351,7 +352,8 @@ option(BRODIFFUSION_QWENIMAGE21_CAPI "Build the Qwen-Image 2.1 research C API DL
 if(BRODIFFUSION_QWENIMAGE21_CAPI)
     add_library(qwenimage21_capi SHARED
         src/capi/qwenimage21_capi.cpp
-        src/capi/qwenimage21_capi_hooks.cpp)
+        src/capi/qwenimage21_capi_hooks.cpp
+        src/capi/qwenimage21_capi_control.cpp)
     target_link_libraries(qwenimage21_capi PRIVATE brodiffusion)
     target_compile_definitions(qwenimage21_capi PRIVATE QI_CAPI_BUILD)
 endif()

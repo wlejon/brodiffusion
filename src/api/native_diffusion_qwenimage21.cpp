@@ -769,6 +769,9 @@ void decoratePipelineQwenImage21Proto(ObjectBuilder& proto) {
     // The multi-slot Add/Clear/Count forms, the prefix KV dial and its saved
     // slots, the text rows and the prompt memo.
     decoratePipelineQwenImage21SlotsProto(proto);
+    // The between-step control schedule — the conditioning axes, re-aimed per
+    // denoise step instead of once before step 0.
+    decoratePipelineQwenImage21SchedProto(proto);
 }
 
 } // namespace brodiffusion::api

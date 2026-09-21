@@ -15,6 +15,7 @@
 
 #include "brolm/clip.h"
 #include "brodiffusion/cond_control.h"
+#include "brodiffusion/control_schedule.h"
 #include "brodiffusion/controlnet.h"
 #include "brodiffusion/denoiser.h"
 #include "brodiffusion/dit/flux.h"
@@ -884,6 +885,70 @@ public:
     brotensor::Tensor qi21_text_rows(bool uncond = false) const;
     void qi21_set_text_rows(const brotensor::Tensor& rows, bool uncond = false);
 
+    // ── the between-step control schedule ─────────────────────────────────
+    //
+    // A control-dictionary direction re-applied with a PER-STEP alpha during
+    // denoising. See control_schedule.h for why this is a separate surface
+    // from cond_control(): the conditioning axes carry an order of magnitude
+    // more steering authority than anything in-network, and a prime-time
+    // seam can only aim them once.
+    //
+    // At every step_once() the armed schedules' stack for that step index is
+    // built, added to the conditioning the generation was PRIMED with, pushed
+    // back through txt_in and installed as the text rows:
+    //
+    //     rows(s) = txt_in( primed_embeds + Σ_k alpha_k[s] * scale_k * dir_k )
+    //
+    // Because the base is the primed embedding, a schedule composes with
+    // whatever prime-time setControl() asked for, and its own contribution is
+    // independent of that value. Only the POSITIVE branch is steered, exactly
+    // as cond_control() steers only the positive branch.
+    //
+    // Ranges are HALF-OPEN [lo_step, hi_step) like the rest of the 2.1
+    // surface, hi_step < 0 means "to the end", and `alpha` is indexed by the
+    // ABSOLUTE step index (not the offset from lo_step), so a schedule and
+    // its window can be edited independently.
+    //
+    // Cost: a step whose alpha stack MOVED rebuilds the rows and resets the
+    // prefix KV cache, so it pays one extra prefill; a step whose stack sat
+    // still costs nothing at all. Armed prefix edits (gate scales, prefix-KV
+    // dials) survive the re-extract the way they always have — they are
+    // applied where the cache is read, not written into it.
+
+    // Append a schedule over dictionary axis `name`; returns its slot index.
+    // Throws when no dictionary is loaded or the axis is unknown.
+    int qi21_add_control_schedule(const std::string& name,
+                                  const std::vector<float>& alpha,
+                                  int lo_step, int hi_step);
+    // Append a schedule over an explicit direction — a diff-of-means axis the
+    // caller minted, which need not be in any bank. `dir` is taken as-is and
+    // the injection is alpha * scale * dir, the same contract
+    // CondControl::set_vector() has.
+    int qi21_add_control_schedule_dir(const std::vector<float>& dir,
+                                      float scale,
+                                      const std::vector<float>& alpha,
+                                      int lo_step, int hi_step);
+    // Replace the whole list with one schedule; returns 0.
+    int qi21_set_control_schedule(const std::string& name,
+                                  const std::vector<float>& alpha,
+                                  int lo_step, int hi_step);
+    int qi21_set_control_schedule_dir(const std::vector<float>& dir,
+                                      float scale,
+                                      const std::vector<float>& alpha,
+                                      int lo_step, int hi_step);
+    // Drop every schedule. When a schedule had already moved the rows of a
+    // live generation, this puts the primed rows back (and re-extracts), so
+    // clearing mid-denoise means what it says.
+    void qi21_clear_control_schedules();
+    int  qi21_control_schedule_count() const;
+
+    // Apply the armed schedules for step `step` to the live generation.
+    // step_once() calls this itself, so a caller only needs it when driving
+    // the denoiser out of band. Returns true when the rows were rebuilt (and
+    // the prefix cache therefore dropped), false when this step's stack was
+    // already the one the rows carry.
+    bool qi21_apply_control_step(PipelineState& state, int step);
+
     // ── conditioning entry points ─────────────────────────────────────────
 
     // Encode `prompt` into 2.1's raw text conditioning: the (n, 4096)
@@ -1083,6 +1148,12 @@ private:
     // in every prime() (no-op until a dictionary is loaded + a weight set).
     CondControl           cond_control_;
 
+    // Between-step control schedules (Qwen-Image 2.1). The conditioning rows
+    // they rebuild come from conditioning_ above — which is the primed
+    // embedding, cond_control_ already folded in — so a schedule is a delta
+    // on the static desk rather than a replacement for it.
+    ControlSchedule       qi21_ctl_sched_;
+
     // Reference-attention identity anchor state (Sana only). identity_anchor_ is
     // set once capture_identity_anchor() succeeds; identity_weight_ scales the
     // injection (0 = off). capturing_anchor_ is true only while
@@ -1176,6 +1247,13 @@ private:
     // Encode `prompt`, or serve it from the memo when the backbone has been
     // released. Throws an error NAMING the prompt when neither is possible.
     qwenimage21::TextConditioning qi21_encode_or_memo_(const std::string& prompt);
+
+    // Rebuild `prepared`'s positive text rows as txt_in(primed embeds + the
+    // injection `delta` carries), dropping the prefix KV cache. An inactive
+    // `delta` restores the primed rows exactly. The one place the between-step
+    // schedule touches the conditioning.
+    void qi21_rebuild_text_rows_(PreparedConditioning& prepared,
+                                 const CondControl& delta);
 
     // Working buffers reused across step_once() calls. The current latent
     // lives on PipelineState, not here.

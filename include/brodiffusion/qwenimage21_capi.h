@@ -339,6 +339,69 @@ QI_API int qi_blend_prefix(qi_ctx* c, int slot, float alpha);
 QI_API int qi_clear_prefix_slots(qi_ctx* c);
 QI_API int qi_prefix_slot_valid(qi_ctx* c, int slot);
 
+/* ── conditioning control axes and between-step schedules ─────────────────
+ *
+ * The axes are BCD1 dictionary directions in the text encoder's 4096-d space
+ * (see cond_control.h), and the injected vector is alpha * scale * dir added
+ * to every row of the (n, 4096) conditioning. Applying that once before step 0
+ * is the whole of the static "desk"; a SCHEDULE re-applies it with a per-step
+ * alpha instead, which is what the denoise loop needed and could not express.
+ *
+ * On this API the caller drives the loop, so the schedule is two calls:
+ *
+ *     qi_encode_text(c, embeds, n, txt)     // parks `embeds` as the BASE
+ *     for (s = 0; s < steps; s++) {
+ *         if (qi_control_step(c, s, txt) > 0) { ... }   // rebuilds txt
+ *         qi_forward(c, latent, h, w, txt, n_txt, t, out);
+ *     }
+ *
+ * qi_control_step rebuilds txt as txt_in(base + the step's stack) and drops
+ * the prefix cache, returning the new row count — or 0, meaning this step's
+ * alpha is the one `txt` already carries and nothing was written or reset. A
+ * flat schedule therefore pays for one re-extract, not one per step.
+ *
+ * Ranges are HALF-OPEN [lo_step, hi_step), hi_step < 0 means "to the end",
+ * and `alpha` is indexed by the ABSOLUTE step index, not by the offset from
+ * lo_step. The _dir forms take the direction outright, for an axis that is in
+ * no bank (a diff-of-means built from qi_get_prompt_embeds, say). */
+
+/* Load a BCD1 dictionary. merge != 0 adds its axes to those already loaded
+ * (same-named axes overwritten) instead of replacing them. */
+QI_API int qi_load_control_dictionary(qi_ctx* c, const char* path, int merge);
+/* How many axes are loaded, and axis `index`'s name into `out` (NUL
+ * terminated, truncated to `cap`). qi_control_axis_name returns the full name
+ * length, or -1. */
+QI_API int qi_control_axis_count(qi_ctx* c);
+QI_API int qi_control_axis_name(qi_ctx* c, int index, char* out, int cap);
+/* Axis `name`'s stored direction (qi_text_hidden_dim() floats) and its baked
+ * scale; either pointer may be NULL. */
+QI_API int qi_control_axis_vector(qi_ctx* c, const char* name, float* dir_out,
+                                  float* scale_out);
+
+/* Arm a schedule. qi_set_* replaces the list with this one, qi_add_* appends
+ * and returns the slot index; every armed slot contributes to the same step.
+ * `alpha` is n_alpha floats. Returns the slot index, or -1. */
+QI_API int qi_set_control_schedule(qi_ctx* c, const char* name,
+                                   const float* alpha, int n_alpha,
+                                   int lo_step, int hi_step);
+QI_API int qi_add_control_schedule(qi_ctx* c, const char* name,
+                                   const float* alpha, int n_alpha,
+                                   int lo_step, int hi_step);
+QI_API int qi_set_control_schedule_dir(qi_ctx* c, const float* dir, int dim,
+                                       float scale, const float* alpha,
+                                       int n_alpha, int lo_step, int hi_step);
+QI_API int qi_add_control_schedule_dir(qi_ctx* c, const float* dir, int dim,
+                                       float scale, const float* alpha,
+                                       int n_alpha, int lo_step, int hi_step);
+QI_API int qi_clear_control_schedules(qi_ctx* c);
+QI_API int qi_control_schedule_count(qi_ctx* c);
+
+/* Apply the armed schedules for step `step`. Rewrites `txt_out` (which must
+ * hold n_valid * hidden_size floats — the same buffer qi_encode_text filled)
+ * and drops the prefix cache. Returns the row count when it rebuilt, 0 when
+ * this step's stack is already the one the rows carry, -1 on failure. */
+QI_API int qi_control_step(qi_ctx* c, int step, float* txt_out);
+
 /* ── VAE (QI_LOAD_VAE) ─────────────────────────────────────────────────────
  * Both halves are loaded together — the encoder is ~200 MB against the DiT's
  * 7-14 GB, and having it resident is what makes the image-conditioned paths a
