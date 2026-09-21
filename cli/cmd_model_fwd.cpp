@@ -433,10 +433,16 @@ int run_krea2_text_fwd(int argc, char** argv) {
     const char* prompt = arg_after(argc, argv, "--prompt");
     const char* op = arg_after(argc, argv, "--out");
     const char* mp = arg_after(argc, argv, "--mask-out");
+    // --image <png>: encode the IMAGE through the same fixed template and the
+    // same 12 taps instead of the prompt. The checkpoint's Qwen3-VL-4B ships
+    // its vision tower, so this needs no second model — see
+    // krea2::encode_image_prompt(). --prompt is then unused by the encode and
+    // only labels the run.
+    const char* image = arg_after(argc, argv, "--image");
     if (!wdir || !tdir || !prompt || !op) {
         std::fprintf(stderr,
             "krea2-text-fwd: need --weights-dir --tokenizer-dir --prompt --out "
-            "[--mask-out]\n");
+            "[--mask-out] [--image <png>]\n");
         return 2;
     }
     brotensor::init();
@@ -449,7 +455,38 @@ int run_krea2_text_fwd(int argc, char** argv) {
     auto f = st::File::open(wd + "/text_encoder/model.safetensors");
     model.load_weights(f, "language_model.");
 
-    auto cond = brodiffusion::krea2::encode_prompt(tok, model, prompt);
+    brodiffusion::krea2::TextConditioning cond;
+    if (!image) {
+        cond = brodiffusion::krea2::encode_prompt(tok, model, prompt);
+    } else {
+        const char* vp = nullptr;
+        if (f.find("visual.patch_embed.proj.weight")) vp = "visual.";
+        else if (f.find("model.visual.patch_embed.proj.weight")) {
+            vp = "model.visual.";
+        }
+        if (vp == nullptr) {
+            std::fprintf(stderr, "krea2-text-fwd: --image given but this "
+                                 "text_encoder ships no vision tower\n");
+            return 2;
+        }
+        brolm::qwen3vl::VisionTower vision(cfg.vision, cfg.text.hidden_size);
+        vision.load_weights(f, vp);
+        brotensor::sync_all();
+
+        // Used verbatim: the parity harness hands over the image the
+        // reference already resized, so no resampler sits between the two.
+        brodiffusion::HostImage rgba = brodiffusion::load_image_rgba(image);
+        std::vector<float> rgb = brodiffusion::composite_over_white(rgba);
+        std::printf("krea2-text-fwd: image prompt %s (%dx%d)\n", image,
+                    rgba.W, rgba.H);
+        brolm::qwen3vl::ImageInput in;
+        in.pixels = rgb.data();
+        in.H = rgba.H;
+        in.W = rgba.W;
+        brolm::qwen3vl::PreprocessConfig pp;
+        cond = brodiffusion::krea2::encode_image_prompt(tok, model, vision, pp,
+                                                        in);
+    }
     brotensor::sync_all();
 
     dump_latent_f32(op, cond.prompt_embeds);
