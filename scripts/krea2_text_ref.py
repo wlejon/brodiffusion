@@ -28,7 +28,26 @@
 #                                      no resampler sits between the two.
 #
 # Usage: python scripts/krea2_text_ref.py [weights/krea-2-raw] [outdir] [prompt]
-# Env:   KREA2_TEXT_REF_IMAGE  image path (default: none, i.e. text mode)
+# Env:   KREA2_TEXT_REF_IMAGE        image path (default: none, i.e. text mode)
+#        KREA2_TEXT_REF_DTYPE        bfloat16 (default, what the pipeline ships
+#                                    with) or float32. BF16 is the accuracy
+#                                    FLOOR of this gate, not its ceiling: on an
+#                                    image prompt the reference's own bf16
+#                                    rounding costs ~0.9994 flat cosine and
+#                                    drives a handful of massive-activation
+#                                    tokens to ~0.83 per-token, which is larger
+#                                    than the C++ path's total error. Set this
+#                                    to float32 to measure the implementation
+#                                    instead of the reference's noise.
+#        KREA2_TEXT_REF_VISION_DUMP  directory; when set, the vision tower's
+#                                    stage boundaries (patchified pixels, patch
+#                                    embedding, interpolated pos embed, every
+#                                    block output, the DeepStack merger outputs
+#                                    and the main merger output) are written as
+#                                    raw FP32 <dir>/vis_ref_<name>.f32. The C++
+#                                    side writes the same names with the
+#                                    vis_mine_ prefix under BROLM_VISION_DUMP,
+#                                    so the two dumps diff stage by stage.
 import os
 import sys
 
@@ -45,10 +64,12 @@ prompt = sys.argv[3] if len(sys.argv) > 3 else \
 os.makedirs(out, exist_ok=True)
 
 device = "cuda"
+ref_dtype = getattr(torch, os.environ.get("KREA2_TEXT_REF_DTYPE", "bfloat16"))
 tok = AutoTokenizer.from_pretrained(os.path.join(root, "tokenizer"))
 te = Qwen3VLModel.from_pretrained(
-    os.path.join(root, "text_encoder"), torch_dtype=torch.bfloat16
+    os.path.join(root, "text_encoder"), torch_dtype=ref_dtype
 ).to(device).eval()
+print("reference dtype", ref_dtype)
 
 
 class Shim:
@@ -116,16 +137,60 @@ else:
     ids = PREFIX + content + SUFFIX
     print("image -> %d merged tokens, %d content rows" % (n_img, len(content)))
 
+    # Stage-boundary dump of the vision tower, for bisecting an image-prompt
+    # divergence down to the first stage that disagrees. Hooks sit on the
+    # modules themselves so nothing about the real forward changes.
+    vis_dump = os.environ.get("KREA2_TEXT_REF_VISION_DUMP", "")
+    if vis_dump:
+        os.makedirs(vis_dump, exist_ok=True)
+
+        def write(name, t):
+            arr = t.detach().float().cpu().numpy().astype("<f4")
+            arr.tofile(os.path.join(vis_dump, "vis_ref_%s.f32" % name))
+
+        vis = te.visual
+        handles = []
+        handles.append(vis.patch_embed.register_forward_hook(
+            lambda m, i, o: write("patch_embed", o)))
+        for bi, blk in enumerate(vis.blocks):
+            handles.append(blk.register_forward_hook(
+                (lambda idx: lambda m, i, o: write("block%d" % idx, o))(bi)))
+        for di, mrg in enumerate(vis.deepstack_merger_list):
+            handles.append(mrg.register_forward_hook(
+                (lambda idx: lambda m, i, o: write("ds%d" % idx, o))(di)))
+        handles.append(vis.merger.register_forward_hook(
+            lambda m, i, o: write("merged", o)))
+        write("patches", pv["pixel_values"])
+        with torch.no_grad():
+            # pos_embed is not a module boundary; recompute it the way the
+            # tower does, so the dump has the same stage granularity.
+            from transformers.vision_utils import (
+                get_vision_bilinear_indices_and_weights,
+            )
+            bidx, bw = get_vision_bilinear_indices_and_weights(
+                grid.to(device),
+                num_grid_per_side=vis.num_grid_per_side,
+                spatial_merge_size=vis.config.spatial_merge_size,
+            )
+            write("pos_embed", (vis.pos_embed(bidx) * bw[:, :, None]).sum(0))
+            pe = vis.patch_embed(pv["pixel_values"].to(device, ref_dtype))
+            write("block_in", pe + (vis.pos_embed(bidx) * bw[:, :, None]).sum(0)
+                  .to(pe.dtype))
+    else:
+        handles = []
+
     input_ids = torch.tensor([ids], device=device)
     with torch.no_grad():
         outs = te(
             input_ids=input_ids,
             output_hidden_states=True,
-            pixel_values=pv["pixel_values"].to(device, torch.bfloat16),
+            pixel_values=pv["pixel_values"].to(device, ref_dtype),
             image_grid_thw=grid.to(device),
             # M-RoPE needs the image-token positions marked.
             mm_token_type_ids=(input_ids == IMAGE_PAD).long(),
         )
+    for h in handles:
+        h.remove()
     taps = torch.stack(
         [outs.hidden_states[k][0] for k in shim.text_encoder_select_layers], 1)
     taps = taps.float().cpu().numpy()                # (len(ids), 12, 2560)

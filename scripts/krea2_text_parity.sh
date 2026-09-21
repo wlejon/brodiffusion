@@ -14,6 +14,14 @@
 # tokens. Per-token cosine is reported as well as the flat one, because the
 # flat figure is dominated by the high-norm rows and a splice bug shows up as a
 # few bad tokens rather than a uniformly worse number.
+#
+# The reference runs BF16 by default, matching the shipped pipeline. On an
+# image prompt that is the limiting term, not the C++ path: the vision tower's
+# massive-activation channels turn the reference's own bf16 rounding into
+# ~0.9994 flat / ~0.83 worst-token against an fp32 run of the same weights, so
+# a per-token min in that neighbourhood is the floor and not a defect. Set
+# KREA2_TEXT_REF_DTYPE=float32 to move the floor out of the way and measure the
+# implementation; there the C++ path scores ~0.99998 flat / ~0.98 worst-token.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
