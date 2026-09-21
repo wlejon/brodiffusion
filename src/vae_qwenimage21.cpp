@@ -1,8 +1,10 @@
 #include "brodiffusion/vae_qwenimage21.h"
 #include "brodiffusion/detail/compute.h"
 #include "brodiffusion/detail/device.h"
+#include "brodiffusion/detail/jit_fusion.h"
 #include "brotensor/safetensors.h"
 
+#include "brotensor/jit/trace.h"
 #include "brotensor/ops.h"
 #include "brotensor/tensor.h"
 
@@ -34,6 +36,37 @@ const st::TensorView& need(const st::File& f, const std::string& key, const char
     const auto* v = f.find(key);
     if (!v) fail(who, "missing tensor '" + key + "'");
     return *v;
+}
+
+// ── RMSNorm + SiLU, one kernel ─────────────────────────────────────────────
+//
+// Every norm in this graph except the attention block's is immediately
+// followed by a SiLU. Eagerly that is two full passes over the feature map:
+// rms_norm_forward writes it and silu_forward reads it straight back. The
+// widest map in a 1024x1024 decode reaches the row kernel as 1048576x96 —
+// 384 MB written and 384 MB read for a value that never needed to land.
+// Traced, it is one kernel and the normalised map never exists.
+//
+// gamma is stored as (C, 1). The trace needs it as the (1, C) broadcast row
+// it actually is, or the compiler sees an operand whose element count does
+// not match the trace's (H*W, C) shape and refuses to fuse. The view is
+// non-owning and costs nothing.
+//
+// The binding is identified by the three buffers plus both extents: the
+// scratch tensors are shared across every norm in the graph and grow as the
+// decode walks up the resolutions, so addresses alone would replay a kernel
+// compiled for one feature-map size against another.
+bool fuse_rmsnorm_silu(brodiffusion::detail::JitSite& site, const bt::Tensor& seq,
+                       const bt::Tensor& gamma, bt::Tensor& dst) {
+    const bt::Tensor g_row =
+        bt::Tensor::view(gamma.device, gamma.data, 1, gamma.rows * gamma.cols,
+                         gamma.dtype);
+    return brodiffusion::detail::try_fused(
+        site,
+        {seq.data, gamma.data, dst.data,
+         brodiffusion::detail::token_of_extent(static_cast<std::size_t>(seq.rows)),
+         brodiffusion::detail::token_of_extent(static_cast<std::size_t>(seq.cols))},
+        [&] { bt::store(dst, bt::silu(bt::rms_norm(seq, g_row, kRmsEps))); });
 }
 
 bt::Dtype arith_dtype_for(bool force_upcast) {
@@ -268,6 +301,20 @@ void Decoder::apply_rmsnorm_(const bt::Tensor& gamma, int C, int H, int W,
     bt::sequence_to_nchw(seq2_, 1, C, H, W, out);
 }
 
+void Decoder::apply_rmsnorm_silu_(detail::JitSite& site, const bt::Tensor& gamma,
+                                  int C, int H, int W, const bt::Tensor& x,
+                                  bt::Tensor& out) {
+    bt::nchw_to_sequence(x, 1, C, H, W, seq_);
+    // store() writes into a buffer the caller owns, so seq2_ has to be the
+    // right shape before the expression is traced.
+    detail::resize_like(seq2_, seq_.rows, seq_.cols, seq_.dtype, seq_.device);
+    if (!fuse_rmsnorm_silu(site, seq_, gamma, seq2_)) {
+        bt::rms_norm_forward(seq_, gamma, kRmsEps, seq2_);
+        bt::silu_forward(seq2_, seq2_);
+    }
+    bt::sequence_to_nchw(seq2_, 1, C, H, W, out);
+}
+
 void Decoder::apply_resnet_(const Resnet& r, int H, int W, bt::Tensor& x) {
     if (r.has_shortcut) {
         bt::conv2d_forward(x, r.short_W, &r.short_b, 1, r.C_in, H, W, r.C_out,
@@ -275,12 +322,10 @@ void Decoder::apply_resnet_(const Resnet& r, int H, int W, bt::Tensor& x) {
     } else {
         h_ = x.clone();
     }
-    apply_rmsnorm_(r.norm1_g, r.C_in, H, W, x, n1_);
-    bt::silu_forward(n1_, n1_);
+    apply_rmsnorm_silu_(jit_norm1_, r.norm1_g, r.C_in, H, W, x, n1_);
     bt::conv2d_forward(n1_, r.conv1_W, &r.conv1_b, 1, r.C_in, H, W, r.C_out,
                        3, 3, 1, 1, 1, 1, 1, 1, y_);
-    apply_rmsnorm_(r.norm2_g, r.C_out, H, W, y_, n2_);
-    bt::silu_forward(n2_, n2_);
+    apply_rmsnorm_silu_(jit_norm2_, r.norm2_g, r.C_out, H, W, y_, n2_);
     bt::conv2d_forward(n2_, r.conv2_W, &r.conv2_b, 1, r.C_out, H, W, r.C_out,
                        3, 3, 1, 1, 1, 1, 1, 1, y_);
     bt::add_inplace(y_, h_);
@@ -391,8 +436,7 @@ void Decoder::decode(const bt::Tensor& latent, int H_lat, int W_lat, bt::Tensor&
     }
 
     const int firstC = norm_out_g_.rows;
-    apply_rmsnorm_(norm_out_g_, firstC, H, W, x_, y_);
-    bt::silu_forward(y_, y_);
+    apply_rmsnorm_silu_(jit_norm_out_, norm_out_g_, firstC, H, W, x_, y_);
     bt::conv2d_forward(y_, conv_out_W_, &conv_out_b_, 1, firstC, H, W,
                        cfg_.out_channels, 3, 3, 1, 1, 1, 1, 1, 1, out);
     maybe_dump("dec_conv_out", out);
@@ -516,6 +560,18 @@ void Encoder::apply_rmsnorm_(const bt::Tensor& gamma, int C, int H, int W,
     bt::sequence_to_nchw(seq2_, 1, C, H, W, out);
 }
 
+void Encoder::apply_rmsnorm_silu_(detail::JitSite& site, const bt::Tensor& gamma,
+                                  int C, int H, int W, const bt::Tensor& x,
+                                  bt::Tensor& out) {
+    bt::nchw_to_sequence(x, 1, C, H, W, seq_);
+    detail::resize_like(seq2_, seq_.rows, seq_.cols, seq_.dtype, seq_.device);
+    if (!fuse_rmsnorm_silu(site, seq_, gamma, seq2_)) {
+        bt::rms_norm_forward(seq_, gamma, kRmsEps, seq2_);
+        bt::silu_forward(seq2_, seq2_);
+    }
+    bt::sequence_to_nchw(seq2_, 1, C, H, W, out);
+}
+
 void Encoder::apply_resnet_(const Resnet& r, int H, int W, bt::Tensor& x) {
     if (r.has_shortcut) {
         bt::conv2d_forward(x, r.short_W, &r.short_b, 1, r.C_in, H, W, r.C_out,
@@ -523,12 +579,10 @@ void Encoder::apply_resnet_(const Resnet& r, int H, int W, bt::Tensor& x) {
     } else {
         h_ = x.clone();
     }
-    apply_rmsnorm_(r.norm1_g, r.C_in, H, W, x, n1_);
-    bt::silu_forward(n1_, n1_);
+    apply_rmsnorm_silu_(jit_norm1_, r.norm1_g, r.C_in, H, W, x, n1_);
     bt::conv2d_forward(n1_, r.conv1_W, &r.conv1_b, 1, r.C_in, H, W, r.C_out,
                        3, 3, 1, 1, 1, 1, 1, 1, y_);
-    apply_rmsnorm_(r.norm2_g, r.C_out, H, W, y_, n2_);
-    bt::silu_forward(n2_, n2_);
+    apply_rmsnorm_silu_(jit_norm2_, r.norm2_g, r.C_out, H, W, y_, n2_);
     bt::conv2d_forward(n2_, r.conv2_W, &r.conv2_b, 1, r.C_out, H, W, r.C_out,
                        3, 3, 1, 1, 1, 1, 1, 1, y_);
     bt::add_inplace(y_, h_);
@@ -633,8 +687,7 @@ void Encoder::encode(const bt::Tensor& image, int H, int W,
     maybe_dump("enc_mid_block", x_);
 
     const int mid_C = norm_out_g_.rows;
-    apply_rmsnorm_(norm_out_g_, mid_C, Hc, Wc, x_, y_);
-    bt::silu_forward(y_, y_);
+    apply_rmsnorm_silu_(jit_norm_out_, norm_out_g_, mid_C, Hc, Wc, x_, y_);
     const int twoZ = 2 * z_dim;
     bt::conv2d_forward(y_, conv_out_W_, &conv_out_b_, 1, mid_C, Hc, Wc,
                        twoZ, 3, 3, 1, 1, 1, 1, 1, 1, x_);

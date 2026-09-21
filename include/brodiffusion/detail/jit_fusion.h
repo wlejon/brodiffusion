@@ -11,11 +11,15 @@
 // Two things make that practical in a denoising loop.
 //
 // First, a trace has to be built once and replayed. Re-tracing is not free
-// even on a cache hit — it re-runs the user code, and every traced operator
-// allocates a full-size output tensor that the fused kernel then never uses.
-// At DiT width that is tens of megabytes per re-trace. So a JitSite keeps a
-// compiled trace for each distinct set of buffers it has seen and replays the
-// matching one, which after the first block of the first step means always.
+// even on a cache hit — it re-runs the user code, rebuilds the DAG and
+// re-binds the kernel's pointers, tens of microseconds a time. (It no longer
+// also allocates: a traced op returns a symbolic tensor with no buffer, and
+// end_trace() materialises only what the caller still holds. That is what
+// makes a seam like the VAE's norms adoptable at all — at decode width the
+// old tracer would have bought hundreds of megabytes per trace for values the
+// fused kernel never reads.) So a JitSite keeps a compiled trace for each
+// distinct set of buffers it has seen and replays the matching one, which
+// after the first block of the first step means always.
 //
 // Second, a site that the compiler cannot fuse must not take the model down.
 // try_fused() catches, disables that one site for the rest of the process,

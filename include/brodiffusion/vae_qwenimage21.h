@@ -45,6 +45,7 @@
 // latent*std+mean per channel before post_quant_conv; encode() returns
 // (z - mean)/std.
 
+#include "brodiffusion/detail/jit_fusion.h"
 #include "brotensor/tensor.h"
 
 #include <cstdint>
@@ -156,6 +157,13 @@ private:
                       int C_in, int C_out, Resnet& r);
     void apply_rmsnorm_(const brotensor::Tensor& gamma, int C, int H, int W,
                        const brotensor::Tensor& x, brotensor::Tensor& out);
+    // RMSNorm immediately followed by SiLU — every norm in the graph except
+    // the attention block's. Traced as one kernel when the JIT is on, which
+    // removes a whole read and write of the feature map; `site` names the
+    // seam so each keeps its own compiled binding per (gamma, shape).
+    void apply_rmsnorm_silu_(detail::JitSite& site, const brotensor::Tensor& gamma,
+                             int C, int H, int W, const brotensor::Tensor& x,
+                             brotensor::Tensor& out);
     void apply_resnet_(const Resnet& r, int H, int W, brotensor::Tensor& x);
     void apply_attention_(const Attention& a, int H, int W, brotensor::Tensor& x);
     void apply_upsample_(const UpBlock& u, int H, int W, brotensor::Tensor& x);
@@ -176,6 +184,13 @@ private:
 
     brotensor::Tensor x_, y_, h_, n1_, n2_;
     brotensor::Tensor seq_, seq2_, up_t_, x_copy_, short_, gather_;
+
+    // One site per seam rather than one for the whole decoder: a site
+    // remembers a bounded number of bindings, and each of these sees one per
+    // resnet (a distinct gamma) per feature-map size.
+    detail::JitSite jit_norm1_{"qi21vae.dec.resnet.norm1_silu"};
+    detail::JitSite jit_norm2_{"qi21vae.dec.resnet.norm2_silu"};
+    detail::JitSite jit_norm_out_{"qi21vae.dec.norm_out_silu"};
 };
 
 class Encoder {
@@ -240,6 +255,10 @@ private:
                       int C_in, int C_out, Resnet& r);
     void apply_rmsnorm_(const brotensor::Tensor& gamma, int C, int H, int W,
                        const brotensor::Tensor& x, brotensor::Tensor& out);
+    // See the decoder's overload: RMSNorm + SiLU as one traced kernel.
+    void apply_rmsnorm_silu_(detail::JitSite& site, const brotensor::Tensor& gamma,
+                             int C, int H, int W, const brotensor::Tensor& x,
+                             brotensor::Tensor& out);
     void apply_resnet_(const Resnet& r, int H, int W, brotensor::Tensor& x);
     void apply_attention_(const Attention& a, int H, int W, brotensor::Tensor& x);
     void apply_downsample_(const DownBlock& d, int H, int W, brotensor::Tensor& x);
@@ -262,6 +281,10 @@ private:
     brotensor::Tensor x_, y_, h_, n1_, n2_, pad_;
     brotensor::Tensor seq_, seq2_, x_copy_, short_, pool_;
     brotensor::Tensor moments_, logvar_;
+
+    detail::JitSite jit_norm1_{"qi21vae.enc.resnet.norm1_silu"};
+    detail::JitSite jit_norm2_{"qi21vae.enc.resnet.norm2_silu"};
+    detail::JitSite jit_norm_out_{"qi21vae.enc.norm_out_silu"};
 };
 
 }  // namespace brodiffusion::vae_qwenimage21

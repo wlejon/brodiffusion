@@ -376,32 +376,59 @@ int run_qi21_vae_fwd(int argc, char** argv) {
         brotensor::Tensor lat =
             brotensor::Tensor::from_host(lat_h.data(), 1, n)
                 .to(brotensor::default_device());
+        // The first decode is where every trace is built, so it is the one
+        // that would show a tracer buying buffers for intermediates the fused
+        // kernel never reads. Counting allocations across it makes that
+        // visible next to a --no-jit run of the same decode.
+        const brotensor::AllocStats cold_a0 = brotensor::alloc_stats();
         const auto c0 = std::chrono::steady_clock::now();
         dec.decode(lat, H, W, out);
         brotensor::sync_all();
         const double cold_ms = std::chrono::duration<double, std::milli>(
                                    std::chrono::steady_clock::now() - c0).count();
+        const brotensor::AllocStats cold_a1 = brotensor::alloc_stats();
         // --bench-ab: the same decode with the trace JIT on and off,
         // alternating in one process so both see the same clocks.
         if (bench_ab_s) {
             const int reps = std::atoi(bench_ab_s);
             brotensor::sync_all();
+            // Device memory in use right after a decode, which is the peak the
+            // decode reached: the decoder's scratch tensors are members that
+            // stay at their high-water size, and the CUDA pool holds onto
+            // whatever it handed out until it is trimmed. Trimming between the
+            // two variants keeps one's retained blocks out of the other's
+            // reading.
+            const brotensor::Device dev = brotensor::default_device();
+            auto mem_in_use = [&]() -> double {
+                std::size_t f = 0, t = 0;
+                if (!brotensor::device_mem_info(dev, f, t)) return 0.0;
+                return static_cast<double>(t - f) / (1024.0 * 1024.0);
+            };
             double best[2] = {0.0, 0.0};
+            double peak[2] = {0.0, 0.0};
             for (int i = 0; i < 2 * reps; ++i) {
                 const int which = i & 1;
                 brodiffusion::detail::set_jit_enabled(which == 0);
+                brotensor::device_mem_trim(dev, 0);
                 const auto t0 = std::chrono::steady_clock::now();
                 dec.decode(lat, H, W, out);
                 brotensor::sync_all();
                 const double ms = std::chrono::duration<double, std::milli>(
                                       std::chrono::steady_clock::now() - t0).count();
+                const double mib = mem_in_use();
                 if (i < 2 || ms < best[which]) best[which] = ms;
+                if (mib > peak[which]) peak[which] = mib;
             }
             std::printf("qi21-vae-fwd: decode %dx%d latent -> %dx%d px\n", H, W,
                         H * 16, W * 16);
-            std::printf("  first decode (cold traces): %.1f ms\n", cold_ms);
-            std::printf("  jit on : %.1f ms\n", best[0]);
-            std::printf("  jit off: %.1f ms\n", best[1]);
+            std::printf("  first decode (cold traces): %.1f ms, %llu allocations "
+                        "/ %.0f MiB\n",
+                        cold_ms,
+                        static_cast<unsigned long long>(cold_a1.count - cold_a0.count),
+                        static_cast<double>(cold_a1.bytes - cold_a0.bytes) /
+                            (1024.0 * 1024.0));
+            std::printf("  jit on : %.1f ms, peak %.0f MiB\n", best[0], peak[0]);
+            std::printf("  jit off: %.1f ms, peak %.0f MiB\n", best[1], peak[1]);
             if (!op) return 0;
         }
     } else {
