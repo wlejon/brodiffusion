@@ -807,6 +807,12 @@ private:
     // reconstructs the model output, and applies one TrigFlow scheduler step.
     // Called from step_once() when the active scheduler is scheduler::SCM.
     void step_once_scm_(PipelineState& state, const GenerateOptions& opts);
+    // SD1.5 img2img / inpaint priming: VAE-encode the init image, noise it to
+    // t_start, and (when a mask is given) cache the broadcast inpaint masks.
+    // Sets state.latent and state.step_index; called from prime() once the
+    // schedule is set, when opts.init_image_path is non-empty.
+    void prime_img2img_(const GenerateOptions& opts, PipelineState& state,
+                        int n_lat, int H_lat, int W_lat, int C_lat);
 
     PipelineConfig            cfg_;
     ModelClass                model_class_;

@@ -222,6 +222,12 @@ target_sources(brodiffusion PRIVATE
     src/detail/safetensors_dir.cpp
     src/lora.cpp
     src/pipeline.cpp
+    src/pipeline_detail.cpp
+    src/pipeline_load.cpp
+    src/pipeline_sana.cpp
+    src/pipeline_decode.cpp
+    src/pipeline_sd.cpp
+    src/pipeline_step_graph.cpp
     src/pipeline_krea2.cpp
     src/pipeline_qwenimage21.cpp
     src/pipeline_qwenimage21_hooks.cpp
