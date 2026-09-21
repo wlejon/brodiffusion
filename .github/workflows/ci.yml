@@ -58,6 +58,8 @@ jobs:
         with: { repository: wlejon/brolm, path: brolm }
       - uses: actions/checkout@v7
         with: { repository: wlejon/broimage, path: broimage }
+      - uses: actions/checkout@v7
+        with: { repository: wlejon/brovisionml, path: brovisionml }
 
       - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
@@ -102,6 +104,8 @@ jobs:
         with: { repository: wlejon/brolm, path: brolm }
       - uses: actions/checkout@v7
         with: { repository: wlejon/broimage, path: broimage }
+      - uses: actions/checkout@v7
+        with: { repository: wlejon/brovisionml, path: brovisionml }
 
       - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 

@@ -37,6 +37,8 @@ jobs:
         with: { repository: wlejon/brolm, path: brolm }
       - uses: actions/checkout@v7
         with: { repository: wlejon/broimage, path: broimage }
+      - uses: actions/checkout@v7
+        with: { repository: wlejon/brovisionml, path: brovisionml }
 
       # bronze (and through it brass) is needed at configure for the api;
       # neither is built here, since only the brodiffusion target is traced.
@@ -48,7 +50,7 @@ jobs:
       - name: Configure
         run: cmake -S brodiffusion -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 
-      # The sibling libraries (brotensor core + CPU backend, brolm, broimage) are
+      # The sibling libraries (brotensor core + CPU backend, brolm, broimage, brovisionml) are
       # compiled here, ahead of `init`. For a compiled language CodeQL only
       # extracts what it observes the compiler build while tracing, so anything
       # already built when `init` runs is never analysed. That is the exclusion
@@ -56,7 +58,7 @@ jobs:
       # the siblings out of brodiffusion's Security tab, where they have their own
       # analysis. bromath is header-only.
       - name: Pre-build the siblings (outside the traced build)
-        run: cmake --build build --parallel 4 --target brotensor_core brotensor_cpu brolm broimage
+        run: cmake --build build --parallel 4 --target brotensor_core brotensor_cpu brolm broimage brovisionml
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
