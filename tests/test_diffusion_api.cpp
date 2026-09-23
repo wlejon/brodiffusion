@@ -1,146 +1,161 @@
 #include <brodiffusion/version.h>
 #include "../src/api/api.h"
 #include "../src/api/object_builder.h"
-#include <cassert>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <span>
 #include <string>
+#include <vector>
 
 // tests/test_diffusion_surface.cpp — the restored Pipeline / PipelineState
 // members (docs/transition-drift.md row H7).
 void brodiffusionTestRestoredSurface();
+// tests/test_diffusion_api_weights.cpp — SD1.5 through bro.diffusion, skipped
+// without weights.
+void brodiffusionTestWithWeights();
+
+// Failures exit rather than assert(): assert() is a no-op in the Release
+// configuration this test runs in.
+//
+// Every Value held across an allocating embed call rides in a Persistent
+// (embed.h GC contract); brodiffusion_test_api_gcstress runs this under
+// BRONZE_GC_STRESS=1 BRONZE_GC_POISON=1, where a stale Value crashes.
+
+namespace {
+
+namespace ev = bronze::embed;
+using bronze::Value;
+
+#define CHECK(cond)                                                              \
+    do {                                                                         \
+        if (!(cond)) {                                                           \
+            std::cerr << "FAIL " << __FILE__ << ":" << __LINE__ << ": " #cond     \
+                      << std::endl;                                              \
+            std::exit(1);                                                        \
+        }                                                                        \
+    } while (0)
+
+// obj[name](...args) with obj as the receiver. `args` are Persistents so
+// they survive the method lookup, which allocates.
+ev::CallResult callMethod(const ev::Persistent& obj, const char* name,
+                          const std::vector<const ev::Persistent*>& args = {}) {
+    ev::Persistent fn(ev::getProperty(obj.get(), name));
+    if (!ev::isFunction(fn.get())) {
+        std::cerr << "FAIL: " << name << " is not a function" << std::endl;
+        std::exit(1);
+    }
+    std::vector<Value> argv;
+    argv.reserve(args.size());
+    for (const ev::Persistent* a : args) argv.push_back(a->get());
+    return ev::call(fn.get(), obj.get(), std::span<const Value>(argv));
+}
+
+std::string errorText(const ev::CallResult& r) { return ev::toUtf8(r.value); }
+
+// A call that must throw, with a message containing one of `needles`.
+std::string expectThrow(const ev::Persistent& obj, const char* name,
+                        std::initializer_list<const char*> needles,
+                        const std::vector<const ev::Persistent*>& args = {}) {
+    ev::CallResult r = callMethod(obj, name, args);
+    if (!r.thrown) {
+        std::cerr << "FAIL: " << name << " did not throw" << std::endl;
+        std::exit(1);
+    }
+    std::string msg = errorText(r);
+    bool hit = needles.size() == 0;
+    for (const char* n : needles) hit = hit || msg.find(n) != std::string::npos;
+    if (!hit) {
+        std::cerr << "FAIL: " << name << " threw an unexpected error: " << msg << std::endl;
+        std::exit(1);
+    }
+    return msg;
+}
+
+void expectUndefinedResult(const ev::Persistent& obj, const char* name) {
+    ev::CallResult r = callMethod(obj, name);
+    CHECK(!r.thrown);
+    CHECK(ev::isUndefined(r.value));
+}
+
+void expectObjectProp(const ev::Persistent& obj, const char* name) {
+    Value v = ev::getProperty(obj.get(), name);
+    if (!ev::isObject(v)) {
+        std::cerr << "FAIL: missing " << name << std::endl;
+        std::exit(1);
+    }
+}
+
+}  // namespace
 
 int main() {
-    namespace ev = bronze::embed;
-
     std::cout << "Installing diffusion API into Bronze realm..." << std::endl;
     brodiffusion::api::installDiffusion();
 
-    auto g = ev::globalValue("bro");
-    assert(g.found);
-    assert(ev::isObject(g.value));
+    ev::Persistent bro;
+    {
+        auto g = ev::globalValue("bro");
+        CHECK(g.found);
+        CHECK(ev::isObject(g.value));
+        bro.set(g.value);
+    }
 
     // Check bro.diffusion
-    auto diff = ev::getProperty(g.value, "diffusion");
-    assert(ev::isObject(diff));
+    ev::Persistent diff(ev::getProperty(bro.get(), "diffusion"));
+    CHECK(ev::isObject(diff.get()));
 
-    auto ver = ev::getProperty(diff, "version");
-    assert(ev::isString(ver));
-    assert(!ev::toUtf8(ver).empty());
-    std::cout << "  bro.diffusion.version = " << ev::toUtf8(ver) << std::endl;
+    {
+        Value ver = ev::getProperty(diff.get(), "version");
+        CHECK(ev::isString(ver));
+        std::string v = ev::toUtf8(ver);
+        CHECK(!v.empty());
+        std::cout << "  bro.diffusion.version = " << v << std::endl;
+    }
 
-    auto diffInit = ev::getProperty(diff, "init");
-    assert(ev::isObject(diffInit));
-    auto initRes = ev::call(diffInit, diff, {});
-    assert(!initRes.thrown);
-    assert(ev::isUndefined(initRes.value));
+    expectUndefinedResult(diff, "init");
+    expectObjectProp(diff, "Pipeline");
+    expectObjectProp(diff, "PipelineState");
+    expectObjectProp(diff, "VAE");
 
-    auto pipeCtor = ev::getProperty(diff, "Pipeline");
-    assert(ev::isObject(pipeCtor));
+    std::cout << "  bro.diffusion.loadModel() threw expected error: "
+              << expectThrow(diff, "loadModel", {"path"}) << std::endl;
+    std::cout << "  bro.diffusion.createPipeline() threw expected error: "
+              << expectThrow(diff, "createPipeline", {"config", "vocabPath"}) << std::endl;
+    std::cout << "  bro.diffusion.expandNoise() threw expected error: "
+              << expectThrow(diff, "expandNoise", {"Float32Array", "src"}) << std::endl;
 
-    auto stateCtor = ev::getProperty(diff, "PipelineState");
-    assert(ev::isObject(stateCtor));
-
-    auto vaeCtor = ev::getProperty(diff, "VAE");
-    assert(ev::isObject(vaeCtor));
-
-    // Test argument validation on loadModel
-    auto loadModelFn = ev::getProperty(diff, "loadModel");
-    assert(ev::isObject(loadModelFn));
-    auto badCall = ev::call(loadModelFn, diff, {});
-    assert(badCall.thrown);
-    std::string errMsg = ev::toUtf8(badCall.value);
-    assert(errMsg.find("path") != std::string::npos);
-    std::cout << "  bro.diffusion.loadModel() threw expected error: " << errMsg << std::endl;
-
-    // Test argument validation on createPipeline
-    auto createPipeFn = ev::getProperty(diff, "createPipeline");
-    assert(ev::isObject(createPipeFn));
-    auto badPipeCall = ev::call(createPipeFn, diff, {});
-    assert(badPipeCall.thrown);
-    std::string pipeErrMsg = ev::toUtf8(badPipeCall.value);
-    assert(pipeErrMsg.find("config") != std::string::npos || pipeErrMsg.find("vocabPath") != std::string::npos);
-    std::cout << "  bro.diffusion.createPipeline() threw expected error: " << pipeErrMsg << std::endl;
-
-    // Test argument validation on expandNoise
-    auto expandNoiseFn = ev::getProperty(diff, "expandNoise");
-    assert(ev::isObject(expandNoiseFn));
-    auto badNoiseCall = ev::call(expandNoiseFn, diff, {});
-    assert(badNoiseCall.thrown);
-    std::string noiseErrMsg = ev::toUtf8(badNoiseCall.value);
-    assert(noiseErrMsg.find("Float32Array") != std::string::npos || noiseErrMsg.find("src") != std::string::npos);
-    std::cout << "  bro.diffusion.expandNoise() threw expected error: " << noiseErrMsg << std::endl;
-
-    // Test diffusion cancel
-    auto diffCancel = ev::getProperty(diff, "cancel");
-    assert(ev::isObject(diffCancel));
-    auto cancelRes = ev::call(diffCancel, diff, {});
-    assert(!cancelRes.thrown);
-    assert(ev::isUndefined(cancelRes.value));
-
-    // Test diffusion tick
-    auto diffTick = ev::getProperty(diff, "tick");
-    assert(ev::isObject(diffTick));
-    auto tickRes = ev::call(diffTick, diff, {});
-    assert(!tickRes.thrown);
-    assert(ev::isUndefined(tickRes.value));
+    expectUndefinedResult(diff, "cancel");
+    expectUndefinedResult(diff, "tick");
 
     // Check bro.triposplat
-    auto tsp = ev::getProperty(g.value, "triposplat");
-    assert(ev::isObject(tsp));
+    ev::Persistent tsp(ev::getProperty(bro.get(), "triposplat"));
+    CHECK(ev::isObject(tsp.get()));
 
-    auto tspInit = ev::getProperty(tsp, "init");
-    assert(ev::isObject(tspInit));
-    auto tspInitRes = ev::call(tspInit, tsp, {});
-    assert(!tspInitRes.thrown);
-    assert(ev::isUndefined(tspInitRes.value));
+    expectUndefinedResult(tsp, "init");
+    expectObjectProp(tsp, "TripoSplatPipeline");
 
-    auto tspPipeCtor = ev::getProperty(tsp, "TripoSplatPipeline");
-    assert(ev::isObject(tspPipeCtor));
+    std::cout << "  bro.triposplat.load() threw expected error: "
+              << expectThrow(tsp, "load", {"requires an options object", "dinov3"}) << std::endl;
+    expectUndefinedResult(tsp, "cancel");
 
-    auto tspLoadFn = ev::getProperty(tsp, "load");
-    assert(ev::isObject(tspLoadFn));
-    auto tspBadCall = ev::call(tspLoadFn, tsp, {});
-    assert(tspBadCall.thrown);
-    std::string tspErrMsg = ev::toUtf8(tspBadCall.value);
-    assert(tspErrMsg.find("requires an options object") != std::string::npos ||
-           tspErrMsg.find("dinov3") != std::string::npos);
-    std::cout << "  bro.triposplat.load() threw expected error: " << tspErrMsg << std::endl;
+    // exportPLY and exportSplat validation
+    expectThrow(tsp, "exportPLY", {});
+    expectThrow(tsp, "exportSplat", {});
 
-    auto tspCancel = ev::getProperty(tsp, "cancel");
-    assert(ev::isObject(tspCancel));
-    auto tspCancelRes = ev::call(tspCancel, tsp, {});
-    assert(!tspCancelRes.thrown);
-    assert(ev::isUndefined(tspCancelRes.value));
-
-    // Test exportPLY and exportSplat validation
-    auto expPly = ev::getProperty(tsp, "exportPLY");
-    assert(ev::isObject(expPly));
-    auto badPlyCall = ev::call(expPly, tsp, {});
-    assert(badPlyCall.thrown);
-
-    auto expSplat = ev::getProperty(tsp, "exportSplat");
-    assert(ev::isObject(expSplat));
-    auto badSplatCall = ev::call(expSplat, tsp, {});
-    assert(badSplatCall.thrown);
-
-    // Test triposplat.load dinov3 validation
+    // triposplat.load dinov3 validation
     {
         brodiffusion::api::ObjectBuilder loadOpts;
         loadOpts.set("dinov3", "/tmp/nonexistent_dino_test.safetensors");
         loadOpts.set("vae", "/tmp/nonexistent_vae_test.safetensors");
         loadOpts.set("flow", "/tmp/nonexistent_flow_test.safetensors");
         loadOpts.set("decoder", "/tmp/nonexistent_dec_test.safetensors");
-        const ev::Value lArgs[1] = {loadOpts.build()};
-        auto badLoadCall = ev::call(tspLoadFn, tsp, std::span<const ev::Value>(lArgs, 1));
-        assert(badLoadCall.thrown);
-        std::string err = ev::toUtf8(badLoadCall.value);
-        assert(err.find("dinov3") != std::string::npos);
-        std::cout << "  bro.triposplat.load() rejects non-existent dinov3: " << err << std::endl;
+        ev::Persistent opts(loadOpts.build());
+        std::cout << "  bro.triposplat.load() rejects non-existent dinov3: "
+                  << expectThrow(tsp, "load", {"dinov3"}, {&opts}) << std::endl;
     }
 
-    // Test createPipeline with euler scheduler and stepOnce
+    // createPipeline with the euler scheduler, then the Pipeline methods
     {
         auto tmp = std::filesystem::temp_directory_path();
         auto vp = tmp / "brodiffusion_api_test_vocab.json";
@@ -148,54 +163,55 @@ int main() {
         std::ofstream(vp, std::ios::binary | std::ios::trunc) << "{\"a\":1,\"a</w>\":2}";
         std::ofstream(mp) << "#version: test\n";
 
-        auto createPipeFn = ev::getProperty(diff, "createPipeline");
-        assert(ev::isObject(createPipeFn));
         brodiffusion::api::ObjectBuilder pipeOpts;
         pipeOpts.set("vocabPath", vp.string());
         pipeOpts.set("mergesPath", mp.string());
         pipeOpts.set("scheduler", "euler");
-        const ev::Value pArgs[1] = {pipeOpts.build()};
-        auto pipeRes = ev::call(createPipeFn, diff, std::span<const ev::Value>(pArgs, 1));
-        assert(!pipeRes.thrown);
-        assert(ev::isObject(pipeRes.value));
+        ev::Persistent opts(pipeOpts.build());
+        ev::CallResult pipeRes = callMethod(diff, "createPipeline", {&opts});
+        if (pipeRes.thrown) {
+            std::cerr << "FAIL: createPipeline threw: " << errorText(pipeRes) << std::endl;
+            return 1;
+        }
+        CHECK(ev::isObject(pipeRes.value));
+        ev::Persistent pipe(pipeRes.value);
 
-        auto pipeCfgFn = ev::getProperty(pipeRes.value, "config");
-        assert(ev::isObject(pipeCfgFn));
-        auto cfgRes = ev::call(pipeCfgFn, pipeRes.value, {});
-        assert(!cfgRes.thrown);
-        assert(ev::isObject(cfgRes.value));
-        std::string sched = ev::toUtf8(ev::getProperty(cfgRes.value, "scheduler"));
-        assert(sched == "euler");
-        std::cout << "  bro.diffusion.createPipeline({ scheduler: 'euler' }) config().scheduler: " << sched << std::endl;
+        {
+            ev::CallResult cfgRes = callMethod(pipe, "config");
+            CHECK(!cfgRes.thrown);
+            CHECK(ev::isObject(cfgRes.value));
+            ev::Persistent cfg(cfgRes.value);
+            std::string sched = ev::toUtf8(ev::getProperty(cfg.get(), "scheduler"));
+            CHECK(sched == "euler");
+            std::cout << "  bro.diffusion.createPipeline({ scheduler: 'euler' }) config().scheduler: "
+                      << sched << std::endl;
+        }
 
-        // Test Pipeline.stepOnce validation
-        auto stepOnceFn = ev::getProperty(pipeRes.value, "stepOnce");
-        assert(ev::isObject(stepOnceFn));
-        auto badStep = ev::call(stepOnceFn, pipeRes.value, {});
-        assert(badStep.thrown);
-        std::string stepErr = ev::toUtf8(badStep.value);
-        assert(stepErr.find("state required") != std::string::npos);
-        std::cout << "  Pipeline.prototype.stepOnce validates arguments: " << stepErr << std::endl;
+        std::cout << "  Pipeline.prototype.stepOnce validates arguments: "
+                  << expectThrow(pipe, "stepOnce", {"state required"}) << std::endl;
+        expectThrow(pipe, "generateAsync", {});
+        expectUndefinedResult(pipe, "cancel");
+        expectUndefinedResult(pipe, "tick");
 
-        // Test Pipeline.generateAsync validation
-        auto genAsyncFn = ev::getProperty(pipeRes.value, "generateAsync");
-        assert(ev::isObject(genAsyncFn));
-        auto badGen = ev::call(genAsyncFn, pipeRes.value, {});
-        assert(badGen.thrown);
-
-        // Test Pipeline.cancel
-        auto pipeCancelFn = ev::getProperty(pipeRes.value, "cancel");
-        assert(ev::isObject(pipeCancelFn));
-        auto pCancelRes = ev::call(pipeCancelFn, pipeRes.value, {});
-        assert(!pCancelRes.thrown);
-        assert(ev::isUndefined(pCancelRes.value));
-
-        // Test Pipeline.tick
-        auto pipeTickFn = ev::getProperty(pipeRes.value, "tick");
-        assert(ev::isObject(pipeTickFn));
-        auto pTickRes = ev::call(pipeTickFn, pipeRes.value, {});
-        assert(!pTickRes.thrown);
-        assert(ev::isUndefined(pTickRes.value));
+        // A handle of another class is not a Pipeline: the brand check turns
+        // it into a TypeError rather than a cast of the wrong payload.
+        {
+            ev::Persistent notPipe;
+            {
+                ev::Persistent tctor(ev::getProperty(tsp.get(), "TripoSplatPipeline"));
+                ev::Persistent tproto(ev::getProperty(tctor.get(), "prototype"));
+                notPipe.set(ev::getProperty(tproto.get(), "generate"));
+            }
+            if (ev::isFunction(notPipe.get())) {
+                ev::CallResult r = ev::call(notPipe.get(), pipe.get(), {});
+                if (!r.thrown) {
+                    std::cerr << "FAIL: TripoSplatPipeline.generate accepted a Pipeline" << std::endl;
+                    return 1;
+                }
+                std::cout << "  TripoSplatPipeline.prototype.generate rejects a Pipeline: "
+                          << errorText(r) << std::endl;
+            }
+        }
 
         std::filesystem::remove(vp);
         std::filesystem::remove(mp);
@@ -203,6 +219,8 @@ int main() {
 
     // Methods restored after the QuickJS → bronze port dropped them.
     brodiffusionTestRestoredSurface();
+
+    brodiffusionTestWithWeights();
 
     std::cout << "All brodiffusion_api standalone tests passed successfully!" << std::endl;
     return 0;

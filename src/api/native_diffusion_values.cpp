@@ -132,10 +132,11 @@ std::vector<float> downloadTensorFloats(const brotensor::Tensor& t) {
 
 bool tensorFromJs(Value v, brotensor::Tensor& out) {
     if (!ev::isObject(v)) return false;
+    ev::Persistent root(v);  // each read below allocates
     int rows = 0, cols = 0;
-    propInt(v, "rows", rows);
-    propInt(v, "cols", cols);
-    Value dv = ev::getProperty(v, "data");
+    propInt(root.get(), "rows", rows);
+    propInt(root.get(), "cols", cols);
+    Value dv = ev::getProperty(root.get(), "data");
     const float* fp = nullptr;
     size_t cnt = 0;
     if (!readFloat32Array(dv, fp, cnt)) return false;
@@ -290,10 +291,13 @@ Value attachPipelineToState(Value stateVal, Value pipelineVal) {
     return st.get();
 }
 
-brodiffusion::pipeline::Pipeline* pipelineOfState(Value stateVal) {
+PipelineWrapper* pipelineWrapperOfState(Value stateVal) {
     if (!ev::isObject(stateVal)) return nullptr;
-    Value p = ev::getProperty(stateVal, "__pipeline");
-    PipelineWrapper* pw = unwrapPipeline(p);
+    return unwrapPipeline(ev::getProperty(stateVal, "__pipeline"));
+}
+
+brodiffusion::pipeline::Pipeline* pipelineOfState(Value stateVal) {
+    PipelineWrapper* pw = pipelineWrapperOfState(stateVal);
     return pw ? pw->pipeline.get() : nullptr;
 }
 

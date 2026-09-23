@@ -40,11 +40,12 @@ bool readAlphas(Value v, std::vector<float>& out) {
         out.assign(f, f + n);
         return !out.empty();
     }
-    const uint32_t len = arrayLength(v);
+    ev::Persistent arr(v);  // arrayLength and getElement allocate
+    const uint32_t len = arrayLength(arr.get());
     if (len == 0) return false;
     out.reserve(len);
     for (uint32_t i = 0; i < len; ++i) {
-        Value e = ev::getElement(v, i);
+        Value e = ev::getElement(arr.get(), i);
         if (!ev::isNumber(e)) return false;
         out.push_back(static_cast<float>(ev::toDouble(e)));
     }

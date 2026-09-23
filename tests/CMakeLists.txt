@@ -148,7 +148,11 @@ target_compile_definitions(brodiffusion_test_flow_sampler PRIVATE
 
 # Bronze standalone JavaScript API test
 if(BRODIFFUSION_ENABLE_API)
-    add_executable(brodiffusion_test_api test_diffusion_api.cpp test_diffusion_surface.cpp)
+    add_executable(brodiffusion_test_api test_diffusion_api.cpp test_diffusion_surface.cpp
+        test_diffusion_api_weights.cpp)
+    # The weights-gated half looks under <repo>/weights/sd15 and skips without it.
+    target_compile_definitions(brodiffusion_test_api PRIVATE
+        BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
     target_include_directories(brodiffusion_test_api PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/api
     )
@@ -179,9 +183,20 @@ if(BRODIFFUSION_ENABLE_API)
         message(STATUS "brodiffusion: brodiffusion_test_api not registered (brass has no code generator for this target)")
     else()
         add_test(NAME brodiffusion_test_api COMMAND brodiffusion_test_api)
+        # The same binding test under bronze's GC stress oracle: a collection
+        # on every allocation, from-space poisoned afterwards, so a Value held
+        # across an allocating embed call crashes or reads garbage here
+        # instead of passing by luck. `ctest -LE gcstress` skips it.
+        add_test(NAME brodiffusion_test_api_gcstress COMMAND brodiffusion_test_api)
+        set_tests_properties(brodiffusion_test_api_gcstress PROPERTIES LABELS gcstress)
         if(WIN32)
             set_tests_properties(brodiffusion_test_api PROPERTIES
                 ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brodiffusion_test_api>;$ENV{PATH}")
+            set_tests_properties(brodiffusion_test_api_gcstress PROPERTIES
+                ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1;PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brodiffusion_test_api>;$ENV{PATH}")
+        else()
+            set_tests_properties(brodiffusion_test_api_gcstress PROPERTIES
+                ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1")
         endif()
     endif()
 endif()

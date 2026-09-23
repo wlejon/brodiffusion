@@ -48,6 +48,10 @@ struct PipelineWrapper {
     bool weights_loaded = false;
     std::string scheduler_name;
     std::atomic<bool> cancel_requested{false};
+    // True while a background generate owns the pipeline: the synchronous
+    // entry points refuse it rather than drive the same weights and scratch
+    // from two threads, and dispose() waits the job out.
+    std::atomic<bool> busy{false};
 
     PipelineWrapper();
     ~PipelineWrapper();
@@ -86,6 +90,13 @@ extern HostClass g_tripoSplatClass;
 extern HostClass g_vaeClass;
 
 PipelineWrapper* unwrapPipeline(Value v);
+
+inline constexpr const char* kPipelineBusy =
+    "a background generate is in flight on this Pipeline (cancel() it or wait for onDone)";
+
+// Cancel every background generate on `pw` and join its thread; the jobs'
+// onDone still fires ({cancelled: true}) on the next tick.
+void cancelAndJoinPipelineJobs(PipelineWrapper* pw);
 PipelineStateWrapper* unwrapPipelineState(Value v);
 TripoSplatWrapper* unwrapTripoSplat(Value v);
 VaeWrapper* unwrapVae(Value v);
@@ -137,6 +148,7 @@ void resolveDerivedSize(brodiffusion::pipeline::Pipeline& p,
 // so the weights cannot be collected while a state (or a clone) is alive.
 Value attachPipelineToState(Value stateVal, Value pipelineVal);
 brodiffusion::pipeline::Pipeline* pipelineOfState(Value stateVal);
+PipelineWrapper* pipelineWrapperOfState(Value stateVal);  // ALLOCATES (a property read)
 
 // Prototype decoration, split across TUs to keep each file small.
 void decoratePipelineControlProto(ObjectBuilder& proto);

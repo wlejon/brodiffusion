@@ -27,6 +27,9 @@ TripoSplatWrapper* unwrapTripoSplat(Value v) {
 
 namespace {
 
+// See tripoGenerate / bro.triposplat.cancel().
+std::atomic<uint64_t> g_tripoCancelEpoch{0};
+
 constexpr int kCanvas = 1024;
 
 inline float logitf(float p) {
@@ -142,13 +145,18 @@ bool readImageInput(Value val, std::vector<uint8_t>& rgba, int& w, int& h, std::
     }
 
     if (ev::isObject(val)) {
-        Value wVal = ev::getProperty(val, "width");
-        Value hVal = ev::getProperty(val, "height");
-        if (!ev::isUndefined(wVal) && !ev::isUndefined(hVal)) {
-            w = static_cast<int>(ev::toDouble(wVal));
+        // Every getProperty allocates: the object is rooted and each read is
+        // converted before the next.
+        ev::Persistent root(val);
+        Value wVal = ev::getProperty(root.get(), "width");
+        const bool haveW = !ev::isUndefined(wVal);
+        const double wd = haveW ? ev::toDouble(wVal) : 0.0;
+        Value hVal = ev::getProperty(root.get(), "height");
+        if (haveW && !ev::isUndefined(hVal)) {
+            w = static_cast<int>(wd);
             h = static_cast<int>(ev::toDouble(hVal));
         }
-        Value dataVal = ev::getProperty(val, "data");
+        Value dataVal = ev::getProperty(root.get(), "data");
         const uint8_t* u8Data = nullptr;
         size_t u8Count = 0;
         if (readUint8Array(dataVal, u8Data, u8Count) && u8Data) {
@@ -312,26 +320,23 @@ Value makeSplatsResult(const brodiffusion::triposplat::GaussianSplats& splats) {
 
 bool parseSplatsFromValue(Value val, brodiffusion::triposplat::GaussianSplats& out) {
     if (!ev::isObject(val)) return false;
-    const float* pos = nullptr; size_t posCount = 0;
-    const float* sc = nullptr;  size_t scCount = 0;
-    const float* rot = nullptr; size_t rotCount = 0;
-    const float* op = nullptr;  size_t opCount = 0;
-    const float* sh = nullptr;  size_t shCount = 0;
+    // Each getProperty allocates, which moves both `val` and every typed
+    // array's bytes: root the object, and copy each array out before the
+    // next read.
+    ev::Persistent root(val);
+    auto copyField = [&](const char* key, std::vector<float>& dst) {
+        const float* p = nullptr;
+        size_t n = 0;
+        if (readFloat32Array(ev::getProperty(root.get(), key), p, n) && p) dst.assign(p, p + n);
+    };
+    copyField("positions", out.positions);
+    if (out.positions.empty()) return false;
+    copyField("scales", out.scales);
+    copyField("rotations", out.rotations);
+    copyField("opacities", out.opacities);
+    copyField("sh", out.sh);
 
-    readFloat32Array(ev::getProperty(val, "positions"), pos, posCount);
-    readFloat32Array(ev::getProperty(val, "scales"), sc, scCount);
-    readFloat32Array(ev::getProperty(val, "rotations"), rot, rotCount);
-    readFloat32Array(ev::getProperty(val, "opacities"), op, opCount);
-    readFloat32Array(ev::getProperty(val, "sh"), sh, shCount);
-
-    if (!pos || posCount == 0) return false;
-    out.positions.assign(pos, pos + posCount);
-    if (sc) out.scales.assign(sc, sc + scCount);
-    if (rot) out.rotations.assign(rot, rot + rotCount);
-    if (op) out.opacities.assign(op, op + opCount);
-    if (sh) out.sh.assign(sh, sh + shCount);
-
-    Value degVal = ev::getProperty(val, "shDegree");
+    Value degVal = ev::getProperty(root.get(), "shDegree");
     if (!ev::isUndefined(degVal)) out.shDegree = static_cast<int>(ev::toDouble(degVal));
     return true;
 }
@@ -346,6 +351,14 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
     }
 
     w->cancel_requested.store(false, std::memory_order_relaxed);
+    // bro.triposplat.cancel() with no argument bumps the process-wide epoch:
+    // generate() runs inside a Worker whose handle the main thread cannot
+    // reach, so that is how the main thread stops it (as before the port).
+    const uint64_t epoch = g_tripoCancelEpoch.load(std::memory_order_acquire);
+    auto cancelled = [w, epoch]() {
+        return w->cancel_requested.load(std::memory_order_relaxed) ||
+               g_tripoCancelEpoch.load(std::memory_order_acquire) != epoch;
+    };
 
     int seed = 42, steps = 20, numGaussians = 131072;
     float guidance = 3.0f, shift = 3.0f;
@@ -411,7 +424,7 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
         w->vae->encode(vae_px, kCanvas, kCanvas, vae_tok);
         brotensor::sync_all();
 
-        if (w->cancel_requested.load(std::memory_order_relaxed)) {
+        if (cancelled()) {
             ObjectBuilder b;
             b.set("cancelled", true);
             return b.build();
@@ -436,7 +449,7 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
             auto dino_out = w->dino->encode(dino_px, kCanvas, kCanvas);
             brotensor::sync_all();
 
-            if (w->cancel_requested.load(std::memory_order_relaxed)) {
+            if (cancelled()) {
                 ObjectBuilder b;
                 b.set("cancelled", true);
                 return b.build();
@@ -476,15 +489,13 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
         sopts.steps = steps;
         sopts.guidance_scale = guidance;
         sopts.shift = shift;
-        sopts.should_cancel = [w]() {
-            return w->cancel_requested.load(std::memory_order_relaxed);
-        };
+        sopts.should_cancel = cancelled;
 
         brotensor::Tensor latent;
         brodiffusion::triposplat::sample_latent(*w->flow, feature1, feature2, noise_lat, noise_cam, sopts, latent);
         brotensor::sync_all();
 
-        if (w->cancel_requested.load(std::memory_order_relaxed)) {
+        if (cancelled()) {
             ObjectBuilder b;
             b.set("cancelled", true);
             return b.build();
@@ -608,28 +619,28 @@ Value makeTriposplatNamespace() {
             return ev::throwTypeError("load({ dinov3, vae, flow, decoder }) requires an options object");
         }
 
-        Value dinoV = ev::getProperty(args[0], "dinov3");
-        if (ev::isUndefined(dinoV) || ev::isNull(dinoV)) {
-            dinoV = ev::getProperty(args[0], "dino");
-        }
-        Value vaeV = ev::getProperty(args[0], "vae");
-        Value flowV = ev::getProperty(args[0], "flow");
-        Value decV = ev::getProperty(args[0], "decoder");
+        // Each read is converted before the next: getProperty allocates, so a
+        // Value held across it is stale (embed.h GC contract). args[0] is a
+        // rooted slot.
+        enum class Kind { Absent, String, Other };
+        auto readPath = [&](const char* key, std::string& out) -> Kind {
+            Value v = ev::getProperty(args[0], key);
+            if (ev::isString(v)) {
+                out = resolveDiffusionPath(ev::toUtf8(v));
+                return Kind::String;
+            }
+            return (ev::isUndefined(v) || ev::isNull(v)) ? Kind::Absent : Kind::Other;
+        };
 
-        if (!ev::isString(vaeV) || !ev::isString(flowV) || !ev::isString(decV)) {
+        std::string p_dino, p_vae, p_flow, p_dec;
+        Kind dinoKind = readPath("dinov3", p_dino);
+        if (dinoKind == Kind::Absent) dinoKind = readPath("dino", p_dino);
+        const bool haveRest = readPath("vae", p_vae) == Kind::String &&
+                              readPath("flow", p_flow) == Kind::String &&
+                              readPath("decoder", p_dec) == Kind::String;
+        if (!haveRest || dinoKind == Kind::Other) {
             return ev::throwTypeError("load: dinov3, vae, flow and decoder paths are all required");
         }
-
-        std::string p_dino;
-        if (ev::isString(dinoV)) {
-            p_dino = ev::toUtf8(dinoV);
-        } else if (!ev::isUndefined(dinoV) && !ev::isNull(dinoV)) {
-            return ev::throwTypeError("load: dinov3, vae, flow and decoder paths are all required");
-        }
-
-        std::string p_vae = ev::toUtf8(vaeV);
-        std::string p_flow = ev::toUtf8(flowV);
-        std::string p_dec = ev::toUtf8(decV);
 
         if (!p_dino.empty() && !std::filesystem::exists(p_dino)) {
             return ev::throwError("triposplat.load failed: cannot open dinov3 file " + p_dino);
@@ -694,9 +705,8 @@ Value makeTriposplatNamespace() {
             }
 
             // Optional BiRefNet matte model for generate()'s background removal.
-            Value rmbgV = ev::getProperty(args[0], "birefnet");
-            if (ev::isString(rmbgV)) {
-                const std::string p_rmbg = ev::toUtf8(rmbgV);
+            std::string p_rmbg;
+            if (readPath("birefnet", p_rmbg) == Kind::String) {
                 if (!p_rmbg.empty()) {
                     if (!std::filesystem::exists(p_rmbg)) {
                         return ev::throwError("triposplat.load failed: cannot open birefnet file " + p_rmbg);
@@ -713,11 +723,16 @@ Value makeTriposplatNamespace() {
         }
     });
 
+    // cancel(pipeline?) — that pipeline's run, or with no argument every
+    // generate() in flight in the process (the main thread's way to stop a
+    // Worker's run, whose handle it cannot hold).
     tsp.def("cancel", 0, [](Value, std::span<const Value> args) -> Value {
-        if (!args.empty()) {
+        if (!args.empty() && !ev::isUndefined(args[0])) {
             if (auto* w = unwrapTripoSplat(args[0])) {
                 w->cancel_requested.store(true, std::memory_order_relaxed);
             }
+        } else {
+            g_tripoCancelEpoch.fetch_add(1, std::memory_order_acq_rel);
         }
         return ev::undefined();
     });

@@ -163,6 +163,7 @@ Value krea2NumLayers(Value thisVal, std::span<const Value>) {
 Value krea2EncodePromptTaps(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.krea2EncodePromptTaps: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (!w->weights_loaded) {
         return ev::throwError("Pipeline.krea2EncodePromptTaps: call loadWeights() first");
     }
@@ -183,6 +184,7 @@ Value krea2EncodePromptTaps(Value thisVal, std::span<const Value> args) {
 Value krea2EncodeText(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.krea2EncodeText: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     brotensor::Tensor embeds, mask;
     if (args.size() < 2 || !tensorFromJs(args[0], embeds) || !tensorFromJs(args[1], mask)) {
         return ev::throwTypeError("Pipeline.krea2EncodeText(embeds, mask): {rows,cols,data} tensors required");
@@ -201,6 +203,7 @@ Value krea2EncodeText(Value thisVal, std::span<const Value> args) {
 Value krea2EncodeImagePrompt(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.krea2EncodeImagePrompt: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (!w->weights_loaded) {
         return ev::throwError("Pipeline.krea2EncodeImagePrompt: call loadWeights() first");
     }
@@ -231,6 +234,7 @@ Value krea2EncodeImagePrompt(Value thisVal, std::span<const Value> args) {
 Value krea2PrimeFromTaps(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.krea2PrimeFromTaps: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (!w->weights_loaded) {
         return ev::throwError("Pipeline.krea2PrimeFromTaps: call loadWeights() first");
     }

@@ -543,17 +543,18 @@ Value qi21PrimeEdit(Value thisVal, std::span<const Value> args) {
     std::string prompt = ev::toUtf8(args[0]);
 
     // The options object carries everything else; the `images` argument wins
-    // over any conditionImages inside it.
-    Value optsVal = args.size() >= 3 ? args[2] : ev::undefined();
-    auto opts = parseGenerateOptions(optsVal);
+    // over any conditionImages inside it. Rooted: it is read again after
+    // parseGenerateOptions and readConditionImages have allocated.
+    ev::Persistent optsRoot(args.size() >= 3 ? args[2] : ev::undefined());
+    auto opts = parseGenerateOptions(optsRoot.get());
     if (args.size() >= 2 && !ev::isUndefined(args[1]) && !ev::isNull(args[1])) {
         auto images = readConditionImages(args[1]);
         if (!images.empty()) opts.condition_images = std::move(images);
         // Condition images with no explicit canvas mean "derive it from the
         // last image's aspect" — the same rule generate() follows.
-        if (!ev::isObject(optsVal) ||
-            !ev::isNumber(ev::getProperty(optsVal, "width")) ||
-            !ev::isNumber(ev::getProperty(optsVal, "height"))) {
+        if (!ev::isObject(optsRoot.get()) ||
+            !ev::isNumber(ev::getProperty(optsRoot.get(), "width")) ||
+            !ev::isNumber(ev::getProperty(optsRoot.get(), "height"))) {
             opts.width = 0;
             opts.height = 0;
         }

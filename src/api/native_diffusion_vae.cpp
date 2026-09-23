@@ -29,7 +29,7 @@ Value vaeLoadWeights(Value thisVal, std::span<const Value> args) {
         return ev::throwTypeError("loadWeights(path, prefix?): path string required");
     }
 
-    std::string path = ev::toUtf8(args[0]);
+    std::string path = resolveDiffusionPath(ev::toUtf8(args[0]));
     std::string prefix = args.size() > 1 && ev::isString(args[1]) ? ev::toUtf8(args[1]) : "decoder.";
 
     if (!std::filesystem::exists(path)) {
@@ -68,32 +68,41 @@ Value vaeDecode(Value thisVal, std::span<const Value> args) {
     if (!w || !w->decoder) return ev::throwTypeError("VAE.decode: decoder not initialized");
     if (args.empty()) return ev::throwTypeError("VAE.decode(latent, opts?): latent required");
 
-    const float* latData = nullptr;
-    size_t latCount = 0;
     int H_lat = 64, W_lat = 64;
-
-    if (ev::isObject(args[0]) && !readFloat32Array(args[0], latData, latCount)) {
-        Value dataVal = ev::getProperty(args[0], "data");
-        readFloat32Array(dataVal, latData, latCount);
-        Value wv = ev::getProperty(args[0], "width");
-        Value hv = ev::getProperty(args[0], "height");
+    // A typed array's bytes move at the next allocation, so every property
+    // read happens first and the latent is copied out last.
+    auto readDims = [&](const Value& obj) {
+        Value wv = ev::getProperty(obj, "width");
         if (!ev::isUndefined(wv)) W_lat = static_cast<int>(ev::toDouble(wv));
+        Value hv = ev::getProperty(obj, "height");
         if (!ev::isUndefined(hv)) H_lat = static_cast<int>(ev::toDouble(hv));
-    }
+    };
+    const bool bare = ev::typedArrayInfo(args[0]).data != nullptr;
+    if (ev::isObject(args[0]) && !bare) readDims(args[0]);
+    if (args.size() > 1 && ev::isObject(args[1])) readDims(args[1]);
 
-    if (args.size() > 1 && ev::isObject(args[1])) {
-        Value wv = ev::getProperty(args[1], "width");
-        Value hv = ev::getProperty(args[1], "height");
-        if (!ev::isUndefined(wv)) W_lat = static_cast<int>(ev::toDouble(wv));
-        if (!ev::isUndefined(hv)) H_lat = static_cast<int>(ev::toDouble(hv));
+    std::vector<float> lat;
+    {
+        const float* p = nullptr;
+        size_t n = 0;
+        if (bare) {
+            readFloat32Array(args[0], p, n);
+        } else if (ev::isObject(args[0])) {
+            readFloat32Array(ev::getProperty(args[0], "data"), p, n);
+        }
+        if (p && n > 0) lat.assign(p, p + n);
     }
-
-    if (!latData || latCount == 0) {
+    if (lat.empty()) {
         return ev::throwTypeError("VAE.decode: latent must be a Float32Array or { data, width, height }");
     }
+    if (H_lat <= 0 || W_lat <= 0) {
+        return ev::throwTypeError("VAE.decode: width and height must be positive");
+    }
+    const float* latData = lat.data();
+    const size_t latCount = lat.size();
 
     const size_t inCh = static_cast<size_t>(w->decoder->config().in_channels);
-    if (latCount < inCh * H_lat * W_lat) {
+    if (latCount < inCh * static_cast<size_t>(H_lat) * static_cast<size_t>(W_lat)) {
         return ev::throwTypeError("VAE.decode: latent buffer smaller than in_channels * H_lat * W_lat");
     }
 

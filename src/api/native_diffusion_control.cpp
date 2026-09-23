@@ -169,6 +169,7 @@ Value pipelineControlVector(Value thisVal, std::span<const Value> args) {
 Value pipelineEncodeConditioning(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.encodeConditioning: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (!w->weights_loaded) {
         return ev::throwError("Pipeline.encodeConditioning: call loadWeights() first");
     }
@@ -235,6 +236,7 @@ Value pipelineRemoveControl(Value thisVal, std::span<const Value> args) {
 Value pipelineSetIdentityAnchor(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.setIdentityAnchor: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (!w->weights_loaded) {
         return ev::throwError("Pipeline.setIdentityAnchor: call loadWeights() first");
     }

@@ -27,17 +27,30 @@ namespace brodiffusion::api {
 // Every qwenImage21* method is QwenImage21-only. Returns null and leaves the
 // caller to raise a TypeError (notQi21) when `thisVal` is not a loaded
 // Qwen-Image 2.1 Pipeline.
+// Why the last qi21Pipeline() on this thread refused: every hook here reads or
+// arms state a background generate is using, so a busy pipeline is refused
+// too, and notQi21() says which it was.
+inline thread_local bool t_qi21RefusedBusy = false;
+
 inline PipelineWrapper* qi21Pipeline(Value thisVal) {
+    t_qi21RefusedBusy = false;
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return nullptr;
     if (w->pipeline->config().model_class !=
         brodiffusion::ModelClass::QwenImage21) {
         return nullptr;
     }
+    if (w->busy.load(std::memory_order_acquire)) {
+        t_qi21RefusedBusy = true;
+        return nullptr;
+    }
     return w;
 }
 
 inline Value notQi21(const char* method) {
+    if (t_qi21RefusedBusy) {
+        return ev::throwError(std::string("Pipeline.") + method + ": " + kPipelineBusy);
+    }
     return ev::throwTypeError(
         std::string("Pipeline.") + method +
         ": not a loaded Qwen-Image 2.1 Pipeline");

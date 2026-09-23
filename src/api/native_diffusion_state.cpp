@@ -25,16 +25,14 @@ namespace {
 Value stateStepOnce(Value thisVal, std::span<const Value> args) {
     auto* sw = unwrapPipelineState(thisVal);
     if (!sw) return ev::throwTypeError("PipelineState.stepOnce: not a PipelineState");
-    brodiffusion::pipeline::Pipeline* pipe = pipelineOfState(thisVal);
+    PipelineWrapper* pw = pipelineWrapperOfState(thisVal);  // thisVal is stale after this
+    brodiffusion::pipeline::Pipeline* pipe = pw ? pw->pipeline.get() : nullptr;
     if (!pipe) return ev::throwError("PipelineState.stepOnce: pipeline handle lost");
-
-    Value p = ev::getProperty(thisVal, "__pipeline");
-    if (auto* pw = unwrapPipeline(p)) {
-        if (pw->cancel_requested.load(std::memory_order_relaxed)) {
-            ObjectBuilder b;
-            b.set("cancelled", true);
-            return b.build();
-        }
+    if (pw->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
+    if (pw->cancel_requested.load(std::memory_order_relaxed)) {
+        ObjectBuilder b;
+        b.set("cancelled", true);
+        return b.build();
     }
 
     ev::Persistent ctrl(args.empty() ? ev::undefined() : args[0]);
@@ -130,8 +128,10 @@ Value stateStepOnce(Value thisVal, std::span<const Value> args) {
 Value stateDecode(Value thisVal, std::span<const Value> args) {
     auto* sw = unwrapPipelineState(thisVal);
     if (!sw) return ev::throwTypeError("PipelineState.decode: not a PipelineState");
-    brodiffusion::pipeline::Pipeline* pipe = pipelineOfState(thisVal);
+    PipelineWrapper* pw = pipelineWrapperOfState(thisVal);
+    brodiffusion::pipeline::Pipeline* pipe = pw ? pw->pipeline.get() : nullptr;
     if (!pipe) return ev::throwError("PipelineState.decode: pipeline handle lost");
+    if (pw->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
 
     const bool includeFp32 = !args.empty() && propBool(args[0], "includeFp32");
     try {
@@ -230,8 +230,11 @@ Value stateClone(Value thisVal, std::span<const Value>) {
         auto nw = std::make_unique<PipelineStateWrapper>();
         nw->state = sw->state.clone();
         nw->opts = sw->opts;
-        Value st = g_pipelineStateClass.createInstance(std::move(nw));
-        return attachPipelineToState(st, ev::getProperty(self.get(), "__pipeline"));
+        // The link is read first: a Value is stale after any allocation, and
+        // the two would otherwise be evaluated in unspecified order.
+        ev::Persistent pipe(ev::getProperty(self.get(), "__pipeline"));
+        ev::Persistent st(g_pipelineStateClass.createInstance(std::move(nw)));
+        return attachPipelineToState(st.get(), pipe.get());
     } catch (const std::exception& e) {
         return ev::throwError(std::string("PipelineState.clone failed: ") + e.what());
     }

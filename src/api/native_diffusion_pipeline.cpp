@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -76,13 +77,31 @@ static void cancelJobsForPipeline(PipelineWrapper* pw) {
     }
 }
 
+// Bumped by bro.diffusion.cancel() (no argument) and by shutdown; a
+// loadModel() in flight on any thread compares it against the value it
+// started with, so a cancel reaches a load already under way and never a
+// later one.
+static std::atomic<uint64_t> g_loadCancelEpoch{0};
+
 static void cancelAllDiffusionJobs() {
+    g_loadCancelEpoch.fetch_add(1, std::memory_order_acq_rel);
     {
         std::lock_guard<std::mutex> lock(g_pipelineRegMtx);
         for (auto* pw : g_activePipelines) if (pw) pw->cancel_requested.store(true, std::memory_order_relaxed);
     }
     std::lock_guard<std::mutex> lock(s_diffusionJobsMtx);
     for (auto& job : s_diffusionJobs) job->work->cancel.store(true, std::memory_order_release);
+}
+
+void cancelAndJoinPipelineJobs(PipelineWrapper* pw) {
+    if (!pw) return;
+    cancelJobsForPipeline(pw);
+    // The worker never takes s_diffusionJobsMtx, so joining under it is safe;
+    // the joined job stays listed for tick to deliver its onDone.
+    std::lock_guard<std::mutex> lock(s_diffusionJobsMtx);
+    for (auto& job : s_diffusionJobs) {
+        if (job->pw == pw && job->th.joinable()) job->th.join();
+    }
 }
 
 void tickDiffusionAsync() {
@@ -125,6 +144,9 @@ void tickDiffusionAsync() {
             const Value args[2] = {result.get(), info.get()};
             ev::CallResult r = ev::call(onDone, ev::undefined(), std::span<const Value>(args, 2));
             (void)r;
+        } else if (!err.empty()) {
+            // No one to tell: say it rather than drop it.
+            std::fprintf(stderr, "[bro.diffusion] background generate failed: %s\n", err.c_str());
         }
 
         job->onDone.set(ev::undefined());
@@ -133,6 +155,7 @@ void tickDiffusionAsync() {
 }
 
 void shutdownDiffusionAsync() {
+    g_loadCancelEpoch.fetch_add(1, std::memory_order_acq_rel);
     std::vector<std::unique_ptr<DiffusionJob>> all;
     {
         std::lock_guard<std::mutex> lock(s_diffusionJobsMtx);
@@ -146,9 +169,15 @@ void shutdownDiffusionAsync() {
     }
 }
 
-static Value dispatchGenerateAsync(Value thisVal, PipelineWrapper* w, std::string prompt,
+// `self` roots the Pipeline for the job's lifetime, so `w` outlives the
+// worker; both it and `onDone` arrive rooted because the caller has already
+// allocated (parseGenerateOptions) since it was handed them.
+static Value dispatchGenerateAsync(const ev::Persistent& self, PipelineWrapper* w, std::string prompt,
                                   brodiffusion::pipeline::GenerateOptions opts,
-                                  bool includeFp32, Value onDoneVal) {
+                                  bool includeFp32, const ev::Persistent& onDone) {
+    if (w->busy.exchange(true, std::memory_order_acq_rel)) {
+        return ev::throwError(kPipelineBusy);
+    }
     auto work = std::make_shared<DiffusionWork>();
     work->height = opts.height;
     work->width = opts.width;
@@ -157,9 +186,9 @@ static Value dispatchGenerateAsync(Value thisVal, PipelineWrapper* w, std::strin
     auto job = std::make_unique<DiffusionJob>();
     job->work = work;
     job->pw = w;
-    job->pipelineRef = ev::Persistent(thisVal);
-    if (ev::isFunction(onDoneVal)) {
-        job->onDone = ev::Persistent(onDoneVal);
+    job->pipelineRef.set(self.get());
+    if (ev::isFunction(onDone.get())) {
+        job->onDone.set(onDone.get());
     }
 
     w->cancel_requested.store(false, std::memory_order_relaxed);
@@ -178,6 +207,7 @@ static Value dispatchGenerateAsync(Value thisVal, PipelineWrapper* w, std::strin
         } catch (...) {
             work->error = "unknown error in generate";
         }
+        w->busy.store(false, std::memory_order_release);
         work->finished.store(true, std::memory_order_release);
     });
 
@@ -217,9 +247,11 @@ Value pipelineGenerate(Value thisVal, std::span<const Value> args) {
         return ev::throwTypeError("Pipeline.generate(prompt, opts?): string prompt required");
     }
 
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
+
+    ev::Persistent self(thisVal);  // before the first allocation below
     std::string prompt = ev::toUtf8(args[0]);
-    Value optVal = args.size() > 1 ? args[1] : ev::undefined();
-    ev::Persistent opt(optVal);
+    ev::Persistent opt(args.size() > 1 ? args[1] : ev::undefined());
     const bool includeFp32 = propBool(opt.get(), "includeFp32");
     auto opts = parseGenerateOptions(opt.get());
     try {
@@ -228,11 +260,11 @@ Value pipelineGenerate(Value thisVal, std::span<const Value> args) {
         return ev::throwError(std::string("Pipeline.generate failed: ") + e.what());
     }
 
-    Value onDoneVal = ev::isObject(opt.get()) ? ev::getProperty(opt.get(), "onDone") : ev::undefined();
-    const bool isAsync = ev::isFunction(onDoneVal) || propBool(opt.get(), "async");
+    ev::Persistent onDone(ev::isObject(opt.get()) ? ev::getProperty(opt.get(), "onDone") : ev::undefined());
+    const bool isAsync = ev::isFunction(onDone.get()) || propBool(opt.get(), "async");
 
     if (isAsync) {
-        return dispatchGenerateAsync(thisVal, w, std::move(prompt), std::move(opts), includeFp32, onDoneVal);
+        return dispatchGenerateAsync(self, w, std::move(prompt), std::move(opts), includeFp32, onDone);
     }
 
     try {
@@ -259,9 +291,9 @@ Value pipelineGenerateAsync(Value thisVal, std::span<const Value> args) {
         return ev::throwTypeError("Pipeline.generateAsync(prompt, opts?): string prompt required");
     }
 
+    ev::Persistent self(thisVal);  // before the first allocation below
     std::string prompt = ev::toUtf8(args[0]);
-    Value optVal = args.size() > 1 ? args[1] : ev::undefined();
-    ev::Persistent opt(optVal);
+    ev::Persistent opt(args.size() > 1 ? args[1] : ev::undefined());
     const bool includeFp32 = propBool(opt.get(), "includeFp32");
     auto opts = parseGenerateOptions(opt.get());
     try {
@@ -269,9 +301,9 @@ Value pipelineGenerateAsync(Value thisVal, std::span<const Value> args) {
     } catch (const std::exception& e) {
         return ev::throwError(std::string("Pipeline.generateAsync failed: ") + e.what());
     }
-    Value onDoneVal = ev::isObject(opt.get()) ? ev::getProperty(opt.get(), "onDone") : ev::undefined();
+    ev::Persistent onDone(ev::isObject(opt.get()) ? ev::getProperty(opt.get(), "onDone") : ev::undefined());
 
-    return dispatchGenerateAsync(thisVal, w, std::move(prompt), std::move(opts), includeFp32, onDoneVal);
+    return dispatchGenerateAsync(self, w, std::move(prompt), std::move(opts), includeFp32, onDone);
 }
 
 Value pipelineTextToImage(Value thisVal, std::span<const Value> args) {
@@ -280,20 +312,20 @@ Value pipelineTextToImage(Value thisVal, std::span<const Value> args) {
 
 // Shared body of imageToImage()/inpaint(): both are generate() with the init
 // (and mask) image path forced on top of the caller's opts.
-Value generateWithImages(Value thisVal, PipelineWrapper* w, const std::string& label,
-                         const std::string& prompt, Value optVal,
+Value generateWithImages(const ev::Persistent& self, PipelineWrapper* w, const std::string& label,
+                         const std::string& prompt, const ev::Persistent& opt,
                          const std::string& initPath, const std::string& maskPath) {
-    ev::Persistent opt(optVal);
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     const bool includeFp32 = propBool(opt.get(), "includeFp32");
     auto opts = parseGenerateOptions(opt.get());
     opts.init_image_path = initPath;
     if (!maskPath.empty()) opts.mask_image_path = maskPath;
 
-    Value onDoneVal = ev::isObject(opt.get()) ? ev::getProperty(opt.get(), "onDone") : ev::undefined();
-    const bool isAsync = ev::isFunction(onDoneVal) || propBool(opt.get(), "async");
+    ev::Persistent onDone(ev::isObject(opt.get()) ? ev::getProperty(opt.get(), "onDone") : ev::undefined());
+    const bool isAsync = ev::isFunction(onDone.get()) || propBool(opt.get(), "async");
 
     if (isAsync) {
-        return dispatchGenerateAsync(thisVal, w, prompt, std::move(opts), includeFp32, onDoneVal);
+        return dispatchGenerateAsync(self, w, prompt, std::move(opts), includeFp32, onDone);
     }
 
     try {
@@ -318,8 +350,9 @@ Value pipelineImageToImage(Value thisVal, std::span<const Value> args) {
     if (args.size() < 2 || !ev::isString(args[0]) || !ev::isString(args[1])) {
         return ev::throwTypeError("Pipeline.imageToImage(imagePath, prompt, opts?): string imagePath and prompt required");
     }
-    return generateWithImages(thisVal, w, "Pipeline.imageToImage", ev::toUtf8(args[1]),
-                              args.size() > 2 ? args[2] : ev::undefined(),
+    ev::Persistent self(thisVal);
+    ev::Persistent opt(args.size() > 2 ? args[2] : ev::undefined());
+    return generateWithImages(self, w, "Pipeline.imageToImage", ev::toUtf8(args[1]), opt,
                               ev::toUtf8(args[0]), std::string());
 }
 
@@ -329,8 +362,9 @@ Value pipelineInpaint(Value thisVal, std::span<const Value> args) {
     if (args.size() < 3 || !ev::isString(args[0]) || !ev::isString(args[1]) || !ev::isString(args[2])) {
         return ev::throwTypeError("Pipeline.inpaint(imagePath, maskPath, prompt, opts?): string imagePath, maskPath, prompt required");
     }
-    return generateWithImages(thisVal, w, "Pipeline.inpaint", ev::toUtf8(args[2]),
-                              args.size() > 3 ? args[3] : ev::undefined(),
+    ev::Persistent self(thisVal);
+    ev::Persistent opt(args.size() > 3 ? args[3] : ev::undefined());
+    return generateWithImages(self, w, "Pipeline.inpaint", ev::toUtf8(args[2]), opt,
                               ev::toUtf8(args[0]), ev::toUtf8(args[1]));
 }
 
@@ -344,6 +378,7 @@ Value pipelineInpaint(Value thisVal, std::span<const Value> args) {
 Value pipelineLoadWeights(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.loadWeights: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (args.empty() || !ev::isString(args[0])) {
         return ev::throwTypeError("Pipeline.loadWeights(path, ...): path string required");
     }
@@ -385,6 +420,7 @@ Value pipelineLoadWeights(Value thisVal, std::span<const Value> args) {
 Value pipelineReloadTextEncoder(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.reloadTextEncoder: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (args.empty() || !ev::isString(args[0])) {
         return ev::throwTypeError("Pipeline.reloadTextEncoder(modelDir, textEncoderPath, opts?)");
     }
@@ -412,6 +448,7 @@ Value pipelineReloadTextEncoder(Value thisVal, std::span<const Value> args) {
 Value pipelineApplyLora(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.applyLora: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (!w->weights_loaded) return ev::throwError("Pipeline.applyLora: call loadWeights() first");
     if (args.empty() || !ev::isString(args[0])) {
         return ev::throwTypeError("Pipeline.applyLora(path, scale?): path string required");
@@ -471,6 +508,7 @@ Value pipelineNumLoras(Value thisVal, std::span<const Value>) {
 Value pipelineAddControlNet(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.addControlNet: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (!w->weights_loaded) {
         return ev::throwError("Pipeline.addControlNet: call loadWeights() / loadModel() first");
     }
@@ -586,6 +624,7 @@ Value pipelineConfig(Value thisVal, std::span<const Value>) {
 Value pipelinePrime(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.prime: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (!w->weights_loaded) return ev::throwError("Pipeline.prime: call loadWeights() first");
     if (args.empty() || !ev::isString(args[0])) {
         return ev::throwTypeError("Pipeline.prime(prompt, opts?): string prompt required");
@@ -620,33 +659,34 @@ Value pipelinePrime(Value thisVal, std::span<const Value> args) {
 Value pipelineStepOnce(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.stepOnce: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (args.empty()) return ev::throwTypeError("Pipeline.stepOnce(state, ctrl?): state required");
 
     auto* sw = unwrapPipelineState(args[0]);
     if (!sw) return ev::throwTypeError("Pipeline.stepOnce: expected PipelineState argument");
 
     bool wantTrace = false;
-    Value biasVal = ev::undefined();
+    ev::Persistent bias;  // read across allocating calls below
     if (args.size() > 1) {
         if (ev::isObject(args[1])) {
             wantTrace = propBool(args[1], "trace");
-            biasVal = ev::getProperty(args[1], "attnBias");
-            if (ev::isUndefined(biasVal) || ev::isNull(biasVal)) {
-                biasVal = ev::getProperty(args[1], "logitBias");
+            bias.set(ev::getProperty(args[1], "attnBias"));
+            if (ev::isUndefined(bias.get()) || ev::isNull(bias.get())) {
+                bias.set(ev::getProperty(args[1], "logitBias"));
             }
         } else if (ev::isBool(args[1])) {
             wantTrace = ev::toBool(args[1]);
-            if (args.size() > 2) biasVal = args[2];
+            if (args.size() > 2) bias.set(args[2]);
         }
     }
 
     std::vector<brotensor::Tensor> owned;
     std::vector<const brotensor::Tensor*> ptrs;
     bool haveBias = false;
-    if (ev::isObject(biasVal)) {
+    if (ev::isObject(bias.get())) {
         haveBias = true;
         const int n = w->pipeline->num_xattn_blocks();
-        const uint32_t len = arrayLength(biasVal);
+        const uint32_t len = arrayLength(bias.get());
         if (static_cast<int>(len) != n) {
             return ev::throwRangeError(
                 "Pipeline.stepOnce: attnBias length " + std::to_string(len) +
@@ -656,7 +696,7 @@ Value pipelineStepOnce(Value thisVal, std::span<const Value> args) {
         ptrs.reserve(static_cast<size_t>(n));
         std::vector<bool> present(static_cast<size_t>(n), false);
         for (int i = 0; i < n; ++i) {
-            ev::Persistent e(ev::getElement(biasVal, static_cast<uint32_t>(i)));
+            ev::Persistent e(ev::getElement(bias.get(), static_cast<uint32_t>(i)));
             if (!ev::isObject(e.get())) continue;
             present[static_cast<size_t>(i)] = true;
             int Lq = 0, Lk = 0;
@@ -722,6 +762,7 @@ Value pipelineStepOnce(Value thisVal, std::span<const Value> args) {
 Value pipelineDecode(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.decode: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (args.empty()) return ev::throwTypeError("Pipeline.decode(state): state required");
 
     auto* sw = unwrapPipelineState(args[0]);
@@ -742,6 +783,9 @@ Value pipelineDecode(Value thisVal, std::span<const Value> args) {
 Value pipelineDispose(Value thisVal, std::span<const Value>) {
     auto* w = unwrapPipeline(thisVal);
     if (!w) return ev::throwTypeError("Pipeline.dispose: not a Pipeline");
+    // A background generate is still driving these weights: stop it and wait
+    // before they go.
+    cancelAndJoinPipelineJobs(w);
     w->pipeline.reset();
     w->weights_loaded = false;
     return ev::undefined();
@@ -780,6 +824,12 @@ void decoratePipeline(ObjectBuilder& proto) {
     proto.def("tick", 0, [](Value, std::span<const Value>) -> Value {
         tickDiffusionAsync();
         return ev::undefined();
+    });
+    // True while a background generate owns the pipeline; generate, prime,
+    // stepOnce, decode and the loaders throw until it finishes.
+    proto.accessor("busy", [](Value thisVal, std::span<const Value>) -> Value {
+        auto* w = unwrapPipeline(thisVal);
+        return ev::fromBool(w && w->busy.load(std::memory_order_acquire));
     });
 
     // Conditioning-control + identity anchor, and the per-model research
@@ -838,7 +888,14 @@ Value makeDiffusionNamespace() {
                 dirOpts.text_encoder_path = resolveDiffusionPath(tePath);
             }
         }
-        dirOpts.should_cancel = nullptr;
+        // Cooperative cancellation, as before the bronze port: a Krea 2 or
+        // Qwen-Image load reads tens of GB in one native call, and
+        // bro.diffusion.cancel() (or teardown) must be able to abandon it.
+        // from_model_dir then throws LoadCancelled -> { cancelled: true }.
+        const uint64_t epoch = g_loadCancelEpoch.load(std::memory_order_acquire);
+        dirOpts.should_cancel = [epoch]() {
+            return g_loadCancelEpoch.load(std::memory_order_acquire) != epoch;
+        };
 
         if (!std::filesystem::exists(dir)) {
             return ev::throwError(std::string("loadModel failed: model dir not found: ") + dir);
