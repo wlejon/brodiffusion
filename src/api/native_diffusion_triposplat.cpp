@@ -7,8 +7,10 @@
 #include <brovisionml/dinov3.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <random>
@@ -31,6 +33,40 @@ namespace {
 std::atomic<uint64_t> g_tripoCancelEpoch{0};
 
 constexpr int kCanvas = 1024;
+
+// Stage profiler, enabled with BRO_TRIPOSPLAT_PROFILE=1: one stderr line per
+// stage of generate(), then the total. Every GPU stage it times ends in a
+// brotensor::sync_all() (the rest is host work), so a delta is that stage's
+// real GPU + host cost rather than launch skew.
+struct TsProfiler {
+    using clock = std::chrono::steady_clock;
+    bool on = false;
+    clock::time_point t0, tStage;
+
+    TsProfiler() {
+        const char* e = std::getenv("BRO_TRIPOSPLAT_PROFILE");
+        on = e && e[0] && e[0] != '0';
+        if (on) t0 = tStage = clock::now();
+    }
+    // A GPU stage: drain the device first so the time lands on this stage.
+    void gpuStage(const char* name) {
+        if (!on) return;
+        brotensor::sync_all();
+        stage(name);
+    }
+    void stage(const char* name) {
+        if (!on) return;
+        const auto now = clock::now();
+        std::fprintf(stderr, "[triposplat] %-28s %8.1f ms\n", name,
+                     std::chrono::duration<double, std::milli>(now - tStage).count());
+        tStage = now;
+    }
+    void total() {
+        if (!on) return;
+        std::fprintf(stderr, "[triposplat] %-28s %8.1f ms\n", "TOTAL",
+                     std::chrono::duration<double, std::milli>(clock::now() - t0).count());
+    }
+};
 
 inline float logitf(float p) {
     p = std::clamp(p, 1e-6f, 1.0f - 1e-6f);
@@ -380,12 +416,15 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
         if (!ev::isUndefined(shv)) shift = static_cast<float>(ev::toDouble(shv));
     }
 
+    TsProfiler prof;
+
     std::vector<uint8_t> rgba;
     int iw = 0, ih = 0;
     std::string err;
     if (!readImageInput(args[0], rgba, iw, ih, err)) {
         return ev::throwTypeError(std::string("triposplat: ") + err);
     }
+    prof.stage("read image");
 
     // Replace the image alpha with the predicted matte so the composite over
     // black isolates the subject.
@@ -405,10 +444,12 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
         } catch (const std::exception& e) {
             return ev::throwTypeError(std::string("triposplat: birefnet: ") + e.what());
         }
+        prof.gpuStage("birefnet matte");
     }
 
     std::vector<float> rgb01;
     preprocessImage(rgba, iw, ih, rgb01);
+    prof.stage("preprocess 1024^2 (host)");
 
     try {
         const int HW = kCanvas * kCanvas;
@@ -420,9 +461,11 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
             }
         }
         brotensor::Tensor vae_px = uploadCompute(vae_in.data(), 1, 3 * HW);
+        prof.stage("vae input prep (host)");
         brotensor::Tensor vae_tok;
         w->vae->encode(vae_px, kCanvas, kCanvas, vae_tok);
         brotensor::sync_all();
+        prof.stage("vae encode");
 
         if (cancelled()) {
             ObjectBuilder b;
@@ -446,8 +489,10 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
             }
             brotensor::Tensor dino_px = brotensor::Tensor::from_host_on(
                 w->dino->device(), dino_in.data(), 1, 3 * HW);
+            prof.stage("dino input prep (host)");
             auto dino_out = w->dino->encode(dino_px, kCanvas, kCanvas);
             brotensor::sync_all();
+            prof.stage("dinov3 encode");
 
             if (cancelled()) {
                 ObjectBuilder b;
@@ -455,12 +500,27 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
                 return b.build();
             }
 
-            if (brotensor::compute_dtype() == brotensor::Dtype::FP16 &&
-                dino_out.last_hidden_state.dtype != brotensor::Dtype::FP16) {
-                brotensor::cast(dino_out.last_hidden_state, feature1, brotensor::Dtype::FP16);
-            } else {
-                feature1 = std::move(dino_out.last_hidden_state);
+            // feature1 = an affine-free LayerNorm over the channels of the
+            // (already HF-normed) DINOv3 output — the reference's
+            // F.layer_norm(dinov3_feat, [-1]). Done on the device in FP32
+            // (last_hidden_state is always FP32), then cast to the compute
+            // dtype.
+            const brotensor::Tensor& hs = dino_out.last_hidden_state;
+            if (hs.cols != D1 || hs.rows != K) {
+                throw std::runtime_error("DINOv3 features are " + std::to_string(hs.rows) + "x" +
+                                         std::to_string(hs.cols) + ", expected " +
+                                         std::to_string(K) + "x" + std::to_string(D1));
             }
+            std::vector<float> ones(static_cast<size_t>(D1), 1.0f);
+            brotensor::Tensor g = brotensor::Tensor::from_host_on(hs.device, ones.data(), D1, 1);
+            brotensor::Tensor normed;
+            brotensor::layernorm_forward_inference_batched(hs, g, normed, 1e-5f);
+            if (brotensor::compute_dtype() == brotensor::Dtype::FP16) {
+                brotensor::cast(normed, feature1, brotensor::Dtype::FP16);
+            } else {
+                feature1 = std::move(normed);
+            }
+            prof.gpuStage("feature1 layernorm");
         } else {
             std::vector<float> f1(static_cast<size_t>(K) * D1, 0.0f);
             feature1 = uploadCompute(f1.data(), K, D1);
@@ -469,11 +529,15 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
         std::vector<float> vt = downloadF32(vae_tok);
         const int Tvae = vae_tok.rows;
         const int prefix = K - Tvae;
-        std::vector<float> f2(static_cast<size_t>(K) * D2, 0.0f);
-        if (prefix >= 0 && vt.size() <= f2.size() - static_cast<size_t>(prefix) * D2) {
-            std::copy(vt.begin(), vt.end(), f2.begin() + static_cast<size_t>(prefix) * D2);
+        if (prefix < 0 || vae_tok.cols != D2) {
+            throw std::runtime_error("VAE tokens are " + std::to_string(Tvae) + "x" +
+                                     std::to_string(vae_tok.cols) + ", expected at most " +
+                                     std::to_string(K) + "x" + std::to_string(D2));
         }
+        std::vector<float> f2(static_cast<size_t>(K) * D2, 0.0f);
+        std::copy(vt.begin(), vt.end(), f2.begin() + static_cast<size_t>(prefix) * D2);
         brotensor::Tensor feature2 = uploadCompute(f2.data(), K, D2);
+        prof.stage("feature2 assemble (host)");
 
         const auto& fc = w->flow->config();
         std::mt19937_64 rng(static_cast<uint64_t>(static_cast<uint32_t>(seed)));
@@ -494,6 +558,11 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
         brotensor::Tensor latent;
         brodiffusion::triposplat::sample_latent(*w->flow, feature1, feature2, noise_lat, noise_cam, sopts, latent);
         brotensor::sync_all();
+        if (prof.on) {
+            char label[64];
+            std::snprintf(label, sizeof label, "flow sampler (%d steps)", steps);
+            prof.stage(label);
+        }
 
         if (cancelled()) {
             ObjectBuilder b;
@@ -503,6 +572,7 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
 
         brodiffusion::triposplat::GaussianSplats splats =
             w->decoder->decode(latent, numGaussians, static_cast<uint64_t>(static_cast<uint32_t>(seed)));
+        prof.gpuStage("octree decode");
 
         // model space (z-up) -> scene space (y-up): (x, y, z) -> (x, -z, y)
         const float s2 = 0.70710678118654752440f;
@@ -522,7 +592,10 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
         }
 
         w->lastSplats = splats;
-        return makeSplatsResult(splats);
+        Value result = makeSplatsResult(splats);
+        prof.stage("pack typed arrays");
+        prof.total();
+        return result;
     } catch (const brodiffusion::triposplat::SampleCancelled&) {
         ObjectBuilder b;
         b.set("cancelled", true);

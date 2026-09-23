@@ -113,6 +113,52 @@ void triposplatWithWeights() {
     }
     std::filesystem::remove(ply, ec);
     std::filesystem::remove(splat, ec);
+
+    // With the DINOv3 backbone (BRODIFFUSION_DINOV3, else
+    // weights/triposplat/clip_vision, else the brovisionml sibling's copy) and
+    // the stage profiler on: the feature1 LayerNorm path and every profiler
+    // probe run.
+    std::filesystem::path dino;
+    if (const char* e = std::getenv("BRODIFFUSION_DINOV3"); e && *e) dino = e;
+    const std::filesystem::path candidates[] = {
+        root / "clip_vision/dino_v3_vit_h.safetensors",
+        std::filesystem::path(BRODIFFUSION_WEIGHTS_DIR) /
+            "../../brovisionml/weights/triposplat/clip_vision/dino_v3_vit_h.safetensors",
+    };
+    for (const auto& c : candidates) {
+        if (dino.empty() && std::filesystem::exists(c)) dino = c;
+    }
+    if (dino.empty() || !std::filesystem::exists(dino)) {
+        std::cout << "  triposplat + dinov3 skipped (no DINOv3 weights)" << std::endl;
+        return;
+    }
+#ifdef _WIN32
+    _putenv_s("BRO_TRIPOSPLAT_PROFILE", "1");
+#else
+    setenv("BRO_TRIPOSPLAT_PROFILE", "1", 1);
+#endif
+    expectOk("triposplat + dinov3 generate (profiled)", R"JS(
+        (function() {
+            const tp = bro.triposplat.load({ dinov3: ")JS" + dino.generic_string() + R"JS(", vae: ")JS" + vae +
+                                           R"JS(", flow: ")JS" + flow + R"JS(", decoder: ")JS" + dec + R"JS(" });
+            const W = 64, H = 64, px = new Uint8ClampedArray(W * H * 4);
+            for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+                const i = (y * W + x) * 4, inside = x > 16 && x < 48 && y > 16 && y < 48;
+                px[i] = 40; px[i + 1] = 90; px[i + 2] = 200; px[i + 3] = inside ? 255 : 0;
+            }
+            const s = tp.generate({ data: px, width: W, height: H }, { steps: 2, numGaussians: 4096, seed: 1 });
+            if (s.cancelled) throw new Error("cancelled");
+            if (!(s.count > 0)) throw new Error("splats " + s.count);
+            for (let i = 0; i < s.positions.length; i++)
+                if (!Number.isFinite(s.positions[i])) throw new Error("non-finite position at " + i);
+            return "OK";
+        })()
+    )JS");
+#ifdef _WIN32
+    _putenv_s("BRO_TRIPOSPLAT_PROFILE", "");
+#else
+    unsetenv("BRO_TRIPOSPLAT_PROFILE");
+#endif
 }
 
 // bro.diffusion.loadTerrain over the converted terrain-diffusion checkpoint:
