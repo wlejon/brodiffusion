@@ -195,8 +195,11 @@ Value stateSetLatent(Value thisVal, std::span<const Value> args) {
 Value stateKrea2StepTimestep(Value thisVal, std::span<const Value>) {
     auto* sw = unwrapPipelineState(thisVal);
     if (!sw) return ev::throwTypeError("PipelineState.krea2StepTimestep: not a PipelineState");
-    brodiffusion::pipeline::Pipeline* pipe = pipelineOfState(thisVal);
+    PipelineWrapper* pw = pipelineWrapperOfState(thisVal);
+    brodiffusion::pipeline::Pipeline* pipe = pw ? pw->pipeline.get() : nullptr;
     if (!pipe) return ev::throwError("PipelineState.krea2StepTimestep: pipeline handle lost");
+    // The schedule it reads is rewritten by a background generate's prime().
+    if (pw->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     try {
         return ev::fromDouble(static_cast<double>(pipe->krea_step_timestep(sw->state)));
     } catch (const std::exception& e) {
@@ -211,8 +214,10 @@ Value stateKrea2StepTimestep(Value thisVal, std::span<const Value>) {
 Value stateQwenImage21StepTimestep(Value thisVal, std::span<const Value>) {
     auto* sw = unwrapPipelineState(thisVal);
     if (!sw) return ev::throwTypeError("PipelineState.qwenImage21StepTimestep: not a PipelineState");
-    brodiffusion::pipeline::Pipeline* pipe = pipelineOfState(thisVal);
+    PipelineWrapper* pw = pipelineWrapperOfState(thisVal);
+    brodiffusion::pipeline::Pipeline* pipe = pw ? pw->pipeline.get() : nullptr;
     if (!pipe) return ev::throwError("PipelineState.qwenImage21StepTimestep: pipeline handle lost");
+    if (pw->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     try {
         return ev::fromDouble(static_cast<double>(pipe->qi21_step_timestep(sw->state)));
     } catch (const std::exception& e) {

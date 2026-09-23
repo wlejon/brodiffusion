@@ -315,6 +315,7 @@ void brodiffusionTestWithWeights() {
         (function() {
             const p = globalThis.__pipe;
             globalThis.__done = null;
+            const st = p.prime("a green hill", { width: 256, height: 256, steps: 2, seed: 5 });
             p.generate("a green hill", { width: 512, height: 512, steps: 30, seed: 5,
                 onDone: (img, info) => { globalThis.__done = { img, info }; } });
             // Every research setter (and the readers of state the job
@@ -336,6 +337,12 @@ void brodiffusionTestWithWeights() {
                 let refused = "";
                 try { p[name](...hooks[name]); } catch (e) { refused = e.message; }
                 if (!/in flight/.test(refused)) throw new Error(name + " while busy: " + refused);
+            }
+            // A state's schedule readers too: the job's prime() rewrites it.
+            for (const name of ["krea2StepTimestep", "qwenImage21StepTimestep", "stepOnce", "decode"]) {
+                let refused = "";
+                try { st[name](); } catch (e) { refused = e.message; }
+                if (!/in flight/.test(refused)) throw new Error("state." + name + " while busy: " + refused);
             }
             p.dispose();
             if (p.busy) throw new Error("busy after dispose");
