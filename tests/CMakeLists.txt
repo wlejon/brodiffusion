@@ -45,6 +45,12 @@ brodiffusion_add_test(brodiffusion_test_dcae_decoder test_dcae_decoder.cpp)
 target_compile_definitions(brodiffusion_test_dcae_decoder PRIVATE
     BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
 
+# Terrain world determinism: the same GPU read twice is bit-identical, gated on
+# weights/terrain-diffusion-30m-bro (skips cleanly when absent).
+brodiffusion_add_test(brodiffusion_test_terrain_determinism test_terrain_determinism.cpp)
+target_compile_definitions(brodiffusion_test_terrain_determinism PRIVATE
+    BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
+
 # Qwen-Image VAE (Krea 2 decoder) test: an unconditional synthetic-weights
 # smoke test plus a real-weights numerical smoke test gated on
 # weights/krea-2-raw/vae (skips cleanly when absent).

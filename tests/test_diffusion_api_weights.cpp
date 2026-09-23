@@ -201,9 +201,11 @@ void terrainWithWeights() {
                 dBig = Math.max(dBig, Math.abs(v - big.data[y * 24 + x]));
                 dAgain = Math.max(dAgain, Math.abs(v - again.data[y * 16 + x]));
             }
-            // Agreement to within FP16 rounding, not bitwise: the GPU run is
-            // not bit-reproducible (a re-read of the same cells after
-            // clearCache drifts by a few cm at ~1000 m, under one FP16 ULP).
+            // Agreement to within FP16 rounding, not bitwise: reads with a
+            // different cache state batch the latent stage differently, and
+            // the batch size changes the reduction order (a few cm at ~1000 m,
+            // under one FP16 ULP). The same request from the same cache state
+            // is bit-identical — brodiffusion_test_terrain_determinism.
             if (dBig > 0.25 || dAgain > 0.25)
                 throw new Error("region not a pure function of position: inside a larger read " + dBig +
                                 " m, after clearCache " + dAgain + " m (range " + lo + ".." + hi + " m)");

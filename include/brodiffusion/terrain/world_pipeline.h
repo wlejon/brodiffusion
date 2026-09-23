@@ -32,8 +32,25 @@
 // Coarse-map cells, not metres and not pixels of the final terrain. One coarse
 // cell is `native_resolution * latent_compression * 32` metres on a side. World
 // coordinates are signed and unbounded in both axes; nothing here has an origin
-// bias, and a region generates identically regardless of what was generated
+// bias, and a region generates the same world regardless of what was generated
 // before it.
+//
+// ── Determinism on the GPU ─────────────────────────────────────────────────
+//
+// The same request against the same cache state is bit-identical, run to run
+// and pipeline to pipeline (tests/test_terrain_determinism.cpp). What is NOT
+// bit-identical is the same cells reached through a different request history
+// — read cold vs. with neighbours cached, or inside a larger region — which
+// differ by FP16 rounding (a few centimetres of elevation at ~1000 m, under one
+// FP16 ULP of the result). That is reduction order, not a race: the latent
+// stage batches up to kLatentBatch windows per forward, and which windows share
+// a forward depends on what the request finds uncached. A sample's output does
+// not depend on its batch-mates (the test checks that bitwise), but it does
+// depend on the batch SIZE: brotensor's FP16 linear takes a split-K GEMV for
+// B <= 4 rows and the tiled GEMM above that, and the two sum in different
+// orders. The coarse and decoder stages run one window at a time and are
+// unaffected. Bit-reproducibility across histories would need every latent
+// forward at a fixed batch size; it is not worth the compute.
 
 #pragma once
 
@@ -155,8 +172,10 @@ public:
     TileBuffer latent_init(std::int64_t i1, std::int64_t j1,
                            std::int64_t i2, std::int64_t j2);
 
-    // Drop every cached tile. Purely an optimisation — the world is a pure
-    // function of (seed, position), so a cleared cache changes nothing but time.
+    // Drop every cached tile. The world is a function of (seed, position), so
+    // a cleared cache changes nothing but time — up to FP16 rounding, since a
+    // re-read may batch the latent stage differently (see "Determinism on the
+    // GPU" above).
     void clear_cache();
 
 private:

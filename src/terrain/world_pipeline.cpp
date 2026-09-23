@@ -510,9 +510,11 @@ std::vector<TileBuffer> WorldPipeline::latent_step_(
     }
 
     // One batched forward for the whole group. `f` is pure, so batching is a
-    // scheduling concern only — the infinite-tensor gate proved the graph is
-    // batch-invariant, and any residual batch dependence would come from cuDNN
-    // algorithm selection inside the network rather than from here.
+    // scheduling concern only, up to rounding: a sample never reads its
+    // batch-mates, but the batch size picks the GEMM kernels (brotensor's FP16
+    // linear is a split-K GEMV for B <= 4), so the same window batched 4 and
+    // batched 5+ differ by FP16 rounding. See "Determinism on the GPU" in
+    // world_pipeline.h.
     brotensor::Tensor xt = brodiffusion::detail::upload_host(
         x_in.data(), static_cast<int>(B), static_cast<int>(n));
     std::vector<float> labels(B, t);
