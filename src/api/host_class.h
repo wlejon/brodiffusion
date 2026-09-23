@@ -50,7 +50,9 @@ public:
 
     void setStatic(const char* name, Value v) const;
 
-    void* unwrap(Value val) const { return ev::handleData(val); }
+    // The payload of a handle THIS class made; nullptr for anything else,
+    // including a handle of another class (host_class.cpp, brands).
+    void* unwrap(Value val) const;
 
     Value prototype() const;
     Value constructor() const;

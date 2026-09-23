@@ -1,6 +1,7 @@
 #include "host_class.h"
 #include "object_builder.h"
 
+#include <mutex>
 #include <unordered_map>
 
 namespace brodiffusion::api {
@@ -14,6 +15,54 @@ namespace {
 std::unordered_map<const HostClass*, HostClass::Slots>& threadSlots() {
     static thread_local std::unordered_map<const HostClass*, HostClass::Slots> t;
     return t;
+}
+
+// registerGlobal + globalThis[name]. The value and globalThis are rooted:
+// registerGlobal and setProperty both allocate.
+void publishGlobal(const char* name, Value val) {
+    ev::Persistent v(val);
+    ev::registerGlobal(name, v.get());
+    ev::GlobalValue gt = ev::globalValue("globalThis");
+    if (gt.found && ev::isObject(gt.value)) {
+        ev::Persistent global(gt.value);
+        ev::setProperty(global.get(), name, v.get());
+    }
+}
+
+// ── Brands ──────────────────────────────────────────────────────────────────
+// ev::handleData answers the payload of ANY handle, so a method called with a
+// receiver of another class (`Pipeline.prototype.generate.call(vae)`) would
+// cast one class's payload to another's. Every payload made here is
+// registered with the class that made it; unwrap() answers only for its own.
+struct Brand {
+    const HostClass* cls;
+    ev::HandleDestructor dtor;
+};
+
+std::mutex& brandMutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::unordered_map<const void*, Brand>& brands() {
+    static auto* m = new std::unordered_map<const void*, Brand>();  // outlives every sweep
+    return *m;
+}
+
+// The destructor every branded handle carries: unregister, then run the
+// class's own destructor.
+void brandedDestroy(void* data) {
+    ev::HandleDestructor dtor = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(brandMutex());
+        auto& m = brands();
+        auto it = m.find(data);
+        if (it != m.end()) {
+            dtor = it->second.dtor;
+            m.erase(it);
+        }
+    }
+    if (dtor) dtor(data);
 }
 
 }  // namespace
@@ -52,21 +101,13 @@ void HostClass::install(const char* name, uint32_t arity, ev::NativeFn body,
         s.proto = new ev::Persistent(proto.get());
     }
 
-    ev::registerGlobal(name, s.ctor->get());
-    ev::GlobalValue gt = ev::globalValue("globalThis");
-    if (gt.found && !gt.value.isUndefined() && ev::isObject(gt.value)) {
-        ev::setProperty(gt.value, name, s.ctor->get());
-    }
+    publishGlobal(name, s.ctor->get());
 }
 
 void HostClass::alias(const char* name) const {
     const Slots* s = slotsIfAny();
     if (!s || !s->ctor) return;
-    ev::registerGlobal(name, s->ctor->get());
-    ev::GlobalValue gt = ev::globalValue("globalThis");
-    if (gt.found && !gt.value.isUndefined() && ev::isObject(gt.value)) {
-        ev::setProperty(gt.value, name, s->ctor->get());
-    }
+    publishGlobal(name, s->ctor->get());
 }
 
 void HostClass::inherit(const HostClass& base) const {
@@ -83,9 +124,22 @@ void HostClass::inherit(const HostClass& base) const {
 }
 
 Value HostClass::make(void* data, ev::HandleDestructor dtor, ev::Finalize when) const {
+    if (data) {
+        std::lock_guard<std::mutex> lk(brandMutex());
+        brands()[data] = Brand{this, dtor};
+    }
     const Slots* s = slotsIfAny();
-    if (!s || !s->proto) return ev::makeHandle(data, dtor, when);
-    return ev::makeHandle(data, dtor, when, s->proto->get());
+    if (!s || !s->proto) return ev::makeHandle(data, brandedDestroy, when);
+    return ev::makeHandle(data, brandedDestroy, when, s->proto->get());
+}
+
+void* HostClass::unwrap(Value val) const {
+    void* data = ev::handleData(val);
+    if (!data) return nullptr;
+    std::lock_guard<std::mutex> lk(brandMutex());
+    auto& m = brands();
+    auto it = m.find(data);
+    return (it != m.end() && it->second.cls == this) ? data : nullptr;
 }
 
 void HostClass::setStatic(const char* name, Value v) const {

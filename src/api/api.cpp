@@ -8,30 +8,31 @@ void installDiffusion() {
     ensureTriposplatClassesInstalled();
     ensureVaeClassesInstalled();
 
-    Value globalThisVal = ev::undefined();
-    auto gt = ev::globalValue("globalThis");
-    if (gt.found && ev::isObject(gt.value)) {
-        globalThisVal = gt.value;
+    // Every Value below that outlives an allocating call rides in a
+    // Persistent (embed.h GC contract): getProperty, createObject and
+    // setProperty may each move everything.
+    ev::Persistent globalThisP;
+    {
+        auto gt = ev::globalValue("globalThis");
+        if (gt.found && ev::isObject(gt.value)) globalThisP.set(gt.value);
     }
 
-    Value broVal = ev::globalValue("bro").found ? ev::globalValue("bro").value : ev::undefined();
-    if (!ev::isObject(broVal)) {
-        if (!ev::isUndefined(globalThisVal)) {
-            Value candidate = ev::getProperty(globalThisVal, "bro");
-            if (ev::isObject(candidate)) {
-                broVal = candidate;
-            }
+    ev::Persistent broP;
+    {
+        auto bg = ev::globalValue("bro");
+        if (bg.found && ev::isObject(bg.value)) broP.set(bg.value);
+    }
+    if (!ev::isObject(broP.get()) && ev::isObject(globalThisP.get())) {
+        Value candidate = ev::getProperty(globalThisP.get(), "bro");
+        if (ev::isObject(candidate)) broP.set(candidate);
+    }
+    if (!ev::isObject(broP.get())) {
+        broP.set(ev::createObject());
+        ev::registerGlobal("bro", broP.get());
+        if (ev::isObject(globalThisP.get())) {
+            globalThisP.set(ev::setProperty(globalThisP.get(), "bro", broP.get()));
         }
     }
-    if (!ev::isObject(broVal)) {
-        broVal = ev::createObject();
-        ev::registerGlobal("bro", broVal);
-        if (!ev::isUndefined(globalThisVal)) {
-            ev::setProperty(globalThisVal, "bro", broVal);
-        }
-    }
-
-    ev::Persistent broP(broVal);
 
     // Mount bro.diffusion
     Value diffVal = makeDiffusionNamespace();
