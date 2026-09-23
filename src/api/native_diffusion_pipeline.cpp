@@ -1042,6 +1042,11 @@ Value makeDiffusionNamespace() {
     ensureVaeClassesInstalled();
     diff.set("VAE", g_vaeClass.constructor());
 
+    // The terrain-diffusion world generator.
+    ensureTerrainClassInstalled();
+    diff.def("loadTerrain", 2, loadTerrain);
+    diff.set("TerrainWorld", terrainConstructor());
+
     return diff.build();
 }
 

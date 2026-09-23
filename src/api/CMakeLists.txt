@@ -11,6 +11,7 @@ add_library(brodiffusion_api STATIC
     native_diffusion_state.cpp
     native_diffusion_triposplat.cpp
     native_diffusion_vae.cpp
+    native_diffusion_terrain.cpp
 )
 
 target_include_directories(brodiffusion_api PUBLIC

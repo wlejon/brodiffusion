@@ -128,6 +128,16 @@ int main() {
     expectUndefinedResult(diff, "cancel");
     expectUndefinedResult(diff, "tick");
 
+    // Terrain: the class is mounted and the loader validates before touching
+    // any weights.
+    expectObjectProp(diff, "TerrainWorld");
+    std::cout << "  bro.diffusion.loadTerrain() threw expected error: "
+              << expectThrow(diff, "loadTerrain", {"weightsDir"}) << std::endl;
+    {
+        ev::Persistent missing(ev::fromUtf8("/nonexistent/terrain-dir"));
+        expectThrow(diff, "loadTerrain", {"config.json"}, {&missing});
+    }
+
     // Check bro.triposplat
     ev::Persistent tsp(ev::getProperty(bro.get(), "triposplat"));
     CHECK(ev::isObject(tsp.get()));

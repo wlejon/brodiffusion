@@ -115,7 +115,67 @@ void triposplatWithWeights() {
     std::filesystem::remove(splat, ec);
 }
 
+// bro.diffusion.loadTerrain over the converted terrain-diffusion checkpoint:
+// every stage's read has the documented shape, and a region is a pure
+// function of (seed, position) — the same cells read cold, cached, and as
+// part of a larger region agree.
+void terrainWithWeights() {
+    const std::filesystem::path dir =
+        std::filesystem::path(BRODIFFUSION_WEIGHTS_DIR) / "terrain-diffusion-30m-bro";
+    if (!std::filesystem::exists(dir / "config.json")) {
+        std::cout << "  terrain skipped (no weights/terrain-diffusion-30m-bro)" << std::endl;
+        return;
+    }
+    expectOk("terrain load / stages / determinism", R"JS(
+        (function() {
+            const t = bro.diffusion.loadTerrain(")JS" + dir.generic_string() + R"JS(", { seed: 1234 });
+            if (!(t instanceof bro.diffusion.TerrainWorld)) throw new Error("instanceof");
+            if (t.seed !== 1234) throw new Error("seed " + t.seed);
+            const cfg = t.config();
+            if (cfg.nativeResolution !== 30 || cfg.latentCellMetres !== 240) throw new Error("config " + JSON.stringify(cfg));
+            const shape = (r, c, h, w, what) => {
+                if (r.channels !== c || r.height !== h || r.width !== w || r.data.length !== c * h * w)
+                    throw new Error(what + " shape " + [r.channels, r.height, r.width, r.data.length]);
+            };
+            shape(t.coarse(-2, -2, 2, 2), 6, 4, 4, "coarse");
+            shape(t.coarse(-2, -2, 2, 2, { weighted: true }), 7, 4, 4, "coarse weighted");
+            shape(t.latent(0, 0, 8, 8), 5, 8, 8, "latent");
+            shape(t.residual(0, 0, 16, 16), 1, 16, 16, "residual");
+            const e = t.elevation(0, 0, 16, 16);
+            shape(e, 1, 16, 16, "elevation");
+            for (const v of e.data) if (!Number.isFinite(v)) throw new Error("non-finite elevation");
+            // The same cells inside a larger read, and again after a cache drop.
+            const big = t.elevation(0, 0, 24, 24);
+            t.clearCache();
+            const again = t.elevation(0, 0, 16, 16);
+            let dBig = 0, dAgain = 0, lo = Infinity, hi = -Infinity;
+            for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {
+                const v = e.data[y * 16 + x];
+                lo = Math.min(lo, v); hi = Math.max(hi, v);
+                dBig = Math.max(dBig, Math.abs(v - big.data[y * 24 + x]));
+                dAgain = Math.max(dAgain, Math.abs(v - again.data[y * 16 + x]));
+            }
+            // Agreement to within FP16 rounding, not bitwise: the GPU run is
+            // not bit-reproducible (a re-read of the same cells after
+            // clearCache drifts by a few cm at ~1000 m, under one FP16 ULP).
+            if (dBig > 0.25 || dAgain > 0.25)
+                throw new Error("region not a pure function of position: inside a larger read " + dBig +
+                                " m, after clearCache " + dAgain + " m (range " + lo + ".." + hi + " m)");
+            let msg = "";
+            try { t.elevation(0, 0, 0, 16); } catch (err) { msg = err.message; }
+            if (!/empty/.test(msg)) throw new Error("empty region: " + msg);
+            t.dispose();
+            try { t.elevation(0, 0, 4, 4); msg = ""; } catch (err) { msg = err.message; }
+            if (!/not a loaded/.test(msg)) throw new Error("after dispose: " + msg);
+            return "OK";
+        })()
+    )JS");
+}
+
 void brodiffusionTestWithWeights() {
+    std::cout << "[weights] bro.diffusion.loadTerrain..." << std::endl;
+    terrainWithWeights();
+
     std::cout << "[weights] bro.triposplat..." << std::endl;
     triposplatWithWeights();
 

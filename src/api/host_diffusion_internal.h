@@ -106,6 +106,12 @@ void ensureTriposplatClassesInstalled();
 void ensureVaeClassesInstalled();
 
 Value makeDiffusionNamespace();
+
+// bro.diffusion.loadTerrain and its TerrainWorld class
+// (native_diffusion_terrain.cpp).
+void ensureTerrainClassInstalled();
+Value terrainConstructor();
+Value loadTerrain(Value thisVal, std::span<const Value> args);
 Value makeTriposplatNamespace();
 
 Value makeFloat32Array(const float* data, size_t count);
