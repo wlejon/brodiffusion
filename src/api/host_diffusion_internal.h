@@ -28,6 +28,9 @@
 namespace brovisionml::dinov3 {
 class Backbone;
 }
+namespace brovisionml::birefnet {
+class BiRefNet;
+}
 
 namespace brodiffusion::api {
 
@@ -62,6 +65,9 @@ struct TripoSplatWrapper {
     std::unique_ptr<brodiffusion::triposplat::FlowDiT> flow;
     std::unique_ptr<brodiffusion::triposplat::OctreeGaussianDecoder> decoder;
     std::unique_ptr<brodiffusion::triposplat::Flux2VaeEncoder> vae;
+    // Optional BiRefNet matte model (load({ birefnet })): generate() isolates
+    // the subject before encoding, unless opts.removeBackground is false.
+    std::unique_ptr<brovisionml::birefnet::BiRefNet> rmbg;
     brotensor::Device device = brotensor::Device::CPU;
     brodiffusion::triposplat::GaussianSplats lastSplats;
     std::atomic<bool> cancel_requested{false};

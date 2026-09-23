@@ -3,6 +3,7 @@
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
+#include <brovisionml/birefnet.h>
 #include <brovisionml/dinov3.h>
 
 #include <algorithm>
@@ -348,7 +349,12 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
 
     int seed = 42, steps = 20, numGaussians = 131072;
     float guidance = 3.0f, shift = 3.0f;
+    // BiRefNet bg-removal runs whenever the matte model is loaded; opts can
+    // turn it off per call (an already-masked input) without a reload.
+    bool removeBackground = (w->rmbg != nullptr);
     if (args.size() > 1 && ev::isObject(args[1])) {
+        Value rbv = ev::getProperty(args[1], "removeBackground");
+        if (!ev::isUndefined(rbv)) removeBackground = ev::toBool(rbv);
         Value sv = ev::getProperty(args[1], "seed");
         if (!ev::isUndefined(sv)) seed = static_cast<int>(ev::toDouble(sv));
         Value stv = ev::getProperty(args[1], "steps");
@@ -366,6 +372,26 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
     std::string err;
     if (!readImageInput(args[0], rgba, iw, ih, err)) {
         return ev::throwTypeError(std::string("triposplat: ") + err);
+    }
+
+    // Replace the image alpha with the predicted matte so the composite over
+    // black isolates the subject.
+    if (w->rmbg && removeBackground) {
+        try {
+            const size_t n = static_cast<size_t>(iw) * static_cast<size_t>(ih);
+            std::vector<float> rgb(n * 3);
+            for (size_t i = 0; i < n; ++i) {
+                rgb[i * 3 + 0] = rgba[i * 4 + 0];
+                rgb[i * 3 + 1] = rgba[i * 4 + 1];
+                rgb[i * 3 + 2] = rgba[i * 4 + 2];
+            }
+            brovisionml::birefnet::Matte m = w->rmbg->removeBackground(rgb.data(), iw, ih, /*rgbIs255=*/true);
+            for (size_t i = 0; i < m.alpha.size() && i < n; ++i) {
+                rgba[i * 4 + 3] = static_cast<uint8_t>(std::clamp(m.alpha[i], 0.0f, 1.0f) * 255.0f + 0.5f);
+            }
+        } catch (const std::exception& e) {
+            return ev::throwTypeError(std::string("triposplat: birefnet: ") + e.what());
+        }
     }
 
     std::vector<float> rgb01;
@@ -545,6 +571,12 @@ void decorateTripoSplatProto(ObjectBuilder& proto) {
             default:                           return ev::fromUtf8("CPU");
         }
     });
+    // True when a BiRefNet matte model was loaded — generate() can isolate
+    // the subject. Lets a UI gate its "remove background" control.
+    proto.accessor("backgroundRemoval", [](Value thisVal, std::span<const Value>) -> Value {
+        auto* w = unwrapTripoSplat(thisVal);
+        return ev::fromBool(w && w->rmbg != nullptr);
+    });
 }
 
 } // namespace
@@ -659,6 +691,20 @@ Value makeTriposplatNamespace() {
             {
                 auto f = brotensor::safetensors::File::open(p_dec);
                 w->decoder->load_weights(f);
+            }
+
+            // Optional BiRefNet matte model for generate()'s background removal.
+            Value rmbgV = ev::getProperty(args[0], "birefnet");
+            if (ev::isString(rmbgV)) {
+                const std::string p_rmbg = ev::toUtf8(rmbgV);
+                if (!p_rmbg.empty()) {
+                    if (!std::filesystem::exists(p_rmbg)) {
+                        return ev::throwError("triposplat.load failed: cannot open birefnet file " + p_rmbg);
+                    }
+                    w->rmbg = std::make_unique<brovisionml::birefnet::BiRefNet>();
+                    w->rmbg->load(p_rmbg);
+                    w->rmbg->to(device);
+                }
             }
 
             return g_tripoSplatClass.createInstance(std::move(w));
