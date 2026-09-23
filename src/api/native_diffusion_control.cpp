@@ -23,6 +23,7 @@ namespace {
 Value pipelineLoadControlDictionary(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.loadControlDictionary: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (args.empty() || !ev::isString(args[0])) {
         return ev::throwTypeError("Pipeline.loadControlDictionary(path): path string required");
     }
@@ -43,6 +44,7 @@ Value pipelineLoadControlDictionary(Value thisVal, std::span<const Value> args) 
 Value pipelineSetControl(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.setControl: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (args.empty()) {
         return ev::throwTypeError("Pipeline.setControl(name, alpha) or setControl(map) required");
     }
@@ -89,6 +91,7 @@ Value pipelineSetControl(Value thisVal, std::span<const Value> args) {
 Value pipelineClearControl(Value thisVal, std::span<const Value>) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.clearControl: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     w->pipeline->cond_control().clear();
     return ev::undefined();
 }
@@ -99,6 +102,7 @@ Value pipelineClearControl(Value thisVal, std::span<const Value>) {
 Value pipelineSetControlBudget(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.setControlBudget: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (args.empty() || !ev::isNumber(args[0])) {
         return ev::throwTypeError("Pipeline.setControlBudget(alpha): numeric alpha required");
     }
@@ -191,6 +195,7 @@ Value pipelineEncodeConditioning(Value thisVal, std::span<const Value> args) {
 Value pipelineSetControlVector(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.setControlVector: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (args.empty() || !ev::isString(args[0])) {
         return ev::throwTypeError("Pipeline.setControlVector(name, dir, alpha, scale?): name required");
     }
@@ -221,6 +226,7 @@ Value pipelineSetControlVector(Value thisVal, std::span<const Value> args) {
 Value pipelineRemoveControl(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.removeControl: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (args.empty() || !ev::isString(args[0])) {
         return ev::throwTypeError("Pipeline.removeControl(name): name string required");
     }
@@ -270,6 +276,7 @@ Value pipelineSetIdentityAnchor(Value thisVal, std::span<const Value> args) {
 Value pipelineSetIdentityWeight(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.setIdentityWeight: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (args.empty() || !ev::isNumber(args[0])) {
         return ev::throwTypeError("Pipeline.setIdentityWeight(weight): numeric weight required");
     }
@@ -288,6 +295,7 @@ Value pipelineHasIdentityAnchor(Value thisVal, std::span<const Value>) {
 Value pipelineClearIdentityAnchor(Value thisVal, std::span<const Value>) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.clearIdentityAnchor: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     w->pipeline->clear_identity_anchor();
     return ev::undefined();
 }

@@ -19,6 +19,7 @@ namespace {
 Value krea2SetModDelta(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.krea2SetModDelta: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     brotensor::Tensor delta;
     if (!args.empty() && ev::isObject(args[0])) {
         if (!tensorFromJs(args[0], delta)) {
@@ -40,6 +41,7 @@ Value krea2SetModDelta(Value thisVal, std::span<const Value> args) {
 Value krea2TimeMod(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.krea2TimeMod: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (args.empty() || !ev::isNumber(args[0])) {
         return ev::throwTypeError("Pipeline.krea2TimeMod(timestep): numeric timestep required");
     }
@@ -65,6 +67,7 @@ Value krea2TimeMod(Value thisVal, std::span<const Value> args) {
 Value krea2SetGateScale(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.krea2SetGateScale: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (args.size() < 4 || !ev::isNumber(args[0]) || !ev::isNumber(args[1]) ||
         !ev::isNumber(args[2]) || !ev::isNumber(args[3])) {
         return ev::throwTypeError(
@@ -85,6 +88,7 @@ Value krea2SetGateScale(Value thisVal, std::span<const Value> args) {
 Value krea2SetGateMask(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.krea2SetGateMask: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     brotensor::Tensor mask;
     if (!args.empty() && ev::isObject(args[0])) {
         if (!tensorFromJs(args[0], mask)) {
@@ -106,6 +110,7 @@ Value krea2SetGateMask(Value thisVal, std::span<const Value> args) {
 Value krea2CaptureGates(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.krea2CaptureGates: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     const bool enable = !args.empty() && ev::toBool(args[0]);
     try {
         w->pipeline->krea_capture_gates(enable);
@@ -120,6 +125,8 @@ Value krea2CaptureGates(Value thisVal, std::span<const Value> args) {
 Value krea2Gates(Value thisVal, std::span<const Value>) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.krea2Gates: not a loaded Pipeline");
+    // The sink is rewritten by every step a background generate takes.
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     try {
         std::vector<float> flat = w->pipeline->krea_gates();
         const int rows = w->pipeline->krea_num_layers();

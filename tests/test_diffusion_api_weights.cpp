@@ -249,6 +249,17 @@ void brodiffusionTestWithWeights() {
         if (s != "DONE") die("background generate: " + s);
         std::cout << "  background generate delivered: OK" << std::endl;
     }
+    expectOk("setters work again once the job is done", R"JS(
+        (function() {
+            const p = globalThis.__pipe;
+            p.clearControl();
+            p.setControlBudget(0);
+            p.clearControlNets();
+            p.setIdentityWeight(0);
+            if (!(p.sigmas() instanceof Float32Array)) throw new Error("sigmas");
+            return "OK";
+        })()
+    )JS");
 
     // dispose() during a background generate stops and joins it before the
     // weights go; onDone still reports the cancellation.
@@ -258,6 +269,26 @@ void brodiffusionTestWithWeights() {
             globalThis.__done = null;
             p.generate("a green hill", { width: 512, height: 512, steps: 30, seed: 5,
                 onDone: (img, info) => { globalThis.__done = { img, info }; } });
+            // Every research setter (and the readers of state the job
+            // rewrites) is refused while the job owns the pipeline, before it
+            // looks at its arguments. This job is long enough to still be
+            // running here even under GC stress.
+            const hooks = {
+                setLoraScale: [0, 0.5], clearLoras: [], removeControlNet: [0],
+                clearControlNets: [], sigmas: [],
+                loadControlDictionary: ["nope.bcd"], setControl: ["x", 1],
+                clearControl: [], setControlBudget: [1], removeControl: ["x"],
+                setControlVector: ["x", new Float32Array(4), 1],
+                setIdentityWeight: [1], clearIdentityAnchor: [],
+                krea2SetModDelta: [null, 0, 1], krea2TimeMod: [500],
+                krea2SetGateScale: [1, 1, 0, 1], krea2SetGateMask: [null, 0, 1],
+                krea2CaptureGates: [true], krea2Gates: [],
+            };
+            for (const name of Object.keys(hooks)) {
+                let refused = "";
+                try { p[name](...hooks[name]); } catch (e) { refused = e.message; }
+                if (!/in flight/.test(refused)) throw new Error(name + " while busy: " + refused);
+            }
             p.dispose();
             if (p.busy) throw new Error("busy after dispose");
             let msg = "";

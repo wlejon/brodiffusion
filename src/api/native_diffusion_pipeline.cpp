@@ -470,6 +470,7 @@ Value pipelineApplyLora(Value thisVal, std::span<const Value> args) {
 Value pipelineSetLoraScale(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.setLoraScale: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (args.size() < 2) return ev::throwTypeError("Pipeline.setLoraScale(index, scale): required");
     int index = i32At(args, 0);
     float scale = static_cast<float>(numAt(args, 1));
@@ -484,6 +485,7 @@ Value pipelineSetLoraScale(Value thisVal, std::span<const Value> args) {
 Value pipelineClearLoras(Value thisVal, std::span<const Value>) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.clearLoras: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     try {
         w->pipeline->clear_loras();
         return ev::undefined();
@@ -542,6 +544,7 @@ Value pipelineAddControlNet(Value thisVal, std::span<const Value> args) {
 Value pipelineRemoveControlNet(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.removeControlNet: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     if (args.empty() || !ev::isNumber(args[0])) {
         return ev::throwTypeError("Pipeline.removeControlNet(index): integer index required");
     }
@@ -556,6 +559,7 @@ Value pipelineRemoveControlNet(Value thisVal, std::span<const Value> args) {
 Value pipelineClearControlNets(Value thisVal, std::span<const Value>) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.clearControlNets: not a loaded Pipeline");
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     try {
         w->pipeline->clear_controlnets();
         return ev::undefined();
@@ -579,6 +583,8 @@ Value pipelineNumXAttnBlocks(Value thisVal, std::span<const Value>) {
 Value pipelineSigmas(Value thisVal, std::span<const Value>) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.sigmas: not a loaded Pipeline");
+    // A background generate's prime() rewrites the schedule.
+    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     try {
         std::vector<float> s = w->pipeline->schedule_sigmas();
         return makeFloat32Array(s.data(), s.size());
