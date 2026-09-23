@@ -233,10 +233,8 @@ Pipeline Pipeline::from_model_dir(const std::string& model_dir,
 
         p.text_encoder_.load_weights(te_files.front(), "text_model.");
         p.vae_.load_weights(vae_files.front(), "decoder.");
-        // Load the VAE encoder too — Flux img2img isn't wired yet, but the
-        // diffusers Flux VAE ships an encoder and loading it now keeps the
-        // model-dir load complete (and matches the SD branch which loads
-        // the encoder via the (text, unet, vae) load_weights overload).
+        // The diffusers Flux VAE ships an encoder; img2img priming uses it
+        // (Flux has no quant_conv, which the encoder load detects).
         p.vae_encoder_.load_weights(vae_files.front(), "encoder.");
 
         std::vector<const brotensor::safetensors::File*> tf_ptrs;

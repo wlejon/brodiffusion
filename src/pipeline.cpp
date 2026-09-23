@@ -275,9 +275,9 @@ PipelineState Pipeline::prime(std::string_view prompt,
              "(img2img and explicit-noise priming are mutually exclusive)");
     }
     if (!opts.init_image_path.empty() &&
-        model_class_ != ModelClass::StableDiffusion) {
-        fail("prime: img2img (init_image_path) is currently SD1.5 only; "
-             "Flux img2img is not yet supported");
+        model_class_ != ModelClass::StableDiffusion &&
+        model_class_ != ModelClass::Flux) {
+        fail("prime: img2img (init_image_path) is SD1.5 and Flux only");
     }
     if (!opts.mask_image_path.empty() && opts.init_image_path.empty()) {
         fail("inpaint: --mask requires --init (mask_image_path is set but "

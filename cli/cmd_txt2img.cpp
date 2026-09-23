@@ -209,12 +209,6 @@ int run_txt2img_model_dir(int argc, char** argv, const char* model_dir) {
     }
 
     if (init_path) {
-        if (is_flux) {
-            std::fprintf(stderr,
-                "img2img: --init is not supported for Flux model dirs "
-                "(SD1.5 only for now)\n");
-            return 2;
-        }
         opts.init_image_path   = init_path;
         opts.vae_encode_sample = vae_sample;
         if (strength_s) {

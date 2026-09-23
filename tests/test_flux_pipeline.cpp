@@ -24,6 +24,8 @@
 
 #include "brotensor/runtime.h"
 
+#include "broimage/encode.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -484,6 +486,18 @@ void build_t5_tokenizer(const fs::path& dir) {
     write_text(dir / "tokenizer_2" / "tokenizer.json", j);
 }
 
+// A 16x16 solid-gray opaque PNG, the init image for the img2img checks.
+void write_solid_png(const fs::path& path, std::uint8_t v) {
+    const int w = 16, h = 16;
+    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(w * h * 4), v);
+    for (std::size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 255;
+    if (!broimage::encode_png_file(path.string(), rgba.data(), w, h, 4)) {
+        std::fprintf(stderr, "write_solid_png: encode failed for %s\n",
+                     path.string().c_str());
+        std::abort();
+    }
+}
+
 void build_model_dir(const fs::path& dir) {
     write_text(dir / "model_index.json", "{\"_class_name\":\"FluxPipeline\"}");
     write_text(dir / "scheduler" / "scheduler_config.json",
@@ -587,6 +601,57 @@ int main() {
             std::printf("flux quantized vs dense: max_abs_err=%.4f\n",
                         max_abs_err);
             CHECK(max_abs_err < 0.08f);
+        }
+
+        // ── img2img ──────────────────────────────────────────────────────
+        // The init image is VAE-encoded and flow-match noised to the
+        // strength's t_start, so strength 0.5 over 4 steps starts at step 2
+        // and the output depends on the init image.
+        {
+            const fs::path dark  = base / "init_dark.png";
+            const fs::path light = base / "init_light.png";
+            write_solid_png(dark, 40);
+            write_solid_png(light, 220);
+
+            pl::GenerateOptions io = opts;
+            io.num_inference_steps = 4;
+            io.strength = 0.5f;
+            io.init_image_path = dark.string();
+
+            pl::PipelineState st = pipeline.prime("a cat", io);
+            CHECK(st.step_index == 2);
+            CHECK(st.n_steps == 4);
+
+            std::vector<float> a = pipeline.generate("a cat", io);
+            CHECK(a.size() == expected);
+            int nf = 0;
+            for (float v : a) if (!std::isfinite(v)) ++nf;
+            CHECK(nf == 0);
+            CHECK(a == pipeline.generate("a cat", io));   // deterministic
+
+            io.init_image_path = light.string();
+            std::vector<float> b = pipeline.generate("a cat", io);
+            CHECK(b.size() == expected);
+            CHECK(a != b);                                 // init matters
+
+            // A sampled VAE encode draws eps from the seed: it changes the
+            // result but stays deterministic per seed.
+            io.vae_encode_sample = true;
+            std::vector<float> c = pipeline.generate("a cat", io);
+            CHECK(c != b);
+            CHECK(c == pipeline.generate("a cat", io));
+
+            // Strength 1.0 runs the whole schedule from the encoded init.
+            io.vae_encode_sample = false;
+            io.strength = 1.0f;
+            CHECK(pipeline.prime("a cat", io).step_index == 0);
+
+            // Inpaint is still SD1.5 only.
+            io.mask_image_path = dark.string();
+            bool threw = false;
+            try { (void)pipeline.prime("a cat", io); }
+            catch (const std::exception&) { threw = true; }
+            CHECK(threw);
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL exception: %s\n", e.what());

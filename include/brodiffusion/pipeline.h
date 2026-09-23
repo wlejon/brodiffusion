@@ -227,7 +227,10 @@ struct GenerateOptions {
     // the model only denoises the remaining (1 - strength) fraction of the
     // schedule, so the generated image stays close to the init.
     //
-    // SD1.5 only for now; throws on Flux. Empty path = txt2img (existing
+    // SD1.5 and Flux. Flux follows diffusers' FluxImg2ImgPipeline: the VAE
+    // encode applies (z - shift_factor) * scaling_factor, and the flow-match
+    // add_noise is (1 - sigma) * x0 + sigma * noise at the t_start sigma.
+    // Inpaint (mask_image_path) is still SD1.5 only. Empty path = txt2img (existing
     // behavior). Throws if both init_image_path and init_noise are set.
     // noise_source / init_noise are ignored when init_image_path is set.
     std::string init_image_path;
@@ -1076,7 +1079,7 @@ private:
     // reconstructs the model output, and applies one TrigFlow scheduler step.
     // Called from step_once() when the active scheduler is scheduler::SCM.
     void step_once_scm_(PipelineState& state, const GenerateOptions& opts);
-    // SD1.5 img2img / inpaint priming: VAE-encode the init image, noise it to
+    // SD1.5 / Flux img2img (and SD1.5 inpaint) priming: VAE-encode the init image, noise it to
     // t_start, and (when a mask is given) cache the broadcast inpaint masks.
     // Sets state.latent and state.step_index; called from prime() once the
     // schedule is set, when opts.init_image_path is non-empty.
@@ -1095,7 +1098,7 @@ private:
     vae::Decoder              vae_;
     // VAE encoder mirrors vae_; used by img2img / inpaint priming. Always
     // constructed (config derived from cfg.vae); weights are loaded by every
-    // load_weights() overload. SD1.5 only — the Flux img2img path is TODO.
+    // load_weights() overload and by the Flux model-dir load (img2img).
     // Robustness: if encoder weights are missing in the safetensors file
     // (some decoder-only derivative checkpoints), the load throws clearly.
     vae::Encoder              vae_encoder_;
