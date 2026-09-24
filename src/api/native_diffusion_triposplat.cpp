@@ -574,21 +574,27 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
             w->decoder->decode(latent, numGaussians, static_cast<uint64_t>(static_cast<uint32_t>(seed)));
         prof.gpuStage("octree decode");
 
-        // model space (z-up) -> scene space (y-up): (x, y, z) -> (x, -z, y)
-        const float s2 = 0.70710678118654752440f;
+        // model space -> scene space (Y-up, subject facing +Z, the default
+        // camera side). The model is Z-up with the subject facing +X and the
+        // image's left-to-right running along +Y, so the turn is the cyclic
+        // (x, y, z) -> (y, z, x): model up (+z) lands on scene +y, the face
+        // (+x) on scene +z, and image-left on scene -x. That is a -120 degree
+        // turn about (1,1,1); quaternions are pre-multiplied by
+        // q = (-1/2, -1/2, -1/2, 1/2).
         float* P = splats.positions.data();
         float* R = splats.rotations.data();
         const size_t n = splats.count();
         for (size_t i = 0; i < n; ++i) {
-            const float py = P[i * 3 + 1], pz = P[i * 3 + 2];
-            P[i * 3 + 1] = -pz;
-            P[i * 3 + 2] = py;
+            const float px = P[i * 3 + 0], py = P[i * 3 + 1], pz = P[i * 3 + 2];
+            P[i * 3 + 0] = py;
+            P[i * 3 + 1] = pz;
+            P[i * 3 + 2] = px;
             const float qx = R[i * 4 + 0], qy = R[i * 4 + 1];
             const float qz = R[i * 4 + 2], qw = R[i * 4 + 3];
-            R[i * 4 + 0] = s2 * (qx + qw);
-            R[i * 4 + 1] = s2 * (qy - qz);
-            R[i * 4 + 2] = s2 * (qz + qy);
-            R[i * 4 + 3] = s2 * (qw - qx);
+            R[i * 4 + 0] = 0.5f * (qx + qy - qz - qw);
+            R[i * 4 + 1] = 0.5f * (qy + qz - qx - qw);
+            R[i * 4 + 2] = 0.5f * (qz + qx - qy - qw);
+            R[i * 4 + 3] = 0.5f * (qw + qx + qy + qz);
         }
 
         w->lastSplats = splats;
