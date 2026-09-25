@@ -4,8 +4,9 @@
 // and under brodiffusion_test_api_gcstress run with a collection on every
 // allocation.
 //
-// The model dir is BRODIFFUSION_SD15_DIR, else <repo>/weights/sd15; the test
-// prints a skip line and passes when neither exists.
+// The model dir is BRODIFFUSION_SD15_DIR, else <repo>/weights/sd15 when it
+// holds both unet/ and model_index.json; the test prints a skip line and
+// passes when neither is usable.
 //
 // Linked into brodiffusion_test_api; called from its main().
 
@@ -46,7 +47,10 @@ std::string sd15Dir() {
         return std::filesystem::exists(e) ? std::string(e) : std::string();
     }
     const std::filesystem::path p = std::filesystem::path(BRODIFFUSION_WEIGHTS_DIR) / "sd15";
-    return std::filesystem::exists(p / "unet") ? p.generic_string() : std::string();
+    // model_index.json as well as unet/: a partial checkout (unet/ fetched,
+    // the index not) cannot load, and is a skip rather than a failure.
+    return std::filesystem::exists(p / "unet") && std::filesystem::exists(p / "model_index.json")
+        ? p.generic_string() : std::string();
 }
 
 // Run `script` (an expression) and require the string "OK".
