@@ -249,8 +249,13 @@ int main() {
         return 1;
     }
 
-    if (!bt::is_available(bt::Device::Metal)) {
-        std::printf("device_parity: no Metal backend — skipping\n");
+    bt::Device gpu_dev = bt::Device::CPU;
+    if (bt::is_available(bt::Device::HIP))        gpu_dev = bt::Device::HIP;
+    else if (bt::is_available(bt::Device::CUDA))  gpu_dev = bt::Device::CUDA;
+    else if (bt::is_available(bt::Device::Metal)) gpu_dev = bt::Device::Metal;
+
+    if (gpu_dev == bt::Device::CPU) {
+        std::printf("device_parity: no GPU backend — skipping\n");
         return 0;
     }
 
@@ -264,12 +269,13 @@ int main() {
     b.write(path);
     auto file = st::File::open(path.string());
 
-    std::printf("device_parity: CPU (FP32) vs Metal (FP16)\n");
+    const char* gpu_name = bt::device_name(gpu_dev);
+    std::printf("device_parity: CPU (FP32) vs %s (FP16)\n", gpu_name);
 
     // ── Single-forward parity per module ───────────────────────────────────
     {
         const auto cpu = run_clip(file, bt::Device::CPU);
-        const auto gpu = run_clip(file, bt::Device::Metal);
+        const auto gpu = run_clip(file, gpu_dev);
         // 2-layer transformer: FP16 storage + accumulation drift end to end.
         // Observed err ~0.0017; bound leaves generous cross-GPU headroom.
         expect_parity("clip text encoder", compare(cpu, gpu), gpu.size(),
@@ -277,9 +283,9 @@ int main() {
     }
     {
         const auto cpu  = run_unet(file, bt::Device::CPU, 8, 8);
-        const auto gpu  = run_unet(file, bt::Device::Metal, 8, 8);
-        const auto gpu2 = run_unet(file, bt::Device::Metal, 8, 8);
-        CHECK(gpu == gpu2);   // Metal forward must be deterministic
+        const auto gpu  = run_unet(file, gpu_dev, 8, 8);
+        const auto gpu2 = run_unet(file, gpu_dev, 8, 8);
+        CHECK(gpu == gpu2);   // GPU forward must be deterministic
         // Full U-Net: conv_in, down/mid/up blocks (incl. the up-path skip
         // concats), conv_out — the deepest graph under test. Observed err
         // ~0.004; the bound stays well below the ~0.5 a concat-class
@@ -289,14 +295,14 @@ int main() {
     }
     {
         const auto cpu = run_unet(file, bt::Device::CPU, 16, 16);
-        const auto gpu = run_unet(file, bt::Device::Metal, 16, 16);
+        const auto gpu = run_unet(file, gpu_dev, 16, 16);
         // Larger spatial — exercises the multi-tile conv path end to end.
         expect_parity("unet forward 16x16", compare(cpu, gpu), gpu.size(),
                       /*tol_rel=*/0.04f, /*tol_abs=*/0.02f);
     }
     {
         const auto cpu = run_vae(file, bt::Device::CPU, 2, 2);
-        const auto gpu = run_vae(file, bt::Device::Metal, 2, 2);
+        const auto gpu = run_vae(file, gpu_dev, 2, 2);
         // VAE decoder: three 2x upsamples + a self-attention mid block.
         expect_parity("vae decode 2x2->16x16", compare(cpu, gpu), gpu.size(),
                       /*tol_rel=*/0.03f, /*tol_abs=*/0.015f);
@@ -305,13 +311,13 @@ int main() {
     // ── Multi-step accumulation ────────────────────────────────────────────
     {
         const int n_steps = 6;
-        const auto cpu = run_unet_loop(file, bt::Device::CPU,   8, 8, n_steps);
-        const auto gpu = run_unet_loop(file, bt::Device::Metal, 8, 8, n_steps);
+        const auto cpu = run_unet_loop(file, bt::Device::CPU, 8, 8, n_steps);
+        const auto gpu = run_unet_loop(file, gpu_dev,         8, 8, n_steps);
         CHECK(static_cast<int>(cpu.size()) == n_steps);
         CHECK(static_cast<int>(gpu.size()) == n_steps);
 
-        std::printf("  unet feedback loop (%d steps): per-step CPU<->Metal drift\n",
-                    n_steps);
+        std::printf("  unet feedback loop (%d steps): per-step CPU<->%s drift\n",
+                    n_steps, gpu_name);
         float final_err = 0.0f, final_ref = 1.0f;
         for (int s = 0; s < n_steps && s < static_cast<int>(gpu.size()); ++s) {
             const Cmp c = compare(cpu[static_cast<std::size_t>(s)],
