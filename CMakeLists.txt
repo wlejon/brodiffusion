@@ -37,6 +37,7 @@ endif()
 # GPU-resident tensors — CPU by default, GPU when available.
 option(BROTENSOR_WITH_CUDA  "Build the CUDA GPU backend"  OFF)
 option(BROTENSOR_WITH_METAL "Build the Metal GPU backend" OFF)
+option(BROTENSOR_WITH_HIP   "Build the HIP GPU backend"   OFF)
 
 # brodiffusion ships SD1.5-specific fused CUDA kernels (e.g. fused_resblock.cu);
 # enable the CUDA language only when CUDA is the selected backend.
@@ -51,6 +52,16 @@ if(BROTENSOR_WITH_CUDA)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+endif()
+
+if(BROTENSOR_WITH_HIP)
+    if(NOT CMAKE_HIP_ARCHITECTURES)
+        set(CMAKE_HIP_ARCHITECTURES "gfx1151")
+    endif()
+    enable_language(HIP)
+    set(CMAKE_HIP_STANDARD 20)
+    set(CMAKE_HIP_STANDARD_REQUIRED ON)
+    find_package(hip REQUIRED)
 endif()
 
 # brodiffusion ships SD1.5-specific fused Metal kernels (fused_resblock.mm,
@@ -283,6 +294,26 @@ if(BROTENSOR_WITH_CUDA)
     # Static CUDA runtime so the shipped binary carries no cudart DLL dependency
     # and launches on machines without the CUDA toolkit (falls back to CPU).
     target_link_libraries(brodiffusion PUBLIC CUDA::cudart_static)
+endif()
+
+if(BROTENSOR_WITH_HIP)
+    target_sources(brodiffusion PRIVATE
+        src/fused_resblock.cu
+        src/fused_transformer.cu
+        src/triposplat/flow_rope.cu
+    )
+    set_source_files_properties(
+        src/fused_resblock.cu
+        src/fused_transformer.cu
+        src/triposplat/flow_rope.cu
+        PROPERTIES LANGUAGE HIP
+    )
+    target_include_directories(brodiffusion PRIVATE
+        ${BROTENSOR_DIR}/src/hip/compat
+        ${BROTENSOR_DIR}/src/hip/detail
+        /opt/rocm/include
+    )
+    target_link_libraries(brodiffusion PUBLIC hip::host)
 endif()
 
 if(BROTENSOR_WITH_METAL)

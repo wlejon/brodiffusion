@@ -33,7 +33,7 @@
 
 #include "brotensor/tensor.h"
 
-#ifdef BROTENSOR_HAS_CUDA
+#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
 #include "brotensor/cuda_graph.h"
 #endif
 
@@ -171,7 +171,7 @@ bool cfg_branch_active(ModelClass model_class, const Denoiser& denoiser,
 // Defined here rather than in pipeline_step_graph.cpp because ~Pipeline
 // destroys the unique_ptr that holds it and lives in pipeline.cpp.
 struct Pipeline::StepGraphSession {
-#ifdef BROTENSOR_HAS_CUDA
+#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     brotensor::CudaGraph graph;          // cond branch (also the single graph when no CFG)
     brotensor::CudaGraph graph_uncond;   // uncond branch — a SEPARATE graph under CFG
 #endif

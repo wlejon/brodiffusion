@@ -9,7 +9,7 @@
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 
-#ifdef BROTENSOR_HAS_CUDA
+#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
 #include "brotensor/cuda_graph.h"
 #endif
 
@@ -21,7 +21,7 @@ namespace bt = ::brotensor;
 
 void Pipeline::step_denoise_captured_(PipelineState& state, float t,
                                       bool do_cfg) {
-#ifdef BROTENSOR_HAS_CUDA
+#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     StepGraphSession* s = step_graph_.get();
     const bool key_match =
         s != nullptr &&

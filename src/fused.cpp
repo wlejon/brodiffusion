@@ -101,7 +101,7 @@ void fused_resblock_forward(
     int C_in, int C_out, int H, int W,
     int num_groups, float eps,
     bt::Tensor& Y) {
-#if defined(BROTENSOR_HAS_CUDA)
+#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     if (on_gpu(X)) {
         detail::fused_resblock_forward_cuda(
             X, gn1_g, gn1_b, W1, b1, t_emb_shift, gn2_g, gn2_b, W2, b2,
@@ -141,7 +141,7 @@ void fused_resblock_forward(  // W8A16 — GPU-only
     [[maybe_unused]] int H, [[maybe_unused]] int W,
     [[maybe_unused]] int num_groups, [[maybe_unused]] float eps,
     [[maybe_unused]] bt::Tensor& Y) {
-#if defined(BROTENSOR_HAS_CUDA)
+#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     if (on_gpu(X)) {
         detail::fused_resblock_forward_cuda(
             X, gn1_g, gn1_b, W1_int8, W1_scales, b1, t_emb_shift, gn2_g, gn2_b,
@@ -166,7 +166,7 @@ void fused_resblock_forward(  // W8A16 — GPU-only
 
 void fused_linear_geglu(const bt::Tensor& X, const bt::Tensor& W,
                         const bt::Tensor& b, bt::Tensor& Y) {
-#if defined(BROTENSOR_HAS_CUDA)
+#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     if (on_gpu(X)) {
         detail::fused_linear_geglu_cuda(X, W, b, Y);
         return;
@@ -185,7 +185,7 @@ void fused_linear_geglu([[maybe_unused]] const bt::Tensor& X,       // W8A16
                         [[maybe_unused]] const bt::Tensor& W_scales,
                         [[maybe_unused]] const bt::Tensor& b,
                         [[maybe_unused]] bt::Tensor& Y) {
-#if defined(BROTENSOR_HAS_CUDA)
+#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     if (on_gpu(X)) {
         detail::fused_linear_geglu_cuda(X, W_int8, W_scales, b, Y);
         return;
@@ -204,7 +204,7 @@ void fused_linear_geglu([[maybe_unused]] const bt::Tensor& X,       // W8A16
 }
 
 void add_inplace_vec(bt::Tensor& Y, const bt::Tensor& X) {
-#if defined(BROTENSOR_HAS_CUDA)
+#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     if (on_gpu(Y)) {
         detail::add_inplace_vec_cuda(Y, X);
         return;
@@ -219,7 +219,7 @@ void add_inplace_vec(bt::Tensor& Y, const bt::Tensor& X) {
 }
 
 void add_inplace_row_bias(bt::Tensor& Y, const bt::Tensor& bias) {
-#if defined(BROTENSOR_HAS_CUDA)
+#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     if (on_gpu(Y)) {
         detail::add_inplace_row_bias_cuda(Y, bias);
         return;

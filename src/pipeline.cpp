@@ -40,7 +40,7 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
-#ifdef BROTENSOR_HAS_CUDA
+#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
 #include "brotensor/cuda_graph.h"
 #endif
 
@@ -891,7 +891,7 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
         // classic eager forwards.
         const bool graph_eligible =
             denoiser_->supports_step_capture() &&
-            state.latent.device == bt::Device::CUDA &&
+            (state.latent.device == bt::Device::CUDA || state.latent.device == bt::Device::HIP) &&
             !step_graph_disabled();
         if (graph_eligible) {
             step_denoise_captured_(state, t, do_cfg);
