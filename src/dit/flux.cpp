@@ -215,10 +215,10 @@ void FluxDenoiser::load_weights(const std::vector<const st::File*>& shards,
     const int HD   = cfg_.attention_head_dim;
 
     bool quant = cfg_.quantize_weights;
-    if (quant && bt::default_device() != bt::Device::CUDA) {
+    if (quant && !bt::default_device().is_gpu()) {
         std::fprintf(stderr,
             "FluxDenoiser: quantize_weights requested but the default device "
-            "is not CUDA — loading dense weights instead (the fused INT8 "
+            "is not a GPU — loading dense weights instead (the fused INT8 "
             "dequant matmuls are GPU-only)\n");
         quant = false;
     }

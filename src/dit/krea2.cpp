@@ -213,10 +213,10 @@ void Krea2Transformer2DModel::load_impl_(
     };
 
     bool quant = cfg_.quantize_weights;
-    if (quant && bt::default_device() != bt::Device::CUDA) {
+    if (quant && !bt::default_device().is_gpu()) {
         std::fprintf(stderr,
             "Krea2Transformer2DModel: quantize_weights requested but the "
-            "default device is not CUDA — loading dense weights instead (the "
+            "default device is not a GPU — loading dense weights instead (the "
             "fused INT8 dequant matmuls are GPU-only)\n");
         quant = false;
     }
