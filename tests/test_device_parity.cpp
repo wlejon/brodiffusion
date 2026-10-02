@@ -29,6 +29,7 @@
 
 #include "sd_fixtures.h"
 #include "test_compute.h"
+#include "test_device.h"
 
 #include <cmath>
 #include <cstdint>
@@ -249,10 +250,7 @@ int main() {
         return 1;
     }
 
-    bt::Device gpu_dev = bt::Device::CPU;
-    if (bt::is_available(bt::Device::HIP))        gpu_dev = bt::Device::HIP;
-    else if (bt::is_available(bt::Device::CUDA))  gpu_dev = bt::Device::CUDA;
-    else if (bt::is_available(bt::Device::Metal)) gpu_dev = bt::Device::Metal;
+    const bt::Device gpu_dev = bdtest::preferred_gpu();
 
     if (gpu_dev == bt::Device::CPU) {
         std::printf("device_parity: no GPU backend — skipping\n");

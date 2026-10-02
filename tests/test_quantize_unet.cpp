@@ -17,6 +17,8 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
+#include "test_device.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -269,8 +271,7 @@ int main() {
         std::fprintf(stderr, "init failed: %s\n", e.what());
         return 1;
     }
-    if (!bt::is_available(bt::Device::CUDA) &&
-        !bt::is_available(bt::Device::Metal)) {
+    if (bdtest::preferred_gpu() == bt::Device::CPU) {
         std::fprintf(stderr,
                      "INT8 quantization is GPU-only — skipping\n");
         return 0;

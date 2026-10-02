@@ -30,6 +30,7 @@
 #include "brotensor/tensor.h"
 
 #include "test_compute.h"
+#include "test_device.h"
 
 #include <cmath>
 #include <cstdint>
@@ -71,12 +72,7 @@ bt::Tensor cpu_t(const std::vector<float>& v, int r, int c) {
     return bt::Tensor::from_host_on(bt::Device::CPU, v.data(), r, c);
 }
 
-bt::Device gpu_dev() {
-    if (bt::is_available(bt::Device::Metal)) return bt::Device::Metal;
-    if (bt::is_available(bt::Device::CUDA))  return bt::Device::CUDA;
-    if (bt::is_available(bt::Device::HIP))   return bt::Device::HIP;
-    return bt::Device::CPU;
-}
+bt::Device gpu_dev() { return bdtest::preferred_gpu(); }
 
 bt::Tensor gpu_t(const std::vector<float>& v, int r, int c) {
     std::vector<std::uint16_t> bits(v.size());

@@ -80,8 +80,8 @@ int main(int argc, char** argv) {
     const int iters = 20;
 
     bt::init();
-    if (bt::default_device() != bt::Device::CUDA) {
-        std::fprintf(stderr, "bench_krea2_kernels: CUDA backend required\n");
+    if (!bt::default_device().is_gpu()) {
+        std::fprintf(stderr, "bench_krea2_kernels: GPU backend required\n");
         return 1;
     }
     std::mt19937 rng(0);
