@@ -18,12 +18,7 @@
 namespace brodiffusion::pipeline {
 
 namespace bt = ::brotensor;
-
-static bool step_graph_disabled() {
-    const char* e = std::getenv("BRODIFFUSION_DISABLE_STEP_GRAPH");
-    if (e && std::strcmp(e, "0") != 0) return true;
-    return bt::default_device() == bt::Device::HIP;
-}
+using detail_pipe::step_graph_disabled;
 
 void Pipeline::step_denoise_captured_(PipelineState& state, float t,
                                       bool do_cfg) {
