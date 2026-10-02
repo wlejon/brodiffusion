@@ -71,12 +71,19 @@ bt::Tensor cpu_t(const std::vector<float>& v, int r, int c) {
     return bt::Tensor::from_host_on(bt::Device::CPU, v.data(), r, c);
 }
 
-bt::Tensor metal_t(const std::vector<float>& v, int r, int c) {
+bt::Device gpu_dev() {
+    if (bt::is_available(bt::Device::Metal)) return bt::Device::Metal;
+    if (bt::is_available(bt::Device::CUDA))  return bt::Device::CUDA;
+    if (bt::is_available(bt::Device::HIP))   return bt::Device::HIP;
+    return bt::Device::CPU;
+}
+
+bt::Tensor gpu_t(const std::vector<float>& v, int r, int c) {
     std::vector<std::uint16_t> bits(v.size());
     for (std::size_t i = 0; i < v.size(); ++i) {
         bits[i] = bt::fp32_to_fp16_bits(v[i]);
     }
-    return bt::Tensor::from_host_fp16_on(bt::Device::Metal, bits.data(), r, c);
+    return bt::Tensor::from_host_fp16_on(gpu_dev(), bits.data(), r, c);
 }
 
 // Max absolute error and reference magnitude across two host-side results.
@@ -140,7 +147,7 @@ void test_resblock(int C_in, int C_out, int H, int W, int num_groups,
 
     auto run = [&](bt::Device dev) {
         auto mk = [&](const std::vector<float>& v, int r, int c) {
-            return dev == bt::Device::CPU ? cpu_t(v, r, c) : metal_t(v, r, c);
+            return dev == bt::Device::CPU ? cpu_t(v, r, c) : gpu_t(v, r, c);
         };
         bt::Tensor X   = mk(x,   1, C_in * spatial);
         bt::Tensor G1  = mk(g1,  C_in, 1);
@@ -166,7 +173,7 @@ void test_resblock(int C_in, int C_out, int H, int W, int num_groups,
     };
 
     const auto cpu = run(bt::Device::CPU);
-    const auto gpu = run(bt::Device::Metal);
+    const auto gpu = run(gpu_dev());
     // Observed err ~0.001 (FP16 storage + intermediate rounding through GN,
     // SiLU and two convs); bound leaves ~20x headroom for cross-GPU ULP drift
     // in the transcendentals while still catching a genuinely broken kernel.
@@ -184,7 +191,7 @@ void test_geglu(int B, int D_in, int D_out, const char* label) {
 
     auto run = [&](bt::Device dev) {
         auto mk = [&](const std::vector<float>& v, int r, int c) {
-            return dev == bt::Device::CPU ? cpu_t(v, r, c) : metal_t(v, r, c);
+            return dev == bt::Device::CPU ? cpu_t(v, r, c) : gpu_t(v, r, c);
         };
         bt::Tensor X = mk(x, B, D_in);
         bt::Tensor Wt = mk(w, two_D, D_in);
@@ -195,7 +202,7 @@ void test_geglu(int B, int D_in, int D_out, const char* label) {
     };
 
     const auto cpu = run(bt::Device::CPU);
-    const auto gpu = run(bt::Device::Metal);
+    const auto gpu = run(gpu_dev());
     // Observed err ~0.0006 (FP16 GEMM accumulator downcast + erf approx).
     expect_parity(label, compare(cpu, gpu), gpu.size(),
                   /*tol_rel=*/0.01f, /*tol_abs=*/0.008f);
@@ -209,15 +216,15 @@ void test_add_vec(int rows, int cols, const char* label) {
 
     auto run = [&](bt::Device dev) {
         bt::Tensor Y = dev == bt::Device::CPU ? cpu_t(y0, rows, cols)
-                                              : metal_t(y0, rows, cols);
+                                              : gpu_t(y0, rows, cols);
         bt::Tensor X = dev == bt::Device::CPU ? cpu_t(x, rows, cols)
-                                              : metal_t(x, rows, cols);
+                                              : gpu_t(x, rows, cols);
         bd::add_inplace_vec(Y, X);
         return bdtest::bd_download(Y);
     };
 
     const auto cpu = run(bt::Device::CPU);
-    const auto gpu = run(bt::Device::Metal);
+    const auto gpu = run(gpu_dev());
     // Pure FP16 add: observed err ~0.0005 is one ULP at this magnitude.
     expect_parity(label, compare(cpu, gpu), gpu.size(),
                   /*tol_rel=*/0.005f, /*tol_abs=*/0.003f);
@@ -231,15 +238,15 @@ void test_add_row_bias(int rows, int cols, const char* label) {
 
     auto run = [&](bt::Device dev) {
         bt::Tensor Y = dev == bt::Device::CPU ? cpu_t(y0, rows, cols)
-                                              : metal_t(y0, rows, cols);
+                                              : gpu_t(y0, rows, cols);
         bt::Tensor Bs = dev == bt::Device::CPU ? cpu_t(bias, cols, 1)
-                                               : metal_t(bias, cols, 1);
+                                               : gpu_t(bias, cols, 1);
         bd::add_inplace_row_bias(Y, Bs);
         return bdtest::bd_download(Y);
     };
 
     const auto cpu = run(bt::Device::CPU);
-    const auto gpu = run(bt::Device::Metal);
+    const auto gpu = run(gpu_dev());
     // Pure FP16 add: observed err ~0.0005 is one ULP at this magnitude.
     expect_parity(label, compare(cpu, gpu), gpu.size(),
                   /*tol_rel=*/0.005f, /*tol_abs=*/0.003f);
@@ -255,12 +262,13 @@ int main() {
         return 1;
     }
 
-    if (!bt::is_available(bt::Device::Metal)) {
-        std::printf("fused_parity: no Metal backend — skipping\n");
+    const bt::Device dev = gpu_dev();
+    if (dev == bt::Device::CPU) {
+        std::printf("fused_parity: no GPU backend — skipping\n");
         return 0;
     }
 
-    std::printf("fused_parity: CPU vs Metal\n");
+    std::printf("fused_parity: CPU vs %s\n", bt::device_name(dev));
 
     // fused_resblock_forward — single output tile and multi-tile, with and
     // without the 1x1 skip conv.

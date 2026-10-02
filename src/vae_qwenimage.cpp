@@ -38,7 +38,7 @@ const st::TensorView& need(const st::File& f, const std::string& key, const char
 }
 
 bt::Dtype arith_dtype_for(bool force_upcast) {
-    if (force_upcast && brotensor::default_device() == brotensor::Device::CUDA) {
+    if (force_upcast && brotensor::default_device().is_gpu()) {
         return bt::Dtype::BF16;
     }
     return brodiffusion::compute_dtype();

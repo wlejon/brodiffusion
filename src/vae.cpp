@@ -44,8 +44,7 @@ const st::TensorView& need_enc(const st::File& f, const std::string& key) {
 // bandwidth — and the CUDA backend's fused resblock has FP16/BF16 slots but
 // no FP32 one.
 bt::Dtype vae_arith_dtype(bool force_upcast) {
-    if (force_upcast &&
-        brotensor::default_device() == brotensor::Device::CUDA) {
+    if (force_upcast && brotensor::default_device().is_gpu()) {
         return bt::Dtype::BF16;
     }
     return brodiffusion::compute_dtype();

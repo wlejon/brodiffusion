@@ -70,7 +70,7 @@ bool fuse_rmsnorm_silu(brodiffusion::detail::JitSite& site, const bt::Tensor& se
 }
 
 bt::Dtype arith_dtype_for(bool force_upcast) {
-    if (force_upcast && brotensor::default_device() == brotensor::Device::CUDA) {
+    if (force_upcast && brotensor::default_device().is_gpu()) {
         return bt::Dtype::BF16;
     }
     return brodiffusion::compute_dtype();

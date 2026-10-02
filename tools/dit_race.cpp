@@ -60,8 +60,8 @@ int main(int argc, char** argv) {
     const int Warg = argc > 4 ? std::atoi(argv[4]) : 128;
 
     bt::init();
-    std::fprintf(stderr, "[dit_race] default device=%d (0=CPU,1=CUDA)\n",
-                 bt::default_device() == bt::Device::CUDA ? 1 : 0);
+    std::fprintf(stderr, "[dit_race] default device=%s\n",
+                 bt::default_device().is_gpu() ? "GPU" : "CPU");
 
     fs::path tdir = fs::path(model) / "transformer";
     std::string sfile;

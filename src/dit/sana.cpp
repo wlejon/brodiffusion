@@ -199,7 +199,7 @@ void SanaDenoiser::load_weights(const st::File& f, const std::string& prefix) {
     const int CAP     = cfg_.caption_channels;      // 2304
     const int hidden  = static_cast<int>(cfg_.mlp_ratio * D);  // 2880
     const int inv     = 2 * hidden;                 // 5760
-    const bt::Dtype cdt = bt::default_device() == bt::Device::CUDA
+    const bt::Dtype cdt = bt::default_device().is_gpu()
                               ? bt::Dtype::BF16
                               : bt::Dtype::FP32;
 

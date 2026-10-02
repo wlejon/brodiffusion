@@ -136,7 +136,7 @@ brotensor::Dtype PixArtDenoiser::compute_dtype() const {
 }
 
 brotensor::Dtype PixArtDenoiser::mm_dtype() const {
-    return brotensor::default_device() == brotensor::Device::CUDA
+    return brotensor::default_device().is_gpu()
                ? brotensor::Dtype::FP16
                : brotensor::Dtype::FP32;
 }

@@ -53,7 +53,7 @@ std::vector<float> download_fp32(const bt::Tensor& t) {
 }  // namespace
 
 brotensor::Dtype flux_compute_dtype() {
-    return bt::default_device() == bt::Device::CUDA
+    return bt::default_device().is_gpu()
                ? bt::Dtype::BF16
                : brodiffusion::compute_dtype();
 }
