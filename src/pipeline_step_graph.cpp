@@ -19,9 +19,25 @@ namespace brodiffusion::pipeline {
 
 namespace bt = ::brotensor;
 
+static bool step_graph_disabled() {
+    const char* e = std::getenv("BRODIFFUSION_DISABLE_STEP_GRAPH");
+    if (e && std::strcmp(e, "0") != 0) return true;
+    return bt::default_device() == bt::Device::HIP;
+}
+
 void Pipeline::step_denoise_captured_(PipelineState& state, float t,
                                       bool do_cfg) {
 #if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
+    if (step_graph_disabled()) {
+        denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
+                           *state.prepared, Branch::Cond, noise_pred_cond_);
+        if (do_cfg) {
+            denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
+                               *state.prepared, Branch::Uncond,
+                               noise_pred_uncond_);
+        }
+        return;
+    }
     StepGraphSession* s = step_graph_.get();
     const bool key_match =
         s != nullptr &&
