@@ -1,0 +1,37 @@
+#version 460
+// TripoSplat flow DiT's content-conditioned axial RoPE tables on Vulkan, the
+// twin of src/triposplat/flow_rope.cu (see include/brodiffusion/detail/flow_rope.h):
+//   a = delta_pos[row, axis(j)] * freqs_pi[j],  cos_out / sin_out[row, j] = cos / sin(a)
+// with axis(j) = 0 for j < f0, 1 for j < f0 + f1, else 2. delta_pos and
+// freqs_pi in -DDT (0 FP32, 1 FP16), the tables FP32. sin / cos through
+// brotensor's sincos_acc (about an ulp of sinf / cosf at any argument, where
+// GLSL's built-ins are only bounded on [-pi, pi]).
+#include "common.glsl"
+#include "math_acc.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    uint64_t dp;
+    uint64_t freqs;
+    uint64_t cos_out;
+    uint64_t sin_out;
+    uint rows;
+    uint half_dim;
+    uint f0;
+    uint f1;
+} pc;
+
+void main() {
+    const uint total = pc.rows * pc.half_dim;
+    for (uint i = gl_GlobalInvocationID.x; i < total; i += GRID_STRIDE_X) {
+        const uint j = i % pc.half_dim;
+        const uint row = i / pc.half_dim;
+        const uint axis = j < pc.f0 ? 0u : (j < pc.f0 + pc.f1 ? 1u : 2u);
+        const float a = load_elem(DT, pc.dp, row * 3u + axis) * load_elem(DT, pc.freqs, j);
+        float s, c;
+        sincos_acc(a, s, c);
+        F32Buf(pc.cos_out).v[i] = c;
+        F32Buf(pc.sin_out).v[i] = s;
+    }
+}

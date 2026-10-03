@@ -38,6 +38,11 @@ endif()
 option(BROTENSOR_WITH_CUDA  "Build the CUDA GPU backend"  OFF)
 option(BROTENSOR_WITH_METAL "Build the Metal GPU backend" OFF)
 option(BROTENSOR_WITH_HIP   "Build the HIP GPU backend"   OFF)
+# Vulkan compute backend (brotensor's docs/vulkan.md); additive, coexists with
+# HIP. brodiffusion's own kernels for it are GLSL (src/vulkan/*.comp), compiled
+# by brotensor's cmake/BrotensorVulkan.cmake; the SD1.5 fused ops map onto
+# brotensor's fused GPU ops there (src/fused.cpp).
+option(BROTENSOR_WITH_VULKAN "Build the Vulkan GPU backend" OFF)
 
 # brodiffusion ships SD1.5-specific fused CUDA kernels (e.g. fused_resblock.cu);
 # enable the CUDA language only when CUDA is the selected backend.
@@ -71,6 +76,19 @@ if(BROTENSOR_WITH_HIP)
     set(CMAKE_HIP_STANDARD 20)
     set(CMAKE_HIP_STANDARD_REQUIRED ON)
     find_package(hip REQUIRED)
+endif()
+
+if(BROTENSOR_WITH_VULKAN)
+    # glslc and brotensor's shader include directory, found exactly as
+    # brotensor's own build finds them.
+    set(BROTENSOR_DIR "${CMAKE_SOURCE_DIR}/../brotensor" CACHE PATH
+        "Path to standalone brotensor repo (set to a missing path to force submodule fallback)")
+    if(EXISTS "${BROTENSOR_DIR}/cmake/BrotensorVulkan.cmake")
+        include("${BROTENSOR_DIR}/cmake/BrotensorVulkan.cmake")
+    else()
+        include("${CMAKE_SOURCE_DIR}/third_party/brotensor/cmake/BrotensorVulkan.cmake")
+    endif()
+    brotensor_vulkan_prepare()
 endif()
 
 # brodiffusion ships SD1.5-specific fused Metal kernels (fused_resblock.mm,
@@ -322,6 +340,19 @@ if(BROTENSOR_WITH_HIP)
         ${BROTENSOR_DIR}/src/hip/detail
     )
     target_link_libraries(brodiffusion PUBLIC hip::host)
+endif()
+
+if(BROTENSOR_WITH_VULKAN)
+    # GLSL kernels for the Vulkan device, embedded as SPIR-V and dispatched
+    # through brotensor::vulkan::dispatch (the generated
+    # brodiffusion_vk_shaders.h: brodiffusion::detail::vk::Shader / handle()).
+    target_sources(brodiffusion PRIVATE src/triposplat/flow_rope_vulkan.cpp)
+    brotensor_vulkan_add_shaders(brodiffusion
+        NAMESPACE brodiffusion::detail::vk
+        HEADER brodiffusion_vk_shaders.h
+        SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan"
+        SHADERS "flow_rope_f32|flow_rope.comp|-DDT=0"
+                "flow_rope_f16|flow_rope.comp|-DDT=1")
 endif()
 
 if(BROTENSOR_WITH_METAL)

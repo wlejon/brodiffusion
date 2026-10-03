@@ -8,9 +8,7 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
-#include "brotensor/cuda_graph.h"
-#endif
+#include "brotensor/cuda_graph.h"   // device-neutral: CUDA, HIP, Vulkan
 
 #include <cstdlib>
 #include <stdexcept>
@@ -72,15 +70,15 @@ void sample_latent(FlowDiT& flow,
     // on-device: v = s*v_cond + (1-s)*v_uncond ≡ s*v_cond - (s-1)*v_uncond.
     bt::Tensor v_lat, v_cam, v_lat_u, v_cam_u, scratch_l, scratch_c;
 
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     // Step-capture session, local to this call: the latent/camera/feature
     // buffers (and the model's scratch members) are fixed for the whole call,
-    // so the session never needs a cross-call identity key.
+    // so the session never needs a cross-call identity key. Any GPU with
+    // graph capture (CUDA, HIP, Vulkan) records on the latent's device.
+    const bt::Device step_device = latent.device;
     const bool capture_enabled =
-        (bt::default_device() == bt::Device::CUDA || bt::default_device() == bt::Device::HIP) && !step_graph_disabled();
+        bt::graph_capture_available(step_device) && !step_graph_disabled();
     bt::CudaGraph graph;
     int eager_steps = 0;
-#endif
 
     for (int i = 0; i < opts.steps; ++i) {
         // Cooperative cancellation: bail out between steps if asked. Checked
@@ -93,12 +91,9 @@ void sample_latent(FlowDiT& flow,
         // writes the persistent t_emb_/t_mod_ buffers the captured body reads.
         flow.prepare_step(t);
 
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
         if (graph.valid()) {
             graph.launch();
-        } else
-#endif
-        {
+        } else {
             // Eager warm-up step through the capture seam: computes this
             // step's real outputs and settles every body buffer at its
             // high-water capacity.
@@ -108,7 +103,6 @@ void sample_latent(FlowDiT& flow,
                 bt::axpby_inplace(v_lat, v_lat_u, s, 1.0f - s);
                 bt::axpby_inplace(v_cam, v_cam_u, s, 1.0f - s);
             }
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
             ++eager_steps;
             // Capture only once every buffer-role assignment the captured
             // calls can start from has already been warmed (an alloc/free of
@@ -125,7 +119,7 @@ void sample_latent(FlowDiT& flow,
                 // (the eager outputs above stand for this step); every later
                 // step replays the whole sequence with one cudaGraphLaunch.
                 bt::sync_all();
-                bt::CudaGraphCapture cap;
+                bt::CudaGraphCapture cap(step_device);
                 flow.forward_body(latent, camera, feature1, feature2, v_lat, v_cam);
                 if (cfg) {
                     flow.forward_body(latent, camera, zero1, zero2, v_lat_u, v_cam_u);
@@ -134,7 +128,6 @@ void sample_latent(FlowDiT& flow,
                 }
                 graph = cap.finish();
             }
-#endif
         }
 
         // Euler step — eager: the scheduler bakes the per-step d_sigma scalar

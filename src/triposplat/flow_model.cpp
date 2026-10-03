@@ -307,12 +307,13 @@ void FlowDiT::build_rope(const bt::Tensor& hidden, const Repo& r,
     });
 
     // The rotary is FP32 in the reference; the cos/sin tables are (L*H, half).
+    // On a GPU with a table kernel (CUDA / HIP, Vulkan) build them fully
+    // on-device: no stream sync, no delta_pos download, no host trig, no table
+    // upload — all of which the host path below pays per block (~28
+    // blocks/forward), and none of which a step-graph capture allows. Metal
+    // keeps the host path (left to the Metal backend).
 #if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
-    // On CUDA/HIP build the tables fully on-device: no stream sync, no delta_pos
-    // download, no host trig, no table upload — all of which the host path below
-    // pays per block (~28 blocks/forward). Metal keeps the host path (left to the
-    // Metal backend), so gate specifically on the CUDA/HIP device.
-    if (hidden.device == bt::Device::CUDA || hidden.device == bt::Device::HIP) {
+    if (hidden.device.is_cuda() || hidden.device.is_hip()) {
         prof("rope: tables", [&] {
             detail::flow_rope_tables_cuda(dp, r.freqs_pi, L, H, half, f0, f1,
                                           cos_out, sin_out);
@@ -320,8 +321,17 @@ void FlowDiT::build_rope(const bt::Tensor& hidden, const Repo& r,
         return;
     }
 #endif
+#if defined(BROTENSOR_HAS_VULKAN)
+    if (hidden.device.is_vulkan()) {
+        prof("rope: tables", [&] {
+            detail::flow_rope_tables_vulkan(dp, r.freqs_pi, L, H, half, f0, f1,
+                                            cos_out, sin_out);
+        });
+        return;
+    }
+#endif
 
-    // CPU (and non-CUDA) fallback: download delta_pos, build the tables host-side
+    // CPU (and Metal) fallback: download delta_pos, build the tables host-side
     // (also satisfies rope_apply_perhead's FP32-table requirement), upload back.
     bt::sync_all();
     std::vector<float> d = download_f32(dp);        // (L, 3H), [head, axis]

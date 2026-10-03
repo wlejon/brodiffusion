@@ -1,5 +1,6 @@
-// The CUDA-graph denoising-step seam: warm-up, capture, and replay of the
-// denoiser body. Moved verbatim out of pipeline.cpp — see pipeline_detail.h
+// The step-graph denoising seam: warm-up, capture, and replay of the denoiser
+// body, on whichever GPU the latent lives (brotensor's CudaGraphCapture is
+// device-neutral: CUDA, HIP, Vulkan). Moved verbatim out of pipeline.cpp — see pipeline_detail.h
 // for the file map and for StepGraphSession's keying rules.
 
 #include "brodiffusion/pipeline.h"
@@ -9,9 +10,7 @@
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
-#include "brotensor/cuda_graph.h"
-#endif
+#include "brotensor/cuda_graph.h"   // device-neutral: CUDA, HIP, Vulkan
 
 #include <memory>
 
@@ -22,8 +21,7 @@ using detail_pipe::step_graph_disabled;
 
 void Pipeline::step_denoise_captured_(PipelineState& state, float t,
                                       bool do_cfg) {
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
-    if (step_graph_disabled()) {
+    if (step_graph_disabled() || !bt::graph_capture_available(state.latent.device)) {
         denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
                            *state.prepared, Branch::Cond, noise_pred_cond_);
         if (do_cfg) {
@@ -86,7 +84,7 @@ void Pipeline::step_denoise_captured_(PipelineState& state, float t,
     // own graph (the bodies share all scratch buffers).
     {
         bt::sync_all();
-        bt::CudaGraphCapture cap;
+        bt::CudaGraphCapture cap(state.latent.device);
         denoiser_->forward_body(state.latent, state.H_lat, state.W_lat,
                                 *state.prepared, Branch::Cond,
                                 noise_pred_cond_);
@@ -94,23 +92,13 @@ void Pipeline::step_denoise_captured_(PipelineState& state, float t,
     }
     if (do_cfg) {
         bt::sync_all();
-        bt::CudaGraphCapture cap;
+        bt::CudaGraphCapture cap(state.latent.device);
         denoiser_->forward_body(state.latent, state.H_lat, state.W_lat,
                                 *state.prepared, Branch::Uncond,
                                 noise_pred_uncond_);
         s->graph_uncond = cap.finish();
     }
     s->captured = true;
-#else
-    // No CUDA backend in this build: plain eager forwards.
-    denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
-                       *state.prepared, Branch::Cond, noise_pred_cond_);
-    if (do_cfg) {
-        denoiser_->forward(state.latent, state.H_lat, state.W_lat, t,
-                           *state.prepared, Branch::Uncond,
-                           noise_pred_uncond_);
-    }
-#endif
 }
 
 }  // namespace brodiffusion::pipeline

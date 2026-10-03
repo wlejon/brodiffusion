@@ -33,9 +33,7 @@
 
 #include "brotensor/tensor.h"
 
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
-#include "brotensor/cuda_graph.h"
-#endif
+#include "brotensor/cuda_graph.h"   // device-neutral: CUDA, HIP, Vulkan
 
 #include <cstdint>
 #include <memory>
@@ -171,10 +169,8 @@ bool cfg_branch_active(ModelClass model_class, const Denoiser& denoiser,
 // Defined here rather than in pipeline_step_graph.cpp because ~Pipeline
 // destroys the unique_ptr that holds it and lives in pipeline.cpp.
 struct Pipeline::StepGraphSession {
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
     brotensor::CudaGraph graph;          // cond branch (also the single graph when no CFG)
     brotensor::CudaGraph graph_uncond;   // uncond branch — a SEPARATE graph under CFG
-#endif
     std::uint64_t state_id = 0;   // PipelineState::id — never a recycled address
     int  H = 0, W = 0;
     bool do_cfg = false;

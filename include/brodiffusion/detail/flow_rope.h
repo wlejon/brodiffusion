@@ -1,6 +1,6 @@
 #pragma once
 //
-// CUDA entry point for the TripoSplat flow DiT's content-conditioned axial RoPE
+// GPU entry points (CUDA / HIP, Vulkan) for the TripoSplat flow DiT's content-conditioned axial RoPE
 // table build. Defined in src/triposplat/flow_rope.cu — compiled only in a CUDA
 // build. FlowDiT::build_rope dispatches a GPU-resident delta_pos here instead of
 // the host round-trip (sync + download + host trig + upload) it runs per block
@@ -25,3 +25,17 @@ void flow_rope_tables_cuda(const brotensor::Tensor& delta_pos,
                            brotensor::Tensor& sin_out);
 
 }  // namespace brodiffusion::detail
+
+#if defined(BROTENSOR_HAS_VULKAN)
+namespace brodiffusion::detail {
+
+// The same tables on a Vulkan device (src/triposplat/flow_rope_vulkan.cpp,
+// kernel src/vulkan/flow_rope.comp). Same contract as flow_rope_tables_cuda.
+void flow_rope_tables_vulkan(const brotensor::Tensor& delta_pos,
+                             const brotensor::Tensor& freqs_pi,
+                             int L, int num_heads, int half, int f0, int f1,
+                             brotensor::Tensor& cos_out,
+                             brotensor::Tensor& sin_out);
+
+}  // namespace brodiffusion::detail
+#endif
