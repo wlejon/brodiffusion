@@ -8,7 +8,7 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
-#include "brotensor/cuda_graph.h"   // device-neutral: CUDA, HIP, Vulkan
+#include "brotensor/cuda_graph.h"   // device-neutral: CUDA, Vulkan
 
 #include <cstdlib>
 #include <stdexcept>
@@ -73,7 +73,7 @@ void sample_latent(FlowDiT& flow,
     // Step-capture session, local to this call: the latent/camera/feature
     // buffers (and the model's scratch members) are fixed for the whole call,
     // so the session never needs a cross-call identity key. Any GPU with
-    // graph capture (CUDA, HIP, Vulkan) records on the latent's device.
+    // graph capture (CUDA, Vulkan) records on the latent's device.
     const bt::Device step_device = latent.device;
     const bool capture_enabled =
         bt::graph_capture_available(step_device) && !step_graph_disabled();

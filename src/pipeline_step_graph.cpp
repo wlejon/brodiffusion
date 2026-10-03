@@ -1,6 +1,6 @@
 // The step-graph denoising seam: warm-up, capture, and replay of the denoiser
 // body, on whichever GPU the latent lives (brotensor's CudaGraphCapture is
-// device-neutral: CUDA, HIP, Vulkan). Moved verbatim out of pipeline.cpp — see pipeline_detail.h
+// device-neutral: CUDA, Vulkan). Moved verbatim out of pipeline.cpp — see pipeline_detail.h
 // for the file map and for StepGraphSession's keying rules.
 
 #include "brodiffusion/pipeline.h"
@@ -10,7 +10,7 @@
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 
-#include "brotensor/cuda_graph.h"   // device-neutral: CUDA, HIP, Vulkan
+#include "brotensor/cuda_graph.h"   // device-neutral: CUDA, Vulkan
 
 #include <memory>
 

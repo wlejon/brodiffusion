@@ -9,7 +9,7 @@ through the CLI, plus image-to-3D, text-to-motion, and terrain generation as
 library modules.
 Part of the [bro](https://github.com/wlejon/bro) stack, and usable
 standalone as a CLI or library — built on [brotensor](https://github.com/wlejon/brotensor)
-for tensors and compute kernels (CPU / CUDA / Metal / Vulkan / HIP), [bromath](https://github.com/wlejon/bromath)
+for tensors and compute kernels (CPU / CUDA / Metal / Vulkan), [bromath](https://github.com/wlejon/bromath)
 for scalar/RNG/color math, [brolm](https://github.com/wlejon/brolm) for
 tokenizers and text encoders, and [broimage](https://github.com/wlejon/broimage)
 for image decode/encode and host preprocessing.
@@ -21,7 +21,7 @@ Every model family below is ported weight-for-weight from its Hugging Face
 FP16/BF16 tolerance.
 
 Runs **CPU-by-default and on a GPU when one is available** — FP32 on the CPU
-backend, FP16/BF16 on CUDA, Metal, Vulkan or HIP — with the device chosen at runtime, no
+backend, FP16/BF16 on CUDA, Metal or Vulkan — with the device chosen at runtime, no
 rebuild required.
 
 ## Model families
@@ -86,10 +86,9 @@ latent map's low-frequency band.
 
 ## Build
 
-brotensor always builds its CPU backend; the GPU backends are additive. CUDA,
-Metal and HIP are mutually exclusive; Vulkan sits beside any of them. On AMD,
-Vulkan is the backend of choice and HIP is kept as the comparison backend.
-brodiffusion forwards the choice:
+brotensor always builds its CPU backend; the GPU backends are additive. CUDA
+and Metal are mutually exclusive; Vulkan sits beside either. Vulkan is the
+AMD GPU backend. brodiffusion forwards the choice:
 
 ```bash
 # CPU-only — the default. Runs the full inference path in FP32.
@@ -104,9 +103,8 @@ cmake --build build --config Release
 cmake -B build -DBROTENSOR_WITH_METAL=ON
 cmake --build build --config Release
 
-# AMD: Vulkan (default device) + HIP for comparison (BROTENSOR_PREFER_HIP=1 picks it).
-# brodiffusion's own kernels: GLSL under Vulkan, the .cu files compiled as HIP under HIP.
-cmake -B build_vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_VULKAN=ON -DBROTENSOR_WITH_HIP=ON
+# AMD (or any Vulkan GPU): brodiffusion's own kernels are GLSL under Vulkan.
+cmake -B build_vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_VULKAN=ON
 cmake --build build_vk
 ```
 
@@ -114,8 +112,7 @@ cmake --build build_vk
 |---|---|---|
 | `BROTENSOR_WITH_CUDA` | `OFF` | Build the CUDA GPU backend |
 | `BROTENSOR_WITH_METAL` | `OFF` | Build the Metal GPU backend |
-| `BROTENSOR_WITH_VULKAN` | `OFF` | Build the Vulkan GPU backend (AMD's backend of choice; needs glslc + Vulkan headers) |
-| `BROTENSOR_WITH_HIP` | `OFF` | Build the HIP GPU backend (AMD / ROCm; the comparison backend) |
+| `BROTENSOR_WITH_VULKAN` | `OFF` | Build the Vulkan GPU backend (the AMD GPU backend; needs glslc + Vulkan headers) |
 | `BRODIFFUSION_CLI` | on when top-level | Build the `brodiffusion` CLI |
 | `BRODIFFUSION_KREA2_CAPI` | on when top-level | Build `krea2_capi`, a flat C API DLL over the Krea 2 components for research bindings |
 | `BRODIFFUSION_TESTS` | `ON` | Build the test suite (only runs when brodiffusion is the top-level project) |

@@ -37,11 +37,10 @@ endif()
 # GPU-resident tensors — CPU by default, GPU when available.
 option(BROTENSOR_WITH_CUDA  "Build the CUDA GPU backend"  OFF)
 option(BROTENSOR_WITH_METAL "Build the Metal GPU backend" OFF)
-option(BROTENSOR_WITH_HIP   "Build the HIP GPU backend"   OFF)
 # Vulkan compute backend (brotensor's docs/vulkan.md); additive, coexists with
-# HIP. brodiffusion's own kernels for it are GLSL (src/vulkan/*.comp), compiled
-# by brotensor's cmake/BrotensorVulkan.cmake; the SD1.5 fused ops map onto
-# brotensor's fused GPU ops there (src/fused.cpp).
+# the other backends. brodiffusion's own kernels for it are GLSL
+# (src/vulkan/*.comp), compiled by brotensor's cmake/BrotensorVulkan.cmake;
+# the SD1.5 fused ops map onto brotensor's fused GPU ops there (src/fused.cpp).
 option(BROTENSOR_WITH_VULKAN "Build the Vulkan GPU backend" OFF)
 
 # brodiffusion ships SD1.5-specific fused CUDA kernels (e.g. fused_resblock.cu);
@@ -57,25 +56,6 @@ if(BROTENSOR_WITH_CUDA)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-endif()
-
-if(BROTENSOR_WITH_HIP)
-    # ROCm root and target architectures resolve exactly as brotensor's do
-    # (brotensor's cmake/BrotensorHip.cmake): ROCM_PATH, and the build
-    # machine's GPUs unless CMAKE_HIP_ARCHITECTURES is given.
-    set(BROTENSOR_DIR "${CMAKE_SOURCE_DIR}/../brotensor" CACHE PATH
-        "Path to standalone brotensor repo (set to a missing path to force submodule fallback)")
-    if(EXISTS "${BROTENSOR_DIR}/cmake/BrotensorHip.cmake")
-        include("${BROTENSOR_DIR}/cmake/BrotensorHip.cmake")
-    else()
-        include("${CMAKE_SOURCE_DIR}/third_party/brotensor/cmake/BrotensorHip.cmake")
-    endif()
-    brotensor_hip_prepare()
-    enable_language(HIP)
-    brotensor_hip_check_archs()
-    set(CMAKE_HIP_STANDARD 20)
-    set(CMAKE_HIP_STANDARD_REQUIRED ON)
-    find_package(hip REQUIRED)
 endif()
 
 if(BROTENSOR_WITH_VULKAN)
@@ -321,25 +301,6 @@ if(BROTENSOR_WITH_CUDA)
     # Static CUDA runtime so the shipped binary carries no cudart DLL dependency
     # and launches on machines without the CUDA toolkit (falls back to CPU).
     target_link_libraries(brodiffusion PUBLIC CUDA::cudart_static)
-endif()
-
-if(BROTENSOR_WITH_HIP)
-    target_sources(brodiffusion PRIVATE
-        src/fused_resblock.cu
-        src/fused_transformer.cu
-        src/triposplat/flow_rope.cu
-    )
-    set_source_files_properties(
-        src/fused_resblock.cu
-        src/fused_transformer.cu
-        src/triposplat/flow_rope.cu
-        PROPERTIES LANGUAGE HIP
-    )
-    target_include_directories(brodiffusion PRIVATE
-        ${BROTENSOR_DIR}/src/hip/compat
-        ${BROTENSOR_DIR}/src/hip/detail
-    )
-    target_link_libraries(brodiffusion PUBLIC hip::host)
 endif()
 
 if(BROTENSOR_WITH_VULKAN)

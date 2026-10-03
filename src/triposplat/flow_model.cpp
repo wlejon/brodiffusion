@@ -307,13 +307,13 @@ void FlowDiT::build_rope(const bt::Tensor& hidden, const Repo& r,
     });
 
     // The rotary is FP32 in the reference; the cos/sin tables are (L*H, half).
-    // On a GPU with a table kernel (CUDA / HIP, Vulkan) build them fully
+    // On a GPU with a table kernel (CUDA, Vulkan) build them fully
     // on-device: no stream sync, no delta_pos download, no host trig, no table
     // upload — all of which the host path below pays per block (~28
     // blocks/forward), and none of which a step-graph capture allows. Metal
     // keeps the host path (left to the Metal backend).
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
-    if (hidden.device.is_cuda() || hidden.device.is_hip()) {
+#if defined(BROTENSOR_HAS_CUDA)
+    if (hidden.device.is_cuda()) {
         prof("rope: tables", [&] {
             detail::flow_rope_tables_cuda(dp, r.freqs_pi, L, H, half, f0, f1,
                                           cos_out, sin_out);

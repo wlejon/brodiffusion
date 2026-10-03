@@ -33,7 +33,7 @@
 
 #include "brotensor/tensor.h"
 
-#include "brotensor/cuda_graph.h"   // device-neutral: CUDA, HIP, Vulkan
+#include "brotensor/cuda_graph.h"   // device-neutral: CUDA, Vulkan
 
 #include <cstdint>
 #include <memory>

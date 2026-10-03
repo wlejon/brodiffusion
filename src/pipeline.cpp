@@ -40,7 +40,7 @@
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
-#include "brotensor/cuda_graph.h"   // device-neutral: CUDA, HIP, Vulkan
+#include "brotensor/cuda_graph.h"   // device-neutral: CUDA, Vulkan
 
 #include <algorithm>
 #include <cmath>
@@ -884,7 +884,7 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
         }
     } else {
         // Plain fast path. When the denoiser exposes the step-capture seam
-        // and the latent lives on a GPU with graph capture (CUDA, HIP,
+        // and the latent lives on a GPU with graph capture (CUDA,
         // Vulkan), run it through the step-graph session (warm-up → capture →
         // single-launch replay); otherwise the classic eager forwards.
         const bool graph_eligible =

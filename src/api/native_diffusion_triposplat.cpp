@@ -657,7 +657,6 @@ void decorateTripoSplatProto(ObjectBuilder& proto) {
         if (!w) return ev::fromUtf8("CPU");
         switch (w->device.type) {
             case brotensor::DeviceType::CUDA:  return ev::fromUtf8("CUDA");
-            case brotensor::DeviceType::HIP:   return ev::fromUtf8("HIP");
             case brotensor::DeviceType::Metal: return ev::fromUtf8("Metal");
             case brotensor::DeviceType::VULKAN: return ev::fromUtf8("Vulkan");
             default:                           return ev::fromUtf8("CPU");
@@ -738,8 +737,7 @@ Value makeTriposplatNamespace() {
 
         try {
             brotensor::init();
-            // brotensor's default device: the registered GPU (Vulkan before
-            // HIP unless BROTENSOR_PREFER_HIP=1), else the CPU.
+            // brotensor's default device: the registered GPU, else the CPU.
             brotensor::Device device = brotensor::default_device();
 
             Value devVal = ev::getProperty(args[0], "device");
@@ -747,7 +745,6 @@ Value makeTriposplatNamespace() {
                 std::string dev = ev::toUtf8(devVal);
                 if (dev == "cpu") device = brotensor::Device::CPU;
                 else if (dev == "cuda") device = brotensor::Device::CUDA;
-                else if (dev == "hip" || dev == "rocm") device = brotensor::Device::HIP;
                 else if (dev == "metal") device = brotensor::Device::Metal;
                 else if (dev == "vulkan" || dev == "vk") device = brotensor::Device::VULKAN;
             }

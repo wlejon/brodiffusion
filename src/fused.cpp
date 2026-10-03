@@ -1,10 +1,10 @@
 // brodiffusion fused-op dispatch + CPU fallback.
 //
 // brodiffusion ships SD1.5-tuned fused CUDA kernels (fused_resblock.cu,
-// fused_transformer.cu, also built as HIP) and their Metal twins. This
+// fused_transformer.cu) and their Metal twins. This
 // translation unit provides the public brodiffusion::fused_* entry points as
 // runtime dispatchers on the input's device:
-//   * CUDA / HIP -> the CUDA kernel (brodiffusion::detail::*_cuda);
+//   * CUDA       -> the CUDA kernel (brodiffusion::detail::*_cuda);
 //   * Metal      -> the Metal kernel (detail::*_metal);
 //   * any other GPU (Vulkan) -> brotensor's own fused GPU ops, which is what
 //     these kernels fuse: resblock_forward (GroupNorm+SiLU, conv with the
@@ -12,11 +12,11 @@
 //     onto it), a linear then geglu_exact_forward, add_inplace,
 //     add_row_bias_inplace (gpu_* below);
 //   * CPU        -> an FP32 fallback composed from brotensor's CPU ops.
-// A tensor never reaches a kernel built for another backend: a HIP + Vulkan
+// A tensor never reaches a kernel built for another backend: a CUDA + Vulkan
 // build sends a Vulkan tensor (a buffer device address) to the gpu_* path.
 //
-// Always compiled. The CUDA / HIP branch is gated on BROTENSOR_HAS_CUDA /
-// BROTENSOR_HAS_HIP, so a build without them needs no nvcc / hipcc.
+// Always compiled. The CUDA branch is gated on BROTENSOR_HAS_CUDA, so a
+// build without it needs no nvcc.
 
 #include "brodiffusion/fused_resblock.h"
 #include "brodiffusion/fused_transformer.h"
@@ -35,9 +35,9 @@ namespace bt = ::brotensor;
 
 namespace {
 
-// The tensor lives where brodiffusion's CUDA / HIP kernels can run on it.
+// The tensor lives where brodiffusion's CUDA kernels can run on it.
 [[maybe_unused]] bool on_cuda_kernel_device(const bt::Tensor& t) {
-    return t.device.is_cuda() || t.device.is_hip();
+    return t.device.is_cuda();
 }
 [[maybe_unused]] bool on_metal(const bt::Tensor& t) { return t.device.is_metal(); }
 
@@ -149,7 +149,7 @@ void fused_resblock_forward(
     int C_in, int C_out, int H, int W,
     int num_groups, float eps,
     bt::Tensor& Y) {
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
+#if defined(BROTENSOR_HAS_CUDA)
     if (on_cuda_kernel_device(X)) {
         detail::fused_resblock_forward_cuda(
             X, gn1_g, gn1_b, W1, b1, t_emb_shift, gn2_g, gn2_b, W2, b2,
@@ -189,7 +189,7 @@ void fused_resblock_forward(  // W8A16 — GPU-only
     int C_in, int C_out, int H, int W,
     int num_groups, float eps,
     bt::Tensor& Y) {
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
+#if defined(BROTENSOR_HAS_CUDA)
     if (on_cuda_kernel_device(X)) {
         detail::fused_resblock_forward_cuda(
             X, gn1_g, gn1_b, W1_int8, W1_scales, b1, t_emb_shift, gn2_g, gn2_b,
@@ -213,7 +213,7 @@ void fused_resblock_forward(  // W8A16 — GPU-only
 
 void fused_linear_geglu(const bt::Tensor& X, const bt::Tensor& W,
                         const bt::Tensor& b, bt::Tensor& Y) {
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
+#if defined(BROTENSOR_HAS_CUDA)
     if (on_cuda_kernel_device(X)) {
         detail::fused_linear_geglu_cuda(X, W, b, Y);
         return;
@@ -237,7 +237,7 @@ void fused_linear_geglu(const bt::Tensor& X,       // W8A16
                         const bt::Tensor& W_scales,
                         const bt::Tensor& b,
                         bt::Tensor& Y) {
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
+#if defined(BROTENSOR_HAS_CUDA)
     if (on_cuda_kernel_device(X)) {
         detail::fused_linear_geglu_cuda(X, W_int8, W_scales, b, Y);
         return;
@@ -253,7 +253,7 @@ void fused_linear_geglu(const bt::Tensor& X,       // W8A16
 }
 
 void add_inplace_vec(bt::Tensor& Y, const bt::Tensor& X) {
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
+#if defined(BROTENSOR_HAS_CUDA)
     if (on_cuda_kernel_device(Y)) {
         detail::add_inplace_vec_cuda(Y, X);
         return;
@@ -270,7 +270,7 @@ void add_inplace_vec(bt::Tensor& Y, const bt::Tensor& X) {
 }
 
 void add_inplace_row_bias(bt::Tensor& Y, const bt::Tensor& bias) {
-#if defined(BROTENSOR_HAS_CUDA) || defined(BROTENSOR_HAS_HIP)
+#if defined(BROTENSOR_HAS_CUDA)
     if (on_cuda_kernel_device(Y)) {
         detail::add_inplace_row_bias_cuda(Y, bias);
         return;

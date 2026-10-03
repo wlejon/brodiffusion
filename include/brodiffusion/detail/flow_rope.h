@@ -1,6 +1,6 @@
 #pragma once
 //
-// GPU entry points (CUDA / HIP, Vulkan) for the TripoSplat flow DiT's content-conditioned axial RoPE
+// GPU entry points (CUDA, Vulkan) for the TripoSplat flow DiT's content-conditioned axial RoPE
 // table build. Defined in src/triposplat/flow_rope.cu — compiled only in a CUDA
 // build. FlowDiT::build_rope dispatches a GPU-resident delta_pos here instead of
 // the host round-trip (sync + download + host trig + upload) it runs per block
