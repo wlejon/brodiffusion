@@ -738,8 +738,8 @@ Value makeTriposplatNamespace() {
 
         try {
             brotensor::init();
-            // brotensor's default device: the registered HIP, CUDA or Metal
-            // GPU, else the CPU (Vulkan when BROTENSOR_DEFAULT_DEVICE says so).
+            // brotensor's default device: the registered GPU (Vulkan before
+            // HIP unless BROTENSOR_PREFER_HIP=1), else the CPU.
             brotensor::Device device = brotensor::default_device();
 
             Value devVal = ev::getProperty(args[0], "device");
