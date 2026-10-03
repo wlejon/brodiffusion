@@ -209,7 +209,6 @@ private:
     brotensor::Tensor ones_bf_;                  // (1,N) ones at compute dtype
     brotensor::Tensor sa_S_, sa_z_, sa_qt_;      // KᵀV (nh,hd,hd), colsum (D,1), Qrᵀ (nh,N,hd)
     brotensor::Tensor sa_num_, sa_den_;          // (D,N) numerator, (nh,N) denominator
-    brotensor::Tensor sa_qf_, sa_kf_, sa_vf_;     // FP32 q/k/v of the Vulkan core
     brotensor::Tensor sa_denf_, sa_recip_;       // FP32 1/den scratch, (nh,N) recip
     // cross-attention (ca_*f_: flash-dtype casts; ca_of_: FP32 output cast)
     brotensor::Tensor ca_q_, ca_k_, ca_v_, ca_o_;

@@ -523,38 +523,27 @@ void SanaDenoiser::self_attention_(const Block& blk, int N, int H, int W,
         // All heads at once: 2 elementwise relus, 1 transpose, 4 batched A@Bᵀ
         // GEMMs and a per-head broadcast divide — instead of ~10 ops × nh heads.
         //
-        // On Vulkan the core runs in FP32: its matrix cores take 16-bit
-        // operands as FP16 (brotensor docs/vulkan.md, dtype policy), and
-        // S = V·relu(K)ᵀ sums N products, far past FP16's 65504 at 1024px
-        // (it is what BF16's exponent range is for on CUDA / HIP). Vulkan's
-        // matmul_abt takes FP32 (the SIMT GEMM); the projections and the rest
-        // of the block stay in BF16.
-        const bool f32_core = dev.is_vulkan() && cdt != bt::Dtype::FP32;
-        const bt::Dtype adt = f32_core ? bt::Dtype::FP32 : cdt;
-        bt::Tensor& Q = f32_core ? sa_qf_ : q_;
-        bt::Tensor& K = f32_core ? sa_kf_ : k_;
-        bt::Tensor& V = f32_core ? sa_vf_ : v_;
-        if (f32_core) {
-            bt::cast(q_, sa_qf_, adt);
-            bt::cast(k_, sa_kf_, adt);
-            bt::cast(v_, sa_vf_, adt);
-        }
+        // S = V·relu(K)ᵀ sums N products, far past FP16's 65504 at 1024px:
+        // it is what BF16's exponent range is for. On Vulkan, whose matrix
+        // cores take FP16 operands, brotensor's GEMM scales each row of a
+        // BF16 A operand (S and z below) into FP16's range as it stages it
+        // (brotensor docs/vulkan-bf16.md), so the same BF16 core runs there.
         const std::int64_t hdN = static_cast<std::int64_t>(hd) * N;
         const std::int64_t hdhd = static_cast<std::int64_t>(hd) * hd;
         const std::int64_t Nhd = static_cast<std::int64_t>(N) * hd;
-        bt::relu_forward(Q, Q);                            // relu(Q) (D,N)
-        bt::relu_forward(K, K);                            // relu(K) (D,N)
+        bt::relu_forward(q_, q_);                          // relu(Q) (D,N)
+        bt::relu_forward(k_, k_);                          // relu(K) (D,N)
         // S[h] = V[h] @ relu(K)[h]ᵀ → (hd, hd), batched over heads.
-        detail::resize_like(sa_S_, nh * hd, hd, adt, dev);
-        bt::matmul_abt(V, K, sa_S_, nh, hd, hd, N, hdN, hdN, hdhd, nullptr, 0);
+        detail::resize_like(sa_S_, nh * hd, hd, cdt, dev);
+        bt::matmul_abt(v_, k_, sa_S_, nh, hd, hd, N, hdN, hdN, hdhd, nullptr, 0);
         // z[r] = Σ_n relu(K)[r,n] → (D,1) via relu(K) @ onesᵀ.
-        if (ones_bf_.cols != N || ones_bf_.dtype != adt ||
+        if (ones_bf_.cols != N || ones_bf_.dtype != cdt ||
             ones_bf_.data == nullptr) {
             ensure_ones_(N);
-            bt::cast(ones_, ones_bf_, adt);
+            bt::cast(ones_, ones_bf_, cdt);
         }
-        detail::resize_like(sa_z_, D, 1, adt, dev);
-        bt::matmul_abt(K, ones_bf_, sa_z_, 1, D, 1, N, 0, 0, 0, nullptr, 0);
+        detail::resize_like(sa_z_, D, 1, cdt, dev);
+        bt::matmul_abt(k_, ones_bf_, sa_z_, 1, D, 1, N, 0, 0, 0, nullptr, 0);
         // Identity seam: capture or inject the (S, z) summaries before the
         // query read. Inject is sa_S_ += w·anchorS, sa_z_ += w·anchorz — the
         // exact linear-attention equivalent of concatenating the anchor's K,V.
@@ -569,13 +558,13 @@ void SanaDenoiser::self_attention_(const Block& blk, int N, int H, int W,
             }
         }
         // Qrᵀ: (nh,hd,N) → (nh,N,hd) channel→token transpose, batched over heads.
-        bt::nchw_to_sequence(Q, nh, hd, H, W, sa_qt_);     // (nh*N, hd)
+        bt::nchw_to_sequence(q_, nh, hd, H, W, sa_qt_);    // (nh*N, hd)
         // num[h] = S[h] @ Qrᵀ[h]ᵀ → (hd, N), batched.
-        detail::resize_like(sa_num_, D, N, adt, dev);
+        detail::resize_like(sa_num_, D, N, cdt, dev);
         bt::matmul_abt(sa_S_, sa_qt_, sa_num_, nh, hd, N, hd, hdhd, Nhd, hdN,
                        nullptr, 0);
         // den[h] = z[h] @ Qrᵀ[h]ᵀ → (1, N), batched (z[h] is a (1,hd) row).
-        detail::resize_like(sa_den_, nh, N, adt, dev);
+        detail::resize_like(sa_den_, nh, N, cdt, dev);
         bt::matmul_abt(sa_z_, sa_qt_, sa_den_, nh, 1, N, hd, hd, Nhd,
                        static_cast<std::int64_t>(N), nullptr, 0);
         // recip = 1/(den+eps), computed in FP32 for a stable reciprocal.
@@ -583,21 +572,16 @@ void SanaDenoiser::self_attention_(const Block& blk, int N, int H, int W,
         bt::add_scalar_inplace(sa_denf_, kAttnEps);
         bt::rsqrt_forward(sa_denf_, sa_denf_);
         bt::mul_inplace(sa_denf_, sa_denf_);               // 1/(den+eps)
-        bt::cast(sa_denf_, sa_recip_, adt);                // (nh, N)
+        bt::cast(sa_denf_, sa_recip_, cdt);                // (nh, N)
         // out[h] = num[h] * recip[h] (broadcast the (1,N) row over hd).
-        bt::Tensor& attn = f32_core ? attn_f_ : attn_c_;
-        detail::resize_like(attn, D, N, adt, dev);
+        detail::resize_like(attn_c_, D, N, cdt, dev);
         for (int h = 0; h < nh; ++h) {
             const std::int64_t base = static_cast<std::int64_t>(h) * hd;
             bt::Tensor num_h = sub_view(sa_num_, base * N, hd, N);
             bt::Tensor rec_h = sub_view(sa_recip_,
                                         static_cast<std::int64_t>(h) * N, 1, N);
-            bt::Tensor out_h = sub_view(attn, base * N, hd, N);
+            bt::Tensor out_h = sub_view(attn_c_, base * N, hd, N);
             bt::broadcast_mul(num_h, rec_h, out_h);
-        }
-        if (f32_core) {
-            detail::resize_like(attn_c_, D, N, cdt, dev);
-            bt::cast(attn_f_, attn_c_, cdt);
         }
     }
     });
