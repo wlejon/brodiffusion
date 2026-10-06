@@ -11,8 +11,12 @@ Part of the [bro](https://github.com/wlejon/bro) stack, and usable
 standalone as a CLI or library — built on [brotensor](https://github.com/wlejon/brotensor)
 for tensors and compute kernels (CPU / CUDA / Metal / Vulkan), [bromath](https://github.com/wlejon/bromath)
 for scalar/RNG/color math, [brolm](https://github.com/wlejon/brolm) for
-tokenizers and text encoders, and [broimage](https://github.com/wlejon/broimage)
-for image decode/encode and host preprocessing.
+tokenizers and text encoders, [broimage](https://github.com/wlejon/broimage)
+for image decode/encode and host preprocessing, and [brovisionml](https://github.com/wlejon/brovisionml)
+for the vision backbones image-to-3D conditions on. Inside bro it is the
+engine behind the `bro.diffusion` and `bro.triposplat` JavaScript namespaces.
+Where it sits among the other libraries is in the
+[ecosystem index](https://github.com/wlejon/bro/blob/main/docs/ecosystem.md).
 
 Every model family below is ported weight-for-weight from its Hugging Face
 `diffusers` implementation and checked against it component-by-component
@@ -115,29 +119,59 @@ cmake --build build_vk
 | `BROTENSOR_WITH_VULKAN` | `OFF` | Build the Vulkan GPU backend (the AMD GPU backend; needs glslc + Vulkan headers) |
 | `BRODIFFUSION_CLI` | on when top-level | Build the `brodiffusion` CLI |
 | `BRODIFFUSION_KREA2_CAPI` | on when top-level | Build `krea2_capi`, a flat C API DLL over the Krea 2 components for research bindings |
+| `BRODIFFUSION_QWENIMAGE21_CAPI` | on when top-level | Build the same kind of research C API DLL for Qwen-Image 2.1 |
+| `BRODIFFUSION_ENABLE_API` | `ON` | Build `brodiffusion_api`, the bronze JavaScript binding bro links (needs bronze + brass, below) |
 | `BRODIFFUSION_TESTS` | `ON` | Build the test suite (only runs when brodiffusion is the top-level project) |
 | `BRODIFFUSION_INSTALL` | `OFF` | Generate `install` / `find_package` targets |
 
 INT8 (`--quantize-unet`) weight quantization is GPU-only; it's ignored on
 the CPU backend.
 
+### Platforms
+
+Windows (MSVC), Linux (GCC, Clang) and macOS (Apple Silicon) build and run the
+CPU backend in CI. The GPU backends are developed on real hardware: CUDA on
+Windows/Linux, Metal on macOS, Vulkan on Windows/Linux (AMD and NVIDIA). CI
+has no GPU, so it exercises none of them; the GPU-only tests skip there.
+
 ## Layout
 
-Standalone sibling of [bro](https://github.com/wlejon/bro), [bromath](https://github.com/wlejon/bromath), and
-[brotensor](https://github.com/wlejon/brotensor). The build auto-detects siblings at `../<name>`:
+Each sibling resolves in the same order as everywhere in the bro ecosystem:
 
-```
-projects/
-├── bromath/          # ../bromath    (header-only math)
-├── brotensor/        # ../brotensor  (tensor + compute, CPU + GPU)
-├── brolm/            # ../brolm      (tokenizers + text encoders)
-├── broimage/         # ../broimage   (image decode/encode + host preproc)
-└── brodiffusion/     # this repo
-```
+1. A target that already exists (a superbuild such as bro added it) wins.
+2. A checkout beside this repo, `../<name>` (override with `-D<NAME>_DIR=<path>`):
 
-If a sibling isn't found at `../<name>`, CMake falls back to the matching
-`third_party/` submodule. Override with `-DBROMATH_DIR=...` /
-`-DBROTENSOR_DIR=...` / `-DBROLM_DIR=...` / `-DBROIMAGE_DIR=...`.
+   ```
+   projects/
+   ├── bromath/          # header-only math
+   ├── brotensor/        # tensor + compute, CPU + GPU
+   ├── broimage/         # image decode/encode + host preproc
+   ├── brolm/            # tokenizers + text encoders
+   ├── brovisionml/      # DINOv3 / BiRefNet image encoders
+   ├── bronze/           # JavaScript runtime the api binds (see below)
+   ├── brass/            # bronze's code generator
+   └── brodiffusion/     # this repo
+   ```
+
+3. The flat `third_party/<name>` git submodules, which carry every sibling,
+   transitive ones included:
+
+   ```bash
+   git clone --recursive https://github.com/wlejon/brodiffusion
+   # or, in an existing clone
+   git submodule update --init --recursive
+   ```
+
+The configure log names where each one came from
+(`brodiffusion: brolm from .../third_party/brolm (submodule)`).
+
+bronze and brass are the exception: they have no submodule, because
+`brodiffusion_api` binds across bronze's C++ embed boundary and must compile
+against the same bronze as the program that loads it. A standalone build
+needs [bronze](https://github.com/wlejon/bronze) and
+[brass](https://github.com/wlejon/brass) checked out beside this repo (or
+`-DBRONZE_DIR=<path>`); pass `-DBRODIFFUSION_ENABLE_API=OFF` to build
+without them.
 
 ## Weights
 
@@ -275,13 +309,28 @@ Notable flags:
 codec-agnostic: `Pipeline::generate()` returns an RGB host buffer
 (`3 * H * W` FP32, NCHW, in `[-1, 1]`) and the consumer encodes as it sees fit.
 
+## JavaScript API
+
+`src/api/` builds `brodiffusion_api`, the bronze binding bro installs as
+`bro.diffusion` (pipelines, the step-wise `PipelineState`, LoRA, ControlNet,
+VAE, Krea 2 / Qwen-Image hooks, terrain) and `bro.triposplat`. Its reference
+is bro's
+[diffusion-api.js](https://github.com/wlejon/bro/blob/main/docs/diffusion-api.js),
+[diffusion-control-api.js](https://github.com/wlejon/bro/blob/main/docs/diffusion-control-api.js)
+and [triposplat-api.js](https://github.com/wlejon/bro/blob/main/docs/triposplat-api.js).
+
 ## Tests
 
 ```bash
 cmake -B build
 cmake --build build --config Release
-cd build && ctest -C Release --output-on-failure
+ctest --test-dir build -C Release --output-on-failure
 ```
+
+Tests that need downloaded weights or a GPU skip when those are missing, so
+the suite passes on a CPU-only checkout. CI runs it on Linux (GCC, Clang),
+Windows and macOS with the siblings beside the repo, again in a "Submodule
+fallback" job from a recursive clone alone, and under gcovr for coverage.
 
 ## License
 

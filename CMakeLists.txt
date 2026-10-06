@@ -80,89 +80,47 @@ if(BROTENSOR_WITH_METAL)
     enable_language(OBJCXX)
 endif()
 
-# --- Siblings: bromath (header-only) + brotensor (GPU ops) ---
+# --- Siblings: bromath, brotensor, broimage, brolm, brovisionml ---
 #
-# Prefer standalone repos at ../<name>; fall back to third_party/ submodules.
-# Matches the pattern documented in bro/docs/multi-repo-workflow.md.
-
-set(BROMATH_DIR "${CMAKE_SOURCE_DIR}/../bromath" CACHE PATH
-    "Path to standalone bromath repo (set to a missing path to force submodule fallback)")
-if(NOT TARGET bromath)
-    if(EXISTS "${BROMATH_DIR}/CMakeLists.txt")
-        add_subdirectory("${BROMATH_DIR}" "${CMAKE_BINARY_DIR}/bromath" EXCLUDE_FROM_ALL)
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/bromath/CMakeLists.txt")
-        add_subdirectory(third_party/bromath EXCLUDE_FROM_ALL)
-    else()
-        message(FATAL_ERROR
-            "bromath not found at ${BROMATH_DIR} or third_party/bromath. "
-            "Clone github.com/wlejon/bromath next to this repo, or override with -DBROMATH_DIR=...")
-    endif()
-endif()
-
-set(BROTENSOR_DIR "${CMAKE_SOURCE_DIR}/../brotensor" CACHE PATH
-    "Path to standalone brotensor repo (set to a missing path to force submodule fallback)")
-if(NOT TARGET brotensor)
-    if(EXISTS "${BROTENSOR_DIR}/CMakeLists.txt")
-        add_subdirectory("${BROTENSOR_DIR}" "${CMAKE_BINARY_DIR}/brotensor" EXCLUDE_FROM_ALL)
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/brotensor/CMakeLists.txt")
-        add_subdirectory(third_party/brotensor EXCLUDE_FROM_ALL)
-    else()
-        message(FATAL_ERROR
-            "brotensor not found at ${BROTENSOR_DIR} or third_party/brotensor. "
-            "Clone the brotensor repo next to this repo, or override with -DBROTENSOR_DIR=...")
-    endif()
-endif()
-
-# --- brolm (text encoders + tokenizers — brodiffusion's text frontend) ---
+# Each resolves like every repo in the bro ecosystem: an existing target (a
+# superbuild such as bro already added it) wins; otherwise a checkout beside the
+# top-level project (../<name>, overridable with -D<NAME>_DIR=<path>);
+# otherwise the top-level project's third_party/<name> submodule (`git
+# submodule update --init --recursive`). third_party/ is flat: it carries every
+# sibling brodiffusion needs, transitive ones included. Resolved in dependency
+# order, so brolm and brovisionml find bromath, brotensor and broimage already
+# there and reuse them.
 #
-# Prefer the standalone repo at ../brolm; fall back to third_party/brolm.
-# brolm pulls in bromath + brotensor guarded by if(NOT TARGET ...), so it
-# reuses the targets added above.
-set(BROLM_DIR "${CMAKE_SOURCE_DIR}/../brolm" CACHE PATH
-    "Path to standalone brolm repo (set to a missing path to force submodule fallback)")
-if(NOT TARGET brolm)
-    if(EXISTS "${BROLM_DIR}/CMakeLists.txt")
-        add_subdirectory("${BROLM_DIR}" "${CMAKE_BINARY_DIR}/brolm" EXCLUDE_FROM_ALL)
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/brolm/CMakeLists.txt")
-        add_subdirectory(third_party/brolm EXCLUDE_FROM_ALL)
+#   brolm        text encoders + tokenizers, brodiffusion's text frontend
+#   broimage     image decode/encode + host preproc
+#   brovisionml  vision backbones (DINOv3, BiRefNet) for image-to-3D
+function(brodiffusion_sibling name what)
+    if(TARGET ${name})
+        return()
+    endif()
+    string(TOUPPER "${name}" _upper)
+    set(${_upper}_DIR "${CMAKE_SOURCE_DIR}/../${name}" CACHE PATH
+        "Path to standalone ${name} repo (set to a missing path to force submodule fallback)")
+    if(EXISTS "${${_upper}_DIR}/CMakeLists.txt")
+        message(STATUS "brodiffusion: ${name} from ${${_upper}_DIR}")
+        add_subdirectory("${${_upper}_DIR}" "${CMAKE_BINARY_DIR}/${name}" EXCLUDE_FROM_ALL)
+    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/${name}/CMakeLists.txt")
+        message(STATUS "brodiffusion: ${name} from ${CMAKE_SOURCE_DIR}/third_party/${name} (submodule)")
+        add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/${name}" "${CMAKE_BINARY_DIR}/${name}" EXCLUDE_FROM_ALL)
     else()
         message(FATAL_ERROR
-            "brolm not found at ${BROLM_DIR} or third_party/brolm. "
-            "Clone the brolm repo next to this repo, or override with -DBROLM_DIR=...")
+            "brodiffusion needs ${name} (${what}): not found at ${${_upper}_DIR} or "
+            "${CMAKE_SOURCE_DIR}/third_party/${name}. Clone https://github.com/wlejon/${name} next "
+            "to this repo, run `git submodule update --init --recursive`, or override with "
+            "-D${_upper}_DIR=...")
     endif()
-endif()
+endfunction()
 
-# --- broimage (image decode/encode + host preproc) ---
-set(BROIMAGE_DIR "${CMAKE_SOURCE_DIR}/../broimage" CACHE PATH
-    "Path to standalone broimage repo (set to a missing path to force submodule fallback)")
-if(NOT TARGET broimage)
-    if(EXISTS "${BROIMAGE_DIR}/CMakeLists.txt")
-        add_subdirectory("${BROIMAGE_DIR}" "${CMAKE_BINARY_DIR}/broimage" EXCLUDE_FROM_ALL)
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/broimage/CMakeLists.txt")
-        add_subdirectory(third_party/broimage EXCLUDE_FROM_ALL)
-    else()
-        message(FATAL_ERROR
-            "broimage not found at ${BROIMAGE_DIR} or third_party/broimage. "
-            "Clone the broimage repo next to this repo, or override with -DBROIMAGE_DIR=...")
-    endif()
-endif()
-
-# --- brovisionml (vision backbones — DINOv3, etc.) ---
-set(BROVISIONML_DIR "${CMAKE_SOURCE_DIR}/../brovisionml" CACHE PATH
-    "Path to standalone brovisionml repo (set to a missing path to force submodule fallback)")
-if(NOT TARGET brovisionml)
-    if(EXISTS "${BROVISIONML_DIR}/CMakeLists.txt")
-        add_subdirectory("${BROVISIONML_DIR}" "${CMAKE_BINARY_DIR}/brovisionml" EXCLUDE_FROM_ALL)
-    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/brovisionml/CMakeLists.txt")
-        add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/third_party/brovisionml" "${CMAKE_BINARY_DIR}/brovisionml" EXCLUDE_FROM_ALL)
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/brovisionml/CMakeLists.txt")
-        add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/brovisionml" "${CMAKE_BINARY_DIR}/brovisionml" EXCLUDE_FROM_ALL)
-    else()
-        message(FATAL_ERROR
-            "brovisionml not found at ${BROVISIONML_DIR} or third_party/brovisionml. "
-            "Clone the brovisionml repo next to this repo, or override with -DBROVISIONML_DIR=...")
-    endif()
-endif()
+brodiffusion_sibling(bromath "math headers")
+brodiffusion_sibling(brotensor "tensors and GPU ops")
+brodiffusion_sibling(broimage "image decode and preprocessing")
+brodiffusion_sibling(brolm "text encoders and tokenizers")
+brodiffusion_sibling(brovisionml "vision backbones")
 
 # --- bronze, the JavaScript runtime the api binds ---
 # A checkout beside this one (../bronze, with ../brass beside it — bronze
@@ -179,6 +137,9 @@ if(NOT TARGET bronze_runtime_shared)
         # Explicit BRONZE_DIR supplied
     elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../bronze/CMakeLists.txt")
         set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bronze" CACHE PATH "bronze source tree")
+    elseif(EXISTS "${CMAKE_SOURCE_DIR}/../bronze/CMakeLists.txt")
+        # Beside the top-level project: this repo is a third_party/ submodule of the project being built.
+        set(BRONZE_DIR "${CMAKE_SOURCE_DIR}/../bronze" CACHE PATH "bronze source tree")
     endif()
 
     if(NOT BRONZE_DIR OR NOT EXISTS "${BRONZE_DIR}/CMakeLists.txt")

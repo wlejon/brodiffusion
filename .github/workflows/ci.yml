@@ -12,9 +12,11 @@ concurrency:
 
 # brodiffusion composes brotensor ops and uses brolm for its text frontend.
 # The dependency closure is bromath (header-only) + brotensor (Tensor + CPU op
-# backend) + brolm (text encoders/tokenizers) + broimage (brolm pulls it in).
-# CI builds the default CPU-only configuration (GPU backends OFF), so all four
-# siblings are reconstructed beside this repo:
+# backend) + broimage (image I/O; brolm needs it too) + brolm (text
+# encoders/tokenizers) + brovisionml (image-to-3D encoders). CI builds the
+# default CPU-only configuration (GPU backends OFF). The test and coverage
+# jobs reconstruct the siblings beside this repo; the Submodule fallback job
+# takes them from third_party/ instead:
 #
 #   $GITHUB_WORKSPACE/
 #     brodiffusion/  <- this repo, checked out into a named path
@@ -22,7 +24,8 @@ concurrency:
 #     brotensor/
 #     brolm/
 #     broimage/
-#     bronze/        <- the JavaScript runtime brodiffusion_api binds
+#     brovisionml/
+#     bronze/       <- the JavaScript runtime brodiffusion_api binds
 #     brass/         <- bronze's code generator
 #
 # bronze and brass are laid out by bronze's checkout-toolchain action and
@@ -87,6 +90,44 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
+
+  # ── Submodule fallback ────────────────────────────────────────────────────
+  #
+  # No siblings beside the repo: bromath, brotensor, broimage, brolm and
+  # brovisionml come from the flat third_party/ submodules at the commits this
+  # repo pins, as they do for a fresh `git clone --recursive`. bronze and brass
+  # are the documented exception (no submodule; the api has to compile against
+  # the bronze of the program that loads it) and are laid out beside the repo
+  # as in the other jobs. The configure step checks each sibling really took
+  # the submodule path.
+  submodule:
+    name: Submodule fallback · ubuntu-24.04
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: brodiffusion
+          submodules: recursive
+
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
+
+      - name: Install Ninja
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
+
+      - name: Configure
+        shell: bash
+        run: |
+          for s in bromath brotensor broimage brolm brovisionml; do test ! -e $s; done
+          cmake -S brodiffusion -B build -G Ninja -DCMAKE_BUILD_TYPE=Release | tee configure.log
+          for s in bromath brotensor broimage brolm brovisionml; do
+            grep -q "brodiffusion: $s from .*third_party/$s (submodule)" configure.log
+          done
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
 
   # ── Coverage ──────────────────────────────────────────────────────────────
   coverage:
