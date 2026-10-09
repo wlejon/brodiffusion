@@ -136,10 +136,13 @@ has no GPU, so it exercises none of them; the GPU-only tests skip there.
 
 ## Layout
 
-Each sibling resolves in the same order as everywhere in the bro ecosystem:
+A plain clone is all it takes. Each dependency is pinned to a commit in
+`CMakeLists.txt` (`bro_dependency()`, `cmake/bro_deps.cmake`) and resolves in
+the same order as everywhere in the bro ecosystem:
 
 1. A target that already exists (a superbuild such as bro added it) wins.
-2. A checkout beside this repo, `../<name>` (override with `-D<NAME>_DIR=<path>`):
+2. A working tree beside this repo, `../<name>` (override with
+   `-DFETCHCONTENT_SOURCE_DIR_<NAME>=<path>`):
 
    ```
    projects/
@@ -153,25 +156,16 @@ Each sibling resolves in the same order as everywhere in the bro ecosystem:
    └── brodiffusion/     # this repo
    ```
 
-3. The flat `third_party/<name>` git submodules, which carry every sibling,
-   transitive ones included:
+3. The pinned commit, fetched at configure.
 
-   ```bash
-   git clone --recursive https://github.com/wlejon/brodiffusion
-   # or, in an existing clone
-   git submodule update --init --recursive
-   ```
+The configure log names where each one came from (`brolm: working tree ...`
+or the fetched archive URL).
 
-The configure log names where each one came from
-(`brodiffusion: brolm from .../third_party/brolm (submodule)`).
-
-bronze and brass are the exception: they have no submodule, because
-`brodiffusion_api` binds across bronze's C++ embed boundary and must compile
-against the same bronze as the program that loads it. A standalone build
-needs [bronze](https://github.com/wlejon/bronze) and
-[brass](https://github.com/wlejon/brass) checked out beside this repo (or
-`-DBRONZE_DIR=<path>`); pass `-DBRODIFFUSION_ENABLE_API=OFF` to build
-without them.
+[bronze](https://github.com/wlejon/bronze) and
+[brass](https://github.com/wlejon/brass) compile inside this build tree,
+because `brodiffusion_api` binds across bronze's C++ embed boundary and must
+compile against the same bronze as the program that loads it;
+`-DBRODIFFUSION_ENABLE_API=OFF` skips the binding.
 
 ## Weights
 
@@ -328,9 +322,9 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 Tests that need downloaded weights or a GPU skip when those are missing, so
-the suite passes on a CPU-only checkout. CI runs it on Linux (GCC, Clang),
-Windows and macOS with the siblings beside the repo, again in a "Submodule
-fallback" job from a recursive clone alone, and under gcovr for coverage.
+the suite passes on a CPU-only checkout. CI runs it on a plain clone on Linux
+(GCC, Clang), Windows and macOS against the pinned dependencies, and under
+gcovr for coverage.
 
 ## License
 

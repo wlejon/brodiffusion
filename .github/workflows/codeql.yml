@@ -29,20 +29,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: brodiffusion
-      - uses: actions/checkout@v7
-        with: { repository: wlejon/bromath, path: bromath }
-      - uses: actions/checkout@v7
-        with: { repository: wlejon/brotensor, path: brotensor }
-      - uses: actions/checkout@v7
-        with: { repository: wlejon/brolm, path: brolm }
-      - uses: actions/checkout@v7
-        with: { repository: wlejon/broimage, path: broimage }
-      - uses: actions/checkout@v7
-        with: { repository: wlejon/brovisionml, path: brovisionml }
 
-      # bronze (and through it brass) is needed at configure for the api;
-      # neither is built here, since only the brodiffusion target is traced.
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
+      # The dependencies — the siblings and bronze (with brass) — are fetched
+      # at configure from the pinned commits. bronze is needed at configure for
+      # the api; it is not built here, since only the brodiffusion target is
+      # traced.
 
       - name: Install Ninja
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
@@ -50,14 +41,14 @@ jobs:
       - name: Configure
         run: cmake -S brodiffusion -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 
-      # The sibling libraries (brotensor core + CPU backend, brolm, broimage, brovisionml) are
+      # The dependency libraries (brotensor core + CPU backend, brolm, broimage, brovisionml) are
       # compiled here, ahead of `init`. For a compiled language CodeQL only
       # extracts what it observes the compiler build while tracing, so anything
       # already built when `init` runs is never analysed. That is the exclusion
       # mechanism — paths-ignore does not filter compiled sources — and it keeps
-      # the siblings out of brodiffusion's Security tab, where they have their own
-      # analysis. bromath is header-only.
-      - name: Pre-build the siblings (outside the traced build)
+      # the dependencies out of brodiffusion's Security tab, where they have their
+      # own analysis. bromath is header-only.
+      - name: Pre-build the dependencies (outside the traced build)
         run: cmake --build build --parallel 4 --target brotensor_core brotensor_cpu brolm broimage brovisionml
 
       - name: Initialize CodeQL

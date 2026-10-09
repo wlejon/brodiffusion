@@ -3,16 +3,12 @@ name: brodiffusion CodeQL config
 queries:
   - uses: security-extended
 
-# The sibling libraries (brotensor, brolm, broimage) are kept out of the
-# analysis by build order (see the pre-build step in codeql.yml) — that is what
-# excludes their compiled TUs. This paths-ignore is the complement: it drops any
-# finding that originates in a sibling *header* pulled into a brodiffusion
-# translation unit, which build order cannot catch. Together they scope the
-# Security tab to brodiffusion's own code.
+# The dependency libraries (brotensor, brolm, broimage, brovisionml) are kept
+# out of the analysis by build order (see the pre-build step in codeql.yml) —
+# that is what excludes their compiled TUs. This paths-ignore is the
+# complement: it drops any finding that originates in a dependency *header*
+# pulled into a brodiffusion translation unit, which build order cannot catch.
+# Together they scope the Security tab to brodiffusion's own code. Every
+# dependency is fetched under the build tree's _deps/.
 paths-ignore:
-  - bromath
-  - brotensor
-  - brolm
-  - broimage
-  - bronze
-  - brass
+  - build/_deps

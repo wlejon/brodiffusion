@@ -6,11 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # This project ships a shared library (krea2_capi) that whole-archives
-# libbrodiffusion.a and the vendored sibling static libs. On Linux/ELF, a
+# libbrodiffusion.a and the sibling dependencies' static libs. On Linux/ELF, a
 # static archive linked into a shared object must be position-independent, or
 # ld rejects its R_X86_64_PC32/TPOFF32 relocations ("recompile with -fPIC").
-# Set this before the add_subdirectory() calls below so it propagates into
-# every vendored sibling's scope (bromath / brotensor / brolm / broimage) as
+# Set this before the bro_dependency() calls below so it propagates into
+# every dependency's scope (bromath / brotensor / brolm / broimage) as
 # well as this project's own targets.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -58,19 +58,6 @@ if(BROTENSOR_WITH_CUDA)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 endif()
 
-if(BROTENSOR_WITH_VULKAN)
-    # glslc and brotensor's shader include directory, found exactly as
-    # brotensor's own build finds them.
-    set(BROTENSOR_DIR "${CMAKE_SOURCE_DIR}/../brotensor" CACHE PATH
-        "Path to standalone brotensor repo (set to a missing path to force submodule fallback)")
-    if(EXISTS "${BROTENSOR_DIR}/cmake/BrotensorVulkan.cmake")
-        include("${BROTENSOR_DIR}/cmake/BrotensorVulkan.cmake")
-    else()
-        include("${CMAKE_SOURCE_DIR}/third_party/brotensor/cmake/BrotensorVulkan.cmake")
-    endif()
-    brotensor_vulkan_prepare()
-endif()
-
 # brodiffusion ships SD1.5-specific fused Metal kernels (fused_resblock.mm,
 # fused_transformer.mm); enable Objective-C++ only when Metal is selected.
 if(BROTENSOR_WITH_METAL)
@@ -80,76 +67,40 @@ if(BROTENSOR_WITH_METAL)
     enable_language(OBJCXX)
 endif()
 
-# --- Siblings: bromath, brotensor, broimage, brolm, brovisionml ---
+# --- Dependencies: bromath, bronze (+ brass), brotensor, broimage, brolm, brovisionml ---
 #
-# Each resolves like every repo in the bro ecosystem: an existing target (a
-# superbuild such as bro already added it) wins; otherwise a checkout beside the
-# top-level project (../<name>, overridable with -D<NAME>_DIR=<path>);
-# otherwise the top-level project's third_party/<name> submodule (`git
-# submodule update --init --recursive`). third_party/ is flat: it carries every
-# sibling brodiffusion needs, transitive ones included. Resolved in dependency
-# order, so brolm and brovisionml find bromath, brotensor and broimage already
-# there and reuse them.
+# Each resolves through cmake/bro_deps.cmake, like every repo in the bro
+# ecosystem: an existing target (a superbuild such as bro already added it, and
+# its pins win) first; otherwise the ../<name> working tree beside the top-level
+# project; otherwise the commit pinned here, fetched at configure. Leaves first,
+# so brolm and brovisionml find bromath, brotensor and broimage already there
+# and reuse them, and these pins are the ones a standalone build uses.
 #
 #   brolm        text encoders + tokenizers, brodiffusion's text frontend
 #   broimage     image decode/encode + host preproc
 #   brovisionml  vision backbones (DINOv3, BiRefNet) for image-to-3D
-function(brodiffusion_sibling name what)
-    if(TARGET ${name})
-        return()
-    endif()
-    string(TOUPPER "${name}" _upper)
-    set(${_upper}_DIR "${CMAKE_SOURCE_DIR}/../${name}" CACHE PATH
-        "Path to standalone ${name} repo (set to a missing path to force submodule fallback)")
-    if(EXISTS "${${_upper}_DIR}/CMakeLists.txt")
-        message(STATUS "brodiffusion: ${name} from ${${_upper}_DIR}")
-        add_subdirectory("${${_upper}_DIR}" "${CMAKE_BINARY_DIR}/${name}" EXCLUDE_FROM_ALL)
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/${name}/CMakeLists.txt")
-        message(STATUS "brodiffusion: ${name} from ${CMAKE_SOURCE_DIR}/third_party/${name} (submodule)")
-        add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/${name}" "${CMAKE_BINARY_DIR}/${name}" EXCLUDE_FROM_ALL)
-    else()
-        message(FATAL_ERROR
-            "brodiffusion needs ${name} (${what}): not found at ${${_upper}_DIR} or "
-            "${CMAKE_SOURCE_DIR}/third_party/${name}. Clone https://github.com/wlejon/${name} next "
-            "to this repo, run `git submodule update --init --recursive`, or override with "
-            "-D${_upper}_DIR=...")
-    endif()
-endfunction()
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/bro_deps.cmake)
 
-brodiffusion_sibling(bromath "math headers")
-brodiffusion_sibling(brotensor "tensors and GPU ops")
-brodiffusion_sibling(broimage "image decode and preprocessing")
-brodiffusion_sibling(brolm "text encoders and tokenizers")
-brodiffusion_sibling(brovisionml "vision backbones")
+bro_dependency(bromath GITHUB wlejon/bromath REF 8b511fbd69c014bf0584d2b42e6c96a8cf720f6a TARGET bromath::bromath)
 
-# --- bronze, the JavaScript runtime the api binds ---
-# A checkout beside this one (../bronze, with ../brass beside it — bronze
-# resolves and add_subdirectory()s its own code generator), the layout of a
-# bro tree and of CI (bronze's .github/actions/checkout-toolchain), or an
-# explicit -DBRONZE_DIR. No vendored fallback: the api is bound across
-# bronze's C++ embed boundary, so it has to build against the bronze the
-# surrounding tree builds against. Under bro this block is skipped, bro having
-# added bronze already.
-if(NOT TARGET bronze_runtime_shared)
-    set(BRONZE_BUILD_SHARED_RUNTIME ON CACHE BOOL "" FORCE)
-    set(BRONZE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    if(DEFINED BRONZE_DIR AND EXISTS "${BRONZE_DIR}/CMakeLists.txt")
-        # Explicit BRONZE_DIR supplied
-    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../bronze/CMakeLists.txt")
-        set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bronze" CACHE PATH "bronze source tree")
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/../bronze/CMakeLists.txt")
-        # Beside the top-level project: this repo is a third_party/ submodule of the project being built.
-        set(BRONZE_DIR "${CMAKE_SOURCE_DIR}/../bronze" CACHE PATH "bronze source tree")
-    endif()
+# bronze, the JavaScript runtime the api binds (it brings brass, its code
+# generator). The api is bound across bronze's C++ embed boundary, so it has to
+# build against the bronze the surrounding tree builds against.
+bro_dependency(bronze GITHUB wlejon/bronze REF 15ce4cf5fc25d8afe03882985ae95adcba46a6a9 TARGET bronze_runtime_shared
+               OPTIONS BRONZE_BUILD_SHARED_RUNTIME=ON BRONZE_BUILD_TESTS=OFF)
 
-    if(NOT BRONZE_DIR OR NOT EXISTS "${BRONZE_DIR}/CMakeLists.txt")
-        message(FATAL_ERROR
-            "bronze not found: check it out beside this repository (../bronze, with ../brass beside it) "
-            "or pass -DBRONZE_DIR=<path>.")
-    endif()
+bro_dependency(brotensor GITHUB wlejon/brotensor REF a332d9283c1e23b9f39e8ecaa4393f937dd26c0a)
 
-    add_subdirectory("${BRONZE_DIR}" "${CMAKE_BINARY_DIR}/bronze-build" EXCLUDE_FROM_ALL)
+if(BROTENSOR_WITH_VULKAN)
+    # glslc and brotensor's shader include directory, found exactly as
+    # brotensor's own build finds them.
+    include("${brotensor_SOURCE_DIR}/cmake/BrotensorVulkan.cmake")
+    brotensor_vulkan_prepare()
 endif()
+
+bro_dependency(broimage GITHUB wlejon/broimage REF 9346cd5e97cb2fba0bae15e9f15fc0d9e37349ee)
+bro_dependency(brolm GITHUB wlejon/brolm REF 3e2547cba802e183196b95523bc53ee99304664b)
+bro_dependency(brovisionml GITHUB wlejon/brovisionml REF 55727b93a9dbdaf87d86f191fa7c368ec1202ada)
 
 # --- brodiffusion library ---
 
