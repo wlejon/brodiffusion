@@ -81,15 +81,15 @@ endif()
 #   brovisionml  vision backbones (DINOv3, BiRefNet) for image-to-3D
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/bro_deps.cmake)
 
-bro_dependency(bromath GITHUB wlejon/bromath REF 8b511fbd69c014bf0584d2b42e6c96a8cf720f6a TARGET bromath::bromath)
+bro_dependency(bromath GITHUB wlejon/bromath TARGET bromath::bromath)
 
 # bronze, the JavaScript runtime the api binds (it brings brass, its code
 # generator). The api is bound across bronze's C++ embed boundary, so it has to
 # build against the bronze the surrounding tree builds against.
-bro_dependency(bronze GITHUB wlejon/bronze REF 15ce4cf5fc25d8afe03882985ae95adcba46a6a9 TARGET bronze_runtime_shared
+bro_dependency(bronze GITHUB wlejon/bronze TARGET bronze_runtime_shared
                OPTIONS BRONZE_BUILD_SHARED_RUNTIME=ON BRONZE_BUILD_TESTS=OFF)
 
-bro_dependency(brotensor GITHUB wlejon/brotensor REF a332d9283c1e23b9f39e8ecaa4393f937dd26c0a)
+bro_dependency(brotensor GITHUB wlejon/brotensor)
 
 if(BROTENSOR_WITH_VULKAN)
     # glslc and brotensor's shader include directory, found exactly as
@@ -98,9 +98,9 @@ if(BROTENSOR_WITH_VULKAN)
     brotensor_vulkan_prepare()
 endif()
 
-bro_dependency(broimage GITHUB wlejon/broimage REF 9346cd5e97cb2fba0bae15e9f15fc0d9e37349ee)
-bro_dependency(brolm GITHUB wlejon/brolm REF 3e2547cba802e183196b95523bc53ee99304664b)
-bro_dependency(brovisionml GITHUB wlejon/brovisionml REF 55727b93a9dbdaf87d86f191fa7c368ec1202ada)
+bro_dependency(broimage GITHUB wlejon/broimage)
+bro_dependency(brolm GITHUB wlejon/brolm)
+bro_dependency(brovisionml GITHUB wlejon/brovisionml)
 
 # --- brodiffusion library ---
 
