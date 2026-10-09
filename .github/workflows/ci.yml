@@ -17,7 +17,7 @@ concurrency:
 # default CPU-only configuration (GPU backends OFF). Every job builds a plain
 # clone, checked out under brodiffusion/ with the build tree beside it; the
 # siblings and bronze (the JavaScript runtime brodiffusion_api binds, with
-# brass, its code generator) come from the commits CMakeLists.txt pins
+# brass, its code generator) come from the heads of their main branches
 # (cmake/bro_deps.cmake), fetched at configure. There are no submodules and no
 # sibling checkouts.
 #

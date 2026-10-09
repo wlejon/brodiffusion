@@ -1,7 +1,7 @@
 version: 2
 
-# brodiffusion pins its dependencies (bromath, brotensor, brolm, broimage,
-# brovisionml, bronze) to commits with bro_dependency() in CMakeLists.txt, not
+# brodiffusion takes its dependencies (bromath, brotensor, brolm, broimage,
+# brovisionml, bronze) at their main with bro_dependency() in CMakeLists.txt, not
 # through a package manager, and vendors nothing, so there is
 # no manifest for Dependabot to bump. The only versioned things it can watch are
 # the pinned actions in .github/workflows/.

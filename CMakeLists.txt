@@ -71,10 +71,10 @@ endif()
 #
 # Each resolves through cmake/bro_deps.cmake, like every repo in the bro
 # ecosystem: an existing target (a superbuild such as bro already added it, and
-# its pins win) first; otherwise the ../<name> working tree beside the top-level
-# project; otherwise the commit pinned here, fetched at configure. Leaves first,
+# its choice wins) first; otherwise the ../<name> working tree beside the top-level
+# project; otherwise the head of its main, fetched at configure. Leaves first,
 # so brolm and brovisionml find bromath, brotensor and broimage already there
-# and reuse them, and these pins are the ones a standalone build uses.
+# and reuse them, and a standalone build resolves each of them once.
 #
 #   brolm        text encoders + tokenizers, brodiffusion's text frontend
 #   broimage     image decode/encode + host preproc
