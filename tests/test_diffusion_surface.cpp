@@ -1,5 +1,5 @@
 // Surface coverage for the Pipeline / PipelineState methods that the QuickJS →
-// bronze port dropped (see bro's docs/transition-drift.md row H7). Each name
+// bronze port dropped. Each name
 // gets two checks: it must be a callable own member of the class prototype,
 // and calling it with a `this` that is not a live Pipeline / PipelineState must
 // throw rather than return undefined — a missing handler does neither.

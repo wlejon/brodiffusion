@@ -10,7 +10,7 @@
 #include <vector>
 
 // tests/test_diffusion_surface.cpp — the restored Pipeline / PipelineState
-// members (docs/transition-drift.md row H7).
+// members.
 void brodiffusionTestRestoredSurface();
 // tests/test_diffusion_api_weights.cpp — SD1.5 through bro.diffusion, skipped
 // without weights.
