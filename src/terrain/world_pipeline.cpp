@@ -1,7 +1,7 @@
 #include "brodiffusion/terrain/world_pipeline.h"
 
 #include "brodiffusion/detail/compute.h"
-#include "brodiffusion/detail/json.h"
+#include "brotensor/json.h"
 #include "brodiffusion/terrain/laplacian.h"
 #include "brodiffusion/terrain/portable_rng.h"
 #include "brotensor/safetensors.h"
@@ -79,9 +79,9 @@ constexpr int kCondDim         = 58;
 
 // Read a fixed-length array of doubles. Absent, null, or the wrong length is an
 // error rather than a default: every one of these changes the generated world.
-void read_doubles(const detail::json::Value& obj, const std::string& key,
+void read_doubles(const brotensor::json::Value& obj, const std::string& key,
                   double* out, std::size_t n) {
-    const detail::json::Value* v = obj.find(key);
+    const brotensor::json::Value* v = obj.find(key);
     if (v == nullptr || v->is_null()) fail("config.json pipeline has no '" + key + "'");
     const auto& a = v->as_array();
     if (a.size() != n) {
@@ -110,8 +110,8 @@ std::vector<float> mp_concat_scales(const int* sizes, int k) {
     return s;
 }
 
-double read_double(const detail::json::Value& obj, const std::string& key) {
-    const detail::json::Value* v = obj.find(key);
+double read_double(const brotensor::json::Value& obj, const std::string& key) {
+    const brotensor::json::Value* v = obj.find(key);
     if (v == nullptr || v->is_null()) fail("config.json pipeline has no '" + key + "'");
     return v->as_number();
 }
@@ -125,9 +125,9 @@ WorldPipelineConfig WorldPipelineConfig::from_config_json(const std::string& con
     if (!in) fail("cannot open " + config_path);
     std::ostringstream ss;
     ss << in.rdbuf();
-    const detail::json::Value root = detail::json::parse(ss.str());
+    const brotensor::json::Value root = brotensor::json::parse(ss.str());
 
-    const detail::json::Value* p = root.find("pipeline");
+    const brotensor::json::Value* p = root.find("pipeline");
     if (p == nullptr) fail("config.json has no 'pipeline' object");
 
     WorldPipelineConfig c;

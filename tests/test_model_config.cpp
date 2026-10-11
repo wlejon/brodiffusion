@@ -5,7 +5,7 @@
 // cleans up. Does NOT depend on downloaded weights.
 
 #include "brodiffusion/model_config.h"
-#include "brodiffusion/detail/json.h"
+#include "brotensor/json.h"
 
 #include <cmath>
 #include <cstdio>
@@ -16,7 +16,7 @@
 
 namespace bd  = brodiffusion;
 namespace fs  = std::filesystem;
-namespace json = brodiffusion::detail::json;
+namespace json = brotensor::json;
 
 static int g_failures = 0;
 #define CHECK(cond) do { \

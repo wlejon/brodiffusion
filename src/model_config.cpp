@@ -1,11 +1,11 @@
 // model_config — diffusers model-directory JSON config loader.
 //
 // See model_config.h. Uses <filesystem> for path joins / existence checks and
-// <fstream> to read files, then brodiffusion::detail::json to parse them.
+// <fstream> to read files, then brotensor::json to parse them.
 
 #include "brodiffusion/model_config.h"
 
-#include "brodiffusion/detail/json.h"
+#include "brotensor/json.h"
 
 #include <cmath>
 #include <filesystem>
@@ -19,7 +19,7 @@ namespace brodiffusion {
 namespace {
 
 namespace fs = std::filesystem;
-namespace json = brodiffusion::detail::json;
+namespace json = brotensor::json;
 
 // Read an entire file into a string. Throws on failure.
 std::string read_file(const fs::path& path) {

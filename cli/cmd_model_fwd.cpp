@@ -10,7 +10,7 @@
 
 #include "brodiffusion/detail/compute.h"
 #include "brodiffusion/detail/jit_fusion.h"
-#include "brodiffusion/detail/json.h"
+#include "brotensor/json.h"
 #include "brodiffusion/dit/krea2.h"
 #include "brodiffusion/dit/pixart.h"
 #include "brodiffusion/dit/qwenimage21.h"
@@ -57,7 +57,7 @@ brodiffusion::dit::Krea2Config load_krea2_config(const std::string& path) {
     if (!f) throw std::runtime_error("cannot open config: " + path);
     std::string text((std::istreambuf_iterator<char>(f)),
                      std::istreambuf_iterator<char>());
-    namespace j = brodiffusion::detail::json;
+    namespace j = brotensor::json;
     j::Value v = j::parse(text);
     brodiffusion::dit::Krea2Config c;
     c.in_channels = v.get_int("in_channels", c.in_channels);
@@ -91,7 +91,7 @@ brodiffusion::dit::QwenImage21Config load_qi21_config(const std::string& path) {
     if (!f) throw std::runtime_error("cannot open config: " + path);
     std::string text((std::istreambuf_iterator<char>(f)),
                      std::istreambuf_iterator<char>());
-    namespace j = brodiffusion::detail::json;
+    namespace j = brotensor::json;
     j::Value v = j::parse(text);
     brodiffusion::dit::QwenImage21Config c;
     c.patch_size = v.get_int("patch_size", c.patch_size);
@@ -117,7 +117,7 @@ std::vector<st::File> open_transformer_shards(const std::string& wd) {
     if (idxf) {
         std::string text((std::istreambuf_iterator<char>(idxf)),
                          std::istreambuf_iterator<char>());
-        namespace j = brodiffusion::detail::json;
+        namespace j = brotensor::json;
         j::Value v = j::parse(text);
         const auto& wm = v.at("weight_map");
         std::vector<std::string> names;

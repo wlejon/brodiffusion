@@ -1,6 +1,6 @@
 #include "brodiffusion/terrain/synthetic_map.h"
 
-#include "brodiffusion/detail/json.h"
+#include "brotensor/json.h"
 
 #include <algorithm>
 #include <cmath>
@@ -15,7 +15,7 @@
 namespace brodiffusion::terrain {
 namespace {
 
-namespace json = brodiffusion::detail::json;
+namespace json = brotensor::json;
 
 // Per-channel FBm shape. Only the temperature field uses 2 octaves — it wants
 // broad continental gradients, not ridged detail. Everything else uses 4.

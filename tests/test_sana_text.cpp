@@ -17,7 +17,7 @@
 
 #include "brodiffusion/sana_text.h"
 #include "brodiffusion/model_config.h"
-#include "brodiffusion/detail/json.h"
+#include "brotensor/json.h"
 
 #include "brolm/gemma2.h"
 #include "brolm/gemma_tokenizer.h"
@@ -61,7 +61,7 @@ static std::string weights_dir() {
 }
 
 static void run_json_infinity() {
-    namespace json = brodiffusion::detail::json;
+    namespace json = brotensor::json;
     auto doc = json::parse(R"({"a": -Infinity, "b": Infinity, "c": NaN})");
     const double a = doc.at("a").as_number();
     const double b = doc.at("b").as_number();

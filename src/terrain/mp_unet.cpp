@@ -1,7 +1,7 @@
 #include "brodiffusion/terrain/mp_unet.h"
 
 #include "brodiffusion/detail/compute.h"
-#include "brodiffusion/detail/json.h"
+#include "brotensor/json.h"
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 #include "brotensor/safetensors.h"
@@ -147,11 +147,11 @@ MPUNetConfig MPUNetConfig::from_config_json(const std::string& config_path,
     if (!in) fail("cannot open " + config_path);
     std::ostringstream ss;
     ss << in.rdbuf();
-    const detail::json::Value root = detail::json::parse(ss.str());
+    const brotensor::json::Value root = brotensor::json::parse(ss.str());
 
-    const detail::json::Value* models = root.find("models");
+    const brotensor::json::Value* models = root.find("models");
     if (models == nullptr) fail("config.json has no 'models' object");
-    const detail::json::Value* m = models->find(stage);
+    const brotensor::json::Value* m = models->find(stage);
     if (m == nullptr) fail("config.json has no models." + stage);
 
     MPUNetConfig c;
@@ -170,15 +170,15 @@ MPUNetConfig MPUNetConfig::from_config_json(const std::string& config_path,
     c.attn_balance   = m->get_float("attn_balance", 0.3f);
     c.channels_per_head = m->get_int("channels_per_head", 64);
 
-    if (const detail::json::Value* ca = m->find("clip_act")) {
+    if (const brotensor::json::Value* ca = m->find("clip_act")) {
         c.has_clip_act = !ca->is_null();
         c.clip_act = c.has_clip_act ? static_cast<float>(ca->as_number()) : 0.0f;
     }
-    if (const detail::json::Value* fs = m->find("fourier_scale")) {
+    if (const brotensor::json::Value* fs = m->find("fourier_scale")) {
         c.fourier_scale = fs->is_string() ? fs->as_string()
                                           : std::to_string(fs->as_number());
     }
-    if (const detail::json::Value* ci = m->find("conditional_inputs")) {
+    if (const brotensor::json::Value* ci = m->find("conditional_inputs")) {
         for (const auto& e : ci->as_array()) {
             const auto& tup = e.as_array();
             if (tup.size() != 3) fail("conditional_inputs entry is not a 3-tuple");
@@ -189,7 +189,7 @@ MPUNetConfig MPUNetConfig::from_config_json(const std::string& config_path,
             c.conditional_inputs.push_back(std::move(in_));
         }
     }
-    if (const detail::json::Value* cw = m->find("conditional_weights")) {
+    if (const brotensor::json::Value* cw = m->find("conditional_weights")) {
         for (const auto& e : cw->as_array()) {
             c.conditional_weights.push_back(static_cast<float>(e.as_number()));
         }
