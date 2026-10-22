@@ -91,6 +91,11 @@ void HostClass::install(const char* name, uint32_t arity, ev::NativeFn body,
     }
 
     Slots& s = slots();
+    delete s.ctor;
+    delete s.proto;
+    s.ctor = nullptr;
+    s.proto = nullptr;
+
     ev::Persistent ctor(ev::makeFunction(std::move(ctorBody), arity, name));
     s.ctor = new ev::Persistent(ctor.get());
 
@@ -145,7 +150,8 @@ void* HostClass::unwrap(Value val) const {
 void HostClass::setStatic(const char* name, Value v) const {
     const Slots* s = slotsIfAny();
     if (!s || !s->ctor) return;
-    s->ctor->set(ev::setProperty(s->ctor->get(), name, v));
+    ev::Persistent vP(v);
+    s->ctor->set(ev::setProperty(s->ctor->get(), name, vP.get()));
 }
 
 Value HostClass::prototype() const {

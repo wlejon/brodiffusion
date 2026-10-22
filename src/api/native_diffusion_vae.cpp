@@ -210,11 +210,6 @@ void decorateVaeProto(ObjectBuilder& proto) {
 } // namespace
 
 void ensureVaeClassesInstalled() {
-    // Per thread, like ensureDiffusionClassesInstalled.
-    static thread_local bool installed = false;
-    if (installed) return;
-    installed = true;
-
     g_vaeClass.install("VAE", 0, [](Value, std::span<const Value>) -> Value {
         auto w = std::make_unique<VaeWrapper>();
         w->decoder = std::make_unique<brodiffusion::vae::Decoder>(brodiffusion::vae::DecoderConfig{});

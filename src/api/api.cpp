@@ -35,12 +35,12 @@ void installDiffusion() {
     }
 
     // Mount bro.diffusion
-    Value diffVal = makeDiffusionNamespace();
-    broP.set(ev::setProperty(broP.get(), "diffusion", diffVal));
+    ev::Persistent diffP(makeDiffusionNamespace());
+    broP.set(ev::setProperty(broP.get(), "diffusion", diffP.get()));
 
     // Mount bro.triposplat
-    Value tripoVal = makeTriposplatNamespace();
-    broP.set(ev::setProperty(broP.get(), "triposplat", tripoVal));
+    ev::Persistent tripoP(makeTriposplatNamespace());
+    broP.set(ev::setProperty(broP.get(), "triposplat", tripoP.get()));
 }
 
 } // namespace brodiffusion::api

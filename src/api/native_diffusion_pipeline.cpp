@@ -315,11 +315,17 @@ Value pipelineTextToImage(Value thisVal, std::span<const Value> args) {
 Value generateWithImages(const ev::Persistent& self, PipelineWrapper* w, const std::string& label,
                          const std::string& prompt, const ev::Persistent& opt,
                          const std::string& initPath, const std::string& maskPath) {
+    if (!w->weights_loaded) return ev::throwError(label + ": call loadWeights() first");
     if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
     const bool includeFp32 = propBool(opt.get(), "includeFp32");
     auto opts = parseGenerateOptions(opt.get());
     opts.init_image_path = initPath;
     if (!maskPath.empty()) opts.mask_image_path = maskPath;
+    try {
+        resolveDerivedSize(*w->pipeline, opts);
+    } catch (const std::exception& e) {
+        return ev::throwError(label + " failed: " + e.what());
+    }
 
     ev::Persistent onDone(ev::isObject(opt.get()) ? ev::getProperty(opt.get(), "onDone") : ev::undefined());
     const bool isAsync = ev::isFunction(onDone.get()) || propBool(opt.get(), "async");
@@ -624,168 +630,6 @@ Value pipelineConfig(Value thisVal, std::span<const Value>) {
     return o.build();
 }
 
-// prime(prompt, opts?) -> PipelineState. The opts are captured on the returned
-// state so stepOnce()/decode() need none, and the state retains the owning
-// Pipeline so its weights outlive the handle that made it.
-Value pipelinePrime(Value thisVal, std::span<const Value> args) {
-    auto* w = unwrapPipeline(thisVal);
-    if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.prime: not a loaded Pipeline");
-    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
-    if (!w->weights_loaded) return ev::throwError("Pipeline.prime: call loadWeights() first");
-    if (args.empty() || !ev::isString(args[0])) {
-        return ev::throwTypeError("Pipeline.prime(prompt, opts?): string prompt required");
-    }
-
-    ev::Persistent self(thisVal);
-    std::string prompt = ev::toUtf8(args[0]);
-    auto opts = parseGenerateOptions(args.size() > 1 ? args[1] : ev::undefined());
-    try {
-        resolveDerivedSize(*w->pipeline, opts);
-    } catch (const std::exception& e) {
-        return ev::throwError(std::string("Pipeline.prime failed: ") + e.what());
-    }
-    w->cancel_requested.store(false, std::memory_order_relaxed);
-    opts.should_cancel = [w]() {
-        return w->cancel_requested.load(std::memory_order_relaxed);
-    };
-
-    try {
-        auto stateWrapper = std::make_unique<PipelineStateWrapper>();
-        stateWrapper->opts = opts;
-        stateWrapper->state = w->pipeline->prime(prompt, opts);
-        Value st = g_pipelineStateClass.createInstance(std::move(stateWrapper));
-        return attachPipelineToState(st, self.get());
-    } catch (const std::exception& e) {
-        return ev::throwError(std::string("Pipeline.prime failed: ") + e.what());
-    }
-}
-
-// Pipeline.stepOnce(state, ctrl?) / Pipeline.decode(state) — the pipeline-side
-// convenience forms; accepts optional trace and attnBias/logitBias control.
-Value pipelineStepOnce(Value thisVal, std::span<const Value> args) {
-    auto* w = unwrapPipeline(thisVal);
-    if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.stepOnce: not a loaded Pipeline");
-    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
-    if (args.empty()) return ev::throwTypeError("Pipeline.stepOnce(state, ctrl?): state required");
-
-    auto* sw = unwrapPipelineState(args[0]);
-    if (!sw) return ev::throwTypeError("Pipeline.stepOnce: expected PipelineState argument");
-
-    bool wantTrace = false;
-    ev::Persistent bias;  // read across allocating calls below
-    if (args.size() > 1) {
-        if (ev::isObject(args[1])) {
-            wantTrace = propBool(args[1], "trace");
-            bias.set(ev::getProperty(args[1], "attnBias"));
-            if (ev::isUndefined(bias.get()) || ev::isNull(bias.get())) {
-                bias.set(ev::getProperty(args[1], "logitBias"));
-            }
-        } else if (ev::isBool(args[1])) {
-            wantTrace = ev::toBool(args[1]);
-            if (args.size() > 2) bias.set(args[2]);
-        }
-    }
-
-    std::vector<brotensor::Tensor> owned;
-    std::vector<const brotensor::Tensor*> ptrs;
-    bool haveBias = false;
-    if (ev::isObject(bias.get())) {
-        haveBias = true;
-        const int n = w->pipeline->num_xattn_blocks();
-        const uint32_t len = arrayLength(bias.get());
-        if (static_cast<int>(len) != n) {
-            return ev::throwRangeError(
-                "Pipeline.stepOnce: attnBias length " + std::to_string(len) +
-                " must equal numXAttnBlocks() " + std::to_string(n));
-        }
-        owned.reserve(static_cast<size_t>(n));
-        ptrs.reserve(static_cast<size_t>(n));
-        std::vector<bool> present(static_cast<size_t>(n), false);
-        for (int i = 0; i < n; ++i) {
-            ev::Persistent e(ev::getElement(bias.get(), static_cast<uint32_t>(i)));
-            if (!ev::isObject(e.get())) continue;
-            present[static_cast<size_t>(i)] = true;
-            int Lq = 0, Lk = 0;
-            propInt(e.get(), "Lq", Lq);
-            propInt(e.get(), "Lk", Lk);
-            Value dv = ev::getProperty(e.get(), "data");
-            const float* fp = nullptr;
-            size_t cnt = 0;
-            const bool ok = readFloat32Array(dv, fp, cnt) && fp && Lq > 0 && Lk > 0 &&
-                            cnt == static_cast<size_t>(Lq) * static_cast<size_t>(Lk);
-            if (!ok) {
-                return ev::throwTypeError(
-                    "Pipeline.stepOnce: attnBias[" + std::to_string(i) +
-                    "] must be { data: Float32Array(Lq*Lk), Lq, Lk } or null");
-            }
-            owned.push_back(brotensor::Tensor::from_host(fp, Lq, Lk));
-        }
-        size_t next = 0;
-        for (int i = 0; i < n; ++i) {
-            ptrs.push_back(present[static_cast<size_t>(i)] ? &owned[next++] : nullptr);
-        }
-    }
-
-    brodiffusion::AttentionTrace trace;
-    brodiffusion::AttentionTrace* tracePtr = wantTrace ? &trace : nullptr;
-    const std::vector<const brotensor::Tensor*>* biasPtr = haveBias ? &ptrs : nullptr;
-
-    try {
-        if (w->cancel_requested.load(std::memory_order_relaxed)) {
-            ObjectBuilder b;
-            b.set("cancelled", true);
-            return b.build();
-        }
-        w->pipeline->step_once(sw->state, sw->opts, tracePtr, biasPtr);
-        if (w->cancel_requested.load(std::memory_order_relaxed)) {
-            ObjectBuilder b;
-            b.set("cancelled", true);
-            return b.build();
-        }
-        bool hasMore = sw->state.step_index < sw->state.n_steps;
-        if (wantTrace) {
-            ObjectBuilder res;
-            res.set("hasMore", hasMore);
-            ev::Persistent arr(hostArrayOf(trace.size(), [&trace](size_t i) -> Value {
-                const brotensor::Tensor& t = trace[i];
-                std::vector<float> host = downloadTensorFloats(t);
-                ObjectBuilder entry;
-                entry.set("Lq", static_cast<double>(t.rows));
-                entry.set("Lk", static_cast<double>(t.cols));
-                ev::Persistent d(makeFloat32Array(host.data(), host.size()));
-                entry.set("data", d.get());
-                return entry.build();
-            }));
-            res.set("trace", arr.get());
-            return res.build();
-        }
-        return ev::fromBool(hasMore);
-    } catch (const std::exception& e) {
-        return ev::throwError(std::string("Pipeline.stepOnce failed: ") + e.what());
-    }
-}
-
-Value pipelineDecode(Value thisVal, std::span<const Value> args) {
-    auto* w = unwrapPipeline(thisVal);
-    if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.decode: not a loaded Pipeline");
-    if (w->busy.load(std::memory_order_acquire)) return ev::throwError(kPipelineBusy);
-    if (args.empty()) return ev::throwTypeError("Pipeline.decode(state): state required");
-
-    auto* sw = unwrapPipelineState(args[0]);
-    if (!sw) return ev::throwTypeError("Pipeline.decode: expected PipelineState argument");
-
-    const bool includeFp32 = args.size() > 1 && propBool(args[1], "includeFp32");
-    try {
-        std::vector<float> nchw = w->pipeline->decode(sw->state);
-        int scale = w->pipeline->vae_scale_factor();
-        int H = sw->state.H_lat * scale;
-        int W = sw->state.W_lat * scale;
-        return makeImageResult(nchw, H, W, includeFp32);
-    } catch (const std::exception& e) {
-        return ev::throwError(std::string("Pipeline.decode failed: ") + e.what());
-    }
-}
-
 Value pipelineDispose(Value thisVal, std::span<const Value>) {
     auto* w = unwrapPipeline(thisVal);
     if (!w) return ev::throwTypeError("Pipeline.dispose: not a Pipeline");
@@ -822,9 +666,7 @@ void decoratePipeline(ObjectBuilder& proto) {
     proto.def("numXAttnBlocks", 0, pipelineNumXAttnBlocks);
     proto.def("sigmas", 0, pipelineSigmas);
     proto.def("config", 0, pipelineConfig);
-    proto.def("prime", 2, pipelinePrime);
-    proto.def("stepOnce", 2, pipelineStepOnce);
-    proto.def("decode", 1, pipelineDecode);
+    decoratePipelineStepProto(proto);
     proto.def("dispose", 0, pipelineDispose);
     proto.def("cancel", 0, pipelineCancel);
     proto.def("tick", 0, [](Value, std::span<const Value>) -> Value {
@@ -848,12 +690,6 @@ void decoratePipeline(ObjectBuilder& proto) {
 } // namespace
 
 void ensureDiffusionClassesInstalled() {
-    // Once per THREAD: a class's constructor and prototype are the
-    // installing thread's (host_class.h), so a Worker realm installs its own.
-    static thread_local bool installed = false;
-    if (installed) return;
-    installed = true;
-
     g_pipelineClass.install("Pipeline", 0, nullptr, decoratePipeline);
     g_pipelineStateClass.install("PipelineState", 0, nullptr, decoratePipelineStateProto);
 }
@@ -1019,21 +855,22 @@ Value makeDiffusionNamespace() {
 
     diff.def("cancel", 0, [](Value, std::span<const Value> args) -> Value {
         if (!args.empty()) {
-            if (auto* w = unwrapPipeline(args[0])) {
+            ev::Persistent arg0(args[0]);
+            if (auto* w = unwrapPipeline(arg0.get())) {
                 cancelJobsForPipeline(w);
                 return ev::undefined();
             }
-            if (unwrapPipelineState(args[0])) {
-                Value p = ev::getProperty(args[0], "__pipeline");
+            if (unwrapPipelineState(arg0.get())) {
+                Value p = ev::getProperty(arg0.get(), "__pipeline");
                 if (auto* pw = unwrapPipeline(p)) {
                     cancelJobsForPipeline(pw);
                     return ev::undefined();
                 }
             }
-            if (ev::isObject(args[0])) {
-                Value cFn = ev::getProperty(args[0], "cancel");
-                if (ev::isFunction(cFn)) {
-                    ev::call(cFn, args[0], {});
+            if (ev::isObject(arg0.get())) {
+                ev::Persistent cFn(ev::getProperty(arg0.get(), "cancel"));
+                if (ev::isFunction(cFn.get())) {
+                    ev::call(cFn.get(), arg0.get(), {});
                     return ev::undefined();
                 }
             }

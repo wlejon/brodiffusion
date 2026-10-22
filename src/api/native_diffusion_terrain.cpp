@@ -198,10 +198,6 @@ void decorateTerrainProto(ObjectBuilder& proto) {
 }  // namespace
 
 void ensureTerrainClassInstalled() {
-    // Per thread, like ensureDiffusionClassesInstalled.
-    static thread_local bool installed = false;
-    if (installed) return;
-    installed = true;
     g_terrainClass.install("TerrainWorld", 0, nullptr, decorateTerrainProto);
 }
 

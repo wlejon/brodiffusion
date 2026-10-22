@@ -160,6 +160,7 @@ PipelineWrapper* pipelineWrapperOfState(Value stateVal);  // ALLOCATES (a proper
 void decoratePipelineControlProto(ObjectBuilder& proto);
 void decoratePipelineKrea2Proto(ObjectBuilder& proto);
 void decoratePipelineQwenImage21Proto(ObjectBuilder& proto);
+void decoratePipelineStepProto(ObjectBuilder& proto);
 void decoratePipelineStateProto(ObjectBuilder& proto);
 bool readImageInput(Value val, std::vector<uint8_t>& rgba, int& w, int& h, std::string& err);
 

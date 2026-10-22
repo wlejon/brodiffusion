@@ -200,6 +200,26 @@ int main() {
         std::cout << "  Pipeline.prototype.stepOnce validates arguments: "
                   << expectThrow(pipe, "stepOnce", {"state required"}) << std::endl;
         expectThrow(pipe, "generateAsync", {});
+        {
+            ev::Persistent p1(ev::fromUtf8("/tmp/init.png"));
+            ev::Persistent p2(ev::fromUtf8("/tmp/mask.png"));
+            ev::Persistent pr(ev::fromUtf8("a test prompt"));
+            expectThrow(pipe, "imageToImage", {"loadWeights"}, {&p1, &pr});
+            expectThrow(pipe, "inpaint", {"loadWeights"}, {&p1, &p2, &pr});
+        }
+        {
+            brodiffusion::api::ObjectBuilder cancellableBuilder;
+            cancellableBuilder.set("cancelled", false);
+            cancellableBuilder.def("cancel", 0, [](Value thisVal, std::span<const Value>) -> Value {
+                ev::Persistent self(thisVal);
+                ev::setProperty(self.get(), "cancelled", ev::fromBool(true));
+                return ev::undefined();
+            });
+            ev::Persistent cancellable(cancellableBuilder.build());
+            ev::CallResult cr = callMethod(diff, "cancel", {&cancellable});
+            CHECK(!cr.thrown);
+            CHECK(ev::toBool(ev::getProperty(cancellable.get(), "cancelled")));
+        }
         expectUndefinedResult(pipe, "cancel");
         expectUndefinedResult(pipe, "tick");
 
@@ -231,6 +251,20 @@ int main() {
     brodiffusionTestRestoredSurface();
 
     brodiffusionTestWithWeights();
+
+    // Re-installing into the realm refreshes all classes (Pipeline, VAE,
+    // TerrainWorld, TripoSplatPipeline) without stale thread_local guards.
+    brodiffusion::api::installDiffusion();
+    {
+        ev::Persistent bro2(ev::globalValue("bro").value);
+        ev::Persistent diff2(ev::getProperty(bro2.get(), "diffusion"));
+        ev::Persistent tsp2(ev::getProperty(bro2.get(), "triposplat"));
+        expectObjectProp(diff2, "Pipeline");
+        expectObjectProp(diff2, "PipelineState");
+        expectObjectProp(diff2, "VAE");
+        expectObjectProp(diff2, "TerrainWorld");
+        expectObjectProp(tsp2, "TripoSplatPipeline");
+    }
 
     std::cout << "All brodiffusion_api standalone tests passed successfully!" << std::endl;
     return 0;
