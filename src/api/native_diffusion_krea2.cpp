@@ -47,7 +47,7 @@ Value krea2TimeMod(Value thisVal, std::span<const Value> args) {
     }
     try {
         brotensor::Tensor temb, mod;
-        w->pipeline->krea_time_mod(static_cast<float>(ev::toDouble(args[0])), temb, mod);
+        w->pipeline->krea_time_mod(static_cast<float>(numAt(args, 0)), temb, mod);
         ObjectBuilder o;
         {
             ev::Persistent t(tensorToJs(temb));
@@ -74,8 +74,8 @@ Value krea2SetGateScale(Value thisVal, std::span<const Value> args) {
             "Pipeline.krea2SetGateScale(txtScale, imgScale, blockLo, blockHi): numeric args required");
     }
     try {
-        w->pipeline->krea_set_gate_scale(static_cast<float>(ev::toDouble(args[0])),
-                                         static_cast<float>(ev::toDouble(args[1])),
+        w->pipeline->krea_set_gate_scale(static_cast<float>(numAt(args, 0)),
+                                         static_cast<float>(numAt(args, 1)),
                                          i32At(args, 2), i32At(args, 3));
         return ev::undefined();
     } catch (const std::exception& e) {

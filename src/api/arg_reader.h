@@ -19,19 +19,22 @@ inline double numAt(std::span<const Value> args, size_t i) {
     Value v = args[i];
     if (ev::isObject(v)) return 0.0;
     double d = ev::toDouble(v);
-    return std::isnan(d) ? 0.0 : d;
-}
-
-inline int32_t i32At(std::span<const Value> args, size_t i) {
-    return static_cast<int32_t>(static_cast<int64_t>(numAt(args, i)));
-}
-
-inline uint32_t u32At(std::span<const Value> args, size_t i) {
-    return static_cast<uint32_t>(static_cast<int64_t>(numAt(args, i)));
+    return !std::isfinite(d) ? 0.0 : d;
 }
 
 inline int64_t i64At(std::span<const Value> args, size_t i) {
-    return static_cast<int64_t>(numAt(args, i));
+    const double d = numAt(args, i);
+    if (d >= 9223372036854775807.0) return INT64_MAX;
+    if (d <= -9223372036854775808.0) return INT64_MIN;
+    return static_cast<int64_t>(d);
+}
+
+inline int32_t i32At(std::span<const Value> args, size_t i) {
+    return static_cast<int32_t>(i64At(args, i));
+}
+
+inline uint32_t u32At(std::span<const Value> args, size_t i) {
+    return static_cast<uint32_t>(i64At(args, i));
 }
 
 inline uint64_t u64At(std::span<const Value> args, size_t i) {
@@ -109,13 +112,19 @@ inline bool propStr(Value obj, const char* key, std::string& dst) {
 inline void propInt(Value obj, const char* key, int& dst) {
     if (!ev::isObject(obj)) return;
     Value v = ev::getProperty(obj, key);
-    if (ev::isNumber(v)) dst = static_cast<int>(ev::toDouble(v));
+    if (ev::isNumber(v)) {
+        const double d = ev::toDouble(v);
+        if (std::isfinite(d) && d >= -2147483648.0 && d <= 2147483647.0) dst = static_cast<int>(d);
+    }
 }
 
 inline void propNum(Value obj, const char* key, float& dst) {
     if (!ev::isObject(obj)) return;
     Value v = ev::getProperty(obj, key);
-    if (ev::isNumber(v)) dst = static_cast<float>(ev::toDouble(v));
+    if (ev::isNumber(v)) {
+        const double d = ev::toDouble(v);
+        if (std::isfinite(d)) dst = static_cast<float>(d);
+    }
 }
 
 inline bool propBool(Value obj, const char* key, bool def = false) {

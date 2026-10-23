@@ -462,7 +462,7 @@ Value pipelineApplyLora(Value thisVal, std::span<const Value> args) {
 
     std::string path = resolveDiffusionPath(ev::toUtf8(args[0]));
     float scale = 1.0f;
-    if (args.size() > 1 && ev::isNumber(args[1])) scale = static_cast<float>(ev::toDouble(args[1]));
+    if (args.size() > 1 && ev::isNumber(args[1])) scale = static_cast<float>(numAt(args, 1));
     try {
         auto f = brotensor::safetensors::File::open(path);
         int group = w->pipeline->apply_lora(f, scale);

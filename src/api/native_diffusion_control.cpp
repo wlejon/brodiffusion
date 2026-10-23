@@ -55,7 +55,7 @@ Value pipelineSetControl(Value thisVal, std::span<const Value> args) {
         if (args.size() < 2 || !ev::isNumber(args[1])) {
             return ev::throwTypeError("Pipeline.setControl(name, alpha): numeric alpha required");
         }
-        float alpha = static_cast<float>(ev::toDouble(args[1]));
+        float alpha = static_cast<float>(numAt(args, 1));
         try {
             w->pipeline->cond_control().set(name, alpha);
         } catch (const std::exception& e) {
@@ -75,7 +75,9 @@ Value pipelineSetControl(Value thisVal, std::span<const Value> args) {
     for (const std::string& key : objectKeys(map.get())) {
         Value v = ev::getProperty(map.get(), key);
         if (!ev::isNumber(v)) continue;
-        float alpha = static_cast<float>(ev::toDouble(v));
+        const double d = ev::toDouble(v);
+        if (!std::isfinite(d)) continue;
+        float alpha = static_cast<float>(d);
         try {
             w->pipeline->cond_control().set(key, alpha);
         } catch (const std::exception& e) {
@@ -106,7 +108,7 @@ Value pipelineSetControlBudget(Value thisVal, std::span<const Value> args) {
     if (args.empty() || !ev::isNumber(args[0])) {
         return ev::throwTypeError("Pipeline.setControlBudget(alpha): numeric alpha required");
     }
-    w->pipeline->cond_control().set_budget(static_cast<float>(ev::toDouble(args[0])));
+    w->pipeline->cond_control().set_budget(static_cast<float>(numAt(args, 0)));
     return ev::undefined();
 }
 
@@ -203,9 +205,9 @@ Value pipelineSetControlVector(Value thisVal, std::span<const Value> args) {
     if (args.size() < 3 || !ev::isNumber(args[2])) {
         return ev::throwTypeError("Pipeline.setControlVector: numeric alpha required");
     }
-    float alpha = static_cast<float>(ev::toDouble(args[2]));
+    float alpha = static_cast<float>(numAt(args, 2));
     float scale = 1.0f;
-    if (args.size() >= 4 && ev::isNumber(args[3])) scale = static_cast<float>(ev::toDouble(args[3]));
+    if (args.size() >= 4 && ev::isNumber(args[3])) scale = static_cast<float>(numAt(args, 3));
 
     const float* dir = nullptr;
     size_t count = 0;
@@ -280,7 +282,7 @@ Value pipelineSetIdentityWeight(Value thisVal, std::span<const Value> args) {
     if (args.empty() || !ev::isNumber(args[0])) {
         return ev::throwTypeError("Pipeline.setIdentityWeight(weight): numeric weight required");
     }
-    w->pipeline->set_identity_weight(static_cast<float>(ev::toDouble(args[0])));
+    w->pipeline->set_identity_weight(static_cast<float>(numAt(args, 0)));
     return ev::undefined();
 }
 

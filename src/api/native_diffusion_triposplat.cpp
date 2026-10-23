@@ -372,8 +372,7 @@ bool parseSplatsFromValue(Value val, brodiffusion::triposplat::GaussianSplats& o
     copyField("opacities", out.opacities);
     copyField("sh", out.sh);
 
-    Value degVal = ev::getProperty(root.get(), "shDegree");
-    if (!ev::isUndefined(degVal)) out.shDegree = static_cast<int>(ev::toDouble(degVal));
+    propInt(root.get(), "shDegree", out.shDegree);
     return true;
 }
 
@@ -404,16 +403,11 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
     if (args.size() > 1 && ev::isObject(args[1])) {
         Value rbv = ev::getProperty(args[1], "removeBackground");
         if (!ev::isUndefined(rbv)) removeBackground = ev::toBool(rbv);
-        Value sv = ev::getProperty(args[1], "seed");
-        if (!ev::isUndefined(sv)) seed = static_cast<int>(ev::toDouble(sv));
-        Value stv = ev::getProperty(args[1], "steps");
-        if (!ev::isUndefined(stv)) steps = static_cast<int>(ev::toDouble(stv));
-        Value ngv = ev::getProperty(args[1], "numGaussians");
-        if (!ev::isUndefined(ngv)) numGaussians = static_cast<int>(ev::toDouble(ngv));
-        Value gv = ev::getProperty(args[1], "guidanceScale");
-        if (!ev::isUndefined(gv)) guidance = static_cast<float>(ev::toDouble(gv));
-        Value shv = ev::getProperty(args[1], "shift");
-        if (!ev::isUndefined(shv)) shift = static_cast<float>(ev::toDouble(shv));
+        propInt(args[1], "seed", seed);
+        propInt(args[1], "steps", steps);
+        propInt(args[1], "numGaussians", numGaussians);
+        propNum(args[1], "guidanceScale", guidance);
+        propNum(args[1], "shift", shift);
     }
 
     TsProfiler prof;

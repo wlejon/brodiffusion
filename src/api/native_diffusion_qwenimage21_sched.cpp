@@ -47,7 +47,9 @@ bool readAlphas(Value v, std::vector<float>& out) {
     for (uint32_t i = 0; i < len; ++i) {
         Value e = ev::getElement(arr.get(), i);
         if (!ev::isNumber(e)) return false;
-        out.push_back(static_cast<float>(ev::toDouble(e)));
+        const double d = ev::toDouble(e);
+        if (!std::isfinite(d)) return false;
+        out.push_back(static_cast<float>(d));
     }
     return true;
 }
@@ -60,10 +62,10 @@ void readWindow(std::span<const Value> args, std::size_t base, int& lo,
     lo = 0;
     hi = -1;
     if (args.size() > base && ev::isNumber(args[base])) {
-        lo = static_cast<int>(ev::toDouble(args[base]));
+        lo = i32At(args, base);
     }
     if (args.size() > base + 1 && ev::isNumber(args[base + 1])) {
-        hi = static_cast<int>(ev::toDouble(args[base + 1]));
+        hi = i32At(args, base + 1);
     }
 }
 
@@ -111,7 +113,7 @@ Value scheduleImpl(Value thisVal, std::span<const Value> args, bool replace,
         }
         float scale = 1.0f;
         if (args.size() > 4 && ev::isNumber(args[4])) {
-            scale = static_cast<float>(ev::toDouble(args[4]));
+            scale = static_cast<float>(numAt(args, 4));
         }
         const std::vector<float> v(dir, dir + n);
         const int slot =
@@ -178,7 +180,7 @@ Value qi21ApplyControlStep(Value thisVal, std::span<const Value> args) {
     }
     int step = st->state.step_index;
     if (args.size() >= 2 && ev::isNumber(args[1])) {
-        step = static_cast<int>(ev::toDouble(args[1]));
+        step = i32At(args, 1);
     }
     try {
         return ev::fromBool(

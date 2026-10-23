@@ -72,10 +72,8 @@ Value vaeDecode(Value thisVal, std::span<const Value> args) {
     // A typed array's bytes move at the next allocation, so every property
     // read happens first and the latent is copied out last.
     auto readDims = [&](const Value& obj) {
-        Value wv = ev::getProperty(obj, "width");
-        if (!ev::isUndefined(wv)) W_lat = static_cast<int>(ev::toDouble(wv));
-        Value hv = ev::getProperty(obj, "height");
-        if (!ev::isUndefined(hv)) H_lat = static_cast<int>(ev::toDouble(hv));
+        propInt(obj, "width", W_lat);
+        propInt(obj, "height", H_lat);
     };
     const bool bare = ev::typedArrayInfo(args[0]).data != nullptr;
     if (ev::isObject(args[0]) && !bare) readDims(args[0]);

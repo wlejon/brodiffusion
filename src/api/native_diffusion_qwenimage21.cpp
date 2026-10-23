@@ -100,7 +100,7 @@ Value qi21TimeMod(Value thisVal, std::span<const Value> args) {
     }
     try {
         brotensor::Tensor temb, mod;
-        w->pipeline->qi21_time_mod(static_cast<float>(ev::toDouble(args[0])),
+        w->pipeline->qi21_time_mod(static_cast<float>(numAt(args, 0)),
                                    temb, mod);
         std::vector<float> mh = downloadTensorFloats(mod);
         const int cols = mod.cols;
@@ -144,10 +144,10 @@ Value qi21SetGateScale(Value thisVal, std::span<const Value> args) {
     }
     try {
         w->pipeline->qi21_set_gate_scale(
-            static_cast<float>(ev::toDouble(args[0])),
-            static_cast<float>(ev::toDouble(args[1])),
-            static_cast<float>(ev::toDouble(args[2])),
-            static_cast<float>(ev::toDouble(args[3])),
+            static_cast<float>(numAt(args, 0)),
+            static_cast<float>(numAt(args, 1)),
+            static_cast<float>(numAt(args, 2)),
+            static_cast<float>(numAt(args, 3)),
             i32At(args, 4), i32At(args, 5));
         return ev::undefined();
     } catch (const std::exception& e) {
@@ -473,7 +473,7 @@ Value qi21EncodePromptImages(Value thisVal, std::span<const Value> args) {
     }
     int resolution = 1024;
     if (args.size() >= 3 && ev::isNumber(args[2])) {
-        resolution = static_cast<int>(ev::toDouble(args[2]));
+        resolution = i32At(args, 2);
     }
 
     try {

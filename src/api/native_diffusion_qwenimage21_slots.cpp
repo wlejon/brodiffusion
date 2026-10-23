@@ -124,10 +124,10 @@ Value qi21AddGateScale(Value thisVal, std::span<const Value> args) {
     try {
         return ev::fromDouble(static_cast<double>(
             w->pipeline->qi21_add_gate_scale(
-                static_cast<float>(ev::toDouble(args[0])),
-                static_cast<float>(ev::toDouble(args[1])),
-                static_cast<float>(ev::toDouble(args[2])),
-                static_cast<float>(ev::toDouble(args[3])), i32At(args, 4),
+                static_cast<float>(numAt(args, 0)),
+                static_cast<float>(numAt(args, 1)),
+                static_cast<float>(numAt(args, 2)),
+                static_cast<float>(numAt(args, 3)), i32At(args, 4),
                 i32At(args, 5))));
     } catch (const std::exception& e) {
         return ev::throwError(
@@ -155,10 +155,10 @@ Value qi21GateScaleRows(Value thisVal, std::span<const Value> args,
             "(attnTxt, attnImg, mlpTxt, mlpImg, blockLo, blockHi): six "
             "arguments required");
     }
-    const float at = static_cast<float>(ev::toDouble(args[0]));
-    const float ai = static_cast<float>(ev::toDouble(args[1]));
-    const float mt = static_cast<float>(ev::toDouble(args[2]));
-    const float mi = static_cast<float>(ev::toDouble(args[3]));
+    const float at = static_cast<float>(numAt(args, 0));
+    const float ai = static_cast<float>(numAt(args, 1));
+    const float mt = static_cast<float>(numAt(args, 2));
+    const float mi = static_cast<float>(numAt(args, 3));
     const int lo = i32At(args, 4), hi = i32At(args, 5);
     try {
         if (!add) {
@@ -373,8 +373,8 @@ Value qi21PrefixKvScale(Value thisVal, std::span<const Value> args, bool add,
         }
     }
     const int lo = i32At(args, 0), hi = i32At(args, 1);
-    const float ks = static_cast<float>(ev::toDouble(args[2]));
-    const float vs = static_cast<float>(ev::toDouble(args[3]));
+    const float ks = static_cast<float>(numAt(args, 2));
+    const float vs = static_cast<float>(numAt(args, 3));
     try {
         if (!add) {
             w->pipeline->qi21_scale_prefix_kv(lo, hi, ks, vs, rows);
@@ -461,7 +461,7 @@ Value qi21BlendPrefixCache(Value thisVal, std::span<const Value> args) {
     }
     try {
         w->pipeline->qi21_blend_prefix_cache(
-            i32At(args, 0), static_cast<float>(ev::toDouble(args[1])));
+            i32At(args, 0), static_cast<float>(numAt(args, 1)));
         return ev::undefined();
     } catch (const std::exception& e) {
         return ev::throwError(
