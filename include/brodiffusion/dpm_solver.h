@@ -39,6 +39,7 @@
 // on the sample / model-output tensors at the pipeline compute dtype (FP32 on
 // CPU, FP16 on a GPU backend). Single-batch (N=1) like the rest of the stack.
 
+#include "brodiffusion/detail/jit_fusion.h"
 #include "brotensor/tensor.h"
 
 #include <vector>
@@ -102,6 +103,9 @@ private:
     brotensor::Tensor  sc32_;   // FP32 scratch
     int                lower_order_nums_ = 0;
     bool               have_prev_ = false;
+    detail::JitSite    jit_x0_{"dpm.x0"};
+    detail::JitSite    jit_order1_{"dpm.order1"};
+    detail::JitSite    jit_order2_{"dpm.order2"};
 };
 
 }  // namespace brodiffusion::scheduler

@@ -70,14 +70,30 @@ void SCM::step(const bt::Tensor& model_output, int step_index,
 
     const float s = schedule_[static_cast<std::size_t>(step_index)];
     const float t = schedule_[static_cast<std::size_t>(step_index) + 1];
+    const float cos_s = std::cos(s);
+    const float neg_sin_s = -std::sin(s);
+    const float cos_t = std::cos(t);
+    const float sin_t_sd = std::sin(t) * cfg_.sigma_data;
 
-    // pred_x0 = cos(s) * sample - sin(s) * model_output   (in place on sample).
-    bt::axpby_inplace(sample, model_output, std::cos(s), -std::sin(s));
+    if (!detail::try_fused(
+            jit_step_,
+            {sample.data, model_output.data, noise.data,
+             detail::token_of_extent(static_cast<std::size_t>(sample.cols)),
+             detail::token_of(cos_s), detail::token_of(neg_sin_s),
+             detail::token_of(cos_t), detail::token_of(sin_t_sd)},
+            [&] {
+                bt::store(
+                    sample,
+                    (sample * cos_s + model_output * neg_sin_s) * cos_t +
+                        noise * sin_t_sd);
+            })) {
+        // pred_x0 = cos(s) * sample - sin(s) * model_output   (in place on sample).
+        bt::axpby_inplace(sample, model_output, cos_s, neg_sin_s);
 
-    // x_t = cos(t) * pred_x0 + sin(t) * sigma_data * noise. On the final step
-    // t == 0, so this leaves sample == pred_x0 (the denoised reconstruction).
-    bt::axpby_inplace(sample, noise, std::cos(t),
-                      std::sin(t) * cfg_.sigma_data);
+        // x_t = cos(t) * pred_x0 + sin(t) * sigma_data * noise. On the final step
+        // t == 0, so this leaves sample == pred_x0 (the denoised reconstruction).
+        bt::axpby_inplace(sample, noise, cos_t, sin_t_sd);
+    }
 }
 
 }  // namespace brodiffusion::scheduler

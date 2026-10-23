@@ -111,6 +111,7 @@ private:
     // live on the device so the kernel takes them as an operand instead of an
     // immediate (see FlowMatch::step).
     mutable detail::JitSite jit_euler_{"flow-match.euler"};
+    mutable detail::JitSite jit_add_noise_{"flow-match.add_noise"};
     mutable brotensor::Tensor d_sigma_dev_;   // (num_steps, 1) FP32
     bool device_sigma_deltas_(brotensor::Device dev) const;
 };

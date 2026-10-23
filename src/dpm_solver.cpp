@@ -117,12 +117,25 @@ void DPMSolverMultistep::step(const bt::Tensor& model_output,
 
     // ── convert epsilon -> data prediction x0 = (work_ - sigma_s*eps)/alpha_s
     detail::resize_like(m_cur_, 1, n, F32, dev);
-    bt::copy_d2d(mo32_, 0, m_cur_, 0, n);
-    bt::scale_inplace(m_cur_, -sigma_s / alpha_s);
-    detail::resize_like(sc32_, 1, n, F32, dev);
-    bt::copy_d2d(work_, 0, sc32_, 0, n);
-    bt::scale_inplace(sc32_, 1.0f / alpha_s);
-    bt::add_inplace(m_cur_, sc32_);   // m_cur_ = x0 prediction at s
+    const float inv_alpha_s = 1.0f / alpha_s;
+    const float neg_sigma_over_alpha = -sigma_s / alpha_s;
+    if (!detail::try_fused(
+            jit_x0_,
+            {m_cur_.data, work_.data, mo32_.data,
+             detail::token_of_extent(static_cast<std::size_t>(n)),
+             detail::token_of(inv_alpha_s),
+             detail::token_of(neg_sigma_over_alpha)},
+            [&] {
+                bt::store(m_cur_,
+                          mo32_ * neg_sigma_over_alpha + work_ * inv_alpha_s);
+            })) {
+        bt::copy_d2d(mo32_, 0, m_cur_, 0, n);
+        bt::scale_inplace(m_cur_, neg_sigma_over_alpha);
+        detail::resize_like(sc32_, 1, n, F32, dev);
+        bt::copy_d2d(work_, 0, sc32_, 0, n);
+        bt::scale_inplace(sc32_, inv_alpha_s);
+        bt::add_inplace(m_cur_, sc32_);   // m_cur_ = x0 prediction at s
+    }
 
     // ── target alpha/sigma (the next, lower-noise timestep). The step past the
     // last inference timestep lands on the clean image (sigma_t = 0).
@@ -149,10 +162,18 @@ void DPMSolverMultistep::step(const bt::Tensor& model_output,
             const float em1 = std::exp(-h) - 1.0f;
             const float a   = sigma_t / sigma_s;   // coef on x_s
             const float b   = -(alpha_t * em1);    // coef on x0
-            bt::scale_inplace(work_, a);
-            bt::copy_d2d(m_cur_, 0, sc32_, 0, n);
-            bt::scale_inplace(sc32_, b);
-            bt::add_inplace(work_, sc32_);
+            if (!detail::try_fused(
+                    jit_order1_,
+                    {work_.data, m_cur_.data,
+                     detail::token_of_extent(static_cast<std::size_t>(n)),
+                     detail::token_of(a), detail::token_of(b)},
+                    [&] { bt::store(work_, work_ * a + m_cur_ * b); })) {
+                detail::resize_like(sc32_, 1, n, F32, dev);
+                bt::scale_inplace(work_, a);
+                bt::copy_d2d(m_cur_, 0, sc32_, 0, n);
+                bt::scale_inplace(sc32_, b);
+                bt::add_inplace(work_, sc32_);
+            }
         }
     } else {
         // Second-order multistep (midpoint). sigma_t > 0 here: order 2 is never
@@ -173,13 +194,25 @@ void DPMSolverMultistep::step(const bt::Tensor& model_output,
         const float cC    = 0.5f * base / r0;
         const float cCur  = base + cC;
         const float cPrev = -cC;
-        bt::scale_inplace(work_, a);
-        bt::copy_d2d(m_cur_, 0, sc32_, 0, n);
-        bt::scale_inplace(sc32_, cCur);
-        bt::add_inplace(work_, sc32_);
-        bt::copy_d2d(m_prev_, 0, sc32_, 0, n);
-        bt::scale_inplace(sc32_, cPrev);
-        bt::add_inplace(work_, sc32_);
+        if (!detail::try_fused(
+                jit_order2_,
+                {work_.data, m_cur_.data, m_prev_.data,
+                 detail::token_of_extent(static_cast<std::size_t>(n)),
+                 detail::token_of(a), detail::token_of(cCur),
+                 detail::token_of(cPrev)},
+                [&] {
+                    bt::store(work_,
+                              work_ * a + m_cur_ * cCur + m_prev_ * cPrev);
+                })) {
+            detail::resize_like(sc32_, 1, n, F32, dev);
+            bt::scale_inplace(work_, a);
+            bt::copy_d2d(m_cur_, 0, sc32_, 0, n);
+            bt::scale_inplace(sc32_, cCur);
+            bt::add_inplace(work_, sc32_);
+            bt::copy_d2d(m_prev_, 0, sc32_, 0, n);
+            bt::scale_inplace(sc32_, cPrev);
+            bt::add_inplace(work_, sc32_);
+        }
     }
 
     // ── write the FP32 result back into the (possibly 16-bit) sample.

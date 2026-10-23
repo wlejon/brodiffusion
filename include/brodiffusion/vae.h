@@ -19,6 +19,7 @@
 //   conv_norm_out (GroupNorm) -> SiLU -> conv_out: block_out_channels.front()
 //   (128) -> out_channels (3).
 
+#include "brodiffusion/detail/jit_fusion.h"
 #include "brotensor/tensor.h"
 
 #include <cstdint>
@@ -161,6 +162,7 @@ private:
     brotensor::Tensor x_, y_;      // ping-pong residual stream
     brotensor::Tensor seq_, proj_seq_, attn_nchw_;
     brotensor::Tensor ln_nchw_;
+    detail::JitSite jit_latent_scale_{"vae.dec.latent_scale"};
 };
 
 // Encoder mirrors Decoder. Phase A: deterministic-or-sampled forward only.
@@ -295,6 +297,7 @@ private:
     brotensor::Tensor ln_nchw_;
     brotensor::Tensor moments_;     // (1, 2*C_lat*H_lat*W_lat) post-quant_conv
     brotensor::Tensor logvar_;      // (1, C_lat*H_lat*W_lat) — for exp(0.5*lv)
+    detail::JitSite jit_latent_scale_{"vae.enc.latent_scale"};
 };
 
 }  // namespace brodiffusion::vae

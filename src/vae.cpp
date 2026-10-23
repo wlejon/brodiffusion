@@ -321,11 +321,25 @@ void Decoder::decode(const bt::Tensor& latent,
     } else {
         x_ = latent.clone();
     }
-    if (cfg_.scaling_factor != 1.0f) {
-        bt::scale_inplace(x_, 1.0f / cfg_.scaling_factor);
-    }
-    if (cfg_.shift_factor != 0.0f) {
-        bt::add_scalar_inplace(x_, cfg_.shift_factor);
+    if (cfg_.scaling_factor != 1.0f && cfg_.shift_factor != 0.0f) {
+        const float inv_scale = 1.0f / cfg_.scaling_factor;
+        const float shift = cfg_.shift_factor;
+        if (!detail::try_fused(
+                jit_latent_scale_,
+                {x_.data,
+                 detail::token_of_extent(static_cast<std::size_t>(x_.cols)),
+                 detail::token_of(inv_scale), detail::token_of(shift)},
+                [&] { bt::store(x_, x_ * inv_scale + shift); })) {
+            bt::scale_inplace(x_, inv_scale);
+            bt::add_scalar_inplace(x_, shift);
+        }
+    } else {
+        if (cfg_.scaling_factor != 1.0f) {
+            bt::scale_inplace(x_, 1.0f / cfg_.scaling_factor);
+        }
+        if (cfg_.shift_factor != 0.0f) {
+            bt::add_scalar_inplace(x_, cfg_.shift_factor);
+        }
     }
 
     // 1b. post_quant_conv: 1x1 conv (in_channels -> in_channels). Applied by
@@ -688,11 +702,25 @@ void Encoder::encode(const bt::Tensor& image, int H, int W,
     }
 
     // 8. out = (sample - shift_factor) * scaling_factor.
-    if (cfg_.shift_factor != 0.0f) {
-        bt::add_scalar_inplace(out, -cfg_.shift_factor);
-    }
-    if (cfg_.scaling_factor != 1.0f) {
-        bt::scale_inplace(out, cfg_.scaling_factor);
+    if (cfg_.shift_factor != 0.0f && cfg_.scaling_factor != 1.0f) {
+        const float neg_shift = -cfg_.shift_factor;
+        const float scale = cfg_.scaling_factor;
+        if (!detail::try_fused(
+                jit_latent_scale_,
+                {out.data,
+                 detail::token_of_extent(static_cast<std::size_t>(out.cols)),
+                 detail::token_of(neg_shift), detail::token_of(scale)},
+                [&] { bt::store(out, (out + neg_shift) * scale); })) {
+            bt::add_scalar_inplace(out, neg_shift);
+            bt::scale_inplace(out, scale);
+        }
+    } else {
+        if (cfg_.shift_factor != 0.0f) {
+            bt::add_scalar_inplace(out, -cfg_.shift_factor);
+        }
+        if (cfg_.scaling_factor != 1.0f) {
+            bt::scale_inplace(out, cfg_.scaling_factor);
+        }
     }
 
     // Hand the latent back at the pipeline compute dtype: the scheduler and

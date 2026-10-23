@@ -95,12 +95,15 @@ void DDIM::step(const bt::Tensor& noise_pred,
     const float A = sqrt_at_prev / sqrt_at;
     const float B = sqrt_1mat_prev - sqrt_at_prev * sqrt_1mat / sqrt_at;
 
-    detail::resize_like(scratch, noise_pred.rows, noise_pred.cols,
-                        compute_dtype(), noise_pred.device);
-    bt::copy_d2d(noise_pred, 0, scratch, 0, noise_pred.size());
-    bt::scale_inplace(scratch, B);
-    bt::scale_inplace(sample, A);
-    bt::add_inplace(sample, scratch);
+    (void)scratch;
+    if (!detail::try_fused(
+            jit_step_,
+            {sample.data, noise_pred.data,
+             detail::token_of_extent(static_cast<std::size_t>(sample.cols)),
+             detail::token_of(A), detail::token_of(B)},
+            [&] { bt::store(sample, sample * A + noise_pred * B); })) {
+        bt::axpby_inplace(sample, noise_pred, A, B);
+    }
 }
 
 void DDIM::add_noise(const bt::Tensor& x0,
@@ -124,14 +127,21 @@ void DDIM::add_noise(const bt::Tensor& x0,
     const float sqrt_a   = std::sqrt(alpha);
     const float sqrt_1ma = std::sqrt(1.0f - alpha);
 
-    detail::resize_like(sample,  x0.rows, x0.cols, compute_dtype(), x0.device);
-    detail::resize_like(scratch, x0.rows, x0.cols, compute_dtype(), x0.device);
+    detail::resize_like(sample, x0.rows, x0.cols, x0.dtype, x0.device);
+    if (!detail::try_fused(
+            jit_add_noise_,
+            {sample.data, x0.data, noise.data,
+             detail::token_of_extent(static_cast<std::size_t>(x0.cols)),
+             detail::token_of(sqrt_a), detail::token_of(sqrt_1ma)},
+            [&] { bt::store(sample, x0 * sqrt_a + noise * sqrt_1ma); })) {
+        detail::resize_like(scratch, x0.rows, x0.cols, x0.dtype, x0.device);
 
-    bt::copy_d2d(x0,    0, sample,  0, x0.size());
-    bt::scale_inplace(sample, sqrt_a);
-    bt::copy_d2d(noise, 0, scratch, 0, noise.size());
-    bt::scale_inplace(scratch, sqrt_1ma);
-    bt::add_inplace(sample, scratch);
+        bt::copy_d2d(x0,    0, sample,  0, x0.size());
+        bt::scale_inplace(sample, sqrt_a);
+        bt::copy_d2d(noise, 0, scratch, 0, noise.size());
+        bt::scale_inplace(scratch, sqrt_1ma);
+        bt::add_inplace(sample, scratch);
+    }
 }
 
 }  // namespace brodiffusion::scheduler

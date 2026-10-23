@@ -44,6 +44,19 @@ bt::Dtype arith_dtype_for(bool force_upcast) {
     return brodiffusion::compute_dtype();
 }
 
+bool fuse_rmsnorm_silu(brodiffusion::detail::JitSite& site, const bt::Tensor& seq,
+                       const bt::Tensor& gamma, bt::Tensor& dst) {
+    const bt::Tensor g_row =
+        bt::Tensor::view(gamma.device, gamma.data, 1, gamma.rows * gamma.cols,
+                         gamma.dtype);
+    return brodiffusion::detail::try_fused(
+        site,
+        {seq.data, gamma.data, dst.data,
+         brodiffusion::detail::token_of_extent(static_cast<std::size_t>(seq.rows)),
+         brodiffusion::detail::token_of_extent(static_cast<std::size_t>(seq.cols))},
+        [&] { bt::store(dst, bt::silu(bt::rms_norm(seq, g_row, kRmsEps))); });
+}
+
 std::vector<float> view_to_float(const st::TensorView& v, const char* who,
                                  const std::string& key) {
     const int64_t n = v.numel();
@@ -277,6 +290,18 @@ void Decoder::apply_rmsnorm_(const bt::Tensor& gamma, int C, int H, int W,
     bt::sequence_to_nchw(seq2_, 1, C, H, W, out);
 }
 
+void Decoder::apply_rmsnorm_silu_(detail::JitSite& site, const bt::Tensor& gamma,
+                                  int C, int H, int W, const bt::Tensor& x,
+                                  bt::Tensor& out) {
+    bt::nchw_to_sequence(x, 1, C, H, W, seq_);
+    detail::resize_like(seq2_, seq_.rows, seq_.cols, seq_.dtype, seq_.device);
+    if (!fuse_rmsnorm_silu(site, seq_, gamma, seq2_)) {
+        bt::rms_norm_forward(seq_, gamma, kRmsEps, seq2_);
+        bt::silu_forward(seq2_, seq2_);
+    }
+    bt::sequence_to_nchw(seq2_, 1, C, H, W, out);
+}
+
 void Decoder::apply_resnet_(const Resnet& r, int H, int W, bt::Tensor& x) {
     if (r.has_shortcut) {
         bt::conv2d_forward(x, r.short_W, &r.short_b, 1, r.C_in, H, W, r.C_out,
@@ -284,12 +309,10 @@ void Decoder::apply_resnet_(const Resnet& r, int H, int W, bt::Tensor& x) {
     } else {
         h_ = x.clone();
     }
-    apply_rmsnorm_(r.norm1_g, r.C_in, H, W, x, n1_);
-    bt::silu_forward(n1_, n1_);
+    apply_rmsnorm_silu_(jit_norm1_, r.norm1_g, r.C_in, H, W, x, n1_);
     bt::conv2d_forward(n1_, r.conv1_W, &r.conv1_b, 1, r.C_in, H, W, r.C_out,
                        3, 3, 1, 1, 1, 1, 1, 1, y_);
-    apply_rmsnorm_(r.norm2_g, r.C_out, H, W, y_, n2_);
-    bt::silu_forward(n2_, n2_);
+    apply_rmsnorm_silu_(jit_norm2_, r.norm2_g, r.C_out, H, W, y_, n2_);
     bt::conv2d_forward(n2_, r.conv2_W, &r.conv2_b, 1, r.C_out, H, W, r.C_out,
                        3, 3, 1, 1, 1, 1, 1, 1, y_);
     bt::add_inplace(y_, h_);
@@ -375,8 +398,7 @@ void Decoder::decode(const bt::Tensor& latent, int H_lat, int W_lat, bt::Tensor&
 
     // norm_out + SiLU + conv_out.
     const int firstC = norm_out_g_.rows;
-    apply_rmsnorm_(norm_out_g_, firstC, H, W, x_, y_);
-    bt::silu_forward(y_, y_);
+    apply_rmsnorm_silu_(jit_norm_out_, norm_out_g_, firstC, H, W, x_, y_);
     bt::conv2d_forward(y_, conv_out_W_, &conv_out_b_, 1, firstC, H, W,
                        cfg_.input_channels, 3, 3, 1, 1, 1, 1, 1, 1, out);
 }
@@ -501,6 +523,18 @@ void Encoder::apply_rmsnorm_(const bt::Tensor& gamma, int C, int H, int W,
     bt::sequence_to_nchw(seq2_, 1, C, H, W, out);
 }
 
+void Encoder::apply_rmsnorm_silu_(detail::JitSite& site, const bt::Tensor& gamma,
+                                  int C, int H, int W, const bt::Tensor& x,
+                                  bt::Tensor& out) {
+    bt::nchw_to_sequence(x, 1, C, H, W, seq_);
+    detail::resize_like(seq2_, seq_.rows, seq_.cols, seq_.dtype, seq_.device);
+    if (!fuse_rmsnorm_silu(site, seq_, gamma, seq2_)) {
+        bt::rms_norm_forward(seq_, gamma, kRmsEps, seq2_);
+        bt::silu_forward(seq2_, seq2_);
+    }
+    bt::sequence_to_nchw(seq2_, 1, C, H, W, out);
+}
+
 void Encoder::apply_resnet_(const Resnet& r, int H, int W, bt::Tensor& x) {
     if (r.has_shortcut) {
         bt::conv2d_forward(x, r.short_W, &r.short_b, 1, r.C_in, H, W, r.C_out,
@@ -508,12 +542,10 @@ void Encoder::apply_resnet_(const Resnet& r, int H, int W, bt::Tensor& x) {
     } else {
         h_ = x.clone();
     }
-    apply_rmsnorm_(r.norm1_g, r.C_in, H, W, x, n1_);
-    bt::silu_forward(n1_, n1_);
+    apply_rmsnorm_silu_(jit_norm1_, r.norm1_g, r.C_in, H, W, x, n1_);
     bt::conv2d_forward(n1_, r.conv1_W, &r.conv1_b, 1, r.C_in, H, W, r.C_out,
                        3, 3, 1, 1, 1, 1, 1, 1, y_);
-    apply_rmsnorm_(r.norm2_g, r.C_out, H, W, y_, n2_);
-    bt::silu_forward(n2_, n2_);
+    apply_rmsnorm_silu_(jit_norm2_, r.norm2_g, r.C_out, H, W, y_, n2_);
     bt::conv2d_forward(n2_, r.conv2_W, &r.conv2_b, 1, r.C_out, H, W, r.C_out,
                        3, 3, 1, 1, 1, 1, 1, 1, y_);
     bt::add_inplace(y_, h_);
@@ -591,8 +623,7 @@ void Encoder::encode(const bt::Tensor& image, int H, int W,
     apply_resnet_(mid_res1_, Hc, Wc, x_);
 
     const int mid_C = norm_out_g_.rows;
-    apply_rmsnorm_(norm_out_g_, mid_C, Hc, Wc, x_, y_);
-    bt::silu_forward(y_, y_);
+    apply_rmsnorm_silu_(jit_norm_out_, norm_out_g_, mid_C, Hc, Wc, x_, y_);
     const int twoZ = 2 * z_dim;
     bt::conv2d_forward(y_, conv_out_W_, &conv_out_b_, 1, mid_C, Hc, Wc,
                        twoZ, 3, 3, 1, 1, 1, 1, 1, 1, x_);

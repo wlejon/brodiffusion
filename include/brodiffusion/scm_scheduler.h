@@ -30,6 +30,7 @@
 // (N = 1) like the rest of the inference path. Sana runs its latent in FP32
 // even on a GPU backend, so these tensors are FP32.
 
+#include "brodiffusion/detail/jit_fusion.h"
 #include "brotensor/tensor.h"
 
 #include <vector>
@@ -89,6 +90,7 @@ private:
     SCMConfig          cfg_;
     std::vector<float> schedule_;   // full angle schedule, length N+1 (trailing 0)
     std::vector<float> timesteps_;  // run angles, length N (schedule_ minus tail)
+    mutable detail::JitSite jit_step_{"scm.step"};
 };
 
 }  // namespace brodiffusion::scheduler

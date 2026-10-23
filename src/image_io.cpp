@@ -6,6 +6,7 @@
 #include "broimage/decode.h"
 #include "broimage/geometric.h"
 #include "broimage/preproc.h"
+#include "broimage/preproc_jit.h"
 
 #include "brotensor/tensor.h"
 
@@ -44,24 +45,18 @@ brotensor::Tensor load_image_as_latent_input(const std::string& path,
     std::vector<uint8_t> rgb(static_cast<std::size_t>(pixel_count) * 3);
     broimage::rgba_to_rgb_u8(img.pixels.data(), rgb.data(), pixel_count);
 
-    // 2. Resize RGB HWC u8 -> (dst_w, dst_h, 3) HWC u8, bilinear.
-    std::vector<uint8_t> rgb_resized(
-        static_cast<std::size_t>(dst_w) * static_cast<std::size_t>(dst_h) * 3);
-    broimage::resize_hwc_u8(rgb.data(), src_w, src_h, /*channels=*/3,
-                            rgb_resized.data(), dst_w, dst_h,
-                            broimage::Filter::Bilinear,
-                            /*src_stride_bytes=*/0, /*dst_stride_bytes=*/0);
-
-    // 3. u8 NHWC -> f32 NCHW, scaled to either [-1, 1] (VAE input) or [0, 1]
-    //    (ControlNet conditioning input — diffusers does just /255, no bias).
-    const float scale = (range == PixelRange::UnsignedUnit) ? 1.0f / 255.0f
-                                                            : 2.0f / 255.0f;
-    const float bias  = (range == PixelRange::UnsignedUnit) ? 0.0f : -1.0f;
+    // 2. Fused bilinear resize + u8 NHWC -> f32 NCHW, scaled to either [-1, 1]
+    //    (VAE input: (v/255 - 0.5)/0.5) or [0, 1] (ControlNet conditioning
+    //    input: (v/255 - 0.0)/1.0) via broimage's parallel JIT compiler.
+    static constexpr float kZeroMean[3] = {0.0f, 0.0f, 0.0f};
+    static constexpr float kUnitStd[3]  = {1.0f, 1.0f, 1.0f};
+    static constexpr float kHalf[3]     = {0.5f, 0.5f, 0.5f};
+    const float* mean = (range == PixelRange::UnsignedUnit) ? kZeroMean : kHalf;
+    const float* std_dev = (range == PixelRange::UnsignedUnit) ? kUnitStd : kHalf;
     std::vector<float> f32(
         static_cast<std::size_t>(dst_w) * static_cast<std::size_t>(dst_h) * 3);
-    broimage::u8_nhwc_to_f32_nchw(rgb_resized.data(),
-                                  /*N=*/1, /*H=*/dst_h, /*W=*/dst_w, /*C=*/3,
-                                  scale, bias, f32.data());
+    broimage::fused_u8_nhwc_to_f32_nchw_normalized(
+        rgb.data(), src_w, src_h, f32.data(), dst_w, dst_h, mean, std_dev);
 
     // 4. Upload at the pipeline compute dtype.
     return detail::upload_host(f32.data(),

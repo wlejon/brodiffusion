@@ -23,6 +23,7 @@
 #include "brodiffusion/unet.h"
 #include "brodiffusion/vae.h"
 #include "brodiffusion/detail/compute.h"
+#include "brodiffusion/detail/jit_fusion.h"
 #include "brodiffusion/detail/safetensors_dir.h"
 #include "brodiffusion/detail/torch_rng.h"
 #include "brodiffusion/dit/sana.h"
@@ -906,9 +907,24 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
     }
     // CFG combine (DDIM only; LCM has no uncond branch).
     if (do_cfg) {
-        bt::scale_inplace(noise_pred_cond_, opts.guidance_scale);
-        bt::scale_inplace(noise_pred_uncond_, 1.0f - opts.guidance_scale);
-        bt::add_inplace(noise_pred_cond_, noise_pred_uncond_);
+        static thread_local detail::JitSite jit_cfg{"pipeline.cfg_combine"};
+        const float gs = opts.guidance_scale;
+        const float one_minus_gs = 1.0f - gs;
+        if (!detail::try_fused(
+                jit_cfg,
+                {noise_pred_cond_.data, noise_pred_uncond_.data,
+                 detail::token_of_extent(
+                     static_cast<std::size_t>(noise_pred_cond_.cols)),
+                 detail::token_of(gs)},
+                [&] {
+                    bt::store(noise_pred_cond_,
+                              noise_pred_cond_ * gs +
+                                  noise_pred_uncond_ * one_minus_gs);
+                })) {
+            bt::scale_inplace(noise_pred_cond_, gs);
+            bt::scale_inplace(noise_pred_uncond_, one_minus_gs);
+            bt::add_inplace(noise_pred_cond_, noise_pred_uncond_);
+        }
     }
 
     // ── Scheduler step ────────────────────────────────────────────────────
@@ -951,9 +967,24 @@ void Pipeline::step_once(PipelineState& state, const GenerateOptions& opts,
         }, scheduler_);
 
         // Blend: latent = mask_b * latent + (1 - mask_b) * x0_renoised.
-        bt::mul_inplace(state.latent, inpaint_mask_b_);
-        bt::mul_inplace(inpaint_renoise_buf_, inpaint_one_minus_b_);
-        bt::add_inplace(state.latent, inpaint_renoise_buf_);
+        static thread_local detail::JitSite jit_inpaint_blend{
+            "pipeline.inpaint_blend"};
+        if (!detail::try_fused(
+                jit_inpaint_blend,
+                {state.latent.data, inpaint_mask_b_.data,
+                 inpaint_renoise_buf_.data,
+                 inpaint_one_minus_b_.data,
+                 detail::token_of_extent(
+                     static_cast<std::size_t>(state.latent.cols))},
+                [&] {
+                    bt::store(state.latent,
+                              state.latent * inpaint_mask_b_ +
+                                  inpaint_renoise_buf_ * inpaint_one_minus_b_);
+                })) {
+            bt::mul_inplace(state.latent, inpaint_mask_b_);
+            bt::mul_inplace(inpaint_renoise_buf_, inpaint_one_minus_b_);
+            bt::add_inplace(state.latent, inpaint_renoise_buf_);
+        }
     }
 }
 

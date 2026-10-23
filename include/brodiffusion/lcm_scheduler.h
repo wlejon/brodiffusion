@@ -28,6 +28,7 @@
 // that backend's compute dtype — FP32 on CPU, FP16 on a GPU. Single-batch
 // (N=1) like the rest of the inference path.
 
+#include "brodiffusion/detail/jit_fusion.h"
 #include "brotensor/tensor.h"
 
 #include <cstdint>
@@ -107,6 +108,9 @@ private:
     std::vector<float> alphas_cumprod_;     // length num_train_timesteps
     std::vector<int>   timesteps_;          // inference order, high -> low
     float              final_alpha_cumprod_ = 1.0f;
+    mutable detail::JitSite jit_step_{"lcm.step"};
+    mutable detail::JitSite jit_step_final_{"lcm.step_final"};
+    mutable detail::JitSite jit_add_noise_{"lcm.add_noise"};
 };
 
 }  // namespace brodiffusion::scheduler

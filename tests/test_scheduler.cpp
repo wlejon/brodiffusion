@@ -6,7 +6,12 @@
 // loop produces a finite FP16 result that's deterministic across runs.
 
 #include "brodiffusion/detail/compute.h"
+#include "brodiffusion/detail/jit_fusion.h"
+#include "brodiffusion/dpm_solver.h"
+#include "brodiffusion/flow_match_scheduler.h"
+#include "brodiffusion/lcm_scheduler.h"
 #include "brodiffusion/scheduler.h"
+#include "brodiffusion/scm_scheduler.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -150,6 +155,118 @@ int main() {
         int bad2 = 0;
         for (float v : got2) if (!bdtest::bd_finite(v)) ++bad2;
         CHECK(bad2 == 0);
+    }
+
+    // ── JIT-fused vs Eager parity across all schedulers ───────────────────
+    {
+        auto max_diff = [](const std::vector<float>& a,
+                           const std::vector<float>& b) {
+            float m = 0.0f;
+            for (std::size_t i = 0; i < a.size(); ++i) {
+                m = std::max(m, std::fabs(a[i] - b[i]));
+            }
+            return m;
+        };
+        auto max_rel_diff = [](const std::vector<float>& a,
+                               const std::vector<float>& b) {
+            float m = 0.0f;
+            for (std::size_t i = 0; i < a.size(); ++i) {
+                const float denom = std::max(1.0f, std::fabs(a[i]));
+                m = std::max(m, std::fabs(a[i] - b[i]) / denom);
+            }
+            return m;
+        };
+        const float tol = 2e-3f;
+
+        // DDIM step + add_noise: over 10 steps in FP16, latent values grow by
+        // 1/sqrt(alpha_901) ~ 8x to magnitude ~20 where 1 FP16 ULP is 0.015625;
+        // check relative error in FP16 multi-step and tight absolute error in FP32.
+        for (int jit : {0, 1}) {
+            brodiffusion::detail::set_jit_enabled(jit != 0);
+            std::vector<float> out_j;
+            run_loop(out_j);
+            CHECK(max_rel_diff(out_j, out_a) <= 1.5e-2f);
+        }
+        {
+            auto run_ddim_f32 = [&](bool jit_on) {
+                brodiffusion::detail::set_jit_enabled(jit_on);
+                bt::Tensor sample = bt::Tensor::from_host(latent_vals.data(), 1, n);
+                bt::Tensor noise  = bt::Tensor::from_host(noise_vals.data(),  1, n);
+                bt::Tensor scratch;
+                ddim.set_timesteps(10);
+                for (int i = 0; i < ddim.num_inference_steps(); ++i) {
+                    ddim.step(noise, i, sample, scratch);
+                }
+                return bdtest::bd_download(sample);
+            };
+            CHECK(max_diff(run_ddim_f32(false), run_ddim_f32(true)) <= 1e-5f);
+        }
+
+        // LCM step + add_noise (in FP16, 1/sqrt(alpha_999) ~ 14.5x amplifies
+        // the 6 intermediate FP16 roundings of the eager path; check relative
+        // error in FP16 and tight absolute error in FP32).
+        auto run_lcm = [&](bool jit_on, bool fp32) {
+            brodiffusion::detail::set_jit_enabled(jit_on);
+            sc::LCM lcm;
+            lcm.set_timesteps(4);
+            bt::Tensor sample = fp32 ? bt::Tensor::from_host(latent_vals.data(), 1, n)
+                                     : bdtest::bd_upload(latent_vals, 1, n);
+            bt::Tensor noise  = fp32 ? bt::Tensor::from_host(noise_vals.data(),  1, n)
+                                     : bdtest::bd_upload(noise_vals,  1, n);
+            bt::Tensor scratch;
+            for (int i = 0; i < lcm.num_inference_steps(); ++i) {
+                lcm.step(noise, i, sample, noise, scratch);
+            }
+            return bdtest::bd_download(sample);
+        };
+        CHECK(max_rel_diff(run_lcm(false, false), run_lcm(true, false)) <= 1.5e-2f);
+        CHECK(max_diff(run_lcm(false, true),      run_lcm(true, true))  <= 1e-4f);
+
+        // FlowMatch step + add_noise
+        auto run_fm = [&](bool jit_on) {
+            brodiffusion::detail::set_jit_enabled(jit_on);
+            sc::FlowMatch fm;
+            fm.set_timesteps(8);
+            bt::Tensor x0 = bdtest::bd_upload(latent_vals, 1, n);
+            bt::Tensor zn = bdtest::bd_upload(noise_vals,  1, n);
+            bt::Tensor sample, scratch;
+            fm.add_noise(x0, zn, 0, sample, scratch);
+            for (int i = 0; i < fm.num_inference_steps(); ++i) {
+                fm.step(zn, i, sample, scratch);
+            }
+            return bdtest::bd_download(sample);
+        };
+        CHECK(max_diff(run_fm(false), run_fm(true)) <= tol);
+
+        // DPMSolverMultistep step (order 1 and order 2)
+        auto run_dpm = [&](bool jit_on) {
+            brodiffusion::detail::set_jit_enabled(jit_on);
+            sc::DPMSolverMultistep dpm;
+            dpm.set_timesteps(8);
+            bt::Tensor sample = bdtest::bd_upload(latent_vals, 1, n);
+            bt::Tensor noise  = bdtest::bd_upload(noise_vals,  1, n);
+            bt::Tensor scratch;
+            for (int i = 0; i < dpm.num_inference_steps(); ++i) {
+                dpm.step(noise, i, sample, scratch);
+            }
+            return bdtest::bd_download(sample);
+        };
+        CHECK(max_diff(run_dpm(false), run_dpm(true)) <= tol);
+
+        // SCM step
+        auto run_scm = [&](bool jit_on) {
+            brodiffusion::detail::set_jit_enabled(jit_on);
+            sc::SCM scm;
+            scm.set_timesteps(2);
+            bt::Tensor sample = bt::Tensor::from_host(latent_vals.data(), 1, n);
+            bt::Tensor noise  = bt::Tensor::from_host(noise_vals.data(),  1, n);
+            for (int i = 0; i < scm.num_inference_steps(); ++i) {
+                scm.step(noise, i, sample, noise);
+            }
+            return bdtest::bd_download(sample);
+        };
+        CHECK(max_diff(run_scm(false), run_scm(true)) <= 1e-5f);
+        brodiffusion::detail::set_jit_enabled(true);
     }
 
     return g_failures == 0 ? 0 : 1;

@@ -195,14 +195,21 @@ void FlowMatch::add_noise(const bt::Tensor& x0,
     const float one_minus = 1.0f - sigma_t;
 
     // Match the operand dtype (see step() — FP32 for Sana even on a GPU).
-    detail::resize_like(sample,  x0.rows, x0.cols, x0.dtype, x0.device);
-    detail::resize_like(scratch, x0.rows, x0.cols, x0.dtype, x0.device);
+    detail::resize_like(sample, x0.rows, x0.cols, x0.dtype, x0.device);
+    if (!detail::try_fused(
+            jit_add_noise_,
+            {sample.data, x0.data, noise.data,
+             detail::token_of_extent(static_cast<std::size_t>(x0.cols)),
+             detail::token_of(one_minus), detail::token_of(sigma_t)},
+            [&] { bt::store(sample, x0 * one_minus + noise * sigma_t); })) {
+        detail::resize_like(scratch, x0.rows, x0.cols, x0.dtype, x0.device);
 
-    bt::copy_d2d(x0,    0, sample,  0, x0.size());
-    bt::scale_inplace(sample, one_minus);
-    bt::copy_d2d(noise, 0, scratch, 0, noise.size());
-    bt::scale_inplace(scratch, sigma_t);
-    bt::add_inplace(sample, scratch);
+        bt::copy_d2d(x0,    0, sample,  0, x0.size());
+        bt::scale_inplace(sample, one_minus);
+        bt::copy_d2d(noise, 0, scratch, 0, noise.size());
+        bt::scale_inplace(scratch, sigma_t);
+        bt::add_inplace(sample, scratch);
+    }
 }
 
 }  // namespace brodiffusion::scheduler

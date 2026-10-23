@@ -127,9 +127,48 @@ void LCM::step(const bt::Tensor& noise_pred,
     const float denom    = scaled_t * scaled_t + sigma2;
     const float c_skip   = sigma2 / denom;
     const float c_out    = scaled_t / std::sqrt(denom);
+    const float inv_sqrt_at = 1.0f / sqrt_at;
+
+    if (!is_final) {
+        if (noise.dtype != sample.dtype) fail("noise must share sample's dtype");
+        if (noise.rows != sample.rows || noise.cols != sample.cols) {
+            fail("noise shape mismatch");
+        }
+        if (detail::try_fused(
+                jit_step_,
+                {sample.data, noise_pred.data, noise.data,
+                 detail::token_of_extent(static_cast<std::size_t>(sample.cols)),
+                 detail::token_of(-sqrt_1mat), detail::token_of(inv_sqrt_at),
+                 detail::token_of(c_skip), detail::token_of(c_out),
+                 detail::token_of(sqrt_at_prev), detail::token_of(sqrt_1mat_prev)},
+                [&] {
+                    bt::store(
+                        sample,
+                        (sample * c_skip +
+                         ((noise_pred * (-sqrt_1mat) + sample) * inv_sqrt_at) * c_out) *
+                                sqrt_at_prev +
+                            noise * sqrt_1mat_prev);
+                })) {
+            return;
+        }
+    } else {
+        if (detail::try_fused(
+                jit_step_final_,
+                {sample.data, noise_pred.data,
+                 detail::token_of_extent(static_cast<std::size_t>(sample.cols)),
+                 detail::token_of(-sqrt_1mat), detail::token_of(inv_sqrt_at),
+                 detail::token_of(c_skip), detail::token_of(c_out)},
+                [&] {
+                    bt::store(sample,
+                              sample * c_skip +
+                                  ((noise_pred * (-sqrt_1mat) + sample) * inv_sqrt_at) * c_out);
+                })) {
+            return;
+        }
+    }
 
     detail::resize_like(scratch, noise_pred.rows, noise_pred.cols,
-                        compute_dtype(), noise_pred.device);
+                        sample.dtype, noise_pred.device);
 
     // Compute predicted_x0 = (sample - sqrt(1-a_t)*noise_pred) / sqrt(a_t).
     // CRITICAL: do the subtraction in small-magnitude space first, THEN
@@ -144,7 +183,7 @@ void LCM::step(const bt::Tensor& noise_pred,
     //   scratch += sample           (small-magnitude subtraction)
     bt::add_inplace(scratch, sample);
     //   scratch *= 1/sqrt_at        (predicted_x0)
-    bt::scale_inplace(scratch, 1.0f / sqrt_at);
+    bt::scale_inplace(scratch, inv_sqrt_at);
 
     // denoised = c_out * predicted_x0 + c_skip * sample. In place: sample
     // becomes denoised via   sample = c_skip*sample + c_out*scratch.
@@ -155,10 +194,6 @@ void LCM::step(const bt::Tensor& noise_pred,
     // Final step: sample = denoised (no re-noising).
     // Otherwise:  sample = sqrt(a_t_prev)*denoised + sqrt(1 - a_t_prev)*noise.
     if (!is_final) {
-        if (noise.dtype != sample.dtype) fail("noise must share sample's dtype");
-        if (noise.rows != sample.rows || noise.cols != sample.cols) {
-            fail("noise shape mismatch");
-        }
         bt::scale_inplace(sample, sqrt_at_prev);
         bt::copy_d2d(noise, 0, scratch, 0, noise.size());
         bt::scale_inplace(scratch, sqrt_1mat_prev);
@@ -187,14 +222,21 @@ void LCM::add_noise(const bt::Tensor& x0,
     const float sqrt_a   = std::sqrt(alpha);
     const float sqrt_1ma = std::sqrt(1.0f - alpha);
 
-    detail::resize_like(sample,  x0.rows, x0.cols, compute_dtype(), x0.device);
-    detail::resize_like(scratch, x0.rows, x0.cols, compute_dtype(), x0.device);
+    detail::resize_like(sample, x0.rows, x0.cols, x0.dtype, x0.device);
+    if (!detail::try_fused(
+            jit_add_noise_,
+            {sample.data, x0.data, noise.data,
+             detail::token_of_extent(static_cast<std::size_t>(x0.cols)),
+             detail::token_of(sqrt_a), detail::token_of(sqrt_1ma)},
+            [&] { bt::store(sample, x0 * sqrt_a + noise * sqrt_1ma); })) {
+        detail::resize_like(scratch, x0.rows, x0.cols, x0.dtype, x0.device);
 
-    bt::copy_d2d(x0,    0, sample,  0, x0.size());
-    bt::scale_inplace(sample, sqrt_a);
-    bt::copy_d2d(noise, 0, scratch, 0, noise.size());
-    bt::scale_inplace(scratch, sqrt_1ma);
-    bt::add_inplace(sample, scratch);
+        bt::copy_d2d(x0,    0, sample,  0, x0.size());
+        bt::scale_inplace(sample, sqrt_a);
+        bt::copy_d2d(noise, 0, scratch, 0, noise.size());
+        bt::scale_inplace(scratch, sqrt_1ma);
+        bt::add_inplace(sample, scratch);
+    }
 }
 
 }  // namespace brodiffusion::scheduler

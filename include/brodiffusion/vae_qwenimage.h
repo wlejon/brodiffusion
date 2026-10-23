@@ -105,6 +105,7 @@
 // This is a 16-channel latent VAE (z_dim=16), the same class of numerically
 // fragile case as Flux's 16-channel AutoencoderKL — force_upcast defaults on.
 
+#include "brodiffusion/detail/jit_fusion.h"
 #include "brotensor/tensor.h"
 
 #include <cstdint>
@@ -228,6 +229,9 @@ private:
                       int C_in, int C_out, Resnet& r);
     void apply_rmsnorm_(const brotensor::Tensor& gamma, int C, int H, int W,
                        const brotensor::Tensor& x, brotensor::Tensor& out);
+    void apply_rmsnorm_silu_(detail::JitSite& site, const brotensor::Tensor& gamma,
+                             int C, int H, int W, const brotensor::Tensor& x,
+                             brotensor::Tensor& out);
     void apply_resnet_(const Resnet& r, int H, int W, brotensor::Tensor& x);
     void apply_attention_(const Attention& a, int H, int W, brotensor::Tensor& x);
     void apply_upsample_(const UpBlock& u, int H, int W, brotensor::Tensor& x);
@@ -246,6 +250,9 @@ private:
     // Scratch (re-used across decode calls).
     brotensor::Tensor x_, y_, h_, n1_, n2_;
     brotensor::Tensor seq_, seq2_, up_t_;
+    detail::JitSite jit_norm1_{"qivae.dec.resnet.norm1_silu"};
+    detail::JitSite jit_norm2_{"qivae.dec.resnet.norm2_silu"};
+    detail::JitSite jit_norm_out_{"qivae.dec.norm_out_silu"};
 };
 
 // Encoder mirrors Decoder. See the header comment above for the flat
@@ -317,6 +324,9 @@ private:
                       int C_in, int C_out, Resnet& r);
     void apply_rmsnorm_(const brotensor::Tensor& gamma, int C, int H, int W,
                        const brotensor::Tensor& x, brotensor::Tensor& out);
+    void apply_rmsnorm_silu_(detail::JitSite& site, const brotensor::Tensor& gamma,
+                             int C, int H, int W, const brotensor::Tensor& x,
+                             brotensor::Tensor& out);
     void apply_resnet_(const Resnet& r, int H, int W, brotensor::Tensor& x);
     void apply_attention_(const Attention& a, int H, int W, brotensor::Tensor& x);
     void apply_downsample_(const DownBlock& d, int H, int W, brotensor::Tensor& x);
@@ -336,6 +346,9 @@ private:
     brotensor::Tensor x_, y_, h_, n1_, n2_, pad_;
     brotensor::Tensor seq_, seq2_;
     brotensor::Tensor moments_, logvar_;
+    detail::JitSite jit_norm1_{"qivae.enc.resnet.norm1_silu"};
+    detail::JitSite jit_norm2_{"qivae.enc.resnet.norm2_silu"};
+    detail::JitSite jit_norm_out_{"qivae.enc.norm_out_silu"};
 };
 
 }  // namespace brodiffusion::vae_qwenimage
