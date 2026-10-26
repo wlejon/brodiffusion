@@ -1,6 +1,7 @@
 #include <brodiffusion/version.h>
 #include "../src/api/api.h"
 #include "../src/api/object_builder.h"
+#include "eval/eval.h"
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -152,6 +153,16 @@ int main() {
     // exportPLY and exportSplat validation
     expectThrow(tsp, "exportPLY", {});
     expectThrow(tsp, "exportSplat", {});
+    // A cloud whose arrays are shorter than its positions say is refused,
+    // never read past.
+    {
+        auto r = bronze::eval::evalScript(
+            "(function() { const s = { positions: new Float32Array(3) }; let n = 0;\n"
+            "  for (const f of ['exportPLY', 'exportSplat']) {\n"
+            "    try { bro.triposplat[f](s, 'never-written'); } catch (e) { if (e instanceof TypeError) ++n; }\n"
+            "  } return n; })()");
+        CHECK(!r.thrown && ev::isNumber(r.value) && ev::toDouble(r.value) == 2);
+    }
 
     // triposplat.load dinov3 validation
     {

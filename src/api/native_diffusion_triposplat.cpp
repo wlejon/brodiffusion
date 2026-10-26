@@ -373,7 +373,12 @@ bool parseSplatsFromValue(Value val, brodiffusion::triposplat::GaussianSplats& o
     copyField("sh", out.sh);
 
     propInt(root.get(), "shDegree", out.shDegree);
-    return true;
+    // The exporters index every array by the positions' count: each must be
+    // as long as that count says, or they would read past it.
+    const size_t n = out.count();
+    if (out.positions.size() % 3 != 0 || out.shDegree < 0 || out.shDegree > 3) return false;
+    return out.scales.size() >= n * 3 && out.rotations.size() >= n * 4 && out.opacities.size() >= n &&
+           out.sh.size() >= n * static_cast<size_t>(out.shStride());
 }
 
 Value tripoGenerate(Value thisVal, std::span<const Value> args) {
