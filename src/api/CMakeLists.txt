@@ -1,6 +1,5 @@
 add_library(brodiffusion_api STATIC
     api.cpp
-    host_class.cpp
     native_diffusion_values.cpp
     native_diffusion_pipeline.cpp
     native_diffusion_control.cpp

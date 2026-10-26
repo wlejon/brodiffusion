@@ -1,6 +1,13 @@
 #pragma once
 
-#include "embed/embed.h"
+// bronze's HostClass (embed/embed_host_class.h): a constructor and prototype
+// per realm, branded handles, and unwrap() checked across inherit() lineages.
+// It used to be a copy kept per library, one constructor and prototype per
+// thread; the realms of one thread then shared a class's mutable prototype,
+// so one realm could change what another's instances do. One definition
+// keeps every library's classes per realm and every fix made once.
+
+#include "embed/embed_host_class.h"
 #include "object_builder.h"
 
 #include <functional>
@@ -10,59 +17,6 @@
 
 namespace brodiffusion::api {
 
-namespace ev = bronze::embed;
-using Value = bronze::Value;
-
-// A host class: one constructor function + one prototype, with instances
-// born on that prototype by make()/createInstance().
-//
-// The class objects are process-global (`HostClass g_pipelineClass`), but
-// what they hold is PER THREAD: bronze's runtime is per-thread, and a
-// Persistent is a slot in its creating thread's registry, so a constructor
-// made on the main thread means nothing to a Worker's realm. Every accessor
-// reads the CALLING thread's slots and install() fills the calling thread's;
-// a realm installs each class once, and installed() answers for the calling
-// thread, which is what an install guard has to ask.
-class HostClass {
-public:
-    struct Slots {
-        ev::Persistent* proto = nullptr;
-        ev::Persistent* ctor = nullptr;
-    };
-
-    void install(const char* name, uint32_t arity, ev::NativeFn body,
-                 const std::function<void(ObjectBuilder&)>& decorate = nullptr);
-
-    void init(const char* name, const std::function<void(ObjectBuilder&)>& decorate) {
-        install(name, 0, nullptr, decorate);
-    }
-
-    template <typename T>
-    Value createInstance(std::unique_ptr<T> ptr) const {
-        return make(ptr.release(), [](void* p) { delete static_cast<T*>(p); });
-    }
-
-    void alias(const char* name) const;
-    void inherit(const HostClass& base) const;
-
-    Value make(void* data, ev::HandleDestructor dtor,
-               ev::Finalize when = ev::Finalize::InSweep) const;
-
-    void setStatic(const char* name, Value v) const;
-
-    // The payload of a handle THIS class made; nullptr for anything else,
-    // including a handle of another class (host_class.cpp, brands).
-    void* unwrap(Value val) const;
-
-    Value prototype() const;
-    Value constructor() const;
-
-    // Whether install() has run on the CALLING thread.
-    bool installed() const;
-
-private:
-    Slots& slots() const;
-    const Slots* slotsIfAny() const;
-};
+using HostClass = bronze::embed::HostClass;
 
 } // namespace brodiffusion::api
