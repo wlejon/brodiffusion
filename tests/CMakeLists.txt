@@ -154,8 +154,10 @@ target_compile_definitions(brodiffusion_test_flow_sampler PRIVATE
 
 # Bronze standalone JavaScript API test
 if(BRODIFFUSION_ENABLE_API)
+    # test_diffusion_api_gate.cpp: the loaders and exporters under a refusing
+    # access gate (embed/embed_access.h), run from test_diffusion_api.cpp's main.
     add_executable(brodiffusion_test_api test_diffusion_api.cpp test_diffusion_surface.cpp
-        test_diffusion_api_weights.cpp)
+        test_diffusion_api_weights.cpp test_diffusion_api_gate.cpp)
     # The weights-gated half looks under <repo>/weights/sd15 and skips without it.
     target_compile_definitions(brodiffusion_test_api PRIVATE
         BRODIFFUSION_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")

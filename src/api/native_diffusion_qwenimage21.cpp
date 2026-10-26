@@ -471,6 +471,7 @@ Value qi21EncodePromptImages(Value thisVal, std::span<const Value> args) {
             "Pipeline.qwenImage21EncodePromptImages: images must hold at "
             "least one entry — use qwenImage21EncodePrompt for text only");
     }
+    if (PathRefusal r = checkImagesAccess(images)) return throwRefusal(r);
     int resolution = 1024;
     if (args.size() >= 3 && ev::isNumber(args[2])) {
         resolution = i32At(args, 2);
@@ -564,6 +565,7 @@ Value qi21PrimeEdit(Value thisVal, std::span<const Value> args) {
             "Pipeline.qwenImage21PrimeEdit: pass at least one condition "
             "image — prime() is the text-only entry point");
     }
+    if (PathRefusal r = checkImagesAccess(opts)) return throwRefusal(r);
 
     try {
         resolveDerivedSize(*w->pipeline, opts);
@@ -604,6 +606,7 @@ Value qi21PrimeFromText(Value thisVal, std::span<const Value> args) {
             "or null");
     }
     auto opts = parseGenerateOptions(args.size() >= 3 ? args[2] : ev::undefined());
+    if (PathRefusal r = checkImagesAccess(opts)) return throwRefusal(r);
 
     brotensor::Tensor uembeds, umask;
     bool haveUncond = false;
@@ -756,6 +759,7 @@ Value qi21ReloadTextEncoder(Value thisVal, std::span<const Value> args) {
     if (args.size() >= 3 && ev::isObject(args[2])) {
         quantize = propBool(args[2], "quantizeWeights", true);
     }
+    if (PathRefusal r = checkReadAccess({dir, path})) return throwRefusal(r);
     try {
         w->pipeline->qi21_reload_text_encoder(dir, path, quantize);
         return ev::undefined();

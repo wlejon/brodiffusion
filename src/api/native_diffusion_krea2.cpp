@@ -253,6 +253,7 @@ Value krea2PrimeFromTaps(Value thisVal, std::span<const Value> args) {
                                   "{rows,cols,data} tensors required");
     }
     auto opts = parseGenerateOptions(args.size() >= 3 ? args[2] : ev::undefined());
+    if (PathRefusal r = checkImagesAccess(opts)) return throwRefusal(r);
     w->cancel_requested.store(false, std::memory_order_relaxed);
     opts.should_cancel = [w]() {
         return w->cancel_requested.load(std::memory_order_relaxed);

@@ -226,6 +226,7 @@ Value loadTerrain(Value, std::span<const Value> args) {
                 "bro.diffusion.loadTerrain: opts.seed must be a non-negative integer (or a BigInt)");
         }
     }
+    if (PathRefusal r = checkReadAccess({dir})) return throwRefusal(r);
     if (!std::filesystem::exists(std::filesystem::path(dir) / "config.json")) {
         return ev::throwError("bro.diffusion.loadTerrain: no config.json in " + dir +
                               " (a converted terrain-diffusion checkpoint dir)");

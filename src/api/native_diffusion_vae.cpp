@@ -32,6 +32,7 @@ Value vaeLoadWeights(Value thisVal, std::span<const Value> args) {
     std::string path = resolveDiffusionPath(ev::toUtf8(args[0]));
     std::string prefix = args.size() > 1 && ev::isString(args[1]) ? ev::toUtf8(args[1]) : "decoder.";
 
+    if (PathRefusal r = checkReadAccess({path})) return throwRefusal(r);
     if (!std::filesystem::exists(path)) {
         return ev::throwError("VAE.loadWeights failed: file not found: " + path);
     }

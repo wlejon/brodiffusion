@@ -254,6 +254,7 @@ Value pipelineGenerate(Value thisVal, std::span<const Value> args) {
     ev::Persistent opt(args.size() > 1 ? args[1] : ev::undefined());
     const bool includeFp32 = propBool(opt.get(), "includeFp32");
     auto opts = parseGenerateOptions(opt.get());
+    if (PathRefusal r = checkImagesAccess(opts)) return throwRefusal(r);
     try {
         resolveDerivedSize(*w->pipeline, opts);
     } catch (const std::exception& e) {
@@ -296,6 +297,7 @@ Value pipelineGenerateAsync(Value thisVal, std::span<const Value> args) {
     ev::Persistent opt(args.size() > 1 ? args[1] : ev::undefined());
     const bool includeFp32 = propBool(opt.get(), "includeFp32");
     auto opts = parseGenerateOptions(opt.get());
+    if (PathRefusal r = checkImagesAccess(opts)) return throwRefusal(r);
     try {
         resolveDerivedSize(*w->pipeline, opts);
     } catch (const std::exception& e) {
@@ -321,6 +323,7 @@ Value generateWithImages(const ev::Persistent& self, PipelineWrapper* w, const s
     auto opts = parseGenerateOptions(opt.get());
     opts.init_image_path = initPath;
     if (!maskPath.empty()) opts.mask_image_path = maskPath;
+    if (PathRefusal r = checkImagesAccess(opts)) return throwRefusal(r);
     try {
         resolveDerivedSize(*w->pipeline, opts);
     } catch (const std::exception& e) {
@@ -396,10 +399,15 @@ Value pipelineLoadWeights(Value thisVal, std::span<const Value> args) {
                 return ev::throwTypeError(
                     "Pipeline.loadWeights(textPath, unetPath, vaePath): all three must be strings");
             }
+            const std::string p1 = resolveDiffusionPath(ev::toUtf8(args[1]));
+            const std::string p2 = resolveDiffusionPath(ev::toUtf8(args[2]));
+            if (PathRefusal r = checkReadAccess({p0, p1, p2})) return throwRefusal(r);
             auto tf = brotensor::safetensors::File::open(p0);
-            auto uf = brotensor::safetensors::File::open(resolveDiffusionPath(ev::toUtf8(args[1])));
-            auto vf = brotensor::safetensors::File::open(resolveDiffusionPath(ev::toUtf8(args[2])));
+            auto uf = brotensor::safetensors::File::open(p1);
+            auto vf = brotensor::safetensors::File::open(p2);
             w->pipeline->load_weights(tf, uf, vf);
+        } else if (PathRefusal r = checkReadAccess({p0})) {
+            return throwRefusal(r);
         } else if (args.size() == 2 && ev::isObject(args[1])) {
             ev::Persistent cfg(args[1]);
             std::string tp, up, vp;
@@ -436,6 +444,7 @@ Value pipelineReloadTextEncoder(Value thisVal, std::span<const Value> args) {
         std::string raw = ev::toUtf8(args[1]);
         if (!raw.empty()) tePath = resolveDiffusionPath(raw);   // "" → bundled
     }
+    if (PathRefusal r = checkReadAccess({dir, tePath})) return throwRefusal(r);
     bool quantize = true;
     if (args.size() >= 3 && ev::isObject(args[2])) {
         quantize = propBool(args[2], "quantizeWeights", true);
@@ -463,6 +472,7 @@ Value pipelineApplyLora(Value thisVal, std::span<const Value> args) {
     std::string path = resolveDiffusionPath(ev::toUtf8(args[0]));
     float scale = 1.0f;
     if (args.size() > 1 && ev::isNumber(args[1])) scale = static_cast<float>(numAt(args, 1));
+    if (PathRefusal r = checkReadAccess({path})) return throwRefusal(r);
     try {
         auto f = brotensor::safetensors::File::open(path);
         int group = w->pipeline->apply_lora(f, scale);
@@ -525,6 +535,7 @@ Value pipelineAddControlNet(Value thisVal, std::span<const Value> args) {
     }
 
     std::string path = resolveDiffusionPath(ev::toUtf8(args[0]));
+    if (PathRefusal r = checkReadAccess({path})) return throwRefusal(r);
     try {
         auto f = brotensor::safetensors::File::open(path);
         int idx = 0;
@@ -739,6 +750,8 @@ Value makeDiffusionNamespace() {
             return g_loadCancelEpoch.load(std::memory_order_acquire) != epoch;
         };
 
+        if (PathRefusal r = checkReadAccess({dir, dirOpts.text_encoder_path})) return throwRefusal(r);
+
         if (!std::filesystem::exists(dir)) {
             return ev::throwError(std::string("loadModel failed: model dir not found: ") + dir);
         }
@@ -784,6 +797,7 @@ Value makeDiffusionNamespace() {
         bool dpm = (schedulerName == "dpm" || schedulerName == "dpmsolver");
         bool lcmDistilled = propBool(cfgArg.get(), "lcmDistilled");
         bool quantize = propBool(cfgArg.get(), "quantizeWeights");
+        if (PathRefusal r = checkReadAccess({vocabPath, mergesPath})) return throwRefusal(r);
 
         try {
             brotensor::init();

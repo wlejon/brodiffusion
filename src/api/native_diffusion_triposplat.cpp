@@ -389,6 +389,9 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
     if (args.empty()) {
         return ev::throwTypeError("generate(image, opts): image required");
     }
+    if (ev::isString(args[0])) {
+        if (PathRefusal r = checkReadAccess({ev::toUtf8(args[0])})) return throwRefusal(r);
+    }
 
     w->cancel_requested.store(false, std::memory_order_relaxed);
     // bro.triposplat.cancel() with no argument bumps the process-wide epoch:
@@ -617,6 +620,7 @@ Value tripoExportPLY(Value thisVal, std::span<const Value> args) {
         return ev::throwTypeError("exportPLY(path): path string required");
     }
     std::string path = ev::toUtf8(args[0]);
+    if (PathRefusal r = checkWriteAccess(path)) return throwRefusal(r);
     if (!saveSplatPLY(w->lastSplats, path)) {
         return ev::throwError("exportPLY: failed to write PLY to " + path);
     }
@@ -630,6 +634,7 @@ Value tripoExportSplat(Value thisVal, std::span<const Value> args) {
         return ev::throwTypeError("exportSplat(path): path string required");
     }
     std::string path = ev::toUtf8(args[0]);
+    if (PathRefusal r = checkWriteAccess(path)) return throwRefusal(r);
     if (!saveSplatBinary(w->lastSplats, path)) {
         return ev::throwError("exportSplat: failed to write .splat to " + path);
     }
@@ -715,6 +720,10 @@ Value makeTriposplatNamespace() {
         if (!haveRest || dinoKind == Kind::Other) {
             return ev::throwTypeError("load: dinov3, vae, flow and decoder paths are all required");
         }
+        // Optional BiRefNet matte model for generate()'s background removal.
+        std::string p_rmbg;
+        const bool haveRmbg = readPath("birefnet", p_rmbg) == Kind::String;
+        if (PathRefusal r = checkReadAccess({p_dino, p_vae, p_flow, p_dec, p_rmbg})) return throwRefusal(r);
 
         if (!p_dino.empty() && !std::filesystem::exists(p_dino)) {
             return ev::throwError("triposplat.load failed: cannot open dinov3 file " + p_dino);
@@ -778,9 +787,7 @@ Value makeTriposplatNamespace() {
                 w->decoder->load_weights(f);
             }
 
-            // Optional BiRefNet matte model for generate()'s background removal.
-            std::string p_rmbg;
-            if (readPath("birefnet", p_rmbg) == Kind::String) {
+            if (haveRmbg) {
                 if (!p_rmbg.empty()) {
                     if (!std::filesystem::exists(p_rmbg)) {
                         return ev::throwError("triposplat.load failed: cannot open birefnet file " + p_rmbg);
@@ -820,6 +827,7 @@ Value makeTriposplatNamespace() {
             return ev::throwTypeError("exportPLY: invalid splats object");
         }
         std::string path = ev::toUtf8(args[1]);
+        if (PathRefusal r = checkWriteAccess(path)) return throwRefusal(r);
         if (!saveSplatPLY(splats, path)) {
             return ev::throwError("exportPLY: failed to write PLY to " + path);
         }
@@ -835,6 +843,7 @@ Value makeTriposplatNamespace() {
             return ev::throwTypeError("exportSplat: invalid splats object");
         }
         std::string path = ev::toUtf8(args[1]);
+        if (PathRefusal r = checkWriteAccess(path)) return throwRefusal(r);
         if (!saveSplatBinary(splats, path)) {
             return ev::throwError("exportSplat: failed to write .splat to " + path);
         }

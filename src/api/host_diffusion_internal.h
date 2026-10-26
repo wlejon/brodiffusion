@@ -20,9 +20,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace brovisionml::dinov3 {
@@ -125,6 +127,26 @@ bool readUint8Array(Value val, const uint8_t*& outData, size_t& outCount);
 // the host's resolver sees it (api.h setPathResolver), or unchanged when no
 // resolver is installed.
 std::string resolveDiffusionPath(const std::string& path);
+
+// The host's access gate (embed/embed_access.h; api.h, "Access"). A native
+// asks about every path the app handed it, as the library will open it (after
+// resolveDiffusionPath where the native resolves), before anything is opened
+// or stat'ed: Read for what is read (a directory covers what is in it), Write
+// for what is written. The gate is handed the path absolute and lexically
+// normal, in UTF-8; empty paths are skipped. A set PathRefusal carries the
+// gate's sentence and that path.
+struct PathRefusal {
+    std::string message, path;
+    explicit operator bool() const { return !message.empty(); }
+};
+PathRefusal checkReadAccess(std::initializer_list<std::string_view> paths);
+PathRefusal checkWriteAccess(std::string_view path);
+// Every image a GenerateOptions reads: initImagePath, maskImagePath, each
+// control's imagePath and each condition image's path.
+PathRefusal checkImagesAccess(const brodiffusion::pipeline::GenerateOptions& o);
+PathRefusal checkImagesAccess(const std::vector<brodiffusion::pipeline::ConditionImage>& images);
+// The refusal thrown into the running program (Error, code EACCES, path).
+Value throwRefusal(const PathRefusal& refusal);
 
 // ── shared by the pipeline / control / krea2 / state translation units ─────
 

@@ -16,6 +16,8 @@ void brodiffusionTestRestoredSurface();
 // tests/test_diffusion_api_weights.cpp — SD1.5 through bro.diffusion, skipped
 // without weights.
 void brodiffusionTestWithWeights();
+// test_diffusion_api_gate.cpp
+void brodiffusionTestAccessGate();
 
 // Failures exit rather than assert(): assert() is a no-op in the Release
 // configuration this test runs in.
@@ -260,6 +262,8 @@ int main() {
 
     // Methods restored after the QuickJS → bronze port dropped them.
     brodiffusionTestRestoredSurface();
+
+    brodiffusionTestAccessGate();
 
     brodiffusionTestWithWeights();
 

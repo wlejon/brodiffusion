@@ -30,6 +30,7 @@ Value pipelineLoadControlDictionary(Value thisVal, std::span<const Value> args) 
     std::string path = resolveDiffusionPath(ev::toUtf8(args[0]));
     bool merge = false;
     if (args.size() >= 2 && ev::isObject(args[1])) merge = propBool(args[1], "merge");
+    if (PathRefusal r = checkReadAccess({path})) return throwRefusal(r);
     try {
         w->pipeline->cond_control().load(path, merge);
         return ev::undefined();
@@ -255,6 +256,7 @@ Value pipelineSetIdentityAnchor(Value thisVal, std::span<const Value> args) {
     ev::Persistent opt(args.size() > 1 ? args[1] : ev::undefined());
     const bool includeFp32 = propBool(opt.get(), "includeFp32");
     auto opts = parseGenerateOptions(opt.get());
+    if (PathRefusal r = checkImagesAccess(opts)) return throwRefusal(r);
 
     try {
         w->cancel_requested.store(false, std::memory_order_relaxed);

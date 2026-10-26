@@ -260,6 +260,7 @@ Value pipelinePrime(Value thisVal, std::span<const Value> args) {
     ev::Persistent self(thisVal);
     std::string prompt = ev::toUtf8(args[0]);
     auto opts = parseGenerateOptions(args.size() > 1 ? args[1] : ev::undefined());
+    if (PathRefusal r = checkImagesAccess(opts)) return throwRefusal(r);
     try {
         resolveDerivedSize(*w->pipeline, opts);
     } catch (const std::exception& e) {

@@ -10,6 +10,11 @@
 
 #include <brotensor/ops/elementwise.h>
 
+#include "embed/embed_access.h"
+
+#include <filesystem>
+#include <system_error>
+
 namespace brodiffusion::api {
 
 namespace {
@@ -30,6 +35,61 @@ void setPathResolver(std::function<std::string(const std::string&)> resolver) {
 std::string resolveDiffusionPath(const std::string& path) {
     auto& r = pathResolver();
     return r ? r(path) : path;
+}
+
+namespace {
+
+std::string gatePath(std::string_view p) {
+    std::filesystem::path fp(std::u8string(p.begin(), p.end()));
+    std::error_code ec;
+    std::filesystem::path abs = std::filesystem::absolute(fp, ec);
+    if (ec) abs = fp;
+    const std::u8string u = abs.lexically_normal().u8string();
+    return std::string(u.begin(), u.end());
+}
+
+PathRefusal checkOne(ev::AccessKind kind, std::string_view p) {
+    PathRefusal r;
+    if (p.empty()) return r;
+    r.path = gatePath(p);
+    r.message = ev::checkAccess(kind, r.path);
+    return r;
+}
+
+} // namespace
+
+PathRefusal checkReadAccess(std::initializer_list<std::string_view> paths) {
+    if (!ev::accessGateActive()) return {};
+    for (std::string_view p : paths) {
+        if (PathRefusal r = checkOne(ev::AccessKind::Read, p)) return r;
+    }
+    return {};
+}
+
+PathRefusal checkWriteAccess(std::string_view path) {
+    if (!ev::accessGateActive()) return {};
+    return checkOne(ev::AccessKind::Write, path);
+}
+
+PathRefusal checkImagesAccess(const std::vector<brodiffusion::pipeline::ConditionImage>& images) {
+    if (!ev::accessGateActive()) return {};
+    for (const auto& ci : images) {
+        if (PathRefusal r = checkOne(ev::AccessKind::Read, ci.path)) return r;
+    }
+    return {};
+}
+
+PathRefusal checkImagesAccess(const brodiffusion::pipeline::GenerateOptions& o) {
+    if (!ev::accessGateActive()) return {};
+    if (PathRefusal r = checkReadAccess({o.init_image_path, o.mask_image_path})) return r;
+    for (const auto& c : o.controls) {
+        if (PathRefusal r = checkOne(ev::AccessKind::Read, c.image_path)) return r;
+    }
+    return checkImagesAccess(o.condition_images);
+}
+
+Value throwRefusal(const PathRefusal& refusal) {
+    return ev::throwAccessError(refusal.message, "EACCES", refusal.path);
 }
 
 HostClass g_pipelineClass;
