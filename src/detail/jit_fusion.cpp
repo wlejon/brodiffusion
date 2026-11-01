@@ -9,17 +9,10 @@ namespace brodiffusion::detail {
 
 namespace {
 
-bool env_default_on() {
-    const char* v = std::getenv("BRODIFFUSION_JIT");
-    if (!v || !*v) return true;
-    return !(std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0 ||
-             std::strcmp(v, "false") == 0);
-}
-
-// Read the environment once, then let set_jit_enabled() override it. Relaxed is
-// enough: the value changes at most once, from the CLI, before any worker runs.
+// On until set_jit_enabled() turns it off. Relaxed is enough: the CLI changes
+// it before any worker runs, tests between runs.
 std::atomic<bool>& jit_flag() {
-    static std::atomic<bool> on{env_default_on()};
+    static std::atomic<bool> on{true};
     return on;
 }
 

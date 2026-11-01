@@ -126,8 +126,8 @@ int usage() {
         "                   loads it as INT8 (W8A16); --max-length defaults 128.\n"
         "\n"
         "  --no-jit         disable every trace-JIT fusion site and run the\n"
-        "                   eager op sequences instead (same as setting\n"
-        "                   BRODIFFUSION_JIT=0). Accepted by every subcommand.\n"
+        "                   eager op sequences instead. Accepted by every\n"
+        "                   subcommand.\n"
         "\n"
         "Writes an RGB PNG via broimage.\n",
         brodiffusion::version_string());
@@ -285,7 +285,7 @@ int main(int argc, char** argv) {
 
     // --no-jit is global rather than per-subcommand: it turns off every trace-
     // JIT fusion site at once, so a before/after comparison is one flag on an
-    // otherwise identical command line. Equivalent to BRODIFFUSION_JIT=0.
+    // otherwise identical command line.
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--no-jit") == 0) {
             brodiffusion::detail::set_jit_enabled(false);

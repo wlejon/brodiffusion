@@ -26,8 +26,8 @@
 // warns once, and returns false so the caller runs its eager path. Correct
 // output is never contingent on the JIT.
 //
-// BRODIFFUSION_JIT=0 (or set_jit_enabled(false), which is the CLI's --no-jit)
-// turns every site off, so before/after is one flag.
+// set_jit_enabled(false), which is the CLI's --no-jit, turns every site off,
+// so before/after is one flag.
 
 #include "brotensor/jit/trace.h"
 #include "brotensor/tensor.h"
@@ -40,8 +40,7 @@
 
 namespace brodiffusion::detail {
 
-// Process-wide switch. Defaults to on, or to off when BRODIFFUSION_JIT is set
-// to "0". Read once.
+// Process-wide switch. Defaults to on.
 bool jit_enabled();
 void set_jit_enabled(bool on);
 
