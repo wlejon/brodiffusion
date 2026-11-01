@@ -96,10 +96,9 @@ private:
 };
 
 // ── option-bag readers ─────────────────────────────────────────────────────
-// The old QuickJS bindings read an options object key by key, leaving the
-// caller's default in place when the key is absent. These mirror getInt /
-// getNum / getStr / getBool from diffusion_bindings.cpp so a port reads the
-// same way.
+// Read an options object key by key, leaving the caller's default in place
+// when the key is absent (the string and number readers also skip a value of
+// the wrong type; propBool coerces).
 
 inline bool propStr(Value obj, const char* key, std::string& dst) {
     if (!ev::isObject(obj)) return false;

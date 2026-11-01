@@ -1,10 +1,8 @@
 // Krea 2 research hooks on Pipeline — AdaLN / gate dials, raw-taps
 // conditioning, image-as-prompt. Every method here is Krea2-only; the native
 // Pipeline methods they wrap already throw a clear error for any other
-// model_class, so no separate guard is added (the same way the old
-// diffusion_bindings.cpp relied on the native side's own checks).
-//
-// Ported from the QuickJS-era src/js/diffusion_bindings.cpp krea2 block.
+// model_class, so no separate guard is added: the native side's own checks
+// are the guard.
 
 #include "host_diffusion_internal.h"
 

@@ -10,9 +10,8 @@
 #include <string>
 #include <vector>
 
-// tests/test_diffusion_surface.cpp — the restored Pipeline / PipelineState
-// members.
-void brodiffusionTestRestoredSurface();
+// tests/test_diffusion_surface.cpp — the Pipeline / PipelineState methods.
+void brodiffusionTestMethodSurface();
 // tests/test_diffusion_api_weights.cpp — SD1.5 through bro.diffusion, skipped
 // without weights.
 void brodiffusionTestWithWeights();
@@ -260,8 +259,8 @@ int main() {
         std::filesystem::remove(mp);
     }
 
-    // Methods restored after the QuickJS → bronze port dropped them.
-    brodiffusionTestRestoredSurface();
+    // Pipeline / PipelineState method presence, receiver checks and arity.
+    brodiffusionTestMethodSurface();
 
     brodiffusionTestAccessGate();
 

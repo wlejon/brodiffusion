@@ -49,8 +49,7 @@ void shutdownDiffusionAsync();
 
 /// Install the host's asset-path resolver. Model dirs, weight files, LoRAs,
 /// ControlNets and control dictionaries are then reachable by app-relative and
-/// mounted (`/app/...`) paths, as they were before the bronze port — the old
-/// binding's setDiffusionAppContext(). Without a resolver every path is used
+/// mounted (`/app/...`) paths. Without a resolver every path is used
 /// verbatim, which is what a standalone build wants.
 void setPathResolver(std::function<std::string(const std::string&)> resolver);
 

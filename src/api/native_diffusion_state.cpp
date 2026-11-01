@@ -2,10 +2,8 @@
 // (optionally capturing an attention trace or injecting per-layer logit bias),
 // VAE-decode the working latent, read/overwrite that latent, and fork a state.
 //
-// Ported from the QuickJS-era src/js/diffusion_bindings.cpp
-// registerPipelineStateClass block. The bronze rewrite had reduced
-// stepOnce()/decode() to a counter bump and a black image; both now run the
-// owning Pipeline, which the state retains through its `__pipeline` link.
+// stepOnce() and decode() run the owning Pipeline, which the state retains
+// through its `__pipeline` link.
 
 #include "host_diffusion_internal.h"
 

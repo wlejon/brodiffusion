@@ -1,10 +1,7 @@
 // Pipeline conditioning-control surface: the loaded control dictionary, the
 // per-axis weights that steer generate()/prime(), axis introspection, the
-// encoder-space primitives axes are built from, and the Sana identity anchor.
-//
-// Ported from the QuickJS-era src/js/diffusion_bindings.cpp (the
-// js_pipeline_loadControlDictionary .. js_pipeline_clearIdentityAnchor block),
-// which the bronze rewrite dropped wholesale.
+// encoder-space primitives axes are built from, and the Sana identity anchor
+// (loadControlDictionary through clearIdentityAnchor).
 
 #include "host_diffusion_internal.h"
 

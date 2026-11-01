@@ -381,8 +381,8 @@ Value pipelineInpaint(Value thisVal, std::span<const Value> args) {
 // loadWeights(path, {textPrefix,unetPrefix,vaePrefix}) — single file, custom prefixes
 // loadWeights(textPath, unetPath, vaePath)             — diffusers 3-file export
 //
-// An absent prefix stays "" (the root of the file), as it did before the
-// bronze port: substituting the SD1.5 defaults would silently ignore a caller
+// An absent prefix stays "" (the root of the file): substituting the SD1.5
+// defaults would silently ignore a caller
 // that asked for a root-prefixed module.
 Value pipelineLoadWeights(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
@@ -521,8 +521,7 @@ Value pipelineNumLoras(Value thisVal, std::span<const Value>) {
 }
 
 // addControlNet(path, cfg?) -> index. `cfg` carries the ControlNetConfig fields
-// that differ across the SD1.5 ControlNet zoo; all five the old binding
-// forwarded are forwarded again.
+// that differ across the SD1.5 ControlNet zoo; all five are forwarded.
 Value pipelineAddControlNet(Value thisVal, std::span<const Value> args) {
     auto* w = unwrapPipeline(thisVal);
     if (!w || !w->pipeline) return ev::throwTypeError("Pipeline.addControlNet: not a loaded Pipeline");
@@ -741,7 +740,7 @@ Value makeDiffusionNamespace() {
                 dirOpts.text_encoder_path = resolveDiffusionPath(tePath);
             }
         }
-        // Cooperative cancellation, as before the bronze port: a Krea 2 or
+        // Cooperative cancellation: a Krea 2 or
         // Qwen-Image load reads tens of GB in one native call, and
         // bro.diffusion.cancel() (or teardown) must be able to abandon it.
         // from_model_dir then throws LoadCancelled -> { cancelled: true }.

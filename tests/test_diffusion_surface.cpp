@@ -1,6 +1,6 @@
-// Surface coverage for the Pipeline / PipelineState methods that the QuickJS →
-// bronze port dropped. Each name
-// gets two checks: it must be a callable own member of the class prototype,
+// Surface coverage for the Pipeline / PipelineState methods: the ControlNet
+// registry, model/schedule introspection, the conditioning-control dictionary,
+// the Krea 2 hooks and the step-wise state. Each name gets two checks: it must be a callable own member of the class prototype,
 // and calling it with a `this` that is not a live Pipeline / PipelineState must
 // throw rather than return undefined — a missing handler does neither.
 //
@@ -29,7 +29,7 @@ namespace ev = bronze::embed;
 }
 using bronze::Value;
 
-// Every method restored onto Pipeline.prototype.
+// Every method checked on Pipeline.prototype.
 const char* const kPipelineMethods[] = {
     // ControlNet registry
     "addControlNet", "removeControlNet", "clearControlNets",
@@ -83,7 +83,7 @@ const char* const kPipelineMethods[] = {
     "qwenImage21ReloadTextEncoder",
 };
 
-// Every method restored onto PipelineState.prototype.
+// Every method checked on PipelineState.prototype.
 const char* const kStateMethods[] = {
     "stepOnce", "decode", "latent", "setLatent", "krea2StepTimestep",
     "qwenImage21StepTimestep", "clone",
@@ -115,8 +115,8 @@ void checkMethod(Value proto, const char* name) {
 
 } // namespace
 
-void brodiffusionTestRestoredSurface() {
-    std::cout << "Checking the restored bro.diffusion surface..." << std::endl;
+void brodiffusionTestMethodSurface() {
+    std::cout << "Checking the bro.diffusion Pipeline / PipelineState surface..." << std::endl;
 
     ev::Persistent broNs(ev::globalValue("bro").value);
     if (!ev::isObject(broNs.get())) die("globalThis.bro is missing");
@@ -126,12 +126,12 @@ void brodiffusionTestRestoredSurface() {
     ev::Persistent pipeProto(prototypeOf(diff.get(), "Pipeline"));
     for (const char* name : kPipelineMethods) checkMethod(pipeProto.get(), name);
     std::cout << "  Pipeline.prototype: " << (sizeof(kPipelineMethods) / sizeof(char*))
-              << " restored methods present and receiver-checked" << std::endl;
+              << " methods present and receiver-checked" << std::endl;
 
     ev::Persistent stateProto(prototypeOf(diff.get(), "PipelineState"));
     for (const char* name : kStateMethods) checkMethod(stateProto.get(), name);
     std::cout << "  PipelineState.prototype: " << (sizeof(kStateMethods) / sizeof(char*))
-              << " restored methods present and receiver-checked" << std::endl;
+              << " methods present and receiver-checked" << std::endl;
 
     for (const char* name : kStateAccessors) {
         Value v = ev::getProperty(stateProto.get(), name);
@@ -140,8 +140,8 @@ void brodiffusionTestRestoredSurface() {
     std::cout << "  PipelineState accessors: stepIndex/numSteps/totalSteps/done/"
                  "latentWidth/latentHeight present" << std::endl;
 
-    // Arity: the dropped positional/option arguments are back, so the declared
-    // lengths match what the old bindings registered.
+    // Arity: each method's declared length counts its positional and option
+    // arguments.
     struct { const char* name; double len; } kArity[] = {
         {"loadWeights", 3}, {"applyLora", 2}, {"addControlNet", 2},
         {"generate", 2}, {"prime", 2}, {"setControlVector", 4},
@@ -190,5 +190,5 @@ void brodiffusionTestRestoredSurface() {
         if (!r.thrown) die("setControl({...}) accepted a foreign receiver");
     }
 
-    std::cout << "Restored bro.diffusion surface OK." << std::endl;
+    std::cout << "bro.diffusion Pipeline / PipelineState surface OK." << std::endl;
 }

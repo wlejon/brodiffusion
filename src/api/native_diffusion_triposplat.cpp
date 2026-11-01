@@ -396,7 +396,7 @@ Value tripoGenerate(Value thisVal, std::span<const Value> args) {
     w->cancel_requested.store(false, std::memory_order_relaxed);
     // bro.triposplat.cancel() with no argument bumps the process-wide epoch:
     // generate() runs inside a Worker whose handle the main thread cannot
-    // reach, so that is how the main thread stops it (as before the port).
+    // reach, so that is how the main thread stops it.
     const uint64_t epoch = g_tripoCancelEpoch.load(std::memory_order_acquire);
     auto cancelled = [w, epoch]() {
         return w->cancel_requested.load(std::memory_order_relaxed) ||

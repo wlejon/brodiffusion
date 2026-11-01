@@ -1,9 +1,6 @@
 // Value translation shared by the diffusion binding's translation units:
 // typed-array in/out, the canvas-ready image result, tensor <-> JS object,
 // the GenerateOptions option bag, and the PipelineState -> Pipeline link.
-//
-// Ported from the QuickJS-era src/js/diffusion_bindings.cpp helpers so the
-// shapes stay exactly what the old surface produced.
 
 #include "host_diffusion_internal.h"
 #include "api.h"
