@@ -131,7 +131,7 @@ void FlowDiT::load_repo(const st::File& f, const std::string& p, Repo& r) {
     r.freqs2 = read_host_f32(need(f, p + ".freqs_2"));
 
     // Precompute the (1, half) frequency table (×π) on the compute device for the
-    // GPU rope-table kernel; the host freqs_* above stay for the CPU path.
+    // GPU rope-table kernel; the host freqs_* above stay for Metal's host path.
     std::vector<float> fpi;
     fpi.reserve(r.freqs0.size() + r.freqs1.size() + r.freqs2.size());
     for (float x : r.freqs0) fpi.push_back(x * kPi);
@@ -292,7 +292,7 @@ void FlowDiT::build_rope(const bt::Tensor& hidden, const Repo& r,
 
     // norm -> silu(gate)*content -> final_map  =>  delta_pos (L, 3H)
     // Member scratch (rope_*_) keeps the CUDA branch allocation-stable for
-    // graph capture; the CPU fallback below never captures.
+    // graph capture; the Metal host path below never captures.
     bt::Tensor& h = rope_h_;
     bt::Tensor& g = rope_g_;
     bt::Tensor& c = rope_c_;
@@ -331,8 +331,9 @@ void FlowDiT::build_rope(const bt::Tensor& hidden, const Repo& r,
     }
 #endif
 
-    // CPU (and Metal) fallback: download delta_pos, build the tables host-side
-    // (also satisfies rope_apply_perhead's FP32-table requirement), upload back.
+    // Metal (no table kernel there): download delta_pos, build the tables
+    // host-side (FP32, as rope_apply_perhead requires), upload back.
+    if (!hidden.device.is_metal()) fail("the flow model runs on a GPU (CUDA, Vulkan or Metal)");
     bt::sync_all();
     std::vector<float> d = download_f32(dp);        // (L, 3H), [head, axis]
     std::vector<float> cosv(static_cast<std::size_t>(L) * H * half);

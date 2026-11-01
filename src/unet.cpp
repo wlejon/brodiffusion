@@ -978,16 +978,6 @@ void UNet::finalize_weights() {
     finalized_ = true;
     if (!cfg_.quantize_weights) return;
     if (conv_in_W_.size() == 0) fail("finalize_weights: weights not loaded");
-    // INT8 (W8A16) weight quantization is GPU-only — the W8A16 ops have no CPU
-    // fallback. On the CPU backend, skip quantization so every QWeight stays
-    // inactive and all INT8 branches remain dead.
-    if (conv_in_W_.device == brotensor::Device::CPU) {
-        std::fprintf(stderr,
-            "brodiffusion: INT8 weight quantization is GPU-only; "
-            "ignoring --quantize-unet on the CPU backend.\n");
-        return;
-    }
-
     auto quant_resnet = [&](Resnet& r) {
         quantize_weight_inplace_(r.W1, r.W1_q);
         quantize_weight_inplace_(r.W2, r.W2_q);

@@ -7,9 +7,9 @@
 //   * Shapes used by SD1.5 BasicTransformerBlock: D in {320, 640, 1280},
 //     L in {4096, 1024, 256, 64}, FF inner = 4 * D.
 //
-// These are runtime dispatchers (see src/fused.cpp): a GPU-resident input
-// runs the SD1.5-tuned fused CUDA kernel (FP16 storage, FP32 accumulators);
-// a CPU-resident input runs an FP32 fallback composed from brotensor ops.
+// These are runtime dispatchers (see src/fused.cpp): a CUDA or Metal input
+// runs the SD1.5-tuned fused kernel (FP16 storage, FP32 accumulators), a
+// Vulkan one brotensor's own ops; a CPU input is refused.
 // Generic versions of these ops live in brotensor; SD1.5-tuned fusions
 // belong here.
 
@@ -47,8 +47,8 @@ void fused_linear_geglu(const brotensor::Tensor& X,
                         const brotensor::Tensor& b,
                         brotensor::Tensor& Y);
 
-// In-place elementwise add: Y[i] += X[i]. On a GPU backend this runs a
-// vectorised __half2 kernel; on CPU it routes to brotensor::add_inplace.
+// In-place elementwise add: Y[i] += X[i]. On CUDA this runs a vectorised
+// __half2 kernel; on Vulkan brotensor::add_inplace.
 // Same shape semantics: Y and X must match.
 void add_inplace_vec(brotensor::Tensor& Y, const brotensor::Tensor& X);
 

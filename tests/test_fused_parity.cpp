@@ -1,31 +1,26 @@
-// CPU↔Metal parity tests for brodiffusion's fused ops.
+// Parity tests for brodiffusion's fused ops against brotensor's own.
 //
-// brodiffusion ships SD1.5-tuned fused Metal kernels (src/fused_resblock.mm,
-// src/fused_transformer.mm). The public brodiffusion::fused_* entry points
-// (src/fused.cpp) dispatch on tensor residency: a Metal-resident input runs
-// the fused Metal kernel; a CPU-resident input runs the FP32 fallback
-// composed from brotensor's CPU ops. Both paths claim identical math.
+// brodiffusion ships SD1.5-tuned fused CUDA and Metal kernels
+// (src/fused_resblock.*, src/fused_transformer.*). The public
+// brodiffusion::fused_* entry points (src/fused.cpp) dispatch on the input's
+// device. Each op here runs twice on the same GPU over identical FP16 inputs:
+// once through brodiffusion's dispatcher, once through the brotensor ops it
+// fuses (resblock_forward, linear + geglu_exact_forward, add_inplace,
+// add_row_bias_inplace). On Vulkan the dispatcher IS those ops, so the two
+// agree exactly; on CUDA and Metal the comparison checks the tuned kernel.
 //
-// This test exercises both paths from a single Metal-enabled binary: every
-// op is run once with CPU FP32 tensors and once with Metal FP16 tensors over
-// numerically identical inputs (host values are canonicalised through FP16
-// first, so the only difference under test is CPU-FP32 vs Metal-FP16 compute
-// precision). Outputs are compared within an FP16-appropriate tolerance.
-//
-// Covers the FP16 ops that have a CPU fallback:
+// Covers:
 //   * fused_resblock_forward   (no-skip and 1x1-skip)
 //   * fused_linear_geglu
 //   * add_inplace_vec
 //   * add_inplace_row_bias
-// The W8A16 (INT8 weight-only) overloads are GPU-only by design — the CPU
-// fallback throws — so there is no CPU reference to compare against.
 //
-// Skips cleanly (exit 0) when no Metal backend is available, so the same
-// source builds and passes in the CPU-only configuration.
+// Skips cleanly (exit 0) when no GPU backend is available.
 
 #include "brodiffusion/fused_resblock.h"
 #include "brodiffusion/fused_transformer.h"
 
+#include "brotensor/ops.h"
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
@@ -53,9 +48,7 @@ static int g_failures = 0;
 namespace {
 
 // Deterministic host values in [-scale, scale] + bias, each canonicalised to
-// an FP16-representable value so the CPU-FP32 and Metal-FP16 paths consume
-// byte-identical numeric inputs — the test then isolates kernel compute
-// precision rather than input-quantisation noise.
+// an FP16-representable value so both runs consume byte-identical inputs.
 std::vector<float> gen(std::size_t n, std::uint64_t seed, float scale,
                        float bias = 0.0f) {
     std::mt19937_64 rng(seed);
@@ -66,10 +59,6 @@ std::vector<float> gen(std::size_t n, std::uint64_t seed, float scale,
         out[i] = bt::fp16_bits_to_fp32(bt::fp32_to_fp16_bits(v));
     }
     return out;
-}
-
-bt::Tensor cpu_t(const std::vector<float>& v, int r, int c) {
-    return bt::Tensor::from_host_on(bt::Device::CPU, v.data(), r, c);
 }
 
 bt::Device gpu_dev() { return bdtest::preferred_gpu(); }
@@ -89,17 +78,17 @@ struct Cmp {
     int   nonfinite   = 0;
 };
 
-Cmp compare(const std::vector<float>& cpu, const std::vector<float>& gpu) {
+Cmp compare(const std::vector<float>& ref, const std::vector<float>& got) {
     Cmp c;
-    const std::size_t n = std::min(cpu.size(), gpu.size());
-    if (cpu.size() != gpu.size()) { c.nonfinite = 1; return c; }
+    const std::size_t n = std::min(ref.size(), got.size());
+    if (ref.size() != got.size()) { c.nonfinite = 1; return c; }
     for (std::size_t i = 0; i < n; ++i) {
-        if (!std::isfinite(cpu[i]) || !std::isfinite(gpu[i])) {
+        if (!std::isfinite(ref[i]) || !std::isfinite(got[i])) {
             ++c.nonfinite;
             continue;
         }
-        c.max_abs_err = std::max(c.max_abs_err, std::fabs(cpu[i] - gpu[i]));
-        c.max_abs_ref = std::max(c.max_abs_ref, std::fabs(cpu[i]));
+        c.max_abs_err = std::max(c.max_abs_err, std::fabs(ref[i] - got[i]));
+        c.max_abs_ref = std::max(c.max_abs_ref, std::fabs(ref[i]));
     }
     return c;
 }
@@ -141,39 +130,42 @@ void test_resblock(int C_in, int C_out, int H, int W, int num_groups,
 
     const float eps = 1e-5f;
 
-    auto run = [&](bt::Device dev) {
-        auto mk = [&](const std::vector<float>& v, int r, int c) {
-            return dev == bt::Device::CPU ? cpu_t(v, r, c) : gpu_t(v, r, c);
-        };
-        bt::Tensor X   = mk(x,   1, C_in * spatial);
-        bt::Tensor G1  = mk(g1,  C_in, 1);
-        bt::Tensor B1n = mk(bt1, C_in, 1);
-        bt::Tensor W1  = mk(w1,  C_out, C_in * 9);
-        bt::Tensor B1  = mk(b1,  C_out, 1);
-        bt::Tensor SH  = mk(sh,  C_out, 1);
-        bt::Tensor G2  = mk(g2,  C_out, 1);
-        bt::Tensor B2n = mk(bt2, C_out, 1);
-        bt::Tensor W2  = mk(w2,  C_out, C_out * 9);
-        bt::Tensor B2  = mk(b2,  C_out, 1);
+    auto run = [&](bool fused) {
+        bt::Tensor X   = gpu_t(x,   1, C_in * spatial);
+        bt::Tensor G1  = gpu_t(g1,  C_in, 1);
+        bt::Tensor B1n = gpu_t(bt1, C_in, 1);
+        bt::Tensor W1  = gpu_t(w1,  C_out, C_in * 9);
+        bt::Tensor B1  = gpu_t(b1,  C_out, 1);
+        bt::Tensor SH  = gpu_t(sh,  C_out, 1);
+        bt::Tensor G2  = gpu_t(g2,  C_out, 1);
+        bt::Tensor B2n = gpu_t(bt2, C_out, 1);
+        bt::Tensor W2  = gpu_t(w2,  C_out, C_out * 9);
+        bt::Tensor B2  = gpu_t(b2,  C_out, 1);
         bt::Tensor WSK, BSK;
         if (need_skip) {
-            WSK = mk(wsk, C_out, C_in);
-            BSK = mk(bsk, C_out, 1);
+            WSK = gpu_t(wsk, C_out, C_in);
+            BSK = gpu_t(bsk, C_out, 1);
         }
         bt::Tensor Y;
-        bd::fused_resblock_forward(
-            X, G1, B1n, W1, B1, SH, G2, B2n, W2, B2,
-            need_skip ? &WSK : nullptr, need_skip ? &BSK : nullptr,
-            C_in, C_out, H, W, num_groups, eps, Y);
+        if (fused) {
+            bd::fused_resblock_forward(
+                X, G1, B1n, W1, B1, SH, G2, B2n, W2, B2,
+                need_skip ? &WSK : nullptr, need_skip ? &BSK : nullptr,
+                C_in, C_out, H, W, num_groups, eps, Y);
+        } else {
+            bt::resblock_forward(X, G1, B1n, W1, &B1, &SH, G2, B2n, W2, &B2,
+                                 need_skip ? &WSK : nullptr, need_skip ? &BSK : nullptr,
+                                 /*N=*/1, C_in, C_out, H, W, num_groups, eps, Y);
+        }
         return bdtest::bd_download(Y);
     };
 
-    const auto cpu = run(bt::Device::CPU);
-    const auto gpu = run(gpu_dev());
-    // Observed err ~0.001 (FP16 storage + intermediate rounding through GN,
-    // SiLU and two convs); bound leaves ~20x headroom for cross-GPU ULP drift
-    // in the transcendentals while still catching a genuinely broken kernel.
-    expect_parity(label, compare(cpu, gpu), gpu.size(),
+    const auto ref = run(false);
+    const auto got = run(true);
+    // FP16 storage + intermediate rounding through GN, SiLU and two convs,
+    // fused or not; the bound leaves headroom for kernel-order ULP drift while
+    // still catching a genuinely broken kernel.
+    expect_parity(label, compare(ref, got), got.size(),
                   /*tol_rel=*/0.01f, /*tol_abs=*/0.008f);
 }
 
@@ -185,22 +177,25 @@ void test_geglu(int B, int D_in, int D_out, const char* label) {
     const auto w = gen(static_cast<std::size_t>(two_D) * D_in, 22, 0.1f);
     const auto b = gen(static_cast<std::size_t>(two_D), 23, 0.2f);
 
-    auto run = [&](bt::Device dev) {
-        auto mk = [&](const std::vector<float>& v, int r, int c) {
-            return dev == bt::Device::CPU ? cpu_t(v, r, c) : gpu_t(v, r, c);
-        };
-        bt::Tensor X = mk(x, B, D_in);
-        bt::Tensor Wt = mk(w, two_D, D_in);
-        bt::Tensor Bt = mk(b, two_D, 1);
+    auto run = [&](bool fused) {
+        bt::Tensor X = gpu_t(x, B, D_in);
+        bt::Tensor Wt = gpu_t(w, two_D, D_in);
+        bt::Tensor Bt = gpu_t(b, two_D, 1);
         bt::Tensor Y;
-        bd::fused_linear_geglu(X, Wt, Bt, Y);
+        if (fused) {
+            bd::fused_linear_geglu(X, Wt, Bt, Y);
+        } else {
+            bt::Tensor T;
+            bt::linear_forward_batched_ex(Wt, &Bt, X, bt::kLinearActNone,
+                                          bt::kLinearEpiStore, nullptr, T);
+            bt::geglu_exact_forward(T, Y);
+        }
         return bdtest::bd_download(Y);
     };
 
-    const auto cpu = run(bt::Device::CPU);
-    const auto gpu = run(gpu_dev());
-    // Observed err ~0.0006 (FP16 GEMM accumulator downcast + erf approx).
-    expect_parity(label, compare(cpu, gpu), gpu.size(),
+    const auto ref = run(false);
+    const auto got = run(true);
+    expect_parity(label, compare(ref, got), got.size(),
                   /*tol_rel=*/0.01f, /*tol_abs=*/0.008f);
 }
 
@@ -210,19 +205,17 @@ void test_add_vec(int rows, int cols, const char* label) {
     const auto y0 = gen(static_cast<std::size_t>(rows) * cols, 31, 1.0f);
     const auto x  = gen(static_cast<std::size_t>(rows) * cols, 32, 1.0f);
 
-    auto run = [&](bt::Device dev) {
-        bt::Tensor Y = dev == bt::Device::CPU ? cpu_t(y0, rows, cols)
-                                              : gpu_t(y0, rows, cols);
-        bt::Tensor X = dev == bt::Device::CPU ? cpu_t(x, rows, cols)
-                                              : gpu_t(x, rows, cols);
-        bd::add_inplace_vec(Y, X);
+    auto run = [&](bool fused) {
+        bt::Tensor Y = gpu_t(y0, rows, cols);
+        bt::Tensor X = gpu_t(x, rows, cols);
+        if (fused) bd::add_inplace_vec(Y, X);
+        else bt::add_inplace(Y, X);
         return bdtest::bd_download(Y);
     };
 
-    const auto cpu = run(bt::Device::CPU);
-    const auto gpu = run(gpu_dev());
-    // Pure FP16 add: observed err ~0.0005 is one ULP at this magnitude.
-    expect_parity(label, compare(cpu, gpu), gpu.size(),
+    const auto ref = run(false);
+    const auto got = run(true);
+    expect_parity(label, compare(ref, got), got.size(),
                   /*tol_rel=*/0.005f, /*tol_abs=*/0.003f);
 }
 
@@ -232,19 +225,17 @@ void test_add_row_bias(int rows, int cols, const char* label) {
     const auto y0   = gen(static_cast<std::size_t>(rows) * cols, 41, 1.0f);
     const auto bias = gen(static_cast<std::size_t>(cols), 42, 1.0f);
 
-    auto run = [&](bt::Device dev) {
-        bt::Tensor Y = dev == bt::Device::CPU ? cpu_t(y0, rows, cols)
-                                              : gpu_t(y0, rows, cols);
-        bt::Tensor Bs = dev == bt::Device::CPU ? cpu_t(bias, cols, 1)
-                                               : gpu_t(bias, cols, 1);
-        bd::add_inplace_row_bias(Y, Bs);
+    auto run = [&](bool fused) {
+        bt::Tensor Y = gpu_t(y0, rows, cols);
+        bt::Tensor Bs = gpu_t(bias, cols, 1);
+        if (fused) bd::add_inplace_row_bias(Y, Bs);
+        else bt::add_row_bias_inplace(Y, Bs);
         return bdtest::bd_download(Y);
     };
 
-    const auto cpu = run(bt::Device::CPU);
-    const auto gpu = run(gpu_dev());
-    // Pure FP16 add: observed err ~0.0005 is one ULP at this magnitude.
-    expect_parity(label, compare(cpu, gpu), gpu.size(),
+    const auto ref = run(false);
+    const auto got = run(true);
+    expect_parity(label, compare(ref, got), got.size(),
                   /*tol_rel=*/0.005f, /*tol_abs=*/0.003f);
 }
 
@@ -264,23 +255,29 @@ int main() {
         return 0;
     }
 
-    std::printf("fused_parity: CPU vs %s\n", bt::device_name(dev));
+    std::printf("fused_parity: brodiffusion fused vs brotensor ops on %s\n",
+                bt::device_name(dev));
 
-    // fused_resblock_forward — single output tile and multi-tile, with and
-    // without the 1x1 skip conv.
-    test_resblock(8,  8,  8,  8, 2, "resblock 8ch 8x8 no-skip");
-    test_resblock(4,  8,  8,  8, 2, "resblock 4->8ch 8x8 skip");
-    test_resblock(16, 16, 16, 16, 4, "resblock 16ch 16x16 no-skip");
+    try {
+        // fused_resblock_forward — single output tile and multi-tile, with and
+        // without the 1x1 skip conv.
+        test_resblock(8,  8,  8,  8, 2, "resblock 8ch 8x8 no-skip");
+        test_resblock(4,  8,  8,  8, 2, "resblock 4->8ch 8x8 skip");
+        test_resblock(16, 16, 16, 16, 4, "resblock 16ch 16x16 no-skip");
 
-    // fused_linear_geglu — single tile and multi-tile in both grid dims.
-    test_geglu(40,  64,  48, "geglu B40 64->48");
-    test_geglu(128, 128, 96, "geglu B128 128->96");
+        // fused_linear_geglu — single tile and multi-tile in both grid dims.
+        test_geglu(40,  64,  48, "geglu B40 64->48");
+        test_geglu(128, 128, 96, "geglu B128 128->96");
 
-    // Elementwise epilogue helpers.
-    test_add_vec(10, 37, "add_inplace_vec 10x37");
-    test_add_vec(64, 64, "add_inplace_vec 64x64");
-    test_add_row_bias(13, 29, "add_inplace_row_bias 13x29");
-    test_add_row_bias(48, 80, "add_inplace_row_bias 48x80");
+        // Elementwise epilogue helpers.
+        test_add_vec(10, 37, "add_inplace_vec 10x37");
+        test_add_vec(64, 64, "add_inplace_vec 64x64");
+        test_add_row_bias(13, 29, "add_inplace_row_bias 13x29");
+        test_add_row_bias(48, 80, "add_inplace_row_bias 48x80");
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "fused_parity: %s\n", e.what());
+        ++g_failures;
+    }
 
     if (g_failures == 0) std::printf("fused_parity: OK\n");
     else std::fprintf(stderr, "fused_parity: %d failure(s)\n", g_failures);
