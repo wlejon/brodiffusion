@@ -873,13 +873,13 @@ private:
     // The prefix cache slots. One pair per slot because a CFG generation has
     // two branches whose prompts differ; `uncond_valid` says whether the
     // saved branch pair carried one.
-    using Qi21PrefixSlot = detail::Qi21PrefixSlot;
+    using Qi21PrefixSlot = pipeline::Qi21PrefixSlot;
     std::array<Qi21PrefixSlot, kQi21PrefixSlots> qi21_prefix_slots_;
 
     // The prompt memo, most recently encoded FIRST. A plain vector: K is 8,
     // so a linear scan is faster than any map and the eviction order is the
     // vector's own.
-    using Qi21PromptMemo = detail::Qi21PromptMemo;
+    using Qi21PromptMemo = pipeline::Qi21PromptMemo;
     std::vector<Qi21PromptMemo> qi21_prompt_memo_;
     // Remember `prompt`'s rows, evicting the least recently used. A re-encode
     // of a memoized prompt moves it to the front.

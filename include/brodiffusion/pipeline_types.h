@@ -323,8 +323,6 @@ struct PipelineModelDirOptions {
     std::string text_encoder_path;
 };
 
-namespace detail {
-
 // One saved Qwen-Image 2.1 prefix cache slot (cond + optional uncond branch).
 struct Qi21PrefixSlot {
     dit::QwenImage21PrefixCache cond;
@@ -337,8 +335,6 @@ struct Qi21PromptMemo {
     std::string prompt;
     qwenimage21::TextConditioning cond;
 };
-
-}  // namespace detail
 
 // Expand an init-noise tensor (NCHW, c×h×w, raw N(0,1)) by an integer spatial
 // factor k, preserving its low-frequency structure: the result is exactly
