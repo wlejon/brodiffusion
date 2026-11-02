@@ -139,6 +139,7 @@ target_sources(brodiffusion PRIVATE
     src/vae_qwenimage.cpp
     src/vae_qwenimage21.cpp
     src/unet.cpp
+    src/unet_weights.cpp
     src/unet_blocks.cpp
     src/controlnet.cpp
     src/scheduler.cpp

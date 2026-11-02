@@ -13,293 +13,9 @@
 // guidance runs the U-Net twice per step (conditional + unconditional)
 // rather than batching, since the rest of the inference stack is N=1.
 
-#include "brolm/clip.h"
-#include "brodiffusion/cond_control.h"
-#include "brodiffusion/control_schedule.h"
-#include "brodiffusion/controlnet.h"
-#include "brodiffusion/denoiser.h"
-#include "brodiffusion/dit/flux.h"
-#include "brodiffusion/dit/sana.h"
-#include "brodiffusion/dit/pixart.h"
-#include "brodiffusion/flow_match_scheduler.h"
-#include "brodiffusion/scm_scheduler.h"
-#include "brodiffusion/lcm_scheduler.h"
-#include "brodiffusion/dpm_solver.h"
-#include "brodiffusion/model_config.h"
-#include "brodiffusion/scheduler.h"
-#include "brolm/gemma2.h"
-#include "brolm/gemma_tokenizer.h"
-#include "brolm/t5.h"
-#include "brolm/tokenizer.h"
-#include "brolm/tokenizer_t5.h"
-#include "brodiffusion/unet.h"
-#include "brodiffusion/vae.h"
-#include "brodiffusion/vae_dcae.h"
-#include "brodiffusion/vae_qwenimage.h"
-#include "brodiffusion/vae_qwenimage21.h"
-#include "brolm/qwen3vl_text.h"
-#include "brolm/qwen3vl_tokenizer.h"
-#include "brolm/qwen3vl_vision.h"
-#include "brolm/qwen3vl_prompt.h"
-#include "brodiffusion/krea2_text.h"
-#include "brodiffusion/qwenimage21_text.h"
-#include "brodiffusion/dit/qwenimage21.h"
-
-#include "brotensor/tensor.h"
-
-#include <array>
-#include <cstddef>
-#include <cstdint>
-#include <functional>
-#include <memory>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <variant>
-#include <vector>
-
-namespace brotensor::safetensors { class File; }
+#include "brodiffusion/pipeline_types.h"
 
 namespace brodiffusion::pipeline {
-
-struct PipelineConfig {
-    // Which model family this pipeline runs. StableDiffusion uses the UNet
-    // denoiser + CLIP; Flux uses the DiT denoiser + CLIP (pooled) + T5.
-    ModelClass               model_class = ModelClass::StableDiffusion;
-    unet::UNetConfig         unet;          // StableDiffusion
-    dit::FluxConfig          flux;          // Flux
-    dit::SanaConfig          sana;          // Sana (linear DiT transformer)
-    dit::PixArtConfig        pixart;        // PixArt-Sigma (DiT transformer)
-    vae::DecoderConfig       vae;
-    dcae::DecoderConfig      dcae;          // Sana (DC-AE f32c32 decoder)
-    brolm::clip::TextEncoderConfig  text_encoder;  // CLIP — SD / Flux
-    brolm::t5::T5Config             t5;            // Flux
-    int                      t5_max_length = 512;
-    brolm::gemma::Gemma2Config gemma;       // Sana (Gemma-2 text encoder)
-    int                      sana_max_seq_len = 300;  // Gemma caption length
-    Krea2ModelConfig         krea2;         // Krea 2 (transformer + VAE + Qwen3-VL)
-    QwenImage21ModelConfig   qwenimage21;   // Qwen-Image 2.1 (DiT + VAE + Qwen3-VL)
-    // DDIM (default, vanilla SD1.5) or LCM (latent-consistency, distilled
-    // checkpoints with unet.time_cond_proj_dim > 0) or FlowMatch (Flux). The
-    // pipeline branches on the active alternative; existing call sites that
-    // don't set this keep working unchanged.
-    std::variant<scheduler::DDIMConfig, scheduler::LCMConfig,
-                 scheduler::FlowMatchConfig, scheduler::SCMConfig,
-                 scheduler::DPMSolverConfig> scheduler;
-};
-
-// Snapshot of mid-generation state. Cheap to fork — only the latent
-// carries device memory; the rest is host-side scalars / RNG state plus a
-// shared handle to the prepared conditioning.
-//
-// The prepared conditioning (cross-attention K/V cache / projected text
-// context) rides the state as a shared_ptr: prime() builds one per call and
-// every clone() of that state shares it, so forking still costs one latent
-// clone, not a re-encode. Because each prime() owns its conditioning, states
-// from DIFFERENT prime() calls can be stepped interleaved — the spatial-paint
-// dual-state loop primes once plain and once axis-steered, then steps both in
-// lockstep, and each denoises under its own conditioning.
-//
-// Hands out a fresh identity for every PipelineState ever constructed. Process
-// -wide and monotonic: unlike a heap or device address, a value from here is
-// never handed out twice, so two different states can never compare equal.
-std::uint64_t next_state_id();
-
-// Used by cross-attention tree search: at any step, .clone() the current
-// state, advance the clone differently from the original (different RNG, a
-// different attn_logit_bias, etc.), score, and pick a winner.
-struct PipelineState {
-    brotensor::Tensor latent;  // (1, C_lat * H_lat * W_lat) at compute dtype
-
-    // Unique, never-reused identity for this state's buffer set. The CUDA-graph
-    // step session keys on this.
-    //
-    // It used to key on the raw addresses of `latent.data` and `prepared`, and
-    // that is unsound: both are freed and re-allocated at the same size on every
-    // generate(), so a pooled allocator hands the next generation the SAME
-    // addresses, the key compares equal, and a graph captured against the
-    // PREVIOUS generation's buffers gets replayed against this one's. It survives
-    // on the accident that the rest of the buffers usually land at their old
-    // addresses too; perturb the allocator (encode an image with another model
-    // between generations, say) and one of them moves, and the replay reads a
-    // freed pointer — an illegal access if the block is unmapped, and, worse, a
-    // silently mis-conditioned image if it is not. An address that can be recycled
-    // is not an identity. A counter cannot be recycled.
-    std::uint64_t id = next_state_id();
-
-    // Philox key for initial-noise + per-step LCM noise. Initialised from
-    // opts.seed in prime(); branched states should mutate this on the clone
-    // (e.g. XOR a branch id) to diverge their noise streams.
-    std::uint64_t rng_key = 0;
-    int step_index = 0;           // 0-based: how many step_once() calls have run
-    int n_steps    = 0;           // total scheduled steps for this generation
-    int H_lat      = 0;
-    int W_lat      = 0;
-
-    // The conditioning this state denoises under. Set by prime(); shared
-    // (not copied) by clone(). step_once()/decode() read the state's own
-    // conditioning, never a pipeline-global one.
-    std::shared_ptr<PreparedConditioning> prepared;
-
-    // Deep clone: copies the latent on the active device; shares `prepared`.
-    // RNG and ints are trivial copies.
-    PipelineState clone() const;
-};
-
-// Source of the initial latent noise.
-//   Internal — brotensor's device-side Philox stream keyed by `seed`. Same
-//              stream is reused for per-step LCM noise.
-//   Torch    — bit-compatible with torch.randn() filled by a CPU Generator
-//              seeded with `seed`. Lets `--seed N` reproduce a PyTorch
-//              reference run's starting latent exactly, so the two pipelines
-//              can be diffed with the RNG removed as a variable.
-enum class NoiseSource { Internal, Torch };
-
-// One conditioning image for a single registered ControlNet (SD1.5 only).
-// `scale` is the per-net `conditioning_scale` (diffusers parity); 0.0
-// disables that net's contribution for the run, 1.0 is the HF default.
-// `start_step` / `end_step` are the schedule fractions (in [0, 1]) over
-// which this net contributes — outside the window, the net is skipped and
-// its residual stays zero. Defaults cover the full schedule. The window is
-// half-open on the right: a step at fractional position `f` runs the net
-// iff `start_step <= f < end_step`.
-struct ControlNetInput {
-    std::string image_path;
-    float       scale      = 1.0f;
-    float       start_step = 0.0f;
-    float       end_step   = 1.0f;
-};
-
-// One condition image for Qwen-Image 2.1's image-conditioned generation.
-// Either a file path (decoded by broimage) or pixels already in memory —
-// exactly one of the two. In-memory pixels are PLANAR CHW in [0, 1], 3
-// channels (RGB) or 4 (RGBA, alpha preserved for the autoencoder and
-// composited over white for the vision tower).
-//
-// The image is resized before use — see GenerateOptions::output_resolution —
-// so it does not have to arrive at any particular size.
-struct ConditionImage {
-    std::string path;
-    std::vector<float> pixels;
-    int channels = 3;
-    int H = 0;
-    int W = 0;
-};
-
-struct GenerateOptions {
-    // Image dimensions in pixels. Latent dims are H/8, W/8. Both must be
-    // multiples of 8 and at least 8 (so latent dims are >= 1).
-    //
-    // Qwen-Image 2.1 with condition images accepts 0 for both, meaning
-    // "derive the canvas from the LAST condition image's aspect ratio at
-    // output_resolution" — which is what the reference pipeline does when
-    // height/width are omitted. Every other path still demands a positive
-    // multiple of the autoencoder stride.
-    int height = 512;
-    int width  = 512;
-
-    int   num_inference_steps = 30;
-    float guidance_scale      = 7.5f;   // CFG; 1.0 disables (uncond is skipped).
-    std::string negative_prompt;
-
-    // RNG seed for the initial latent noise.
-    std::uint64_t seed = 0;
-
-    // Which RNG produces the initial latent noise from `seed`. Ignored when
-    // init_noise is supplied. See NoiseSource above.
-    NoiseSource noise_source = NoiseSource::Internal;
-
-    // Optional explicit initial latent noise, in raw N(0,1) units (i.e. the
-    // output of randn(), before init_noise_sigma is applied), NCHW flat,
-    // length = C_lat * (height/8) * (width/8). When non-empty, prime() uses
-    // these values instead of seeding the RNG — this lets a caller feed a
-    // noise tensor generated elsewhere (e.g. a PyTorch reference run) so the
-    // two implementations start from a bit-identical latent and any output
-    // difference is attributable to the model, not the RNG. The scheduler's
-    // init_noise_sigma is still applied on top.
-    std::vector<float> init_noise;
-
-    // ── img2img / inpaint priming ─────────────────────────────────────────
-    // If non-empty, prime() encodes this image with the VAE encoder and
-    // noises it to the appropriate point in the schedule (governed by
-    // `strength`) instead of starting from pure Gaussian noise. The image
-    // is decoded by broimage and resized to (width, height). For img2img
-    // the model only denoises the remaining (1 - strength) fraction of the
-    // schedule, so the generated image stays close to the init.
-    //
-    // SD1.5 and Flux. Flux follows diffusers' FluxImg2ImgPipeline: the VAE
-    // encode applies (z - shift_factor) * scaling_factor, and the flow-match
-    // add_noise is (1 - sigma) * x0 + sigma * noise at the t_start sigma.
-    // Inpaint (mask_image_path) is still SD1.5 only. Empty path = txt2img (existing
-    // behavior). Throws if both init_image_path and init_noise are set.
-    // noise_source / init_noise are ignored when init_image_path is set.
-    std::string init_image_path;
-
-    // 0..1. Higher = more noise added = more freedom from the init image.
-    // 1.0 reduces to (almost) full-schedule txt2img against the encoded init.
-    // Ignored when init_image_path is empty.
-    float strength = 0.8f;
-
-    // VAE encode mode: deterministic (use the mean, default) or sampled
-    // (mean + exp(0.5*logvar) * eps, where eps is drawn from the same Philox
-    // stream as the schedule noise at a non-overlapping counter offset).
-    // Ignored when init_image_path is empty.
-    bool vae_encode_sample = false;
-
-    // ── ControlNet (SD1.5 only) ───────────────────────────────────────────
-    // One ControlNetInput per registered ControlNet (in the order they were
-    // added via add_controlnet). When non-empty, prime() loads each control
-    // image and step_once() runs every registered ControlNet, summing their
-    // residuals position-wise (each weighted by its own ControlNetInput::
-    // scale) before feeding them into UNet's skip connections. Size must
-    // equal the number of registered ControlNets. SD1.5 only; throws on
-    // Flux. Empty = no ControlNet for this run.
-    std::vector<ControlNetInput> controls;
-
-    // Inpaint mask path. When non-empty, the pipeline runs in inpaint mode:
-    // init_image_path must ALSO be set, and at each scheduler step (except
-    // the final one) the unmasked region of the latent is replaced by a
-    // re-noised version of the encoded init latent at the next timestep.
-    // The mask is decoded as 1-channel and resized to latent dims with
-    // nearest-neighbor (see load_mask_as_latent). White (>= 128) = inpaint,
-    // black = keep. SD1.5 only; throws on Flux.
-    std::string mask_image_path;
-
-    // ── Qwen-Image 2.1 image conditioning (edit / reference image) ────────
-    //
-    // Condition images, in the order the prompt should see them. Each one is
-    // read twice: the Qwen3-VL vision tower turns it into rows of the prompt
-    // stream, and the autoencoder turns it into latent tokens that sit in the
-    // joint sequence ahead of the noise. The target latents are the only
-    // thing the sampler touches — a condition image is context, never
-    // something being denoised, which is what separates this from img2img.
-    //
-    // Empty = plain text-to-image. QwenImage21 only; other model classes
-    // throw. The vision tower must be resident (it is, unless the checkpoint
-    // shipped without one).
-    std::vector<ConditionImage> condition_images;
-
-    // Target side length used both to size the generated canvas (when
-    // height/width are 0) and to resize every condition image, via the
-    // reference's calculate_dimensions(output_resolution², aspect). 1024 is
-    // the reference default; drop it to fit a smaller card. Ignored when
-    // condition_images is empty.
-    int output_resolution = 1024;
-
-    // Optional cooperative cancellation, honored by generate() only (the
-    // step-wise prime/step_once API leaves pacing to the caller, who can stop
-    // looping whenever it likes). Checked once per denoising step and once
-    // before the VAE decode; if it returns true, generate() throws
-    // GenerateCancelled. Empty by default (no cancellation). Same convention
-    // as triposplat::SamplerOptions::should_cancel.
-    std::function<bool()> should_cancel;
-};
-
-// Thrown by generate() when should_cancel() returns true. Distinct type so a
-// caller can tell a cancel apart from a real failure.
-struct GenerateCancelled : std::exception {
-    const char* what() const noexcept override { return "pipeline: generate cancelled"; }
-};
 
 // LoadCancelled (thrown by from_model_dir when ModelDirOptions::should_cancel
 // fires) lives in denoiser.h — the sharded DiT loaders that throw it sit below
@@ -348,38 +64,8 @@ public:
     // JSON configs, constructs the right sub-modules, loads all component
     // weights and tokenizers. Supports StableDiffusion and Flux model
     // directories. Pipeline is move-only; this returns by value.
-    struct ModelDirOptions {
-        // Quantize the denoiser (SD1.5 U-Net / Flux transformer) — and, for
-        // Flux, the T5-XXL encoder — to INT8 weight-only (W8A16) while
-        // loading. GPU-only; ignored with a warning on the CPU backend.
-        // Flux.1 FP16 (~24 GB) does not fit a 24 GB card next to T5: INT8
-        // (~12 GB) is how Flux runs there at all.
-        bool quantize = false;
-
-        // Optional cooperative cancellation for the load itself. from_model_dir
-        // polls it between components — and, for the big sharded DiTs (Krea 2),
-        // once per transformer block — so a caller (e.g. an app shutting down
-        // mid-load) can abort a multi-GB read promptly instead of blocking a
-        // join until all ~26 GB finish. When it returns true, from_model_dir
-        // throws LoadCancelled. Empty by default (no cancellation). Same
-        // convention as GenerateOptions::should_cancel.
-        std::function<bool()> should_cancel;
-
-        // Krea 2 only: override the text-encoder (Qwen3-VL-4B) backbone. When
-        // non-empty, the text backbone's language-model weights are loaded from
-        // this path instead of `<model_dir>/text_encoder`. Accepts:
-        //   • a llama.cpp `.gguf` checkpoint (e.g. a Q8_0 quant) — text-only, so
-        //     the vision tower still loads from `<model_dir>/text_encoder`;
-        //   • a diffusers `.safetensors` file or a directory of them — its
-        //     `language_model.*` (or `model.language_model.*`) subtree is used,
-        //     and its `visual.*` tower too when present (else the dir's).
-        // The checkpoint must be the same Qwen3-VL-4B architecture the model
-        // dir's config describes (per-tensor shape checks enforce it). Empty
-        // (default) keeps the bundled text encoder. Ignored for non-Krea2.
-        std::string text_encoder_path;
-    };
-    static Pipeline from_model_dir(const std::string& model_dir,
-                                   const ModelDirOptions& opts);
+    using ModelDirOptions = PipelineModelDirOptions;
+    static Pipeline from_model_dir(const std::string& model_dir, const ModelDirOptions& opts);
     // Overload instead of a defaulted `opts = {}` argument: GCC rejects the
     // brace-init default because ModelDirOptions has an in-class member
     // initializer (default member init needed outside a member function).
@@ -399,8 +85,7 @@ public:
     // This is the cheap swap for comparing text encoders without re-reading
     // the whole ~26 GB checkpoint. Throws if this is not a Krea 2 pipeline.
     void reload_krea2_text_encoder(const std::string& model_dir,
-                                   const std::string& text_encoder_path,
-                                   bool quantize);
+                                   const std::string& text_encoder_path, bool quantize);
 
     // Move-only (owns move-only sub-modules; copies make no sense). The
     // move members and destructor are defined in pipeline.cpp where
@@ -420,10 +105,8 @@ public:
 
     // Load with explicit prefixes (e.g. when sub-modules ship in separate
     // diffusers exports).
-    void load_weights(const brotensor::safetensors::File& f,
-                      const std::string& text_prefix,
-                      const std::string& unet_prefix,
-                      const std::string& vae_prefix);
+    void load_weights(const brotensor::safetensors::File& f, const std::string& text_prefix,
+                      const std::string& unet_prefix, const std::string& vae_prefix);
 
     // Load each module from its own diffusers-format safetensors file. Uses
     // the diffusers default prefixes ("text_model.", "", "decoder.").
@@ -494,8 +177,7 @@ public:
     //
     // Internally: prime() → loop(step_once) → decode(). Bit-equivalent to
     // calling those three primitives directly.
-    std::vector<float> generate(std::string_view prompt,
-                                const GenerateOptions& opts);
+    std::vector<float> generate(std::string_view prompt, const GenerateOptions& opts);
 
     // ── Step-wise API (for cross-attention tree search and similar) ───────
     //
@@ -523,8 +205,7 @@ public:
     // num_xattn_blocks() > 0.
     void step_once(PipelineState& state, const GenerateOptions& opts,
                    AttentionTrace* trace_out = nullptr,
-                   const std::vector<const brotensor::Tensor*>*
-                       attn_logit_biases = nullptr);
+                   const std::vector<const brotensor::Tensor*>* attn_logit_biases = nullptr);
     std::vector<float> decode(const PipelineState& state);
 
     // The sigma schedule of the most recent prime()/generate() when the
@@ -613,15 +294,13 @@ public:
     // AdaLN mod-delta: add `delta` (1, 6*krea_hidden_size()) to the shared
     // per-step modulation for body blocks [block_lo, block_hi) on every
     // subsequent step_once(). Empty tensor clears.
-    void krea_set_mod_delta(const brotensor::Tensor& delta,
-                            int block_lo, int block_hi);
+    void krea_set_mod_delta(const brotensor::Tensor& delta, int block_lo, int block_hi);
 
     // Timestep-embedding readout at `timestep` (the SAME 0..1000-scale value
     // krea_step_timestep() returns / step_once() consumes internally — this
     // method does the flow-time (/1000) conversion itself). No forward pass.
     // temb_out: (1, krea_hidden_size()); mod_out: (1, 6*krea_hidden_size()).
-    void krea_time_mod(float timestep, brotensor::Tensor& temb_out,
-                       brotensor::Tensor& mod_out);
+    void krea_time_mod(float timestep, brotensor::Tensor& temb_out, brotensor::Tensor& mod_out);
 
     // The active scheduler's timestep for `state.step_index` — the same
     // 0..1000-scale value step_once() feeds the denoiser internally. Lets a
@@ -632,13 +311,11 @@ public:
     // Attention-gate scale: scale the sigmoid output gate of body-block
     // attention, text rows and image rows separately, for blocks
     // [block_lo, block_hi). (1, 1) clears.
-    void krea_set_gate_scale(float txt_scale, float img_scale,
-                             int block_lo, int block_hi);
+    void krea_set_gate_scale(float txt_scale, float img_scale, int block_lo, int block_hi);
 
     // Per-token gate mask over blocks [block_lo, block_hi); mask holds
     // text_seq + img_len values in forward order. Empty tensor clears.
-    void krea_set_gate_mask(const brotensor::Tensor& mask,
-                            int block_lo, int block_hi);
+    void krea_set_gate_mask(const brotensor::Tensor& mask, int block_lo, int block_hi);
 
     // Gate activity capture. When enabled, every subsequent step_once()
     // overwrites the internal sink; krea_gates() reads it back, row-major
@@ -666,9 +343,8 @@ public:
     // exactly as prime() does internally for a plain text prompt.
     krea2::TextConditioning krea_encode_prompt_taps(std::string_view prompt);
 
-    brotensor::Tensor krea_encode_text(
-        const brotensor::Tensor& prompt_embeds,
-        const brotensor::Tensor& prompt_embeds_mask);
+    brotensor::Tensor krea_encode_text(const brotensor::Tensor& prompt_embeds,
+                                       const brotensor::Tensor& prompt_embeds_mask);
 
     // Prime a step-wise generation from caller-supplied raw taps (as
     // returned by krea_encode_prompt_taps(), optionally edited) instead of
@@ -687,8 +363,7 @@ public:
     // result straight into krea_encode_text()/krea_prime_from_taps(). No
     // separate model — the checkpoint's text encoder ships its vision tower
     // too (unused for plain text prompting).
-    krea2::TextConditioning krea_encode_image_prompt(const float* pixels,
-                                                     int H, int W);
+    krea2::TextConditioning krea_encode_image_prompt(const float* pixels, int H, int W);
 
     // ── Qwen-Image 2.1 research hooks (the qwenimage21_capi seam) ─────────
     //
@@ -720,14 +395,10 @@ public:
     // (1, 4*qi21_hidden_size()) or empty to clear. `target` picks the target
     // row, the prefix row or both; a prefix-side delta resets the live prefix
     // cache so the next step re-extracts under it.
-    void qi21_set_mod_delta(const brotensor::Tensor& delta, int block_lo,
-                            int block_hi,
-                            dit::QwenImage21ModTarget target =
-                                dit::QwenImage21ModTarget::Target);
-    int  qi21_add_mod_delta(const brotensor::Tensor& delta, int block_lo,
-                            int block_hi,
-                            dit::QwenImage21ModTarget target =
-                                dit::QwenImage21ModTarget::Target);
+    void qi21_set_mod_delta(const brotensor::Tensor& delta, int block_lo, int block_hi,
+                            dit::QwenImage21ModTarget target = dit::QwenImage21ModTarget::Target);
+    int  qi21_add_mod_delta(const brotensor::Tensor& delta, int block_lo, int block_hi,
+                            dit::QwenImage21ModTarget target = dit::QwenImage21ModTarget::Target);
     void qi21_clear_mod_deltas();
     int  qi21_mod_delta_count() const;
 
@@ -735,8 +406,7 @@ public:
     // qi21_step_timestep() returns and step_once() consumes; the flow-time
     // conversion happens here. temb_out: (2, hidden); mod_out: (2, 4*hidden),
     // row 0 = the sampled t, row 1 = t = 0.
-    void qi21_time_mod(float timestep, brotensor::Tensor& temb_out,
-                       brotensor::Tensor& mod_out);
+    void qi21_time_mod(float timestep, brotensor::Tensor& temb_out, brotensor::Tensor& mod_out);
 
     // The active scheduler's timestep for `state.step_index`. Qwen-Image 2.1
     // pairs exclusively with the FlowMatch scheduler.
@@ -745,24 +415,20 @@ public:
     // Post-tanh gate dials over blocks [block_lo, block_hi). The rank-1
     // sugar: attn/mlp pick the sublayer, txt/img the row class, and the
     // binding holds their four products. All four at 1 clears.
-    void qi21_set_gate_scale(float attn_scale, float mlp_scale,
-                             float txt_scale, float img_scale, int block_lo,
-                             int block_hi);
-    int  qi21_add_gate_scale(float attn_scale, float mlp_scale,
-                             float txt_scale, float img_scale, int block_lo,
-                             int block_hi);
+    void qi21_set_gate_scale(float attn_scale, float mlp_scale, float txt_scale, float img_scale,
+                             int block_lo, int block_hi);
+    int  qi21_add_gate_scale(float attn_scale, float mlp_scale, float txt_scale, float img_scale,
+                             int block_lo, int block_hi);
 
     // The four multipliers, one per (sublayer x row set), set independently.
     // The rank-1 form cannot say "attention gate on the IMAGE rows only":
     // raising attn_scale raises the prefix product too, which re-extracts
     // the cache (+13%/step). attn_img alone leaves the prefix at 1, so the
     // cache and every armed prefix edit stay live.
-    void qi21_set_gate_scale_rows(float attn_txt, float attn_img,
-                                  float mlp_txt, float mlp_img, int block_lo,
-                                  int block_hi);
-    int  qi21_add_gate_scale_rows(float attn_txt, float attn_img,
-                                  float mlp_txt, float mlp_img, int block_lo,
-                                  int block_hi);
+    void qi21_set_gate_scale_rows(float attn_txt, float attn_img, float mlp_txt, float mlp_img,
+                                  int block_lo, int block_hi);
+    int  qi21_add_gate_scale_rows(float attn_txt, float attn_img, float mlp_txt, float mlp_img,
+                                  int block_lo, int block_hi);
     void qi21_clear_gate_scales();
     int  qi21_gate_scale_count() const;
 
@@ -773,14 +439,10 @@ public:
     // gate chunks, which land before the tanh where most of gate2's channels
     // are saturated — see dit/qwenimage21.h's set_gate_delta(). A prefix-side
     // delta resets the live prefix cache so the next step re-extracts.
-    void qi21_set_gate_delta(const brotensor::Tensor& delta, int block_lo,
-                             int block_hi,
-                             dit::QwenImage21ModTarget target =
-                                 dit::QwenImage21ModTarget::Target);
-    int  qi21_add_gate_delta(const brotensor::Tensor& delta, int block_lo,
-                             int block_hi,
-                             dit::QwenImage21ModTarget target =
-                                 dit::QwenImage21ModTarget::Target);
+    void qi21_set_gate_delta(const brotensor::Tensor& delta, int block_lo, int block_hi,
+                             dit::QwenImage21ModTarget target = dit::QwenImage21ModTarget::Target);
+    int  qi21_add_gate_delta(const brotensor::Tensor& delta, int block_lo, int block_hi,
+                             dit::QwenImage21ModTarget target = dit::QwenImage21ModTarget::Target);
     void qi21_clear_gate_deltas();
     int  qi21_gate_delta_count() const;
 
@@ -791,14 +453,10 @@ public:
     // `which` picks the sublayer the mask scales. Masking both is the blunt
     // form: the MLP half drags a late-step edit's retention from 100%+ down
     // to ~30%, so "restyle this region at step 6" wants Attn.
-    void qi21_set_gate_mask(const brotensor::Tensor& mask, int block_lo,
-                            int block_hi,
-                            dit::QwenImage21GateSublayer which =
-                                dit::QwenImage21GateSublayer::Both);
-    int  qi21_add_gate_mask(const brotensor::Tensor& mask, int block_lo,
-                            int block_hi,
-                            dit::QwenImage21GateSublayer which =
-                                dit::QwenImage21GateSublayer::Both);
+    void qi21_set_gate_mask(const brotensor::Tensor& mask, int block_lo, int block_hi,
+                            dit::QwenImage21GateSublayer which = dit::QwenImage21GateSublayer::Both);
+    int  qi21_add_gate_mask(const brotensor::Tensor& mask, int block_lo, int block_hi,
+                            dit::QwenImage21GateSublayer which = dit::QwenImage21GateSublayer::Both);
     void qi21_clear_gate_masks();
     int  qi21_gate_mask_count() const;
 
@@ -848,11 +506,9 @@ public:
     // prompt weighting over the cache, with no re-encode. Its length must
     // equal the cached prefix length or the next forward throws. Empty =
     // every row, i.e. the broadcast.
-    void qi21_scale_prefix_kv(int layer_lo, int layer_hi, float k_scale,
-                              float v_scale,
+    void qi21_scale_prefix_kv(int layer_lo, int layer_hi, float k_scale, float v_scale,
                               const brotensor::Tensor& row_scale = {});
-    int  qi21_add_prefix_kv_scale(int layer_lo, int layer_hi, float k_scale,
-                                  float v_scale,
+    int  qi21_add_prefix_kv_scale(int layer_lo, int layer_hi, float k_scale, float v_scale,
                                   const brotensor::Tensor& row_scale = {});
     void qi21_clear_prefix_kv_scales();
     int  qi21_prefix_kv_scale_count() const;
@@ -924,25 +580,19 @@ public:
 
     // Append a schedule over dictionary axis `name`; returns its slot index.
     // Throws when no dictionary is loaded or the axis is unknown.
-    int qi21_add_control_schedule(const std::string& name,
-                                  const std::vector<float>& alpha,
+    int qi21_add_control_schedule(const std::string& name, const std::vector<float>& alpha,
                                   int lo_step, int hi_step);
     // Append a schedule over an explicit direction — a diff-of-means axis the
     // caller minted, which need not be in any bank. `dir` is taken as-is and
     // the injection is alpha * scale * dir, the same contract
     // CondControl::set_vector() has.
-    int qi21_add_control_schedule_dir(const std::vector<float>& dir,
-                                      float scale,
-                                      const std::vector<float>& alpha,
-                                      int lo_step, int hi_step);
+    int qi21_add_control_schedule_dir(const std::vector<float>& dir, float scale,
+                                      const std::vector<float>& alpha, int lo_step, int hi_step);
     // Replace the whole list with one schedule; returns 0.
-    int qi21_set_control_schedule(const std::string& name,
-                                  const std::vector<float>& alpha,
+    int qi21_set_control_schedule(const std::string& name, const std::vector<float>& alpha,
                                   int lo_step, int hi_step);
-    int qi21_set_control_schedule_dir(const std::vector<float>& dir,
-                                      float scale,
-                                      const std::vector<float>& alpha,
-                                      int lo_step, int hi_step);
+    int qi21_set_control_schedule_dir(const std::vector<float>& dir, float scale,
+                                      const std::vector<float>& alpha, int lo_step, int hi_step);
     // Drop every schedule. When a schedule had already moved the rows of a
     // live generation, this puts the primed rows back (and re-extracts), so
     // clearing mid-denoise means what it says.
@@ -1006,8 +656,7 @@ public:
     // first, so the vision grid and the VAE's latent grid describe the same
     // picture. Throws when the vision tower is not resident.
     qwenimage21::TextConditioning qi21_encode_prompt_images(
-        std::string_view prompt,
-        const std::vector<ConditionImage>& images,
+        std::string_view prompt, const std::vector<ConditionImage>& images,
         int output_resolution = 1024);
 
     // Resolve the output canvas a generation with `opts` will use: (width,
@@ -1015,8 +664,7 @@ public:
     // from the LAST condition image's aspect at opts.output_resolution.
     // prime() applies the same rule; this lets a caller size its own output
     // buffer without priming first.
-    void qi21_resolve_size(const GenerateOptions& opts, int& width,
-                           int& height);
+    void qi21_resolve_size(const GenerateOptions& opts, int& width, int& height);
 
     // ── image seam (the resident 16x RGBA VAE) ────────────────────────────
 
@@ -1030,8 +678,7 @@ public:
     // Decode a pipeline-scale latent (1, 64*h_lat*w_lat) to RGB, FP32 CHW in
     // [-1,1], length 3*(16*h_lat)*(16*w_lat) — alpha dropped, exactly as
     // decode() does for a generation.
-    std::vector<float> qi21_decode(const brotensor::Tensor& latent, int h_lat,
-                                   int w_lat);
+    std::vector<float> qi21_decode(const brotensor::Tensor& latent, int h_lat, int w_lat);
 
     // ── text-encoder residency ────────────────────────────────────────────
 
@@ -1047,8 +694,7 @@ public:
     // different one). `text_encoder_path` is a .gguf or a diffusers
     // safetensors file/dir; empty means `<model_dir>/text_encoder`.
     void qi21_reload_text_encoder(const std::string& model_dir,
-                                  const std::string& text_encoder_path,
-                                  bool quantize);
+                                  const std::string& text_encoder_path, bool quantize);
 
 private:
     // Encode a prompt to the CLIP (77, hidden) conditioning. If content_end is
@@ -1062,8 +708,7 @@ private:
     // PipelineConfig from_model_dir already built from the model directory's
     // JSON (including the quantize flags).
     static Pipeline from_model_dir_krea2_(const std::string& model_dir,
-                                          const PipelineConfig& cfg,
-                                          const ModelDirOptions& opts);
+                                          const PipelineConfig& cfg, const ModelDirOptions& opts);
     static Pipeline from_model_dir_qwenimage21_(const std::string& model_dir,
                                                 const PipelineConfig& cfg,
                                                 const ModelDirOptions& opts);
@@ -1071,8 +716,7 @@ private:
     // Sana txt2img priming: Gemma-encode prompt(s), prepare conditioning, and
     // allocate the FP32 initial latent (32x downsample, 32 channels). Returns a
     // step_index=0 state. Called from prime() when model_class_ == Sana.
-    PipelineState prime_sana_(std::string_view prompt,
-                              const GenerateOptions& opts);
+    PipelineState prime_sana_(std::string_view prompt, const GenerateOptions& opts);
     // Sana-Sprint denoising step (SCMScheduler / TrigFlow). The few-step,
     // guidance-distilled (no-CFG) path: maps the latent into the sCM input
     // parameterisation, runs one DiT forward with the embedded guidance scale,
@@ -1211,8 +855,7 @@ private:
     // joint prefix each branch's conditioning implies. Fills the three
     // members above and both branches of `conditioning_`. Lives in
     // pipeline_qwenimage21_edit.cpp.
-    void qi21_prime_edit_(std::string_view prompt, const GenerateOptions& opts,
-                          bool do_cfg);
+    void qi21_prime_edit_(std::string_view prompt, const GenerateOptions& opts, bool do_cfg);
     // What the currently-armed Qwen-Image 2.1 hooks do to the PREFIX side.
     // Only an extract step applies a prefix-side hook, so the cache has to be
     // dropped both when one is armed AND when one is cleared — the latter is
@@ -1230,28 +873,19 @@ private:
     // The prefix cache slots. One pair per slot because a CFG generation has
     // two branches whose prompts differ; `uncond_valid` says whether the
     // saved branch pair carried one.
-    struct Qi21PrefixSlot {
-        dit::QwenImage21PrefixCache cond;
-        dit::QwenImage21PrefixCache uncond;
-        bool uncond_valid = false;
-    };
+    using Qi21PrefixSlot = detail::Qi21PrefixSlot;
     std::array<Qi21PrefixSlot, kQi21PrefixSlots> qi21_prefix_slots_;
 
     // The prompt memo, most recently encoded FIRST. A plain vector: K is 8,
     // so a linear scan is faster than any map and the eviction order is the
     // vector's own.
-    struct Qi21PromptMemo {
-        std::string prompt;
-        qwenimage21::TextConditioning cond;
-    };
+    using Qi21PromptMemo = detail::Qi21PromptMemo;
     std::vector<Qi21PromptMemo> qi21_prompt_memo_;
     // Remember `prompt`'s rows, evicting the least recently used. A re-encode
     // of a memoized prompt moves it to the front.
-    void qi21_memo_put_(const std::string& prompt,
-                        const qwenimage21::TextConditioning& tc);
+    void qi21_memo_put_(const std::string& prompt, const qwenimage21::TextConditioning& tc);
     // The memoized rows for `prompt`, or nullptr. Moves the hit to the front.
-    const qwenimage21::TextConditioning* qi21_memo_get_(
-        const std::string& prompt);
+    const qwenimage21::TextConditioning* qi21_memo_get_(const std::string& prompt);
     // Encode `prompt`, or serve it from the memo when the backbone has been
     // released. Throws an error NAMING the prompt when neither is possible.
     qwenimage21::TextConditioning qi21_encode_or_memo_(const std::string& prompt);
@@ -1260,8 +894,7 @@ private:
     // injection `delta` carries), dropping the prefix KV cache. An inactive
     // `delta` restores the primed rows exactly. The one place the between-step
     // schedule touches the conditioning.
-    void qi21_rebuild_text_rows_(PreparedConditioning& prepared,
-                                 const CondControl& delta);
+    void qi21_rebuild_text_rows_(PreparedConditioning& prepared, const CondControl& delta);
 
     // Working buffers reused across step_once() calls. The current latent
     // lives on PipelineState, not here.
@@ -1330,17 +963,5 @@ private:
     // (+ noise_pred_uncond_), exactly like the eager path.
     void step_denoise_captured_(PipelineState& state, float t, bool do_cfg);
 };
-
-// Expand an init-noise tensor (NCHW, c×h×w, raw N(0,1)) by an integer spatial
-// factor k, preserving its low-frequency structure: the result is exactly
-// i.i.d. N(0,1), but each k×k block's mean is tied to the source value
-// (H = E − mean_k(E) + src/k, with E a fresh Philox stream keyed by `seed`).
-// Because a generation's identity/composition is decided by the coarse
-// structure of the init noise, this transports an identity found at one
-// resolution to a k× larger render — a seed cannot do that (the same seed at
-// a different latent shape is an unrelated noise field). Deterministic for a
-// given (src, seed). Output length = c * h*k * w*k.
-std::vector<float> expand_init_noise(const float* src, int c, int h, int w,
-                                     int k, std::uint64_t seed);
 
 }  // namespace brodiffusion::pipeline
