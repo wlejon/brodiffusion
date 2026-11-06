@@ -48,24 +48,48 @@ jobs:
 
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build ccache
       - name: Install Ninja (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+        run: brew install ninja ccache
+
+      - name: Compiler cache (Linux/macOS)
+        if: runner.os != 'Windows'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ matrix.name }}
+          max-size: 500M
+
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Compiler cache (Windows)
+        if: runner.os == 'Windows'
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Configure
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
+          SCCACHE_GHA_ENABLED: "true"
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
-            cmake -S brodiffusion -B build -DCMAKE_BUILD_TYPE=Release
+            cmake -S brodiffusion -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl \
+              -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           else
-            cmake -S brodiffusion -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+            cmake -S brodiffusion -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           fi
         shell: bash
 
       - name: Build
+        env:
+          SCCACHE_GHA_ENABLED: "true"
         run: cmake --build build --config Release --parallel 4
 
       - name: Test
@@ -81,13 +105,19 @@ jobs:
           path: brodiffusion
 
       - name: Install gcovr + Ninja
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gcovr ninja-build
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gcovr ninja-build ccache
+
+      - name: Compiler cache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: coverage
+          max-size: 500M
 
       - name: Configure (instrumented)
         run: |
-          cmake -S brodiffusion -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_FLAGS="--coverage" \
-            -DCMAKE_EXE_LINKER_FLAGS="--coverage"
+          cmake -S brodiffusion -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBRODIFFUSION_COVERAGE=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
         run: cmake --build build --parallel 4

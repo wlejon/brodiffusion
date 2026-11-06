@@ -480,6 +480,14 @@ void QwenImage21Transformer2DModel::forward_joint(
             if (w != QwenImage21GateSublayer::Mlp)  fold(mask_host_attn_[c], src);
             if (w != QwenImage21GateSublayer::Attn) fold(mask_host_mlp_[c], src);
         }
+        auto drop_identity = [](std::vector<float>& host) {
+            for (float v : host) {
+                if (v != 1.0f) return;
+            }
+            host.clear();
+        };
+        drop_identity(mask_host_attn_[c]);
+        drop_identity(mask_host_mlp_[c]);
         auto expand = [&](const std::vector<float>& host, bt::Tensor& dst) {
             if (host.empty()) return;
             if (!ones_built) {

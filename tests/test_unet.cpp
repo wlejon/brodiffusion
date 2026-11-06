@@ -182,6 +182,10 @@ int main() {
         std::fprintf(stderr, "init failed: %s\n", e.what());
         return 1;
     }
+    if (bt::default_device() == bt::Device::CPU) {
+        std::printf("test_unet: no GPU backend — skipping\n");
+        return 0;
+    }
     un::UNetConfig cfg;
     cfg.in_channels         = 4;
     cfg.out_channels        = 4;

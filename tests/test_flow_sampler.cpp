@@ -321,6 +321,10 @@ int main() {
         std::fprintf(stderr, "init failed: %s\n", e.what());
         return 1;
     }
+    if (brodiffusion::compute_dtype() != bt::Dtype::FP16) {
+        std::printf("test_flow_sampler: SKIPPED (CPU backend — flow DiT is GPU/FP16 only)\n");
+        return 0;
+    }
 
     // ── structural: captured vs eager parity (synthetic weights) ──────────
     std::printf("test_flow_sampler: structural captured-vs-eager parity\n");

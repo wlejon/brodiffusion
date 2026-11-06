@@ -263,6 +263,10 @@ int main() {
         std::fprintf(stderr, "init failed: %s\n", e.what());
         return 1;
     }
+    if (bt::default_device() == bt::Device::CPU) {
+        std::printf("test_img2img: no GPU backend — skipping\n");
+        return 0;
+    }
     try {
 
     // ── shared scratch paths ──────────────────────────────────────────────

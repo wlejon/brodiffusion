@@ -102,6 +102,12 @@ bro_dependency(broimage GITHUB wlejon/broimage)
 bro_dependency(brolm GITHUB wlejon/brolm)
 bro_dependency(brovisionml GITHUB wlejon/brovisionml)
 
+option(BRODIFFUSION_COVERAGE "Enable gcov/llvm-cov coverage instrumentation" OFF)
+if(BRODIFFUSION_COVERAGE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
+    add_compile_options(-O0 -g --coverage)
+    add_link_options(--coverage)
+endif()
+
 # --- brodiffusion library ---
 
 add_library(brodiffusion STATIC)
