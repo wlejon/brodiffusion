@@ -9,8 +9,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: codeql-${{ github.ref }}
-  cancel-in-progress: true
+  group: codeql-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 # brodiffusion runs the diffusion sampling loop: latent tensors, scheduler
 # stepping, and fused UNet/VAE op compositions over the brotensor surface, with
