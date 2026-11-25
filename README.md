@@ -99,24 +99,30 @@ AMD GPU backend. brodiffusion forwards the choice:
 cmake -B build
 cmake --build build --config Release
 
-# CUDA (NVIDIA, any OS) — adds the FP16/BF16 GPU path + fused kernels.
+# CUDA (NVIDIA, any OS) — forwards the CUDA backend to brotensor.
 cmake -B build -DBROTENSOR_WITH_CUDA=ON
 cmake --build build --config Release
 
-# Metal (Apple)
+# Metal (Apple) — forwards the Metal backend to brotensor.
 cmake -B build -DBROTENSOR_WITH_METAL=ON
 cmake --build build --config Release
 
-# AMD (or any Vulkan GPU): brodiffusion's own kernels are GLSL under Vulkan.
+# AMD (or any Vulkan GPU) — pure C++20 via brotensor ops and Brass MIR.
 cmake -B build_vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_VULKAN=ON
 cmake --build build_vk
 ```
 
+`brodiffusion` itself builds as pure C++20 without `nvcc`, Objective-C++, or
+`glslc`: SD1.5's fused ops route through `brotensor`'s fused GPU ops
+(`src/fused.cpp`), and TripoSplat's axial RoPE table kernel
+(`src/triposplat/flow_rope_mir.cpp`) lowers from single-source Brass MIR to PTX,
+MSL, or SPIR-V via `brotensor::interop`.
+
 | Option | Default | Effect |
 |---|---|---|
-| `BROTENSOR_WITH_CUDA` | `OFF` | Build the CUDA GPU backend |
-| `BROTENSOR_WITH_METAL` | `OFF` | Build the Metal GPU backend |
-| `BROTENSOR_WITH_VULKAN` | `OFF` | Build the Vulkan GPU backend (the AMD GPU backend; needs glslc + Vulkan headers) |
+| `BROTENSOR_WITH_CUDA` | `OFF` | Build brotensor with the CUDA GPU backend |
+| `BROTENSOR_WITH_METAL` | `OFF` | Build brotensor with the Metal GPU backend |
+| `BROTENSOR_WITH_VULKAN` | `OFF` | Build brotensor with the Vulkan GPU backend (needs Vulkan headers/loader) |
 | `BRODIFFUSION_CLI` | on when top-level | Build the `brodiffusion` CLI |
 | `BRODIFFUSION_KREA2_CAPI` | on when top-level | Build `krea2_capi`, a flat C API DLL over the Krea 2 components for research bindings |
 | `BRODIFFUSION_QWENIMAGE21_CAPI` | on when top-level | Build the same kind of research C API DLL for Qwen-Image 2.1 |
