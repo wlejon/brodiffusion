@@ -208,10 +208,8 @@ if(BRODIFFUSION_ENABLE_API)
     endif()
 endif()
 
-if(BROTENSOR_WITH_VULKAN AND TARGET brass)
+if(TARGET brass)
     brodiffusion_add_test(brodiffusion_test_vulkan_shader_audit test_vulkan_shader_audit.cpp)
     target_link_libraries(brodiffusion_test_vulkan_shader_audit PRIVATE brass)
-    target_include_directories(brodiffusion_test_vulkan_shader_audit PRIVATE
-        "${CMAKE_BINARY_DIR}/brodiffusion_vk_shaders")
 endif()
 

@@ -53,17 +53,6 @@ std::vector<float> read_host_f32(const st::TensorView& v) {
     return out;
 }
 
-// Download a compute-dtype tensor to host fp32.
-std::vector<float> download_f32(const bt::Tensor& t) {
-    if (t.dtype == bt::Dtype::FP16) {
-        std::vector<uint16_t> bits = t.to_host_vector_fp16();
-        std::vector<float> out(bits.size());
-        for (std::size_t i = 0; i < bits.size(); ++i) out[i] = bt::fp16_bits_to_fp32(bits[i]);
-        return out;
-    }
-    return t.to_host_vector();
-}
-
 // Per-op profiler, enabled with BRODIFFUSION_FLOW_PROFILE=1. Syncs around each
 // op category, accumulates ms per category across one forward_body, prints a
 // summary per forward. Sync mid-capture is illegal, so the sampler's
@@ -288,7 +277,6 @@ void FlowDiT::build_rope(const bt::Tensor& hidden, const Repo& r,
     const int half = hd / 2;                        // 32
     const int f0 = static_cast<int>(r.freqs0.size());  // 10
     const int f1 = static_cast<int>(r.freqs1.size());  // 10
-    const int f2 = static_cast<int>(r.freqs2.size());  // 12
 
     // norm -> silu(gate)*content -> final_map  =>  delta_pos (L, 3H)
     // Member scratch (rope_*_) keeps the CUDA branch allocation-stable for
@@ -307,52 +295,15 @@ void FlowDiT::build_rope(const bt::Tensor& hidden, const Repo& r,
     });
 
     // The rotary is FP32 in the reference; the cos/sin tables are (L*H, half).
-    // On a GPU with a table kernel (CUDA, Vulkan) build them fully
-    // on-device: no stream sync, no delta_pos download, no host trig, no table
-    // upload — all of which the host path below pays per block (~28
-    // blocks/forward), and none of which a step-graph capture allows. Metal
-    // keeps the host path (left to the Metal backend).
-#if defined(BROTENSOR_HAS_CUDA)
-    if (hidden.device.is_cuda()) {
-        prof("rope: tables", [&] {
-            detail::flow_rope_tables_cuda(dp, r.freqs_pi, L, H, half, f0, f1,
-                                          cos_out, sin_out);
-        });
-        return;
+    // Build them fully on-device via our single-source Brass MIR kernel across
+    // all GPU backends (CUDA, Vulkan, Metal) — no stream sync or host round-trip.
+    if (!hidden.device.is_gpu()) {
+        fail("the flow model runs on a GPU (CUDA, Vulkan or Metal)");
     }
-#endif
-#if defined(BROTENSOR_HAS_VULKAN)
-    if (hidden.device.is_vulkan()) {
-        prof("rope: tables", [&] {
-            detail::flow_rope_tables_vulkan(dp, r.freqs_pi, L, H, half, f0, f1,
-                                            cos_out, sin_out);
-        });
-        return;
-    }
-#endif
-
-    // Metal (no table kernel there): download delta_pos, build the tables
-    // host-side (FP32, as rope_apply_perhead requires), upload back.
-    if (!hidden.device.is_metal()) fail("the flow model runs on a GPU (CUDA, Vulkan or Metal)");
-    bt::sync_all();
-    std::vector<float> d = download_f32(dp);        // (L, 3H), [head, axis]
-    std::vector<float> cosv(static_cast<std::size_t>(L) * H * half);
-    std::vector<float> sinv(cosv.size());
-    for (int l = 0; l < L; ++l) {
-        for (int hh = 0; hh < H; ++hh) {
-            const float d0 = d[(static_cast<std::size_t>(l) * H + hh) * 3 + 0];
-            const float d1 = d[(static_cast<std::size_t>(l) * H + hh) * 3 + 1];
-            const float d2 = d[(static_cast<std::size_t>(l) * H + hh) * 3 + 2];
-            float* cr = &cosv[(static_cast<std::size_t>(l) * H + hh) * half];
-            float* sr = &sinv[(static_cast<std::size_t>(l) * H + hh) * half];
-            int j = 0;
-            for (int i = 0; i < f0; ++i, ++j) { float a = d0 * r.freqs0[i] * kPi; cr[j] = std::cos(a); sr[j] = std::sin(a); }
-            for (int i = 0; i < f1; ++i, ++j) { float a = d1 * r.freqs1[i] * kPi; cr[j] = std::cos(a); sr[j] = std::sin(a); }
-            for (int i = 0; i < f2; ++i, ++j) { float a = d2 * r.freqs2[i] * kPi; cr[j] = std::cos(a); sr[j] = std::sin(a); }
-        }
-    }
-    cos_out = bt::Tensor::from_host_on(hidden.device, cosv.data(), L * H, half);
-    sin_out = bt::Tensor::from_host_on(hidden.device, sinv.data(), L * H, half);
+    prof("rope: tables", [&] {
+        detail::flow_rope_tables_gpu(dp, r.freqs_pi, L, H, half, f0, f1,
+                                     cos_out, sin_out);
+    });
     (void)D;
 }
 

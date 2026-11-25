@@ -27,45 +27,13 @@ endif()
 
 # --- GPU backend selection ---
 #
-# brotensor always builds its CPU backend; CUDA and Metal are additive and
-# mutually exclusive. brodiffusion forwards whichever the user passed on the
-# cmake line. With neither set, brodiffusion builds and runs CPU-only in
-# FP32: brotensor's CPU backend implements the full diffusion op set, and
-# brodiffusion's own SD1.5 fused kernels fall back to brotensor-op
-# compositions (src/fused.cpp). With -DBROTENSOR_WITH_CUDA=ON the SD1.5-tuned
-# fused CUDA kernels compile in additively and are selected at runtime for
-# GPU-resident tensors — CPU by default, GPU when available.
+# brodiffusion stays pure C++20: it composes brotensor ops (including fused
+# resblocks/GEGLU in src/fused.cpp) and lowers its TripoSplat axial RoPE table
+# kernel from single-source Brass MIR through brotensor::interop — no CUDA,
+# Objective-C++, or GLSL/glslc toolchain required here.
 option(BROTENSOR_WITH_CUDA  "Build the CUDA GPU backend"  OFF)
 option(BROTENSOR_WITH_METAL "Build the Metal GPU backend" OFF)
-# Vulkan compute backend (brotensor's docs/vulkan.md); additive, coexists with
-# the other backends. brodiffusion's own kernels for it are GLSL
-# (src/vulkan/*.comp), compiled by brotensor's cmake/BrotensorVulkan.cmake;
-# the SD1.5 fused ops map onto brotensor's fused GPU ops there (src/fused.cpp).
 option(BROTENSOR_WITH_VULKAN "Build the Vulkan GPU backend" OFF)
-
-# brodiffusion ships SD1.5-specific fused CUDA kernels (e.g. fused_resblock.cu);
-# enable the CUDA language only when CUDA is the selected backend.
-if(BROTENSOR_WITH_CUDA)
-    # CMAKE_CUDA_ARCHITECTURES MUST be set before enable_language(CUDA) —
-    # enable_language initializes it to nvcc's default (52 on Windows) if
-    # unset, after which the (NOT DEFINED) guard would silently skip the
-    # `native` override and we'd end up targeting Maxwell.
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES native)
-    endif()
-    enable_language(CUDA)
-    set(CMAKE_CUDA_STANDARD 17)
-    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-endif()
-
-# brodiffusion ships SD1.5-specific fused Metal kernels (fused_resblock.mm,
-# fused_transformer.mm); enable Objective-C++ only when Metal is selected.
-if(BROTENSOR_WITH_METAL)
-    if(NOT APPLE)
-        message(FATAL_ERROR "BROTENSOR_WITH_METAL requires an Apple platform.")
-    endif()
-    enable_language(OBJCXX)
-endif()
 
 # --- Dependencies: bromath, bronze (+ brass), brotensor, broimage, brolm, brovisionml ---
 #
@@ -90,13 +58,6 @@ bro_dependency(bronze GITHUB wlejon/bronze TARGET bronze_runtime_shared
                OPTIONS BRONZE_BUILD_SHARED_RUNTIME=ON BRONZE_BUILD_TESTS=OFF)
 
 bro_dependency(brotensor GITHUB wlejon/brotensor)
-
-if(BROTENSOR_WITH_VULKAN)
-    # glslc and brotensor's shader include directory, found exactly as
-    # brotensor's own build finds them.
-    include("${brotensor_SOURCE_DIR}/cmake/BrotensorVulkan.cmake")
-    brotensor_vulkan_prepare()
-endif()
 
 bro_dependency(broimage GITHUB wlejon/broimage)
 bro_dependency(brolm GITHUB wlejon/brolm)
@@ -129,6 +90,7 @@ target_link_libraries(brodiffusion PUBLIC
     brolm::brolm
     broimage::broimage
 )
+target_link_libraries(brodiffusion PRIVATE $<BUILD_INTERFACE:brass>)
 
 if(MSVC)
     target_compile_options(brodiffusion PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
@@ -202,60 +164,11 @@ target_sources(brodiffusion PRIVATE
     src/terrain/laplacian.cpp
     src/triposplat/vae_encoder.cpp
     src/triposplat/flow_model.cpp
+    src/triposplat/flow_rope_mir.cpp
     src/triposplat/flow_sobol_pe.cpp
     src/triposplat/octree_decoder.cpp
     src/triposplat/sampler.cpp
 )
-
-# SD1.5-tuned fused GPU kernels. fused.cpp dispatches a GPU-resident tensor to
-# the CUDA or Metal kernel for the active backend and falls back to a
-# brotensor-op composition on CPU. The optimizer (src/optim.cpp, always built)
-# is backend-agnostic — it is composed from device-polymorphic brotensor ops.
-if(BROTENSOR_WITH_CUDA)
-    target_sources(brodiffusion PRIVATE
-        src/fused_resblock.cu
-        src/fused_transformer.cu
-        src/triposplat/flow_rope.cu
-    )
-    find_package(CUDAToolkit REQUIRED)
-    # Static CUDA runtime so the shipped binary carries no cudart DLL dependency
-    # and launches on machines without the CUDA toolkit (falls back to CPU).
-    target_link_libraries(brodiffusion PUBLIC CUDA::cudart_static)
-endif()
-
-if(BROTENSOR_WITH_VULKAN)
-    # GLSL kernels for the Vulkan device, embedded as SPIR-V and dispatched
-    # through brotensor::vulkan::dispatch (the generated
-    # brodiffusion_vk_shaders.h: brodiffusion::detail::vk::Shader / handle()).
-    target_sources(brodiffusion PRIVATE src/triposplat/flow_rope_vulkan.cpp)
-    brotensor_vulkan_add_shaders(brodiffusion
-        NAMESPACE brodiffusion::detail::vk
-        HEADER brodiffusion_vk_shaders.h
-        SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan"
-        SHADERS "flow_rope_f32|flow_rope.comp|-DDT=0"
-                "flow_rope_f16|flow_rope.comp|-DDT=1")
-endif()
-
-if(BROTENSOR_WITH_METAL)
-    # Metal mirrors of the fused CUDA kernels — Objective-C++ (.mm) compiled
-    # with ARC. They reach brotensor's Metal device + buffer pool through the
-    # public <brotensor/metal_interop.h> surface.
-    target_sources(brodiffusion PRIVATE
-        src/fused_resblock.mm
-        src/fused_transformer.mm
-    )
-    set_source_files_properties(
-        src/fused_resblock.mm
-        src/fused_transformer.mm
-        PROPERTIES
-            COMPILE_FLAGS "-fobjc-arc"
-            LANGUAGE OBJCXX
-    )
-    target_link_libraries(brodiffusion PUBLIC
-        "-framework Foundation"
-        "-framework Metal"
-    )
-endif()
 
 # --- CLI ---
 option(BRODIFFUSION_CLI "Build the brodiffusion CLI" ${PROJECT_IS_TOP_LEVEL})

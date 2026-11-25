@@ -1,6 +1,6 @@
-// Static SPIR-V verification & memory-safety audit of brodiffusion Vulkan shaders.
+// Static SPIR-V verification & memory-safety audit of brodiffusion Brass MIR GPU kernels.
 
-#include "brodiffusion_vk_shaders.h"
+#include "brodiffusion/detail/flow_rope.h"
 
 #include <brass/target/spirv/spirv_binary_reader.hpp>
 #include <brass/target/spirv/spirv_ir.hpp>
@@ -22,23 +22,23 @@ static int g_failures = 0;
 } while (0)
 
 int main() {
-    namespace vk = brodiffusion::detail::vk;
-    const std::size_t n = vk::shader_count();
-    std::printf("Auditing %zu brodiffusion Vulkan shaders...\n", n);
+    const auto shaders = brodiffusion::detail::compile_flow_rope_spirv_for_audit();
+    const std::size_t n = shaders.size();
+    std::printf("Auditing %zu brodiffusion Brass MIR SPIR-V kernels...\n", n);
     CHECK(n == 2);
 
     for (std::size_t i = 0; i < n; ++i) {
-        const vk::EmbeddedShader* info = vk::shader_info(i);
-        CHECK(info != nullptr && info->words != nullptr && info->word_count > 0);
-        if (!info || !info->words || info->word_count == 0) continue;
+        const auto& info = shaders[i];
+        CHECK(!info.words.empty());
+        if (info.words.empty()) continue;
 
-        const std::string name = info->name;
-        std::printf("  [%zu/%zu] %s (%zu words)\n", i + 1, n, name.c_str(), info->word_count);
+        const std::string& name = info.name;
+        std::printf("  [%zu/%zu] %s (%zu words)\n", i + 1, n, name.c_str(), info.words.size());
 
         brass::spirv::Module mod;
         std::string parse_err;
         const bool parsed = brass::spirv::parse_binary(
-            std::span<const std::uint32_t>(info->words, info->word_count), mod, &parse_err);
+            std::span<const std::uint32_t>(info.words.data(), info.words.size()), mod, &parse_err);
         if (!parsed) std::printf("    parse error: %s\n", parse_err.c_str());
         CHECK(parsed);
         if (!parsed) continue;

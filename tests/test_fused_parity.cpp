@@ -19,6 +19,7 @@
 
 #include "brodiffusion/fused_resblock.h"
 #include "brodiffusion/fused_transformer.h"
+#include "brodiffusion/detail/flow_rope.h"
 
 #include "brotensor/ops.h"
 #include "brotensor/runtime.h"
@@ -239,6 +240,40 @@ void test_add_row_bias(int rows, int cols, const char* label) {
                   /*tol_rel=*/0.005f, /*tol_abs=*/0.003f);
 }
 
+// ─── flow_rope_tables_gpu ──────────────────────────────────────────────────
+
+void test_flow_rope(bool is_fp16, const char* label) {
+    const int L = 19, H = 8, half = 32, f0 = 10, f1 = 10;
+    const int rows = L * H;
+    const auto dp_v = gen(static_cast<std::size_t>(rows) * 3, 51, 3.0f);
+    const auto fr_v = gen(static_cast<std::size_t>(half), 52, 4.0f);
+
+    std::vector<float> ref_cos(static_cast<std::size_t>(rows) * half);
+    std::vector<float> ref_sin(static_cast<std::size_t>(rows) * half);
+    for (int r = 0; r < rows; ++r) {
+        for (int j = 0; j < half; ++j) {
+            const int axis = (j < f0) ? 0 : (j < f0 + f1 ? 1 : 2);
+            const float a = dp_v[static_cast<std::size_t>(r) * 3 + axis] * fr_v[j];
+            ref_cos[static_cast<std::size_t>(r) * half + j] = std::cos(a);
+            ref_sin[static_cast<std::size_t>(r) * half + j] = std::sin(a);
+        }
+    }
+
+    bt::Tensor dp = is_fp16 ? gpu_t(dp_v, L, 3 * H)
+                            : bt::Tensor::from_host_on(gpu_dev(), dp_v.data(), L, 3 * H);
+    bt::Tensor fr = is_fp16 ? gpu_t(fr_v, 1, half)
+                            : bt::Tensor::from_host_on(gpu_dev(), fr_v.data(), 1, half);
+    bt::Tensor cos_out, sin_out;
+    bd::detail::flow_rope_tables_gpu(dp, fr, L, H, half, f0, f1, cos_out, sin_out);
+    bt::sync(gpu_dev());
+    const auto got_cos = cos_out.to_host_vector();
+    const auto got_sin = sin_out.to_host_vector();
+    expect_parity((std::string(label) + " cos").c_str(), compare(ref_cos, got_cos),
+                  got_cos.size(), /*tol_rel=*/1e-5f, /*tol_abs=*/1e-5f);
+    expect_parity((std::string(label) + " sin").c_str(), compare(ref_sin, got_sin),
+                  got_sin.size(), /*tol_rel=*/1e-5f, /*tol_abs=*/1e-5f);
+}
+
 }  // namespace
 
 int main() {
@@ -274,6 +309,10 @@ int main() {
         test_add_vec(64, 64, "add_inplace_vec 64x64");
         test_add_row_bias(13, 29, "add_inplace_row_bias 13x29");
         test_add_row_bias(48, 80, "add_inplace_row_bias 48x80");
+
+        // TripoSplat axial RoPE table build (FP32 and FP16 inputs).
+        test_flow_rope(false, "flow_rope_f32");
+        test_flow_rope(true,  "flow_rope_f16");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "fused_parity: %s\n", e.what());
         ++g_failures;
